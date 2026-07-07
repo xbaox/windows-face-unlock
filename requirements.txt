@@ -1,14 +1,18 @@
-deepface>=0.0.93
+# Face recognition engine: InsightFace on onnxruntime-GPU (RTX 4070).
+# onnxruntime-gpu is pinned: 1.27 requires CUDA 13 (no pip redistributable);
+# 1.26 uses CUDA 12. Exact CUDA/cuDNN wheels are pinned in requirements.lock.
+onnxruntime-gpu==1.26.0
+insightface>=1.0
+onnx>=1.22
 opencv-python>=4.9
 numpy>=1.26
-tf-keras>=2.16
+
+# Active liveness (blink EAR / head-pose gesture / anti-screen) is built on the
+# InsightFace 2d106 + 3d68 landmarks -- no extra ML dependencies.
+# DeepFace / TensorFlow / tf-keras / torch / torchvision were removed in Stage 2.
+
 pywin32>=306
 psutil>=5.9
-# torch is only needed for DeepFace anti-spoofing (MiniFASNet).
-# Install CPU build with:
-#   pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
-torch>=2.0
-torchvision>=0.15
 pystray>=0.19
 Pillow>=10.0
 tomli>=2.0 ; python_version < "3.11"
