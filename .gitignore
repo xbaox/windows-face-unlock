@@ -3,3 +3,6 @@ stage-*-TZ.md
 audit-notes.md
 stage1-benchmark.md
 requirements.lock
+.venv/
+__pycache__/
+*.pyc
