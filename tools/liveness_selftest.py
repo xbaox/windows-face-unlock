@@ -22,6 +22,7 @@ from face_service.liveness import (
     EYE_IDX, compute_ear, BlinkDetector, BlinkWindow, EAR_THRESH,
     Challenge, ChallengeState, LivenessChallenge,
     POSE_PITCH, POSE_YAW, YAW_DELTA, PITCH_DOWN_DELTA, LEFT_IS_NEGATIVE_YAW,
+    ScreenFeatures, is_screen_features, screen_features, HF_THRESH,
 )
 
 OPEN_EAR = 0.25
@@ -180,6 +181,25 @@ def main():
     for lm in [OPEN] * 3 + [CLOSED] * 2 + [OPEN]:
         ch.feed(lm, None); clk.tick(0.1)
     check("engine BLINK resolves via blink", ch.state == ChallengeState.PASSED)
+
+
+    print("\nAnti-screen classifier (hf-only gate; lap/peak are audit telemetry):")
+    live_like = ScreenFeatures(hf=0.189, peak=7.0, lap=213.0)     # worst-session live means
+    screen_like = ScreenFeatures(hf=0.134, peak=10.0, lap=252.0)  # screen means
+    check("live-like NOT flagged", is_screen_features(live_like) is False)
+    check("screen-like flagged", is_screen_features(screen_like) is True)
+    check("hf just below thr -> flagged",
+          is_screen_features(ScreenFeatures(HF_THRESH - 1e-3, 7.0, 150.0)) is True)
+    check("hf just above thr -> not flagged",
+          is_screen_features(ScreenFeatures(HF_THRESH + 1e-3, 7.0, 150.0)) is False)
+    # lap is telemetry ONLY: a high lap must NOT flag when hf is fine (drift-robustness)
+    check("high lap does NOT flag when hf ok (lap out of gate)",
+          is_screen_features(ScreenFeatures(0.22, 20.0, 999.0)) is False)
+    # smoke test: screen_features runs and returns finite numbers on a real-ish crop
+    g = (np.random.RandomState(0).rand(128, 128) * 255).astype(np.float32)
+    f = screen_features(g)
+    check("screen_features returns finite hf/peak/lap",
+          all(np.isfinite(v) for v in f))
 
     print("\nAll liveness self-tests passed.")
 

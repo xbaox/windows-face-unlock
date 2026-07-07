@@ -1,61 +1,68 @@
 """Active liveness primitives for the face-unlock service (Stage 2).
 
-Blink detection (2d106) + head-pose gesture challenges (1k3d68 face.pose), built on the
-landmarks InsightFace already produces per frame. No InsightFace import here and no extra
-detections: the recognizer runs one app.get(bgr); the resulting face carries
-.normed_embedding (recognition), .landmark_2d_106 (blink) and .pose (gesture). Enabling
-those landmark modules in the recognizer's allowed_modules happens at integration
-(Stage 2, Step 5) -- this module does not touch the recognizer.
+Blink detection (2d106) + head-pose gesture challenges (1k3d68 face.pose) + an anti-screen
+check on the face crop (frequency + texture). Everything here consumes what the recognizer
+already produces per frame; no InsightFace import and no extra detections. Enabling the
+landmark modules in the recognizer's allowed_modules happens at integration (Step 5).
 
 Numbers (measured on this webcam)
 ---------------------------------
-Blink: open eye avg EAR ~= 0.26, closed ~= 0.09 (Step 1/2). EAR_THRESH = 0.18.
-Pose (Step 3, face.pose = [pitch, yaw, roll] in degrees):
-  neutral  ~ pitch -13, yaw -3, roll +2
-  turn L/R ~ yaw +-35     nod down ~ pitch -16 from neutral
-Thresholds are taken relative to a baseline captured at challenge start so they don't
-depend on the user's resting head position.
+Blink: open EAR ~0.26, closed ~0.09 (Step 1/2). EAR_THRESH = 0.18.
+Pose (face.pose = [pitch, yaw, roll] deg, Step 3): neutral ~ pitch -13 / yaw -3;
+  turn L/R ~ yaw +-35; nod down ~ pitch -16 from neutral.
+Anti-screen (Step 4, 3 sessions): live-face FFT/texture features drift with lighting as much
+as screen features do (live hf 0.198->0.189 across sessions; live lap std 28->52; lap sep
+collapsed to 0.24 in dim light). Absolute thresholds therefore trade FP vs detection poorly.
+Kept as a WEAK doubt trigger only: hf-only, conservative threshold (<1% live FP on the worst
+session), escalates to a gesture rather than hard-rejecting. The gesture is the real replay
+defense (behavioral, lighting-independent). lap/peak -> audit telemetry, not in the gate.
 """
 from __future__ import annotations
 
 import time
 import random
 from enum import Enum, auto
+from typing import NamedTuple
 
 import numpy as np
 
 # --- Blink (2d106) -----------------------------------------------------------------------
 
-# Canonical eye landmark indices for the InsightFace 106-pt model. Single source of truth
-# for the whole project (tools/liveness_probe.py imports these).
 EYE_IDX: dict[str, list[int]] = {
     "left":  [35, 41, 42, 39, 37, 36],   # eye A: [outer, top1, top2, inner, bottom2, bottom1]
     "right": [89, 95, 96, 93, 91, 90],   # eye B
 }
 
-EAR_THRESH = 0.18       # below this = eye considered closed
-BLINK_CONSEC = 2        # consecutive closed frames required to arm a blink
+EAR_THRESH = 0.18
+BLINK_CONSEC = 2
 
 # --- Head pose (1k3d68 face.pose) --------------------------------------------------------
 
-# Axis mapping in InsightFace's face.pose, confirmed on camera (Step 3).
 POSE_PITCH = 0   # nod   (down = more negative)
 POSE_YAW = 1     # turn left/right
 POSE_ROLL = 2    # tilt
 
-# Gesture thresholds in degrees, applied relative to a per-challenge baseline.
-YAW_DELTA = 20.0          # |yaw - baseline| to count a left/right turn (full turn ~35)
-PITCH_DOWN_DELTA = 10.0   # (baseline_pitch - pitch) to count a downward nod (nod ~16)
-GESTURE_BASELINE_FRAMES = 3   # frames averaged for the neutral baseline
+YAW_DELTA = 20.0
+PITCH_DOWN_DELTA = 10.0
+GESTURE_BASELINE_FRAMES = 3
+LEFT_IS_NEGATIVE_YAW = True   # confirmed on camera: left turn -> yaw ~ -37
 
-# Left/right sign convention on the mirror-flipped frame. If the probe shows prompts
-# reversed (says LEFT but only a right turn resolves it), flip this single flag.
-LEFT_IS_NEGATIVE_YAW = True
+BLINK_TIMEOUT_S = 4.0
+GESTURE_TIMEOUT_S = 5.0
 
-# --- Timing ------------------------------------------------------------------------------
+# --- Anti-screen (frequency + texture on the face crop) ----------------------------------
 
-BLINK_TIMEOUT_S = 4.0      # default blink window
-GESTURE_TIMEOUT_S = 5.0    # gestures need a beat to read the prompt and move
+SCREEN_CROP = 128
+# Anti-screen is a WEAK conditional signal, not a hard gate. Across 3 sessions the live-face
+# FFT/texture features drifted with lighting (live hf 0.198->0.189, live lap std 28->52) and
+# lap's separation collapsed (sep 0.24 under variable light). So: hf-only gate with a
+# conservative threshold chosen for <1% live false-positive on the WORST observed session
+# (drift-robust), used only as a doubt trigger that escalates to an active gesture -- never a
+# hard reject in fast mode. The robust replay defense is the gesture challenge. lap/peak are
+# logged to the audit trail as telemetry but are NOT in the gate.
+HF_THRESH = 0.150     # gate: screen-like when hf < this (drift-robust, live FP <1% all sessions)
+LAP_AUDIT = 260.0     # telemetry only (moire energy reference; unreliable across lighting)
+PEAK_AUDIT = 8.8      # telemetry only (weakest separator)
 
 
 def _ear_one(lm: np.ndarray, idx: list[int]) -> float:
@@ -78,19 +85,11 @@ class EyeState(Enum):
 
 
 class BlinkDetector:
-    """Streaming blink counter with a small state machine.
-
-    A completed blink is: open -> closed for >= consec_frames -> open. Feed one frame's
-    landmarks per call; state persists across calls so one instance can span a verify loop
-    or a challenge window.
+    """Streaming blink counter. A completed blink is open -> closed(>=consec) -> open.
+    State persists across update() calls so one instance can span a verify loop or window.
     """
 
-    def __init__(
-        self,
-        eye_idx: dict[str, list[int]] = EYE_IDX,
-        ear_thresh: float = EAR_THRESH,
-        consec_frames: int = BLINK_CONSEC,
-    ):
+    def __init__(self, eye_idx=EYE_IDX, ear_thresh=EAR_THRESH, consec_frames=BLINK_CONSEC):
         self.eye_idx = eye_idx
         self.ear_thresh = ear_thresh
         self.consec_frames = consec_frames
@@ -107,7 +106,6 @@ class BlinkDetector:
         return self._state
 
     def update(self, landmark) -> float:
-        """Feed one frame's 106-pt landmarks. Updates state, returns this frame's EAR."""
         e = compute_ear(landmark, self.eye_idx)
         self.last_ear = e
         if e < self.ear_thresh:
@@ -126,17 +124,14 @@ class BlinkDetector:
 
 
 class BlinkWindow:
-    """One blink challenge: require >= 1 completed blink before a deadline.
-
-    feed() tolerates frames with no face (landmark=None) -- they still tick the deadline.
-    `clock` is injectable so this is unit-testable without a camera or real waiting.
+    """Require >= 1 completed blink before a deadline. feed() tolerates no-face frames
+    (landmark=None) -- they still tick the deadline. Clock is injectable for tests.
     """
 
-    def __init__(self, detector: BlinkDetector, timeout_s: float = BLINK_TIMEOUT_S, clock=time.monotonic):
+    def __init__(self, detector: BlinkDetector, timeout_s=BLINK_TIMEOUT_S, clock=time.monotonic):
         self._det = detector
         self._clock = clock
-        self._start = clock()
-        self._deadline = self._start + timeout_s
+        self._deadline = clock() + timeout_s
         self._blinks_at_start = detector.blinks
         self._resolved = False
         self._passed = False
@@ -160,10 +155,6 @@ class BlinkWindow:
     @property
     def passed(self) -> bool:
         return self._passed
-
-    @property
-    def elapsed(self) -> float:
-        return self._clock() - self._start
 
 
 # --- Active challenge engine -------------------------------------------------------------
@@ -194,7 +185,6 @@ ALL_KINDS = (Challenge.BLINK,) + GESTURE_KINDS
 
 
 class _BlinkTask:
-    """Adapts BlinkWindow to the (landmark, pose) feed interface."""
     def __init__(self, timeout_s: float, clock):
         self._win = BlinkDetector().window(timeout_s=timeout_s, clock=clock)
 
@@ -203,7 +193,8 @@ class _BlinkTask:
 
 
 class _PoseTask:
-    """Head-pose gesture: reach a yaw/pitch deviation from a captured baseline before timeout."""
+    """Reach a yaw/pitch deviation from a captured baseline before timeout."""
+
     def __init__(self, kind: Challenge, timeout_s: float, clock):
         self.kind = kind
         self._clock = clock
@@ -245,10 +236,7 @@ class _PoseTask:
 
 class LivenessChallenge:
     """Issue one random challenge and track it to PASS/FAIL.
-
-    States: IDLE -> (issue) -> AWAITING -> PASSED | FAILED. Feed the per-frame landmarks
-    and pose; the active task resolves on success or timeout. `rng` and `clock` are
-    injectable for deterministic tests.
+    IDLE -> (issue) -> AWAITING -> PASSED | FAILED. rng/clock injectable for tests.
     """
 
     def __init__(self, kinds=ALL_KINDS, timeout_s: float | None = None,
@@ -267,13 +255,10 @@ class LivenessChallenge:
         return BLINK_TIMEOUT_S if kind == Challenge.BLINK else GESTURE_TIMEOUT_S
 
     def issue(self, kind: Challenge | None = None) -> Challenge:
-        """Start a challenge (random from allowed kinds unless one is forced)."""
         self.kind = kind or self._rng.choice(self._kinds)
         t = self._timeout_for(self.kind)
-        if self.kind == Challenge.BLINK:
-            self._task = _BlinkTask(t, self._clock)
-        else:
-            self._task = _PoseTask(self.kind, t, self._clock)
+        self._task = _BlinkTask(t, self._clock) if self.kind == Challenge.BLINK \
+            else _PoseTask(self.kind, t, self._clock)
         self.state = ChallengeState.AWAITING
         return self.kind
 
@@ -282,7 +267,6 @@ class LivenessChallenge:
         return PROMPTS.get(self.kind, "") if self.kind else ""
 
     def feed(self, landmark, pose) -> ChallengeState:
-        """Feed one frame. Returns current state; terminal once PASSED or FAILED."""
         if self.state != ChallengeState.AWAITING or self._task is None:
             return self.state
         resolved, passed = self._task.feed(landmark, pose)
@@ -297,3 +281,90 @@ class LivenessChallenge:
     @property
     def passed(self) -> bool:
         return self.state == ChallengeState.PASSED
+
+
+# --- Anti-screen detector ----------------------------------------------------------------
+
+class ScreenFeatures(NamedTuple):
+    hf: float
+    peak: float
+    lap: float
+
+
+_SCREEN_WIN: np.ndarray | None = None
+_SCREEN_R: np.ndarray | None = None
+
+
+def _screen_win() -> np.ndarray:
+    global _SCREEN_WIN
+    if _SCREEN_WIN is None:
+        _SCREEN_WIN = np.outer(np.hanning(SCREEN_CROP), np.hanning(SCREEN_CROP)).astype(np.float32)
+    return _SCREEN_WIN
+
+
+def _screen_radius() -> np.ndarray:
+    global _SCREEN_R
+    if _SCREEN_R is None:
+        c = SCREEN_CROP // 2
+        Y, X = np.ogrid[:SCREEN_CROP, :SCREEN_CROP]
+        r = np.sqrt((X - c) ** 2 + (Y - c) ** 2)
+        _SCREEN_R = (r / r.max()).astype(np.float32)
+    return _SCREEN_R
+
+
+def face_gray(bgr, bbox, size: int = SCREEN_CROP):
+    """Resized grayscale face crop for anti-screen features; None if the bbox is too small."""
+    import cv2
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(bgr.shape[1], x2), min(bgr.shape[0], y2)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+    g = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    return cv2.resize(g, (size, size)).astype(np.float32)
+
+
+def screen_features(gray) -> ScreenFeatures:
+    """FFT high-freq fraction (hf) + mid-band spectral peakiness (peak) + Laplacian variance
+    (lap) on a grayscale face crop. hf drops for a display recapture; peak/lap rise with moire.
+    """
+    import cv2
+    g = (gray - gray.mean()) * _screen_win()
+    mag = np.abs(np.fft.fftshift(np.fft.fft2(g)))
+    rn = _screen_radius()
+    total = float(mag.sum()) + 1e-9
+    hf = float(mag[rn > 0.5].sum()) / total
+    band = mag[(rn > 0.35) & (rn < 0.75)]
+    peak = float(band.max() / (band.mean() + 1e-9)) if band.size else 0.0
+    lap = float(cv2.Laplacian(gray, cv2.CV_32F).var())   # CV_32F: OpenCV 5 drops 32F->64F
+    return ScreenFeatures(hf, peak, lap)
+
+
+def is_screen_features(f: ScreenFeatures, hf_thresh: float = HF_THRESH) -> bool:
+    """Anti-screen gate: screen-like when the fine-texture fraction is low (a display recapture
+    loses skin texture). hf-only and conservative -- across sessions this drifts with lighting,
+    so the threshold is set for <1% live false-positive on the worst observed session and the
+    result is used as a doubt trigger (escalate to gesture), not a hard reject. lap/peak are
+    telemetry, deliberately NOT in the gate. Pure function -> unit-testable without a camera."""
+    return f.hf < hf_thresh
+
+
+class ScreenDetector:
+    """Per-frame anti-screen check on the face crop. Primary signal = FFT high-frequency
+    fraction (a display recapture loses fine skin texture, dropping hf). Returns a per-frame
+    flag; the verify loop aggregates across frames so one noisy frame can't cause a false
+    reject, and a screen suspicion escalates to an active gesture rather than hard-rejecting.
+    """
+
+    def __init__(self, hf_thresh: float = HF_THRESH):
+        self.hf_thresh = hf_thresh
+        self.last: ScreenFeatures | None = None
+
+    def check(self, bgr, bbox) -> bool | None:
+        """True = screen-like (doubt -> escalate), False = live-like, None = crop unusable.
+        self.last holds the full ScreenFeatures (hf/peak/lap) for the audit trail."""
+        g = face_gray(bgr, bbox)
+        if g is None:
+            return None
+        self.last = screen_features(g)
+        return is_screen_features(self.last, self.hf_thresh)
