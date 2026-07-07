@@ -1,41 +1,5 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
-build/
-*.dll
-*.lib
-*.exp
-*.pdb
-*.obj
-.vscode/
-.idea/
-*.log
-
-# Generated / user-specific
-credential_provider/build/
-*.npz
-embeddings.npz
-enroll/
-*.jpg
-*.png
-!docs/**/*.png
-!docs/**/*.jpg
-
-# Never commit credentials or weights
-credentials.bin
-weights/
-*.h5
-*.pth
-*.onnx
-# …but DO ship the bundled YuNet detector (small, opencv_zoo, Apache-2.0)
-!models/face_detection_yunet_2023mar.onnx
-
-# Local build artifacts (release binaries are produced by .github/workflows/release.yml)
-dist/
-installer_output/
-
-# fast-install (uv/aria2) artifacts
-wheelhouse/
-report.json
-urls.txt
+face-unlock-MASTER-TZ.md
+stage-*-TZ.md
+audit-notes.md
+stage1-benchmark.md
+requirements.lock
