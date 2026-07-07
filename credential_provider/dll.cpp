@@ -39,7 +39,7 @@ STDAPI DllRegisterServer(void) {
     WCHAR path[MAX_PATH];
     GetModuleFileNameW((HMODULE)&__ImageBase, path, MAX_PATH);
 
-    const WCHAR* clsid = L"{F8A0B4D9-3C7F-4B0A-9E21-8C1B1E2B7C10}";
+    const WCHAR* clsid = L"{8414D7B6-D536-461B-B31B-ADF77B3A8974}";
     WCHAR sub[MAX_PATH];
 
     wsprintfW(sub, L"CLSID\\%s", clsid);
@@ -57,7 +57,7 @@ STDAPI DllRegisterServer(void) {
 }
 
 STDAPI DllUnregisterServer(void) {
-    const WCHAR* clsid = L"{F8A0B4D9-3C7F-4B0A-9E21-8C1B1E2B7C10}";
+    const WCHAR* clsid = L"{8414D7B6-D536-461B-B31B-ADF77B3A8974}";
     WCHAR sub[MAX_PATH];
     wsprintfW(sub, L"CLSID\\%s", clsid);
     RegDeleteTreeW(HKEY_CLASSES_ROOT, sub);
