@@ -4,7 +4,13 @@ import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # force CPU; no CUDA forking
+# NOTE (stage 1): the recognition engine moved from tf-keras (CPU) to
+# InsightFace on onnxruntime-gpu, so we must NOT hide the GPU anymore.
+# TensorFlow (still used only for passive MiniFASNet liveness) stays on CPU
+# via TF_* thread limits above and native-Windows TF not seeing CUDA, so
+# exposing the GPU here benefits only onnxruntime. Do not re-add
+# CUDA_VISIBLE_DEVICES=-1 or the engine silently falls back to CPU.
+# (Passive TF liveness is removed in stage 2 with active liveness.)
 
 import multiprocessing
 
