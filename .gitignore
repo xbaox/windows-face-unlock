@@ -34,3 +34,8 @@ weights/
 # Local build artifacts (release binaries are produced by .github/workflows/release.yml)
 dist/
 installer_output/
+
+# fast-install (uv/aria2) artifacts
+wheelhouse/
+report.json
+urls.txt
