@@ -2,9 +2,11 @@ from __future__ import annotations
 import logging
 import warnings
 from pathlib import Path
+from typing import NamedTuple
 import numpy as np
 
 from .config import Config, EMBED_PATH, ENROLL_DIR
+from .liveness import ScreenDetector
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +22,11 @@ ENGINE_TAG = "insightface-buffalo_l"
 EMBED_DIM = 512          # InsightFace ArcFace (w600k_r50) output dimension
 DET_SIZE = 640           # detector input square; tune 320/640 for speed vs range
 MODEL_NAME = "buffalo_l"
+
+# Modules loaded from buffalo_l. detection + recognition give bbox/embedding; landmark_2d_106
+# feeds blink (EAR), landmark_3d_68 gives head pose for gesture challenges. One app.get() now
+# yields all of them, so active liveness costs ZERO extra detections (MiniFASNet/DeepFace gone).
+ALLOWED_MODULES = ["detection", "recognition", "landmark_2d_106", "landmark_3d_68"]
 
 _CUDA_DLLS_READY = False
 
@@ -94,25 +101,31 @@ def _select_providers(ort):
     return ["CPUExecutionProvider"], -1
 
 
-def _lazy_deepface():
-    # Imported lazily because TensorFlow import is slow and heavy.
-    from deepface import DeepFace  # type: ignore
-    return DeepFace
+class FrameAnalysis(NamedTuple):
+    """Everything one detect yields, for the service loop to build a liveness verdict."""
+    face: bool                     # a face was detected
+    is_match: bool                 # embedding distance <= threshold
+    distance: float                # best cosine distance to enrolled refs
+    screen: bool | None            # anti-screen: True=screen-like, False=live-like, None=n/a
+    landmark: np.ndarray | None    # 2d106 landmarks (blink), or None
+    pose: np.ndarray | None        # [pitch, yaw, roll] deg (gesture), or None
 
 
 class Recognizer:
     """Face recognizer backed by InsightFace (ONNX / onnxruntime-GPU).
 
-    Detection + alignment + 512-D ArcFace embedding come from buffalo_l on the GPU
-    (graceful CPU fallback). Passive liveness still runs through DeepFace/MiniFASNet
-    on this stage; active liveness is stage 2. Public interface
-    (enroll_from_dir / load / verify_frame) is unchanged from the DeepFace version.
+    Detection + alignment + 512-D ArcFace embedding + 2d106/3d68 landmarks come from buffalo_l
+    on the GPU (graceful CPU fallback). Passive liveness is now the anti-screen check (frequency
+    on the face crop); active blink/gesture liveness lives in face_service.liveness and is driven
+    by the service loop across frames. DeepFace/MiniFASNet (and TensorFlow/torch) are gone.
+    Public interface (enroll_from_dir / load / verify_frame) is unchanged; analyze_frame is new.
     """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._refs: np.ndarray | None = None  # shape (N, 512)
         self._app = None                       # cached insightface FaceAnalysis
+        self._screen = ScreenDetector()        # anti-screen (hf-only, conservative)
 
     # ---------- engine ----------
 
@@ -132,13 +145,14 @@ class Recognizer:
         providers, ctx_id = _select_providers(ort)
         app = FaceAnalysis(
             name=MODEL_NAME,
-            allowed_modules=["detection", "recognition"],
+            allowed_modules=ALLOWED_MODULES,
             providers=providers,
         )
         app.prepare(ctx_id=ctx_id, det_size=(DET_SIZE, DET_SIZE))
 
-        # Warmup so the first real verify_frame doesn't pay CUDA kernel init:
-        # detection on a black frame + recognition on a dummy aligned crop.
+        # Warmup so the first real verify_frame doesn't pay CUDA kernel init: a black-frame
+        # get() exercises detection + both landmark models; recognition gets a dummy crop.
+        # (No DeepFace/MiniFASNet warmup anymore -> ~5.6s and the TF import are gone.)
         try:
             app.get(np.zeros((DET_SIZE, DET_SIZE, 3), dtype=np.uint8))
             rec = app.models.get("recognition")
@@ -147,23 +161,10 @@ class Recognizer:
         except Exception as e:  # pragma: no cover - warmup is best-effort
             log.debug("engine warmup skipped: %s", e)
 
-        # Warm up passive liveness too (DeepFace/MiniFASNet + TF load lazily on
-        # the first real frame otherwise, adding a ~6s spike to verify #1).
-        if self.cfg.anti_spoofing:
-            try:
-                DeepFace = _lazy_deepface()
-                DeepFace.extract_faces(
-                    img_path=np.zeros((DET_SIZE, DET_SIZE, 3), dtype=np.uint8),
-                    detector_backend=self.cfg.detector_backend,
-                    anti_spoofing=True,
-                    enforce_detection=False,
-                )
-            except Exception as e:  # pragma: no cover - warmup is best-effort
-                log.debug("liveness warmup skipped: %s", e)
-
         try:
             eff = app.det_model.session.get_providers()
-            log.info("InsightFace ready: providers=%s ctx_id=%d det_size=%d", eff, ctx_id, DET_SIZE)
+            log.info("InsightFace ready: providers=%s ctx_id=%d det_size=%d modules=%s",
+                     eff, ctx_id, DET_SIZE, ALLOWED_MODULES)
         except Exception:
             log.info("InsightFace ready: ctx_id=%d det_size=%d", ctx_id, DET_SIZE)
 
@@ -248,43 +249,52 @@ class Recognizer:
         nb = b / (np.linalg.norm(b) + 1e-9)
         return float(1.0 - np.dot(na, nb))  # cosine *distance*
 
-    def verify_frame(self, bgr: np.ndarray) -> tuple[bool, float, bool]:
-        """Return (is_match, best_distance, is_real). is_real False if anti-spoofing flagged."""
+    def analyze_frame(self, bgr: np.ndarray) -> FrameAnalysis:
+        """One detect -> match/distance + landmarks + pose + anti-screen. For the service loop
+        to accumulate a multi-frame liveness verdict (blink/gesture/anti-screen). Single detect;
+        landmarks and pose ride along on the same face object.
+        """
         if self._refs is None and not self.load():
             raise RuntimeError("No enrollment found. Run enroll first.")
 
-        # 1) liveness (unchanged: DeepFace MiniFASNet). Early-exit preserved.
-        is_real = True
-        if self.cfg.anti_spoofing:
-            DeepFace = _lazy_deepface()
-            try:
-                faces = DeepFace.extract_faces(
-                    img_path=bgr,
-                    detector_backend=self.cfg.detector_backend,
-                    anti_spoofing=True,
-                    enforce_detection=True,
-                )
-                if not faces:
-                    return False, 1.0, False
-                is_real = bool(faces[0].get("is_real", True))
-                if not is_real:
-                    return False, 1.0, False
-            except Exception as e:
-                log.warning("liveness check failed: %s", e)
-                return False, 1.0, False
-
-        # 2) embedding via InsightFace (GPU), cosine distance to enrolled refs.
         app = self._lazy_app()
         try:
             faces = app.get(bgr)
         except Exception as e:
             log.debug("insightface get failed: %s", e)
-            return False, 1.0, is_real
+            return FrameAnalysis(False, False, 1.0, None, None, None)
         if not faces:
-            return False, 1.0, is_real
+            return FrameAnalysis(False, False, 1.0, None, None, None)
 
         face = self._largest_face(faces)
         emb = np.asarray(face.normed_embedding, dtype=np.float32)
-        dists = [self._cosine(emb, r) for r in self._refs]  # type: ignore[union-attr]
-        best = min(dists)
-        return best <= self.cfg.threshold, best, is_real
+        best = min(self._cosine(emb, r) for r in self._refs)  # type: ignore[union-attr]
+        is_match = best <= self.cfg.threshold
+
+        # Passive anti-screen on the face crop (conservative hf gate; None if crop unusable).
+        screen = None
+        if getattr(self.cfg, "anti_screen", True):
+            try:
+                screen = self._screen.check(bgr, face.bbox)
+            except Exception as e:
+                log.debug("anti-screen check failed: %s", e)
+
+        landmark = face.get("landmark_2d_106") if hasattr(face, "get") else None
+        pose = face.get("pose") if hasattr(face, "get") else None
+        return FrameAnalysis(True, is_match, best, screen, landmark, pose)
+
+    def verify_frame(self, bgr: np.ndarray) -> tuple[bool, float, bool]:
+        """Return (is_match, best_distance, is_real). Compat wrapper over analyze_frame.
+
+        is_real = passive per-frame liveness (anti-screen: not screen-like). As in the stock
+        engine, a liveness failure forces match=False so callers that gate on the match alone
+        (unlock) still refuse spoofs. Active blink/gesture liveness is applied by the service
+        loop across frames, not here (single frame can't observe a blink).
+        """
+        a = self.analyze_frame(bgr)
+        if not a.face:
+            return False, 1.0, False
+        is_real = a.screen is not True   # True=screen -> not real; False/None -> real
+        if not is_real:
+            return False, a.distance, False
+        return a.is_match, a.distance, True
