@@ -1,0 +1,16 @@
+# --- Line-ending policy ---
+# This repo is historically MIXED-EOL (many .py are CRLF in the worktree, a few
+# are CRLF even in HEAD). We deliberately do NOT force a repo-wide normalization
+# here -- that would rewrite ~24 unrelated files and bury real changes. This pins
+# ONLY the two files whose Stage-3 edits had a CRLF-worktree vs LF-HEAD mismatch
+# (audit finding F1), so their commits show functional changes, not a full flip.
+# A repo-wide LF normalization can be done later as its own dedicated change.
+face_service/config.py    text eol=lf
+face_service/service.py   text eol=lf
+
+# --- Binary assets: never apply line-ending or text diffing ---
+*.npz              binary
+*.png              binary
+*.jpg              binary
+*.jpeg             binary
+requirements.lock  binary

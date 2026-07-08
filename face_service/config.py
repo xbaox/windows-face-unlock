@@ -19,10 +19,15 @@ ENROLL_DIR = APP_DIR / "enroll"
 EMBED_PATH = APP_DIR / "embeddings.npz"
 CREDS_PATH = APP_DIR / "credentials.bin"
 LOG_PATH = APP_DIR / "service.log"
+LOCKOUT_PATH = APP_DIR / "lockout.json"
+AUDIT_PATH = APP_DIR / "audit.jsonl"
+ADAPTIVE_PATH = APP_DIR / "adaptive.npz"   # Stage 3: adaptive gallery (separate from embeddings.npz)
+WATCHDOG_PAUSE_PATH = APP_DIR / "watchdog.pause"   # Stage 3 Step 5: deliberate-stop pause (self-expiring)
 
 PIPE_NAME = r"\\.\pipe\FaceUnlock"
 
 PRESENCE_MODES = ("recognition", "detection")
+LIVENESS_MODES = ("fast", "paranoid")
 
 
 def _default_language() -> str:
@@ -37,7 +42,10 @@ class Config:
     model_name: str = "ArcFace"
     detector_backend: str = "yunet"  # yunet is fast + robust. Alternatives: opencv, retinaface
     distance_metric: str = "cosine"
-    threshold: float = 0.45          # ArcFace cosine
+    threshold: float = 0.32          # ArcFace cosine. Set from Stage-9 measurements on this
+                                     # webcam: genuine (self) max ~0.12 over 40 varied frames,
+                                     # impostor min ~0.97 -> huge gap; 0.32 keeps self headroom
+                                     # (~2.6x) while staying far below any impostor.
     anti_spoofing: bool = True
     camera_index: int = 0
     camera_warmup_frames: int = 10   # discard N frames after opening for auto-exposure
@@ -50,6 +58,80 @@ class Config:
     # "detection"   = YuNet any-face-in-frame is enough (weaker; mimics old AutoFaceLock)
     presence_mode: str = "recognition"
     warmup_on_start: bool = True
+    # --- Stage 2: liveness (active challenge / anti-screen / rate-limit) ---
+    # fast    = challenge only on doubt (subsecond when confident + clean)
+    # paranoid = require an active gesture on every valid match
+    liveness_mode: str = "fast"
+    blink_timeout_s: float = 4.0       # window to observe a spontaneous blink
+    challenge_on_doubt: bool = True    # fast mode: on doubt escalate to a gesture (else deny)
+    anti_screen: bool = True           # passive anti-screen (texture/moire) doubt trigger
+    max_face_attempts: int = 5         # consecutive face failures before a temporary face lockout
+    lockout_seconds: int = 300         # face-lockout cooldown; PIN/password stays available
+    audit_log: bool = True             # write a JSONL audit record per verify/unlock/challenge
+    audit_max_mb: float = 5.0          # rotate the audit file past this size (keeps 2 backups)
+    # --- Stage 3: enrollment quality control (locked to this webcam's real enroll set) ---
+    # Good enroll frames measured on this cam: det_score 0.83-0.89, sharpness (variance of
+    # Laplacian on the aligned 112 crop) 151-321, luma 82-131, clipping 0%. Gates sit with
+    # headroom below/above those so a good frame never drops, while blurry / dark / weak-
+    # detection frames do. face_px and clip fractions are logged as telemetry, not hard gates.
+    enroll_min_det_score: float = 0.65  # drop faces the detector is unsure about (< this)
+    enroll_min_sharpness: float = 80.0  # min variance-of-Laplacian on the aligned crop (blur floor)
+    enroll_luma_min: float = 55.0       # drop under-exposed crops (mean luma below this)
+    enroll_luma_max: float = 210.0      # drop blown-out crops (mean luma above this)
+    enroll_min_frames: int = 3          # need >= this many QC-passing frames or enroll fails clearly
+    # --- Stage 3: adaptive gallery (opt-in; adapts to gradual drift, guarded vs poisoning) ---
+    # Off by default: this mutates the gallery. When on, a just-verified frame is added ONLY if it
+    # is within (threshold - adaptive_margin) COSINE OF THE ENROLLMENT BASELINE (not the adaptive-
+    # augmented set -> no drift-hopping), liveness passed, no screen flag, and (in paranoid) a
+    # gesture passed. Measured refs: self <=0.124, replay-of-self ~0.155, impostor ~0.97. Default
+    # margin 0.17 -> ceiling 0.15 at threshold 0.32: above self-max, BELOW replay -> spoof/other
+    # cannot inject. Widening the margin lowers the ceiling toward replay distance -- keep it tight.
+    adaptive_gallery: bool = False      # master toggle (mutates the gallery; opt in explicitly)
+    adaptive_margin: float = 0.17       # add only if enroll-distance <= threshold - this
+    adaptive_max_size: int = 10         # cap on stored adaptive embeddings (FIFO ring; excludes enroll)
+    adaptive_cooldown_s: float = 1800.0 # min seconds between two adaptive additions (rate-limit)
+    # --- Stage 3: low-light gate (Step 3.2; honest "too-dark" refusal, no camera control here) ---
+    # Below this SCENE luma (mean gray of the whole frame, not the crop) an unlock is refused with
+    # reason "too-dark" even if recognition would match: in the dark the passive anti-spoof and the
+    # match margin are not trustworthy (Step 3.1: dist climbs past threshold ~scene 10, anti-screen
+    # hf false-flags ~88%; clean pass only from ~scene 48+). 45.0 sits conservatively between those.
+    # It is an ENVIRONMENT refusal, so the service keeps it lockout-neutral. 0 disables the gate.
+    low_light_luma_min: float = 45.0
+    # --- Stage 3: gated exposure boost (Step 3.3) ---
+    # When an unlock burst is below the floor above, try to raise webcam EXPOSURE and re-capture
+    # BEFORE the too-dark refusal, to pull a genuine user out of the dark. STRICTLY gated (only
+    # below the floor): an unconditional boost blows out a normally-lit face (Step 3.1: the same
+    # boost drove scene 98->230 and lost the face 100%->0%). Only EXPOSURE is touched -- the 3.1
+    # roundtrip showed this webcam's driver ignores GAIN and AUTO_EXPOSURE sets but honors EXPOSURE.
+    # The boost is transient: exposure is always restored after the attempt. Default True:
+    # confirmed on the live smoke -- scene 44 -> 115 (exposure -6 -> -4), restore verified, and the
+    # extra burst adds only ~200-400ms. Set False to disable (then the path is identical to 3.2).
+    low_light_boost: bool = True
+    # Exposure step (EV) added to the current CAP_PROP_EXPOSURE when boosting. Units are
+    # driver-defined; on this webcam less-negative == brighter, so a POSITIVE step brightens
+    # (Step 3.1: set -6 -> -4 honored, scene 10 -> 50, distance 0.363 -> 0.249). One +2 step is
+    # enough on this cam; widen only on evidence.
+    low_light_exposure_step: float = 2.0
+    # --- Stage 3: busy-camera handling (Step 4) ---
+    # When the webcam is held by ANOTHER process (not our own enrollment lease), opening it fails.
+    # Instead of a multi-second RuntimeError bubbling up as reason "exception: ...", the service
+    # bounds the open with a short retry loop (Camera.open_fast) and reports reason "camera-busy"
+    # -- lockout-NEUTRAL, since a busy device is environment, not a failed match. These bound that
+    # loop; open() itself keeps its robust 3x3 zombie recovery for enrollment / warmup.
+    camera_open_retries: int = 2         # extra open attempts after the first before declaring busy
+    camera_open_timeout_s: float = 3.0   # wall-clock budget for the whole open-retry loop (seconds)
+    # --- Stage 3: watchdog (Step 5; external Scheduled-Task supervisor pings the pipe) ---
+    # tools.watchdog pings the existing `ping` command every watchdog_interval_s; after
+    # watchdog_fail_threshold consecutive failures (each bounded by watchdog_ping_timeout_s -- a
+    # hung server that never answers counts as a fail) it restarts the service KILL-THEN-START
+    # (a hung-but-alive process still holds the single-instance mutex). A deliberate `shutdown`
+    # drops a self-expiring pause (watchdog_pause_ttl_s) so the watchdog does not resurrect an
+    # intentional stop; an EXPIRED pause is ignored + deleted, so a stale pause can never silence
+    # the watchdog forever. A permanent disable = stop the FaceUnlock-Watchdog task itself.
+    watchdog_ping_timeout_s: float = 2.0   # per-ping wall-clock budget (a hung server -> a fail)
+    watchdog_fail_threshold: int = 3        # consecutive ping failures before a restart
+    watchdog_interval_s: float = 30.0       # seconds between pings in the watchdog self-loop
+    watchdog_pause_ttl_s: float = 300.0     # deliberate-stop pause lifetime; self-heals after this
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
@@ -87,3 +169,74 @@ class Config:
             raise ValueError(
                 f"language must be one of {LANG_CODES}, got {self.language!r}"
             )
+        if self.liveness_mode not in LIVENESS_MODES:
+            raise ValueError(
+                f"liveness_mode must be one of {LIVENESS_MODES}, got {self.liveness_mode!r}"
+            )
+        if self.blink_timeout_s <= 0:
+            raise ValueError("blink_timeout_s must be > 0")
+        if self.max_face_attempts < 1:
+            raise ValueError("max_face_attempts must be >= 1")
+        if self.lockout_seconds < 0:
+            raise ValueError("lockout_seconds must be >= 0")
+        if self.audit_max_mb <= 0:
+            raise ValueError("audit_max_mb must be > 0")
+        if not (0.0 <= self.enroll_min_det_score <= 1.0):
+            raise ValueError("enroll_min_det_score must be in [0, 1]")
+        if self.enroll_min_sharpness < 0:
+            raise ValueError("enroll_min_sharpness must be >= 0")
+        if not (0.0 <= self.enroll_luma_min < self.enroll_luma_max <= 255.0):
+            raise ValueError("require 0 <= enroll_luma_min < enroll_luma_max <= 255")
+        if self.enroll_min_frames < 1:
+            raise ValueError("enroll_min_frames must be >= 1")
+        if not (0.0 < self.adaptive_margin <= 1.0):
+            raise ValueError("adaptive_margin must be in (0, 1]")
+        if self.adaptive_max_size < 1:
+            raise ValueError("adaptive_max_size must be >= 1")
+        if self.adaptive_cooldown_s < 0:
+            raise ValueError("adaptive_cooldown_s must be >= 0")
+        # Low-light gate floor: a scene-luma value in [0, 255]. 0 disables the gate. Fail loud
+        # rather than silently clamp an out-of-range floor (same spirit as the adaptive checks).
+        if not (0.0 <= self.low_light_luma_min <= 255.0):
+            raise ValueError("low_light_luma_min must be in [0, 255] (0 disables the low-light gate)")
+        if not isinstance(self.low_light_boost, bool):
+            raise ValueError("low_light_boost must be a boolean")
+        # Exposure step in driver-defined EV units; must brighten (>0) and stay sane (<= 16 stops).
+        if not (0.0 < self.low_light_exposure_step <= 16.0):
+            raise ValueError("low_light_exposure_step must be in (0, 16]")
+        # Busy-camera open loop: a non-negative integer retry count (bool rejected) and a positive,
+        # bounded wall-clock budget. Fail loud rather than silently clamp.
+        if isinstance(self.camera_open_retries, bool) or not isinstance(self.camera_open_retries, int):
+            raise ValueError("camera_open_retries must be an integer")
+        if not (0 <= self.camera_open_retries <= 10):
+            raise ValueError("camera_open_retries must be in [0, 10]")
+        if not (0.0 < self.camera_open_timeout_s <= 30.0):
+            raise ValueError("camera_open_timeout_s must be in (0, 30]")
+        # Watchdog bounds (Step 5): positive/bounded timeouts, an integer failure threshold >= 1.
+        if not (0.0 < self.watchdog_ping_timeout_s <= 30.0):
+            raise ValueError("watchdog_ping_timeout_s must be in (0, 30]")
+        if isinstance(self.watchdog_fail_threshold, bool) or not isinstance(self.watchdog_fail_threshold, int):
+            raise ValueError("watchdog_fail_threshold must be an integer")
+        if not (1 <= self.watchdog_fail_threshold <= 100):
+            raise ValueError("watchdog_fail_threshold must be in [1, 100]")
+        if not (0.0 < self.watchdog_interval_s <= 3600.0):
+            raise ValueError("watchdog_interval_s must be in (0, 3600]")
+        if not (0.0 < self.watchdog_pause_ttl_s <= 3600.0):
+            raise ValueError("watchdog_pause_ttl_s must be in (0, 3600]")
+        if self.adaptive_gallery:
+            # Anti-screen is the PRIMARY replay defense for adaptation; the distance ceiling
+            # alone leaves only ~0.005 cosine below replay-of-self (~0.155 vs ceiling ~0.15),
+            # so refuse to run adaptation with it off. F4.
+            if not self.anti_screen:
+                raise ValueError(
+                    "adaptive_gallery requires anti_screen=True (anti-screen is the primary "
+                    "replay defense for adaptation; the distance ceiling alone is too thin)"
+                )
+            # margin >= threshold => ceiling (threshold - margin) <= 0, which silently disables
+            # every adaptation. Fail loudly rather than pretend the feature is on. N2.
+            if self.adaptive_margin >= self.threshold:
+                raise ValueError(
+                    "adaptive_margin must be < threshold when adaptive_gallery is on "
+                    f"(got margin={self.adaptive_margin} >= threshold={self.threshold} "
+                    "=> ceiling <= 0, no frame could ever adapt)"
+                )

@@ -47,6 +47,36 @@ class Camera:
                 time.sleep(1.0)  # let the driver flush stuck handles
         raise RuntimeError(f"Cannot open camera index {self.index} ({last_err})")
 
+    def open_fast(self) -> bool:
+        """Bounded single-pass open for the busy-check path (Stage 3 / Step 4).
+
+        One quick pass over the backends with a few reads and NO long sleeps; returns True if a
+        frame was grabbed (camera acquired), False if it could not be (e.g. the device is held by
+        another process). Unlike ``open()`` it never raises and does NOT run the multi-second
+        zombie-recovery retry -- the service wraps it in its own bounded, config-driven retry loop.
+        ``open()`` stays the authoritative, robust opener for enrollment / warmup.
+        """
+        if self._cap is not None:
+            return True
+        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+            cap = cv2.VideoCapture(self.index, backend)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            ok = False
+            for _ in range(4):
+                ret, _ = cap.read()
+                if ret:
+                    ok = True
+                    break
+            if ok:
+                self._cap = cap
+                for _ in range(self.warmup_frames):
+                    cap.read()
+                return True
+            cap.release()
+        return False
+
     def close(self) -> None:
         if self._cap is not None:
             self._cap.release()

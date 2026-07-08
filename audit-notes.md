@@ -125,3 +125,59 @@
 
 
 > Свой GUID (Шаг 4): {8414D7B6-D536-461B-B31B-ADF77B3A8974}
+
+\---
+
+## Этап 3 — надёжность движка (Stage 3 — engine reliability) — DONE ✅
+
+> Ветка `stage3-reliability` → слита в `master` (`--no-ff`). Дата: 2026-07-08.
+> Коммиты: `8c30224` (Steps 0–2: QC-энролл + adaptive + Stage-2 tail), `1dc496c` (Step 3: low-light detect + too-dark), `c050f16` (Step 3.3: gated exposure-boost), `25bbccc` (Step 4: camera-busy), `d54a93d` (Step 5: watchdog + graceful-shutdown); `259d30e` — гигиена (LF-pin `config.py`/`service.py`, ignore `.idea`/бинарники).
+
+**Что сделано по шагам:**
+
+- **Step 1 — QC-энролл** (`enroll_qc.py`, `recognizer.enroll_from_dir`): каждый кадр проходит гейты `det_score` / sharpness (variance-of-Laplacian на 112-кропе) / luma ДО эмбеддинга; если QC-прошедших `< enroll_min_frames` → чёткий `RuntimeError` с причинами (а не тихая слабая галерея). Per-frame лог + read-only `tools.enroll_qc_probe`.
+- **Step 2 — адаптивная галерея + анти-отравление** (`adaptive.py`, `recognizer.maybe_adapt`, `service._maybe_adapt_gallery`): opt-in, по умолчанию **OFF**. Just-verified эмбеддинг добавляется ТОЛЬКО если его дистанция к enrollment-базе ≤ `threshold − adaptive_margin`, liveness прошёл, нет screen-флага, (в параноике) есть жест; FIFO-cap + cooldown. Ceiling якорится на enrollment (нет drift-hopping); спуф/чужой/replay-of-self галерею не травят.
+- **Step 3 — low-light детект + too-dark гейт** (`lowlight.py`, `service.py`): `scene_luma` по всему кадру; ниже `low_light_luma_min` unlock честно отказывает с reason `too-dark` — **LOCKOUT-НЕЙТРАЛЬНО** (тьма — среда, не провал матча), без тихого false-reject.
+- **Step 3.3 — gated exposure-boost** (`camera_boost.py`, `service._maybe_boost` + `service._analyze_burst`): только НИЖЕ флора поднимает CAP_PROP_EXPOSURE и переснимает бёрст перед too-dark-отказом; exposure всегда восстанавливается (`finally`); если всё ещё темно — остаётся too-dark, нейтрально к lockout. Живой смоук: scene 44→115, restore подтверждён.
+- **Step 4 — camera-busy** (`camera_open.py`, `service._acquire_camera`): когда камеру держит ЧУЖОЙ процесс (не наш enrollment-lease) — ограниченный retry-loop вместо многосекундного `exception:…`; reason `camera-busy`, **LOCKOUT-НЕЙТРАЛЬНО**; отличается от enrollment-lease. Юнит-доказано; реальная интеграция на этой вебке self-skip (cv2 не держит устройство эксклюзивно).
+- **Step 5 — watchdog + graceful-shutdown** (`watchdog.py`, `service.py`): внешний Scheduled-Task пингует пайп; N провалов подряд → рестарт kill-then-start (зависший-но-живой процесс держит mutex); намеренный `shutdown` роняет self-expiring pause (watchdog не воскрешает намеренный стоп; expired pause самоудаляется). Graceful-shutdown чинит error 233. Живой смоук: shutdown без 233, Ctrl+C чисто, рестарт убитого сервиса.
+
+**Обоснование правок `service.py` (критерий 7)** — все по делу шагов выше, ничего лишнего:
+
+| Шаг | Добавлено в `service.py` | Зачем |
+|-|-|-|
+| Step 2 | `_maybe_adapt_gallery` | врезка адаптации в unlock-путь (за liveness/anti-screen гейтами) |
+| Step 3 | too-dark гейт в unlock-хендлере + поле `scene_luma` в `VerifyOutcome` (helpers `scene_luma`/`evaluate_low_light` — в `lowlight.py`) | честный отказ в темноте, нейтральный к lockout |
+| Step 3.3 | `_analyze_burst` (выделен бёрст) + `_maybe_boost` | boost переиспользует ТОТ ЖЕ путь без дублирования кадров |
+| Step 4 | `_acquire_camera` | bounded open + reason `camera-busy` |
+| Step 5 | `stop_event` / `_wake_accept` (self-connect разблокирует `ConnectNamedPipe`) / `_console_ctrl_handler` (Ctrl+C) / `_drain_until_client_closes` (233-handshake) / watchdog-pause | корректный graceful-shutdown без гонки/233 |
+
+**Локи целы (git-сверка `259d30e..HEAD`):** `verify_frame`, `_prep_cuda_dlls` (GPU-фикс), NULL DACL / pipe-security — НЕ в диффе Этапа 3. Пайп **аддитивен**: шаги надёжности (3–5) добавили НОЛЬ новых команд, только reason-токены `too-dark` / `camera-busy`; команды `shutdown`/`pause_camera`/`resume_camera` уже были на базе Этапа 3 (Этап 2). Локскрин (`credential_provider/`), `installer/`, `presence_monitor/` — не тронуты.
+
+**Новые config-поля (append-only, дефолты):**
+
+| Поле | Дефолт | Смысл |
+|-|-|-|
+| `low_light_luma_min` | `45.0` | флор scene-luma; ниже → `too-dark` (0 = гейт выкл) |
+| `low_light_boost` | `true` | поднять exposure и переснять перед too-dark |
+| `low_light_exposure_step` | `2.0` | шаг EV для boost |
+| `camera_open_retries` | `2` | доп. попытки open перед вердиктом `camera-busy` |
+| `camera_open_timeout_s` | `3.0` | бюджет всего open-retry-loop, сек |
+| `watchdog_ping_timeout_s` | `2.0` | бюджет одного пинга (зависший сервер = провал) |
+| `watchdog_fail_threshold` | `3` | провалов подряд до рестарта |
+| `watchdog_interval_s` | `30.0` | период пинга в self-loop |
+| `watchdog_pause_ttl_s` | `300.0` | TTL паузы намеренного стопа (самолечение) |
+
+> Step 1/2 (тоже append-only): `enroll_min_det_score=0.65`, `enroll_min_sharpness=80.0`, `enroll_luma_min=55.0`, `enroll_luma_max=210.0`, `enroll_min_frames=3`; `adaptive_gallery=false`, `adaptive_margin=0.17`, `adaptive_max_size=10`, `adaptive_cooldown_s=1800.0`.
+> Порог `threshold` изменён `0.45 → 0.32` в `8c30224` (из измерений), шагами 3–5 не трогался.
+
+**Ре-энролл (6.1):** 19 QC-кадров приняты (1 DROP `bright>210`); живой self-distance mean=0.0855 / max=0.104 (было ~0.2); 3/3 unlock grant с первой попытки (best 0.065–0.073, margin ~0.25, screen 0/5, 200–245 мс); порог `0.32` НЕ менялся.
+
+**Перенесённые TODO (в следующие этапы):**
+
+- (a) Жёсткий cap одиночного `open_fast` под эксклюзивной контенцией → **Этап 5** (вместе с CP-таймаутом).
+- (b) Тихий режим watchdog (убрать чёрные окна `schtasks`/CIM) → **Этап 6/7**.
+- (c) Читаемость раздувшегося `service.py` → **Этап 6** (НЕ рефакторить перед мержем).
+- (d) Repo-wide EOL-нормализация → **Этап 5/6** (из handoff).
+
+**Анти-отравление (напоминание):** adaptive-галерея по умолчанию OFF; включать только при `anti_screen=true`; ceiling якорится на enrollment-базу; при любом сомнении в чистоте — `clear_adaptive()` или ре-энролл (жёсткий откат). Сквозное напоминание про System Protection до Этапа 7 — см. блок вверху файла.
