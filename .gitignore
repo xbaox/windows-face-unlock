@@ -6,3 +6,6 @@ requirements.lock
 .venv/
 __pycache__/
 *.pyc
+stage-2-RESUME.md
+stage-2-RESUME.md
+.idea/
