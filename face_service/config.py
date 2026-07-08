@@ -89,6 +89,13 @@ class Config:
     adaptive_margin: float = 0.17       # add only if enroll-distance <= threshold - this
     adaptive_max_size: int = 10         # cap on stored adaptive embeddings (FIFO ring; excludes enroll)
     adaptive_cooldown_s: float = 1800.0 # min seconds between two adaptive additions (rate-limit)
+    # --- Stage 3: low-light gate (Step 3.2; honest "too-dark" refusal, no camera control here) ---
+    # Below this SCENE luma (mean gray of the whole frame, not the crop) an unlock is refused with
+    # reason "too-dark" even if recognition would match: in the dark the passive anti-spoof and the
+    # match margin are not trustworthy (Step 3.1: dist climbs past threshold ~scene 10, anti-screen
+    # hf false-flags ~88%; clean pass only from ~scene 48+). 45.0 sits conservatively between those.
+    # It is an ENVIRONMENT refusal, so the service keeps it lockout-neutral. 0 disables the gate.
+    low_light_luma_min: float = 45.0
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
@@ -152,6 +159,10 @@ class Config:
             raise ValueError("adaptive_max_size must be >= 1")
         if self.adaptive_cooldown_s < 0:
             raise ValueError("adaptive_cooldown_s must be >= 0")
+        # Low-light gate floor: a scene-luma value in [0, 255]. 0 disables the gate. Fail loud
+        # rather than silently clamp an out-of-range floor (same spirit as the adaptive checks).
+        if not (0.0 <= self.low_light_luma_min <= 255.0):
+            raise ValueError("low_light_luma_min must be in [0, 255] (0 disables the low-light gate)")
         if self.adaptive_gallery:
             # Anti-screen is the PRIMARY replay defense for adaptation; the distance ceiling
             # alone leaves only ~0.005 cosine below replay-of-self (~0.155 vs ceiling ~0.15),

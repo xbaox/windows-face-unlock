@@ -58,6 +58,7 @@ from .detector import FaceDetector
 from .audit import AuditLog
 from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
 from .lockout import Lockout
+from .lowlight import evaluate_low_light, scene_luma
 from .recognizer import Recognizer
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ class VerifyOutcome(NamedTuple):
     real: bool
     detail: dict
     embedding: "np.ndarray | None" = None   # best-matching frame's 512-D embedding (adaptive gallery)
+    scene_luma: "float | None" = None        # brightest scene luma over the burst (Stage 3.2 low-light gate)
 
 
 class FaceService:
@@ -143,6 +145,7 @@ class FaceService:
         best_emb = None
         screen_flagged = 0
         screen_checked = 0
+        scene_luma_max = None   # brightest scene luma seen this burst (Stage 3.2); None if no frame read
         blink = BlinkDetector()
 
         with self._cam_lock:
@@ -159,6 +162,11 @@ class FaceService:
                     frame = cam.read()
                     if frame is None:
                         continue
+                    # Scene brightness is face-INDEPENDENT: compute it for every captured frame
+                    # (incl. no-face ones) and keep the MAX, so a transient dip or a frame where
+                    # the face was briefly lost can't trip the low-light gate on its own.
+                    sl = scene_luma(frame)
+                    scene_luma_max = sl if scene_luma_max is None else max(scene_luma_max, sl)
                     try:
                         a = self.recog.analyze_frame(frame)
                     except Exception as e:
@@ -195,9 +203,12 @@ class FaceService:
         is_real = screen_frac < SCREEN_DOUBT_FRAC
         latency_ms = (time.monotonic() - t0) * 1000.0
         log.info(
-            "verify verdict=%s matches=%d/%d best=%.3f margin=%.3f blink=%d screen=%d/%d mode=%s",
+            "verify verdict=%s matches=%d/%d best=%.3f margin=%.3f blink=%d screen=%d/%d "
+            "sceneL=%s mode=%s",
             v.name, matches, self.cfg.verify_required, best, margin,
-            blink.blinks, screen_flagged, screen_checked, self.cfg.liveness_mode,
+            blink.blinks, screen_flagged, screen_checked,
+            ("%.1f" % scene_luma_max) if scene_luma_max is not None else "n/a",
+            self.cfg.liveness_mode,
         )
         detail = {
             "verdict": v.name,
@@ -209,10 +220,11 @@ class FaceService:
             "blink": blink.blinks,
             "screen_flagged": screen_flagged,
             "screen_checked": screen_checked,
+            "scene_luma": round(scene_luma_max, 2) if scene_luma_max is not None else None,
             "mode": self.cfg.liveness_mode,
             "latency_ms": round(latency_ms, 1),
         }
-        return VerifyOutcome(v == Verdict.PASS, best, is_real, detail, best_emb)
+        return VerifyOutcome(v == Verdict.PASS, best, is_real, detail, best_emb, scene_luma_max)
 
     def _maybe_adapt_gallery(self, r: "VerifyOutcome") -> None:
         """Opt-in adaptive gallery: on a genuine, live, non-screen unlock, offer the
@@ -458,6 +470,21 @@ class FaceService:
                                              "retry_after_s": round(rem, 1)})
                 return {"ok": False, "reason": "locked-out", "retry_after_s": round(rem, 1)}
             r = self._capture_and_verify()
+            # Stage 3.2 low-light gate. If even the brightest frame of the burst is below the
+            # floor, refuse honestly ("too-dark") and stay LOCKOUT-NEUTRAL: darkness is an
+            # environment problem, not a failed match, so it must NOT add a lockout strike (nor
+            # reset the counter) -- otherwise a user in a dim room would rack up strikes and get
+            # face-locked for 300s just for being in the dark (a soft DoS). Above the floor -- or
+            # when the gate is disabled (floor 0) or no scene was measured (camera leased / no
+            # frame) -- behaviour is byte-for-byte unchanged. (Step 3.3 will insert an exposure
+            # boost + re-capture BEFORE this gate; the gate itself does not change.)
+            too_dark = False
+            if r.scene_luma is not None:
+                _grant, ll_reason, too_dark = evaluate_low_light(
+                    r.scene_luma, self.cfg.low_light_luma_min, r.match)
+            if too_dark:
+                self._audit.write("unlock", {**r.detail, "outcome": "too-dark"})
+                return {"ok": False, "reason": ll_reason, "distance": r.distance, "real": r.real}
             # Don't count an enrollment-lease skip as a real failed attempt.
             if not self._camera_leased_out():
                 self._lockout.record(r.match)
