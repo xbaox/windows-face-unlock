@@ -60,9 +60,14 @@ from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
 from .lockout import Lockout
 from .lowlight import evaluate_low_light, scene_luma
 from .camera_boost import try_exposure_boost
+from .camera_open import open_with_retry
 from .recognizer import Recognizer
 
 log = logging.getLogger(__name__)
+
+# Pause between bounded camera-open attempts (Stage 3.4). The attempt count / total budget are
+# config (camera_open_retries / camera_open_timeout_s); this small inter-attempt pause is fixed.
+CAMERA_OPEN_PAUSE_S = 0.3
 
 
 def _build_sa_everyone() -> win32security.SECURITY_ATTRIBUTES:
@@ -83,6 +88,7 @@ class VerifyOutcome(NamedTuple):
     detail: dict
     embedding: "np.ndarray | None" = None   # best-matching frame's 512-D embedding (adaptive gallery)
     scene_luma: "float | None" = None        # brightest scene luma over the burst (Stage 3.2 low-light gate)
+    camera_busy: bool = False                # Stage 3.4: open failed -- device held by another process
 
 
 class FaceService:
@@ -107,12 +113,32 @@ class FaceService:
     def _camera_leased_out(self) -> bool:
         return time.time() < self._camera_paused_until
 
-    def _get_camera(self) -> Camera:
-        """Return the shared persistent camera, opening it if needed."""
-        if self._cam is None:
-            self._cam = Camera(self.cfg.camera_index, self.cfg.camera_warmup_frames)
-            self._cam.open()
-        return self._cam
+    def _acquire_camera(self):
+        """Open the webcam with a bounded, non-hanging retry (Stage 3.4).
+
+        Returns ``(camera, busy)``: ``(Camera, False)`` on success, ``(None, True)`` when the device
+        is busy (held by ANOTHER process -- distinct from our own enrollment lease, which the callers
+        check first). Never raises, never hangs (Camera.open_fast + open_with_retry). For the
+        persistent camera ``self._cam`` is set ONLY on success, so a failed open leaves it None and
+        the next call retries cleanly instead of returning a stuck half-open handle. The caller must
+        already hold ``self._cam_lock``.
+        """
+        if self.cfg.persistent_camera and self._cam is not None:
+            return self._cam, False
+        cam = Camera(self.cfg.camera_index, self.cfg.camera_warmup_frames)
+        ok = open_with_retry(
+            cam.open_fast,
+            retries=self.cfg.camera_open_retries,
+            pause_s=CAMERA_OPEN_PAUSE_S,
+            timeout_s=self.cfg.camera_open_timeout_s,
+            clock=time.monotonic,
+            sleep=time.sleep,
+        )
+        if not ok:
+            return None, True
+        if self.cfg.persistent_camera:
+            self._cam = cam   # persist ONLY on success -> no stuck half-open handle
+        return cam, False
 
     def _release_camera(self) -> None:
         if self._cam is not None:
@@ -141,11 +167,12 @@ class FaceService:
                                  {"verdict": "SKIPPED", "reason": "camera-leased"})
 
         with self._cam_lock:
-            cam = self._get_camera() if self.cfg.persistent_camera else Camera(
-                self.cfg.camera_index, self.cfg.camera_warmup_frames
-            )
-            if not self.cfg.persistent_camera:
-                cam.open()
+            cam, busy = self._acquire_camera()
+            if busy:
+                log.info("verify skipped: camera busy (held by another process)")
+                return VerifyOutcome(False, 1.0, False,
+                                     {"verdict": "SKIPPED", "reason": "camera-busy"},
+                                     camera_busy=True)
             try:
                 return self._analyze_burst(cam)
             finally:
@@ -248,13 +275,9 @@ class FaceService:
                        "scene_luma_before": round(r_dark.scene_luma, 2)}
         try:
             with self._cam_lock:
-                cam = self._get_camera() if self.cfg.persistent_camera else Camera(
-                    self.cfg.camera_index, self.cfg.camera_warmup_frames
-                )
-                opened = False
-                if not self.cfg.persistent_camera:
-                    cam.open()
-                    opened = True
+                cam, busy = self._acquire_camera()
+                if busy:
+                    return r_dark, boost_audit   # device grabbed by another process; skip boost
                 try:
                     cap = getattr(cam, "_cap", None)
                     if cap is None:
@@ -264,7 +287,7 @@ class FaceService:
                         lambda: self._analyze_burst(cam),
                     )
                 finally:
-                    if opened:
+                    if not self.cfg.persistent_camera:
                         cam.close()
         except Exception as e:   # pragma: no cover - defensive; boost must never break unlock
             log.warning("low-light boost skipped: %s", e)
@@ -333,11 +356,9 @@ class FaceService:
         wall_deadline = time.monotonic() + self.cfg.blink_timeout_s + GESTURE_TIMEOUT_S + 2.0
 
         with self._cam_lock:
-            cam = self._get_camera() if self.cfg.persistent_camera else Camera(
-                self.cfg.camera_index, self.cfg.camera_warmup_frames
-            )
-            if not self.cfg.persistent_camera:
-                cam.open()
+            cam, busy = self._acquire_camera()
+            if busy:
+                return {"ok": False, "reason": "camera-busy"}
             try:
                 for _ in range(2):
                     cam.read()
@@ -385,11 +406,10 @@ class FaceService:
 
     def _presence_probe_recognition(self) -> tuple[bool, bool]:
         with self._cam_lock:
-            cam = self._get_camera() if self.cfg.persistent_camera else Camera(
-                self.cfg.camera_index, self.cfg.camera_warmup_frames
-            )
-            if not self.cfg.persistent_camera:
-                cam.open()
+            cam, busy = self._acquire_camera()
+            if busy:
+                log.info("presence probe skipped: camera busy (held by another process)")
+                return True, True   # like leased: don't rack up absence strikes when we can't see
             try:
                 for _ in range(2):
                     cam.read()
@@ -410,11 +430,10 @@ class FaceService:
 
     def _presence_probe_detection(self) -> tuple[bool, bool]:
         with self._cam_lock:
-            cam = self._get_camera() if self.cfg.persistent_camera else Camera(
-                self.cfg.camera_index, self.cfg.camera_warmup_frames
-            )
-            if not self.cfg.persistent_camera:
-                cam.open()
+            cam, busy = self._acquire_camera()
+            if busy:
+                log.info("presence probe skipped: camera busy (held by another process)")
+                return True, True   # like leased: don't rack up absence strikes when we can't see
             try:
                 for _ in range(2):
                     cam.read()
@@ -528,6 +547,14 @@ class FaceService:
                                              "retry_after_s": round(rem, 1)})
                 return {"ok": False, "reason": "locked-out", "retry_after_s": round(rem, 1)}
             r = self._capture_and_verify()
+            # Stage 3.4 busy camera: the webcam is held by ANOTHER process (not our enrollment
+            # lease). Refuse cleanly with reason "camera-busy" -- LOCKOUT-NEUTRAL (a busy device is
+            # environment, not a failed match) -- instead of the old multi-second RuntimeError that
+            # bubbled up as reason "exception: Cannot open camera...". Returns before the lockout
+            # counter is touched, before boost, and before the too-dark gate.
+            if r.camera_busy:
+                self._audit.write("unlock", {**r.detail, "outcome": "camera-busy"})
+                return {"ok": False, "reason": "camera-busy"}
             # Stage 3.3 gated exposure boost: if the burst came back below the floor, try to raise
             # EXPOSURE and re-capture BEFORE the too-dark fallback. Gated (only below the floor) so a
             # normally-lit face is never blown out; transient (exposure always restored inside
@@ -636,13 +663,18 @@ class FaceService:
         except Exception as e:
             log.warning("model warmup failed: %s", e)
 
-        # Also warm up the camera (open + close if not persistent)
+        # Also warm up the camera (open + close if not persistent). If the device is busy at
+        # startup, skip gracefully -- the first real request will retry the bounded open.
         try:
-            cam = self._get_camera()
-            cam.read()
-            log.info("camera warmup ok (persistent=%s)", self.cfg.persistent_camera)
-            if not self.cfg.persistent_camera:
-                self._release_camera()
+            with self._cam_lock:
+                cam, busy = self._acquire_camera()
+                if busy:
+                    log.info("camera warmup skipped: camera busy (held by another process)")
+                else:
+                    cam.read()
+                    log.info("camera warmup ok (persistent=%s)", self.cfg.persistent_camera)
+                    if not self.cfg.persistent_camera:
+                        cam.close()
         except Exception as e:
             log.warning("camera warmup failed: %s", e)
 

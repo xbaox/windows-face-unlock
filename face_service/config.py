@@ -111,6 +111,14 @@ class Config:
     # (Step 3.1: set -6 -> -4 honored, scene 10 -> 50, distance 0.363 -> 0.249). One +2 step is
     # enough on this cam; widen only on evidence.
     low_light_exposure_step: float = 2.0
+    # --- Stage 3: busy-camera handling (Step 4) ---
+    # When the webcam is held by ANOTHER process (not our own enrollment lease), opening it fails.
+    # Instead of a multi-second RuntimeError bubbling up as reason "exception: ...", the service
+    # bounds the open with a short retry loop (Camera.open_fast) and reports reason "camera-busy"
+    # -- lockout-NEUTRAL, since a busy device is environment, not a failed match. These bound that
+    # loop; open() itself keeps its robust 3x3 zombie recovery for enrollment / warmup.
+    camera_open_retries: int = 2         # extra open attempts after the first before declaring busy
+    camera_open_timeout_s: float = 3.0   # wall-clock budget for the whole open-retry loop (seconds)
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
@@ -183,6 +191,14 @@ class Config:
         # Exposure step in driver-defined EV units; must brighten (>0) and stay sane (<= 16 stops).
         if not (0.0 < self.low_light_exposure_step <= 16.0):
             raise ValueError("low_light_exposure_step must be in (0, 16]")
+        # Busy-camera open loop: a non-negative integer retry count (bool rejected) and a positive,
+        # bounded wall-clock budget. Fail loud rather than silently clamp.
+        if isinstance(self.camera_open_retries, bool) or not isinstance(self.camera_open_retries, int):
+            raise ValueError("camera_open_retries must be an integer")
+        if not (0 <= self.camera_open_retries <= 10):
+            raise ValueError("camera_open_retries must be in [0, 10]")
+        if not (0.0 < self.camera_open_timeout_s <= 30.0):
+            raise ValueError("camera_open_timeout_s must be in (0, 30]")
         if self.adaptive_gallery:
             # Anti-screen is the PRIMARY replay defense for adaptation; the distance ceiling
             # alone leaves only ~0.005 cosine below replay-of-self (~0.155 vs ceiling ~0.15),
