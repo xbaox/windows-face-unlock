@@ -10,11 +10,17 @@ Commands:
       -> {"ok":true,"match":bool,"distance":float,"real":bool}
   {"cmd":"unlock"}             # verify + return credentials on success
       -> {"ok":true,"username":"...","password":"...","domain":"..."}  (on match)
-      -> {"ok":false,"reason":"..."}
+      -> {"ok":false,"reason":"..."}   # "no-match" | "no-credentials" | "locked-out" (+retry_after_s)
+  {"cmd":"reset_lockout"}      # clear the face-auth lockout early (admin / tray / test)
+      -> {"ok":true,"lockout":{...}}
   {"cmd":"presence"}           # single-frame presence probe
       -> {"ok":true,"present":bool,"real":bool,"mode":"recognition|detection"}
+  {"cmd":"challenge","kind":"blink|turn_left|turn_right|nod"}   # active-gesture STUB
+                               # (Stage-5 CP; "kind" optional -> random). Not wired to unlock.
+      -> {"ok":true,"challenge":str,"prompt":str,"passed":bool,"state":str}
   {"cmd":"status"}             # service metadata for GUI
-      -> {"ok":true,"uptime_s":float,"config":{...},"enrollment":bool}
+      -> {"ok":true,"uptime_s":float,"config":{...},"enrollment":bool,
+          "lockout":{...},"audit":{...}}
   {"cmd":"reload_config"}      # re-read config.toml from disk
       -> {"ok":true,"config":{...}}
   {"cmd":"pause_camera","seconds":120}   # release webcam for N seconds so
@@ -33,7 +39,7 @@ import logging
 import threading
 import time
 from dataclasses import asdict
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import pywintypes  # type: ignore
 import win32api  # type: ignore
@@ -46,9 +52,12 @@ def win32api_get_last_error() -> int:
     return win32api.GetLastError()
 
 from .camera import Camera
-from .config import Config, LOG_PATH, PIPE_NAME
+from .config import Config, LOG_PATH, LOCKOUT_PATH, AUDIT_PATH, PIPE_NAME
 from .credentials import load_password
 from .detector import FaceDetector
+from .audit import AuditLog
+from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
+from .lockout import Lockout
 from .recognizer import Recognizer
 
 log = logging.getLogger(__name__)
@@ -64,11 +73,24 @@ def _build_sa_everyone() -> win32security.SECURITY_ATTRIBUTES:
     return sa
 
 
+class VerifyOutcome(NamedTuple):
+    """Result of one capture burst: the legacy 3-tuple plus a detail dict for the audit log."""
+    match: bool
+    distance: float
+    real: bool
+    detail: dict
+    embedding: "np.ndarray | None" = None   # best-matching frame's 512-D embedding (adaptive gallery)
+
+
 class FaceService:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.recog = Recognizer(cfg)
         self.detector = FaceDetector()
+        # Persistent consecutive-failure lockout for the face path (PIN stays available).
+        self._lockout = Lockout(LOCKOUT_PATH, cfg.max_face_attempts, cfg.lockout_seconds)
+        # Structured JSONL audit trail (verify/unlock/challenge; never stores the password).
+        self._audit = AuditLog(AUDIT_PATH, cfg.audit_max_mb, enabled=cfg.audit_log)
         self._stop = threading.Event()
         self._cam_lock = threading.Lock()
         self._cam: Camera | None = None  # kept open when persistent_camera=True
@@ -96,13 +118,33 @@ class FaceService:
 
     # ---------- core ops ----------
 
-    def _capture_and_verify(self) -> tuple[bool, float, bool]:
+    def _capture_and_verify(self) -> VerifyOutcome:
+        """Capture a short burst, fold recognition + passive liveness into a verdict.
+
+        One detect per frame via ``analyze_frame`` -> match/distance + 2d106 landmarks (blink)
+        + an anti-screen vote. After the burst ``liveness.verdict`` combines them (mode-aware).
+        Returns a ``VerifyOutcome``: the legacy ``(match, distance, real)`` plus a ``detail`` dict
+        for the audit log. Only a ``PASS`` verdict yields ``match=True``; ``NEEDS_GESTURE`` and
+        ``NOT_LIVE`` both map to a deny here (the Stage-2 lockscreen is PASSIVE and cannot run a
+        gesture yet, so anything that needs one falls back to PIN). ``real`` = the passive
+        anti-screen did NOT suspect a screen. Active gesture escalation is exposed separately via
+        the ``challenge`` command for the Stage-5 Credential Provider. Runs the full burst (no
+        early-exit) so every frame gets a chance to flag a screen and to catch a spontaneous
+        blink; that burst is still subsecond.
+        """
+        t0 = time.monotonic()
         if self._camera_leased_out():
             log.info("verify skipped: camera leased out to enrollment")
-            return False, 1.0, False
+            return VerifyOutcome(False, 1.0, False,
+                                 {"verdict": "SKIPPED", "reason": "camera-leased"})
+
         matches = 0
         best = 1.0
-        real_seen = False
+        best_emb = None
+        screen_flagged = 0
+        screen_checked = 0
+        blink = BlinkDetector()
+
         with self._cam_lock:
             cam = self._get_camera() if self.cfg.persistent_camera else Camera(
                 self.cfg.camera_index, self.cfg.camera_warmup_frames
@@ -118,21 +160,142 @@ class FaceService:
                     if frame is None:
                         continue
                     try:
-                        ok, dist, real = self.recog.verify_frame(frame)
+                        a = self.recog.analyze_frame(frame)
                     except Exception as e:
                         log.warning("verify error: %s", e)
                         continue
-                    real_seen = real_seen or real
-                    if dist < best:
-                        best = dist
-                    if ok:
+                    if not a.face:
+                        continue
+                    if a.distance < best:
+                        best = a.distance
+                        best_emb = a.embedding
+                    if a.is_match:
                         matches += 1
-                        if matches >= self.cfg.verify_required:
-                            return True, best, True
+                    if a.screen is not None:
+                        screen_checked += 1
+                        if a.screen:
+                            screen_flagged += 1
+                    if a.landmark is not None:
+                        blink.update(a.landmark)   # accumulate spontaneous blinks over the burst
             finally:
                 if not self.cfg.persistent_camera:
                     cam.close()
-        return False, best, real_seen
+
+        screen_frac = (screen_flagged / screen_checked) if screen_checked else 0.0
+        margin = self.cfg.threshold - best
+        v = verdict(
+            matches=matches,
+            blinked=blink.blinks > 0,
+            screen_frac=screen_frac,
+            margin=margin,
+            mode=self.cfg.liveness_mode,
+            required_matches=self.cfg.verify_required,
+            challenge_on_doubt=self.cfg.challenge_on_doubt,
+        )
+        is_real = screen_frac < SCREEN_DOUBT_FRAC
+        latency_ms = (time.monotonic() - t0) * 1000.0
+        log.info(
+            "verify verdict=%s matches=%d/%d best=%.3f margin=%.3f blink=%d screen=%d/%d mode=%s",
+            v.name, matches, self.cfg.verify_required, best, margin,
+            blink.blinks, screen_flagged, screen_checked, self.cfg.liveness_mode,
+        )
+        detail = {
+            "verdict": v.name,
+            "match": v == Verdict.PASS,
+            "distance": round(best, 4),
+            "margin": round(margin, 4),
+            "matches": matches,
+            "required": self.cfg.verify_required,
+            "blink": blink.blinks,
+            "screen_flagged": screen_flagged,
+            "screen_checked": screen_checked,
+            "mode": self.cfg.liveness_mode,
+            "latency_ms": round(latency_ms, 1),
+        }
+        return VerifyOutcome(v == Verdict.PASS, best, is_real, detail, best_emb)
+
+    def _maybe_adapt_gallery(self, r: "VerifyOutcome") -> None:
+        """Opt-in adaptive gallery: on a genuine, live, non-screen unlock, offer the
+        verifying embedding to the recognizer, which applies the anti-poisoning gates
+        (distance-to-enrollment ceiling, cooldown, size cap) and persists it separately.
+        Best-effort: never let adaptation break an unlock."""
+        if not self.cfg.adaptive_gallery:
+            return
+        try:
+            dec = self.recog.maybe_adapt(
+                r.embedding,
+                liveness_passed=True,                             # r.match == verdict PASS => live for the mode
+                is_screen=r.detail.get("screen_flagged", 0) > 0,  # ANY screen flag blocks adaptation
+                mode=self.cfg.liveness_mode,
+                gesture_passed=False,                             # passive unlock path runs no gesture
+                union_distance=r.distance,
+            )
+            self._audit.write("adapt", {"accept": dec.accept, "reason": dec.reason,
+                                        "ceiling": round(dec.ceiling, 4)})
+        except Exception as e:
+            log.warning("adaptive update skipped: %s", e)
+
+    def _run_challenge(self, kind_name: str | None = None) -> dict:
+        """Server-side active-gesture loop -- STUB for the Stage-5 Credential Provider.
+
+        Issues one challenge (random, or the requested ``kind``: blink|turn_left|turn_right|nod)
+        and drives it to PASS/FAIL over camera frames using ``analyze_frame`` landmarks/pose.
+        NOT wired to unlock at Stage 2 (the lockscreen is passive); this exists so the CP can
+        call the same loop unchanged at Stage 5. The pipe server is sequential, so this holds
+        the camera for the duration of the gesture -- acceptable for the stub / camera test.
+        """
+        from .liveness import Challenge, GESTURE_TIMEOUT_S, LivenessChallenge
+
+        if self._camera_leased_out():
+            return {"ok": False, "reason": "camera-busy"}
+
+        kind = None
+        if kind_name:
+            try:
+                kind = Challenge[str(kind_name).upper()]
+            except KeyError:
+                return {"ok": False, "reason": f"unknown-kind: {kind_name}"}
+
+        ch = LivenessChallenge()
+        issued = ch.issue(kind)
+        # Wall-clock safety cap: each task also self-times-out on its own deadline when fed, but
+        # if the camera stalls we must not block the pipe forever.
+        wall_deadline = time.monotonic() + self.cfg.blink_timeout_s + GESTURE_TIMEOUT_S + 2.0
+
+        with self._cam_lock:
+            cam = self._get_camera() if self.cfg.persistent_camera else Camera(
+                self.cfg.camera_index, self.cfg.camera_warmup_frames
+            )
+            if not self.cfg.persistent_camera:
+                cam.open()
+            try:
+                for _ in range(2):
+                    cam.read()
+                while not ch.done and time.monotonic() < wall_deadline:
+                    frame = cam.read()
+                    if frame is None:
+                        continue
+                    try:
+                        a = self.recog.analyze_frame(frame)
+                    except RuntimeError as e:      # e.g. no enrollment
+                        return {"ok": False, "reason": str(e)}
+                    except Exception as e:
+                        log.warning("challenge analyze error: %s", e)
+                        continue
+                    ch.feed(a.landmark, a.pose)
+            finally:
+                if not self.cfg.persistent_camera:
+                    cam.close()
+
+        log.info("challenge kind=%s passed=%s state=%s",
+                 issued.name.lower(), ch.passed, ch.state.name)
+        return {
+            "ok": True,
+            "challenge": issued.name.lower(),
+            "prompt": ch.prompt,
+            "passed": ch.passed,
+            "state": ch.state.name.lower(),
+        }
 
     def _presence_probe(self) -> tuple[bool, bool]:
         """(present, real) — semantics depend on config.presence_mode.
@@ -209,6 +372,8 @@ class FaceService:
             "uptime_s": time.time() - self._started_at,
             "config": asdict(self.cfg),
             "enrollment": EMBED_PATH.exists(),
+            "lockout": self._lockout.status(),
+            "audit": self._audit.status(),
         }
 
     def _reload_config(self) -> dict:
@@ -221,6 +386,8 @@ class FaceService:
         old_persistent = self.cfg.persistent_camera
         self.cfg = new_cfg
         self.recog.cfg = new_cfg
+        self._lockout.reconfigure(new_cfg.max_face_attempts, new_cfg.lockout_seconds)
+        self._audit.reconfigure(new_cfg.audit_log, new_cfg.audit_max_mb)
         # Reset camera if camera-affecting settings changed
         if new_cfg.camera_index != old_index or new_cfg.persistent_camera != old_persistent:
             with self._cam_lock:
@@ -269,26 +436,51 @@ class FaceService:
                 return {"ok": False, "reason": str(e)}
 
         if cmd == "verify":
-            ok, dist, real = self._capture_and_verify()
-            return {"ok": True, "match": ok, "distance": dist, "real": real}
+            r = self._capture_and_verify()
+            self._audit.write("verify", r.detail)
+            return {"ok": True, "match": r.match, "distance": r.distance, "real": r.real}
 
         if cmd == "presence":
             present, real = self._presence_probe()
             return {"ok": True, "present": present, "real": real, "mode": self.cfg.presence_mode}
 
+        if cmd == "challenge":
+            # Active-gesture stub for the Stage-5 Credential Provider (not wired to unlock).
+            resp = self._run_challenge(req.get("kind"))
+            self._audit.write("challenge", {k: resp.get(k)
+                              for k in ("challenge", "passed", "state", "reason") if k in resp})
+            return resp
+
         if cmd == "unlock":
-            ok, dist, real = self._capture_and_verify()
-            if not ok:
-                return {"ok": False, "reason": "no-match", "distance": dist, "real": real}
+            rem = self._lockout.remaining()
+            if rem > 0:
+                self._audit.write("unlock", {"verdict": "LOCKED_OUT", "match": False,
+                                             "retry_after_s": round(rem, 1)})
+                return {"ok": False, "reason": "locked-out", "retry_after_s": round(rem, 1)}
+            r = self._capture_and_verify()
+            # Don't count an enrollment-lease skip as a real failed attempt.
+            if not self._camera_leased_out():
+                self._lockout.record(r.match)
+            if not r.match:
+                self._audit.write("unlock", {**r.detail, "outcome": "no-match"})
+                return {"ok": False, "reason": "no-match", "distance": r.distance, "real": r.real}
             creds = load_password()
             if not creds:
+                self._audit.write("unlock", {**r.detail, "outcome": "no-credentials"})
                 return {"ok": False, "reason": "no-credentials"}
+            self._audit.write("unlock", {**r.detail, "outcome": "granted"})
+            self._maybe_adapt_gallery(r)
             return {
                 "ok": True,
                 "username": creds["u"],
                 "password": creds["p"],
                 "domain": creds.get("d", "."),
             }
+
+        if cmd == "reset_lockout":
+            # Admin / tray / test: clear the face lockout early.
+            self._lockout.reset()
+            return {"ok": True, "lockout": self._lockout.status()}
 
         return {"ok": False, "reason": "unknown-command"}
 

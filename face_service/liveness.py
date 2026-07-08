@@ -368,3 +368,87 @@ class ScreenDetector:
             return None
         self.last = screen_features(g)
         return is_screen_features(self.last, self.hf_thresh)
+
+
+# --- Decision layer (mode-aware verdict) -------------------------------------------------
+
+class Verdict(Enum):
+    PASS = auto()           # recognized + live enough -> unlock now
+    NOT_LIVE = auto()       # deny: no confirmed live enrolled face (too few matches, or a
+                            # static-spoof signature = screen-flagged AND never blinked)
+    NEEDS_GESTURE = auto()  # ambiguous -> escalate to an active gesture (Credential Provider,
+                            # master-Stage 5). At the Stage-2 PASSIVE lockscreen there is no UI
+                            # to run the gesture, so the service maps this to a deny; the
+                            # tri-state exists so the *same* verdict drives the CP gesture loop
+                            # unchanged once Stage 5 lands.
+
+
+# Decision-layer policy knobs. These are POLICY, not measured spoof constants -- but they are
+# informed by the locked numbers: anti-screen live per-frame FP <1% and screen detection
+# ~40-70% (liveness.py header), and the Stage-1 self distance ~0.07 at threshold 0.45. Re-check
+# them against real impostor/spoof margins in Step 9; conservative is safe until then.
+SCREEN_DOUBT_FRAC = 0.34   # >= this share of frames screen-flagged -> screen suspicion.
+                           # With the default 5-frame burst that is >=2 flagged frames: a live
+                           # face (<1% per-frame FP) will not reach it, a screen (~40-70% per
+                           # frame) will. Fraction-based so it is robust to the frame count.
+STRONG_MARGIN = 0.10       # threshold - best_distance >= this -> confident recognition (may skip
+                           # the gesture in fast mode). Self margin ~0.38 today (~0.28 after a
+                           # ~0.35 threshold in Step 9); a borderline impostor sits near 0.
+
+
+def verdict(
+    matches: int,
+    blinked: bool,
+    screen_frac: float,
+    margin: float,
+    mode: str = "fast",
+    *,
+    required_matches: int,
+    challenge_on_doubt: bool = True,
+    screen_doubt_frac: float = SCREEN_DOUBT_FRAC,
+    strong_margin: float = STRONG_MARGIN,
+) -> Verdict:
+    """Fold multi-frame recognition + passive liveness into one decision.
+
+    The service verify loop accumulates these over a short burst of frames and calls this once:
+      matches           frames whose embedding matched the enrolled face
+      blinked           a spontaneous blink was observed in the window (passive liveness)
+      screen_frac       fraction of analyzed frames the anti-screen check flagged (0..1)
+      margin            threshold - best_distance (>0 = confident match; may be <0 if no match)
+      mode              "fast" (challenge only on doubt) | "paranoid" (always challenge)
+      required_matches  matching frames the recognition gate needs (cfg.verify_required)
+      challenge_on_doubt  fast mode only: on doubt escalate to a gesture (True) or hard-deny (False)
+
+    Pure function (no camera / no InsightFace) -> the whole decision matrix is unit-testable.
+
+    fast:
+      - clean + confident (not screen-flagged, margin >= strong_margin) -> PASS (subsecond;
+        a spontaneous blink is a bonus, not required on the clean path)
+      - screen-flagged AND no blink -> NOT_LIVE (flat photo / static screen: no texture, no life)
+      - any other doubt (screen-flagged-but-blinked, or thin margin) -> NEEDS_GESTURE
+        (or NOT_LIVE when challenge_on_doubt is False)
+    paranoid:
+      - a hard static-spoof signature (screen-flagged AND no blink) -> NOT_LIVE
+      - otherwise every valid match -> NEEDS_GESTURE (always require the gesture)
+    both modes: matches < required_matches -> NOT_LIVE (nothing to admit).
+    """
+    if mode not in ("fast", "paranoid"):
+        mode = "fast"  # defensive: an unknown mode falls back to the safe default
+
+    # Recognition gate: without enough matching frames there is no enrolled face to admit.
+    if matches < required_matches:
+        return Verdict.NOT_LIVE
+
+    screen_doubt = screen_frac >= screen_doubt_frac
+    static_spoof = screen_doubt and not blinked   # screen-like texture that never blinked
+
+    if mode == "paranoid":
+        return Verdict.NOT_LIVE if static_spoof else Verdict.NEEDS_GESTURE
+
+    # fast
+    if static_spoof:
+        return Verdict.NOT_LIVE
+    doubt = screen_doubt or (margin < strong_margin)
+    if doubt:
+        return Verdict.NEEDS_GESTURE if challenge_on_doubt else Verdict.NOT_LIVE
+    return Verdict.PASS
