@@ -59,6 +59,7 @@ from .audit import AuditLog
 from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
 from .lockout import Lockout
 from .lowlight import evaluate_low_light, scene_luma
+from .camera_boost import try_exposure_boost
 from .recognizer import Recognizer
 
 log = logging.getLogger(__name__)
@@ -134,19 +135,10 @@ class FaceService:
         early-exit) so every frame gets a chance to flag a screen and to catch a spontaneous
         blink; that burst is still subsecond.
         """
-        t0 = time.monotonic()
         if self._camera_leased_out():
             log.info("verify skipped: camera leased out to enrollment")
             return VerifyOutcome(False, 1.0, False,
                                  {"verdict": "SKIPPED", "reason": "camera-leased"})
-
-        matches = 0
-        best = 1.0
-        best_emb = None
-        screen_flagged = 0
-        screen_checked = 0
-        scene_luma_max = None   # brightest scene luma seen this burst (Stage 3.2); None if no frame read
-        blink = BlinkDetector()
 
         with self._cam_lock:
             cam = self._get_camera() if self.cfg.persistent_camera else Camera(
@@ -155,39 +147,55 @@ class FaceService:
             if not self.cfg.persistent_camera:
                 cam.open()
             try:
-                # drain stale buffered frames
-                for _ in range(2):
-                    cam.read()
-                for _ in range(self.cfg.verify_frames):
-                    frame = cam.read()
-                    if frame is None:
-                        continue
-                    # Scene brightness is face-INDEPENDENT: compute it for every captured frame
-                    # (incl. no-face ones) and keep the MAX, so a transient dip or a frame where
-                    # the face was briefly lost can't trip the low-light gate on its own.
-                    sl = scene_luma(frame)
-                    scene_luma_max = sl if scene_luma_max is None else max(scene_luma_max, sl)
-                    try:
-                        a = self.recog.analyze_frame(frame)
-                    except Exception as e:
-                        log.warning("verify error: %s", e)
-                        continue
-                    if not a.face:
-                        continue
-                    if a.distance < best:
-                        best = a.distance
-                        best_emb = a.embedding
-                    if a.is_match:
-                        matches += 1
-                    if a.screen is not None:
-                        screen_checked += 1
-                        if a.screen:
-                            screen_flagged += 1
-                    if a.landmark is not None:
-                        blink.update(a.landmark)   # accumulate spontaneous blinks over the burst
+                return self._analyze_burst(cam)
             finally:
                 if not self.cfg.persistent_camera:
                     cam.close()
+
+    def _analyze_burst(self, cam) -> VerifyOutcome:
+        """Run ONE analysis burst over an already-open ``cam``. The caller owns the camera lock and
+        the open/close lifecycle. Extracted verbatim from ``_capture_and_verify`` so the Step-3.3
+        low-light boost can re-run the SAME burst under boosted exposure with zero duplication.
+        """
+        t0 = time.monotonic()
+        matches = 0
+        best = 1.0
+        best_emb = None
+        screen_flagged = 0
+        screen_checked = 0
+        scene_luma_max = None   # brightest scene luma seen this burst (Stage 3.2); None if no frame read
+        blink = BlinkDetector()
+
+        # drain stale buffered frames
+        for _ in range(2):
+            cam.read()
+        for _ in range(self.cfg.verify_frames):
+            frame = cam.read()
+            if frame is None:
+                continue
+            # Scene brightness is face-INDEPENDENT: compute it for every captured frame
+            # (incl. no-face ones) and keep the MAX, so a transient dip or a frame where
+            # the face was briefly lost can't trip the low-light gate on its own.
+            sl = scene_luma(frame)
+            scene_luma_max = sl if scene_luma_max is None else max(scene_luma_max, sl)
+            try:
+                a = self.recog.analyze_frame(frame)
+            except Exception as e:
+                log.warning("verify error: %s", e)
+                continue
+            if not a.face:
+                continue
+            if a.distance < best:
+                best = a.distance
+                best_emb = a.embedding
+            if a.is_match:
+                matches += 1
+            if a.screen is not None:
+                screen_checked += 1
+                if a.screen:
+                    screen_flagged += 1
+            if a.landmark is not None:
+                blink.update(a.landmark)   # accumulate spontaneous blinks over the burst
 
         screen_frac = (screen_flagged / screen_checked) if screen_checked else 0.0
         margin = self.cfg.threshold - best
@@ -225,6 +233,56 @@ class FaceService:
             "latency_ms": round(latency_ms, 1),
         }
         return VerifyOutcome(v == Verdict.PASS, best, is_real, detail, best_emb, scene_luma_max)
+
+    def _maybe_boost(self, r_dark: "VerifyOutcome"):
+        """Gated low-light exposure boost (Step 3.3). Called ONLY from unlock, ONLY when the first
+        burst was below the floor and ``cfg.low_light_boost`` is on. Raises webcam EXPOSURE, re-runs
+        the SAME analysis burst, and ALWAYS restores exposure (camera_boost.try_exposure_boost's
+        finally) so the long-lived camera is never left boosted for the next unlock / presence loop.
+
+        Returns ``(outcome, boost_audit)``: the boosted re-capture when it was applied, else the
+        original dark outcome; ``boost_audit`` is additive telemetry (applied / honored / exposure
+        + scene before/after) for the audit log. Best-effort -- never raises.
+        """
+        boost_audit = {"boost_applied": False, "boost_honored": False,
+                       "scene_luma_before": round(r_dark.scene_luma, 2)}
+        try:
+            with self._cam_lock:
+                cam = self._get_camera() if self.cfg.persistent_camera else Camera(
+                    self.cfg.camera_index, self.cfg.camera_warmup_frames
+                )
+                opened = False
+                if not self.cfg.persistent_camera:
+                    cam.open()
+                    opened = True
+                try:
+                    cap = getattr(cam, "_cap", None)
+                    if cap is None:
+                        return r_dark, boost_audit
+                    out = try_exposure_boost(
+                        cap, self.cfg.low_light_exposure_step,
+                        lambda: self._analyze_burst(cam),
+                    )
+                finally:
+                    if opened:
+                        cam.close()
+        except Exception as e:   # pragma: no cover - defensive; boost must never break unlock
+            log.warning("low-light boost skipped: %s", e)
+            return r_dark, boost_audit
+
+        boost_audit.update(out.audit())
+        if out.applied and out.recapture is not None:
+            rc = out.recapture
+            boost_audit["scene_luma_after"] = (
+                round(rc.scene_luma, 2) if rc.scene_luma is not None else None)
+            log.info("low-light boost: sceneL %.1f -> %s match=%s (exposure %.1f->%.1f honored=%s)",
+                     r_dark.scene_luma,
+                     ("%.1f" % rc.scene_luma) if rc.scene_luma is not None else "n/a",
+                     rc.match, out.exposure_before, out.exposure_readback, out.honored)
+            return rc, boost_audit
+        log.info("low-light boost not applied (honored=%s); keeping dark capture (sceneL=%.1f)",
+                 out.honored, r_dark.scene_luma)
+        return r_dark, boost_audit
 
     def _maybe_adapt_gallery(self, r: "VerifyOutcome") -> None:
         """Opt-in adaptive gallery: on a genuine, live, non-screen unlock, offer the
@@ -470,6 +528,18 @@ class FaceService:
                                              "retry_after_s": round(rem, 1)})
                 return {"ok": False, "reason": "locked-out", "retry_after_s": round(rem, 1)}
             r = self._capture_and_verify()
+            # Stage 3.3 gated exposure boost: if the burst came back below the floor, try to raise
+            # EXPOSURE and re-capture BEFORE the too-dark fallback. Gated (only below the floor) so a
+            # normally-lit face is never blown out; transient (exposure always restored inside
+            # _maybe_boost); lockout-neutral (a still-dark result stays too-dark below, adding no
+            # strike). Boost telemetry is merged into r.detail so every unlock audit below carries
+            # it unchanged. low_light_boost=False (or scene >= floor / camera leased) -> no camera
+            # touch and the path is identical to Step 3.2.
+            boost_audit: dict = {}
+            if (r.scene_luma is not None and r.scene_luma < self.cfg.low_light_luma_min
+                    and self.cfg.low_light_boost and not self._camera_leased_out()):
+                r, boost_audit = self._maybe_boost(r)
+                r = r._replace(detail={**r.detail, **boost_audit})
             # Stage 3.2 low-light gate. If even the brightest frame of the burst is below the
             # floor, refuse honestly ("too-dark") and stay LOCKOUT-NEUTRAL: darkness is an
             # environment problem, not a failed match, so it must NOT add a lockout strike (nor

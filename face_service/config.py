@@ -96,6 +96,21 @@ class Config:
     # hf false-flags ~88%; clean pass only from ~scene 48+). 45.0 sits conservatively between those.
     # It is an ENVIRONMENT refusal, so the service keeps it lockout-neutral. 0 disables the gate.
     low_light_luma_min: float = 45.0
+    # --- Stage 3: gated exposure boost (Step 3.3) ---
+    # When an unlock burst is below the floor above, try to raise webcam EXPOSURE and re-capture
+    # BEFORE the too-dark refusal, to pull a genuine user out of the dark. STRICTLY gated (only
+    # below the floor): an unconditional boost blows out a normally-lit face (Step 3.1: the same
+    # boost drove scene 98->230 and lost the face 100%->0%). Only EXPOSURE is touched -- the 3.1
+    # roundtrip showed this webcam's driver ignores GAIN and AUTO_EXPOSURE sets but honors EXPOSURE.
+    # The boost is transient: exposure is always restored after the attempt. Default True:
+    # confirmed on the live smoke -- scene 44 -> 115 (exposure -6 -> -4), restore verified, and the
+    # extra burst adds only ~200-400ms. Set False to disable (then the path is identical to 3.2).
+    low_light_boost: bool = True
+    # Exposure step (EV) added to the current CAP_PROP_EXPOSURE when boosting. Units are
+    # driver-defined; on this webcam less-negative == brighter, so a POSITIVE step brightens
+    # (Step 3.1: set -6 -> -4 honored, scene 10 -> 50, distance 0.363 -> 0.249). One +2 step is
+    # enough on this cam; widen only on evidence.
+    low_light_exposure_step: float = 2.0
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
@@ -163,6 +178,11 @@ class Config:
         # rather than silently clamp an out-of-range floor (same spirit as the adaptive checks).
         if not (0.0 <= self.low_light_luma_min <= 255.0):
             raise ValueError("low_light_luma_min must be in [0, 255] (0 disables the low-light gate)")
+        if not isinstance(self.low_light_boost, bool):
+            raise ValueError("low_light_boost must be a boolean")
+        # Exposure step in driver-defined EV units; must brighten (>0) and stay sane (<= 16 stops).
+        if not (0.0 < self.low_light_exposure_step <= 16.0):
+            raise ValueError("low_light_exposure_step must be in (0, 16]")
         if self.adaptive_gallery:
             # Anti-screen is the PRIMARY replay defense for adaptation; the distance ceiling
             # alone leaves only ~0.005 cosine below replay-of-self (~0.155 vs ceiling ~0.15),
