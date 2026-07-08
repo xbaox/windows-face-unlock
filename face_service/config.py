@@ -22,6 +22,7 @@ LOG_PATH = APP_DIR / "service.log"
 LOCKOUT_PATH = APP_DIR / "lockout.json"
 AUDIT_PATH = APP_DIR / "audit.jsonl"
 ADAPTIVE_PATH = APP_DIR / "adaptive.npz"   # Stage 3: adaptive gallery (separate from embeddings.npz)
+WATCHDOG_PAUSE_PATH = APP_DIR / "watchdog.pause"   # Stage 3 Step 5: deliberate-stop pause (self-expiring)
 
 PIPE_NAME = r"\\.\pipe\FaceUnlock"
 
@@ -119,6 +120,18 @@ class Config:
     # loop; open() itself keeps its robust 3x3 zombie recovery for enrollment / warmup.
     camera_open_retries: int = 2         # extra open attempts after the first before declaring busy
     camera_open_timeout_s: float = 3.0   # wall-clock budget for the whole open-retry loop (seconds)
+    # --- Stage 3: watchdog (Step 5; external Scheduled-Task supervisor pings the pipe) ---
+    # tools.watchdog pings the existing `ping` command every watchdog_interval_s; after
+    # watchdog_fail_threshold consecutive failures (each bounded by watchdog_ping_timeout_s -- a
+    # hung server that never answers counts as a fail) it restarts the service KILL-THEN-START
+    # (a hung-but-alive process still holds the single-instance mutex). A deliberate `shutdown`
+    # drops a self-expiring pause (watchdog_pause_ttl_s) so the watchdog does not resurrect an
+    # intentional stop; an EXPIRED pause is ignored + deleted, so a stale pause can never silence
+    # the watchdog forever. A permanent disable = stop the FaceUnlock-Watchdog task itself.
+    watchdog_ping_timeout_s: float = 2.0   # per-ping wall-clock budget (a hung server -> a fail)
+    watchdog_fail_threshold: int = 3        # consecutive ping failures before a restart
+    watchdog_interval_s: float = 30.0       # seconds between pings in the watchdog self-loop
+    watchdog_pause_ttl_s: float = 300.0     # deliberate-stop pause lifetime; self-heals after this
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
@@ -199,6 +212,17 @@ class Config:
             raise ValueError("camera_open_retries must be in [0, 10]")
         if not (0.0 < self.camera_open_timeout_s <= 30.0):
             raise ValueError("camera_open_timeout_s must be in (0, 30]")
+        # Watchdog bounds (Step 5): positive/bounded timeouts, an integer failure threshold >= 1.
+        if not (0.0 < self.watchdog_ping_timeout_s <= 30.0):
+            raise ValueError("watchdog_ping_timeout_s must be in (0, 30]")
+        if isinstance(self.watchdog_fail_threshold, bool) or not isinstance(self.watchdog_fail_threshold, int):
+            raise ValueError("watchdog_fail_threshold must be an integer")
+        if not (1 <= self.watchdog_fail_threshold <= 100):
+            raise ValueError("watchdog_fail_threshold must be in [1, 100]")
+        if not (0.0 < self.watchdog_interval_s <= 3600.0):
+            raise ValueError("watchdog_interval_s must be in (0, 3600]")
+        if not (0.0 < self.watchdog_pause_ttl_s <= 3600.0):
+            raise ValueError("watchdog_pause_ttl_s must be in (0, 3600]")
         if self.adaptive_gallery:
             # Anti-screen is the PRIMARY replay defense for adaptation; the distance ceiling
             # alone leaves only ~0.005 cosine below replay-of-self (~0.155 vs ceiling ~0.15),

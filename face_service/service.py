@@ -43,9 +43,12 @@ from typing import Callable, NamedTuple
 
 import pywintypes  # type: ignore
 import win32api  # type: ignore
+import win32con  # type: ignore
+import win32event  # type: ignore
 import win32file  # type: ignore
 import win32pipe  # type: ignore
 import win32security  # type: ignore
+import winerror  # type: ignore
 
 
 def win32api_get_last_error() -> int:
@@ -101,6 +104,11 @@ class FaceService:
         # Structured JSONL audit trail (verify/unlock/challenge; never stores the password).
         self._audit = AuditLog(AUDIT_PATH, cfg.audit_max_mb, enabled=cfg.audit_log)
         self._stop = threading.Event()
+        # win32-level stop signal (parity with _stop); set alongside it so a future win32 wait can
+        # observe the stop too. The loop itself is driven by _stop; ConnectNamedPipe is unblocked by
+        # the self-connect in stop().
+        self._stop_event = win32event.CreateEvent(None, True, False, None)
+        self._ctrl_handler = None   # keep a ref so SetConsoleCtrlHandler's callback isn't GC'd
         self._cam_lock = threading.Lock()
         self._cam: Camera | None = None  # kept open when persistent_camera=True
         self._started_at = time.time()
@@ -496,7 +504,22 @@ class FaceService:
 
         if cmd == "shutdown":
             log.info("shutdown requested via pipe")
+            # Drop a self-expiring pause so the watchdog treats this as a DELIBERATE stop and does
+            # not resurrect the service. Expired pauses are ignored+deleted, so this can't silence
+            # the watchdog forever (Step 5). Best-effort -- never block the shutdown on it.
+            try:
+                from .watchdog import write_pause
+                from .config import WATCHDOG_PAUSE_PATH
+                write_pause(WATCHDOG_PAUSE_PATH, time.time(), self.cfg.watchdog_pause_ttl_s)
+            except Exception as e:
+                log.warning("watchdog pause write skipped: %s", e)
             self._stop.set()
+            try:
+                win32event.SetEvent(self._stop_event)
+            except Exception:
+                pass
+            # No self-connect needed here: this shutdown request itself unblocked ConnectNamedPipe,
+            # so after this _serve_one() finishes the loop re-checks _stop and exits.
             return {"ok": True, "shutting_down": True}
 
         if cmd == "pause_camera":
@@ -618,8 +641,27 @@ class FaceService:
             65536, 65536, 0, sa,
         )
         try:
-            win32pipe.ConnectNamedPipe(handle, None)
-            _hr, data = win32file.ReadFile(handle, 65536)
+            try:
+                win32pipe.ConnectNamedPipe(handle, None)
+            except pywintypes.error as e:
+                # ERROR_PIPE_CONNECTED: a client connected between CreateNamedPipe and Connect -> fine.
+                if e.winerror != winerror.ERROR_PIPE_CONNECTED:
+                    raise
+            # We may have been woken by stop()'s self-connect (Ctrl+C / shutdown) rather than a real
+            # request -> just return so the loop re-checks _stop.
+            if self._stop.is_set():
+                return
+            try:
+                _hr, data = win32file.ReadFile(handle, 65536)
+            except pywintypes.error as e:
+                # A wake-up connection that closed immediately, or a client that vanished -> no
+                # request to handle; return cleanly rather than logging a pipe error.
+                if e.winerror in (winerror.ERROR_BROKEN_PIPE, winerror.ERROR_PIPE_NOT_CONNECTED,
+                                  winerror.ERROR_NO_DATA):
+                    return
+                raise
+            if not data:
+                return
             req = json.loads(data.decode("utf-8"))
             log.info("request cmd=%s", req.get("cmd"))
             try:
@@ -629,9 +671,11 @@ class FaceService:
                 resp = {"ok": False, "reason": f"exception: {e}"}
             win32file.WriteFile(handle, (json.dumps(resp) + "\n").encode("utf-8"))
             try:
-                win32file.FlushFileBuffers(handle)
+                win32file.FlushFileBuffers(handle)   # blocks until the client reads the buffered data
             except pywintypes.error:
                 pass
+            # Wait for the client to finish reading and close before we discard the pipe (fixes 233).
+            self._drain_until_client_closes(handle)
         finally:
             try:
                 win32pipe.DisconnectNamedPipe(handle)
@@ -679,8 +723,6 @@ class FaceService:
             log.warning("camera warmup failed: %s", e)
 
     def serve_forever(self) -> None:
-        import win32event  # type: ignore
-        import winerror    # type: ignore
         # Single-instance guard: if another FaceService is already serving
         # this pipe, bail out cleanly instead of competing for connections.
         try:
@@ -690,6 +732,24 @@ class FaceService:
                 return
         except Exception as e:
             log.warning("mutex check failed, continuing: %s", e)
+
+        # A fresh, legitimate start clears any lingering deliberate-stop pause so the watchdog
+        # resumes guarding this instance (Step 5).
+        try:
+            from .watchdog import clear_pause
+            from .config import WATCHDOG_PAUSE_PATH
+            clear_pause(WATCHDOG_PAUSE_PATH)
+        except Exception as e:
+            log.debug("watchdog pause clear skipped: %s", e)
+
+        # Ctrl+C / console-close -> graceful stop, even while the main thread is blocked in
+        # ConnectNamedPipe (a plain KeyboardInterrupt cannot interrupt that native wait). No-op
+        # under pythonw (no console) -- production graceful stop is via the `shutdown` command.
+        try:
+            self._ctrl_handler = self._console_ctrl_handler
+            win32api.SetConsoleCtrlHandler(self._ctrl_handler, True)
+        except Exception as e:
+            log.debug("console ctrl handler not installed (no console?): %s", e)
 
         log.info("FaceService starting; pipe=%s", PIPE_NAME)
         if self.cfg.warmup_on_start:
@@ -703,11 +763,74 @@ class FaceService:
                 time.sleep(0.5)
 
         log.info("FaceService stopped")
+        try:
+            if self._ctrl_handler is not None:
+                win32api.SetConsoleCtrlHandler(self._ctrl_handler, False)
+        except Exception:
+            pass
         with self._cam_lock:
             self._release_camera()
 
     def stop(self) -> None:
+        """Signal a graceful stop and UNBLOCK a _serve_one() waiting in ConnectNamedPipe.
+
+        Sets the loop flag + the win32 stop event, then SELF-CONNECTS to our own pipe (a throwaway
+        client connect+close) so the blocking ConnectNamedPipe returns at once -- otherwise an idle
+        server (e.g. on Ctrl+C) would not notice the stop until a real client happened to connect.
+        Safe to call from any thread (the console-ctrl handler runs on a Windows-owned thread).
+        """
         self._stop.set()
+        try:
+            win32event.SetEvent(self._stop_event)
+        except Exception:   # pragma: no cover - defensive
+            pass
+        self._wake_accept()
+
+    def _wake_accept(self) -> None:
+        """Briefly connect to our own pipe to return a _serve_one() blocked in ConnectNamedPipe."""
+        try:
+            h = win32file.CreateFile(
+                PIPE_NAME, win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0, None, win32file.OPEN_EXISTING, 0, None,
+            )
+            win32file.CloseHandle(h)
+        except pywintypes.error:
+            pass   # no server instance waiting / already torn down -> nothing to wake
+
+    def _console_ctrl_handler(self, ctrl_type) -> bool:
+        """Console control handler. Windows runs this on a dedicated thread, so it stops the service
+        cleanly even while the main thread is blocked in ConnectNamedPipe (which is exactly why a
+        plain Ctrl+C did not work before). Returns True to handle the event and drive the graceful
+        stop instead of the default KeyboardInterrupt. No-op under pythonw (no console)."""
+        if ctrl_type in (win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT,
+                         win32con.CTRL_CLOSE_EVENT, win32con.CTRL_LOGOFF_EVENT,
+                         win32con.CTRL_SHUTDOWN_EVENT):
+            log.info("console control event %s -> graceful stop", ctrl_type)
+            self.stop()
+            return True
+        return False
+
+    def _drain_until_client_closes(self, handle, timeout_s: float = 2.0) -> None:
+        """After the response is written+flushed, wait (bounded) for the client to finish reading and
+        CLOSE its end -- signalled by a read returning ERROR_BROKEN_PIPE -- BEFORE DisconnectNamedPipe.
+
+        DisconnectNamedPipe discards any unread data, handing the client ERROR_PIPE_NOT_CONNECTED
+        (233) if it disconnects before the client's ReadFile completes -- the shutdown race. A
+        well-behaved client (pipe_client) closes immediately, so the drain read returns at once; a
+        misbehaving client is bounded by ``timeout_s`` via a worker thread so it can't wedge the
+        serve loop (we Disconnect anyway, which unblocks the worker)."""
+        done = threading.Event()
+
+        def _wait():
+            try:
+                win32file.ReadFile(handle, 1)   # returns when the client writes (it won't) or CLOSES
+            except pywintypes.error:
+                pass   # ERROR_BROKEN_PIPE = the client closed after reading -> the success signal
+            finally:
+                done.set()
+
+        threading.Thread(target=_wait, daemon=True).start()
+        done.wait(timeout_s)
 
 
 def _setup_logging() -> None:
