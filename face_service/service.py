@@ -76,6 +76,10 @@ CAMERA_OPEN_PAUSE_S = 0.3
 # Well-known SID for the lockscreen Credential Provider: LogonUI loads the CP DLL as SYSTEM.
 SYSTEM_SID_STRING = "S-1-5-18"
 
+# CreateNamedPipe openMode flag (anti-squatting, Stage 4 Step 4): CreateNamedPipe fails if an
+# instance of the name already exists. pywin32 312 does not export it, so define the literal.
+FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+
 
 def _current_user_sid_string() -> str:
     """String SID (S-1-5-21-...) of the account this process runs as (SELF).
@@ -686,13 +690,37 @@ class FaceService:
 
     def _serve_one(self) -> None:
         sa = _build_pipe_sa(self.cfg)
-        handle = win32pipe.CreateNamedPipe(
-            PIPE_NAME,
-            win32pipe.PIPE_ACCESS_DUPLEX,
-            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-            win32pipe.PIPE_UNLIMITED_INSTANCES,
-            65536, 65536, 0, sa,
-        )
+        open_mode = win32pipe.PIPE_ACCESS_DUPLEX
+        if self.cfg.pipe_first_instance:
+            # Refuse to bind if the name is already taken (a squatter). Safe for our per-connection
+            # re-create: the serve loop CloseHandle()s the previous instance in the finally below
+            # BEFORE this next CreateNamedPipe, so no instance of OURS exists at this point -- any
+            # same-name instance found here is therefore foreign.
+            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE
+        try:
+            handle = win32pipe.CreateNamedPipe(
+                PIPE_NAME,
+                open_mode,
+                win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+                win32pipe.PIPE_UNLIMITED_INSTANCES,
+                65536, 65536, 0, sa,
+            )
+        except pywintypes.error as e:
+            # FIRST_PIPE_INSTANCE -> the name is occupied by someone else. Loud log + clean stop so
+            # the serve loop exits (no silent tight crash-loop). The watchdog will retry the start,
+            # and each refusal is logged, so a persistent squatter is visible rather than hidden.
+            if self.cfg.pipe_first_instance and e.winerror in (
+                    winerror.ERROR_ACCESS_DENIED, winerror.ERROR_ALREADY_EXISTS,
+                    winerror.ERROR_PIPE_BUSY):
+                log.error("pipe name %s occupied (winerror=%d) -- refusing to start "
+                          "(possible squatter)", PIPE_NAME, e.winerror)
+                self._stop.set()
+                try:
+                    win32event.SetEvent(self._stop_event)
+                except Exception:
+                    pass
+                return
+            raise
         try:
             try:
                 win32pipe.ConnectNamedPipe(handle, None)

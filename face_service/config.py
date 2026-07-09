@@ -137,6 +137,10 @@ class Config:
     # label NoReadUp/NoWriteUp) instead of the legacy NULL DACL that granted Everyone. Default on;
     # set False only to roll back to the legacy NULL-DACL pipe (_build_sa_everyone_legacy).
     pipe_hardened_sd: bool = True
+    # FILE_FLAG_FIRST_PIPE_INSTANCE on the server (refuse to start if the pipe name is already taken
+    # -- a squatter) PLUS the client-side server-SID check in tools/pipe_client.py (verify the server
+    # runs as SELF or SYSTEM before sending). Both live under this one toggle. Default on.
+    pipe_first_instance: bool = True
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
@@ -228,10 +232,12 @@ class Config:
             raise ValueError("watchdog_interval_s must be in (0, 3600]")
         if not (0.0 < self.watchdog_pause_ttl_s <= 3600.0):
             raise ValueError("watchdog_pause_ttl_s must be in (0, 3600]")
-        # Stage 4: the pipe perimeter toggle must be a real boolean (a stray int/str would silently
-        # take a truthy branch and pick the wrong descriptor). Fail loud, like the checks above.
+        # Stage 4: the pipe perimeter toggles must be real booleans (a stray int/str would silently
+        # take a truthy branch and pick the wrong descriptor / flag). Fail loud, like the checks above.
         if not isinstance(self.pipe_hardened_sd, bool):
             raise ValueError("pipe_hardened_sd must be a boolean")
+        if not isinstance(self.pipe_first_instance, bool):
+            raise ValueError("pipe_first_instance must be a boolean")
         # If the hardened descriptor is requested, the current user's SID MUST resolve -- the DACL is
         # built from it (SELF=GA). Fail loud here rather than fall through to a pipe nobody can use.
         # Lazy pywin32 import so importing config on a stripped interpreter stays cheap when off.
