@@ -19,4 +19,16 @@ bool RequestUnlock(std::wstring& username,
                    std::wstring& domain,
                    std::string& errorOut);
 
+// Parse a raw unlock reply (the JSON the service returns) into credentials.
+// Exposed so the offline unit test can exercise the parser without a live pipe
+// or service. Returns true ONLY for a well-formed ok=true reply that carries a
+// non-empty username AND password; on any failure returns false and sets
+// errorOut to a short reason ("malformed-response", "no-match", or the
+// service-supplied reason string).
+bool ParseUnlockResponse(const std::string& response,
+                         std::wstring& username,
+                         std::wstring& password,
+                         std::wstring& domain,
+                         std::string& errorOut);
+
 }  // namespace FaceUnlock
