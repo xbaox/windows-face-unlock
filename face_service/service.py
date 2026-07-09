@@ -96,6 +96,26 @@ def _current_user_sid_string() -> str:
     return win32security.ConvertSidToStringSid(sid)
 
 
+def _pipe_client_sid_string(handle) -> "str | None":
+    """String SID of the process on the CLIENT end of a connected pipe handle, or None on any
+    failure (client already gone, OpenProcess denied, ...). Server-side symmetric twin of
+    tools/pipe_client._server_sid_string. No impersonation -- reading identity needs no privilege."""
+    try:
+        pid = win32pipe.GetNamedPipeClientProcessId(handle)
+        ph = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            th = win32security.OpenProcessToken(ph, win32con.TOKEN_QUERY)
+            try:
+                sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
+            finally:
+                win32api.CloseHandle(th)
+        finally:
+            win32api.CloseHandle(ph)
+        return win32security.ConvertSidToStringSid(sid)
+    except Exception:
+        return None
+
+
 def _build_sa_everyone_legacy() -> win32security.SECURITY_ATTRIBUTES:
     """LEGACY (rollback path, cfg.pipe_hardened_sd=False): NULL DACL = allow ALL (Everyone).
 
@@ -548,7 +568,7 @@ class FaceService:
                 self._release_camera()
         return {"ok": True, "config": asdict(new_cfg)}
 
-    def _handle(self, req: dict) -> dict:
+    def _handle(self, req: dict, handle=None) -> dict:
         cmd = req.get("cmd")
         if cmd == "ping":
             return {"ok": True, "pong": True}
@@ -621,6 +641,15 @@ class FaceService:
             return resp
 
         if cmd == "unlock":
+            # Stage 4 Step 5 SID-gate (default OFF): when enabled, only a SYSTEM caller -- the
+            # lockscreen Credential Provider -- may invoke unlock. Runs BEFORE lockout/verify/
+            # load_password so no password is ever returned to a non-SYSTEM caller. Only unlock is
+            # gated; every other command is scoped by the Batch-1 pipe DACL.
+            if self.cfg.pipe_unlock_require_system:
+                sid = _pipe_client_sid_string(handle)
+                if sid != SYSTEM_SID_STRING:
+                    log.warning("unlock rejected: caller not SYSTEM (sid=%s)", sid)
+                    return {"ok": False, "reason": "not-authorized"}
             rem = self._lockout.remaining()
             if rem > 0:
                 self._audit.write("unlock", {"verdict": "LOCKED_OUT", "match": False,
@@ -746,7 +775,7 @@ class FaceService:
             req = json.loads(data.decode("utf-8"))
             log.info("request cmd=%s", req.get("cmd"))
             try:
-                resp = self._handle(req)
+                resp = self._handle(req, handle)
             except Exception as e:
                 log.exception("handler error")
                 resp = {"ok": False, "reason": f"exception: {e}"}

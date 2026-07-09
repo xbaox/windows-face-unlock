@@ -141,6 +141,12 @@ class Config:
     # -- a squatter) PLUS the client-side server-SID check in tools/pipe_client.py (verify the server
     # runs as SELF or SYSTEM before sending). Both live under this one toggle. Default on.
     pipe_first_instance: bool = True
+    # SID-gate on the unlock command (Stage 4 Step 5): when True, only a caller whose token SID is
+    # SYSTEM (S-1-5-18) -- the lockscreen Credential Provider -- may invoke unlock; any other caller
+    # gets {"ok":false,"reason":"not-authorized"} before load_password. Default FALSE: Stage 4 has no
+    # real CP yet and dev tests connect as SELF; Stage 5 flips this True. Only unlock is gated (other
+    # commands are scoped by the Batch-1 pipe DACL).
+    pipe_unlock_require_system: bool = False
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
@@ -238,6 +244,8 @@ class Config:
             raise ValueError("pipe_hardened_sd must be a boolean")
         if not isinstance(self.pipe_first_instance, bool):
             raise ValueError("pipe_first_instance must be a boolean")
+        if not isinstance(self.pipe_unlock_require_system, bool):
+            raise ValueError("pipe_unlock_require_system must be a boolean")
         # If the hardened descriptor is requested, the current user's SID MUST resolve -- the DACL is
         # built from it (SELF=GA). Fail loud here rather than fall through to a pipe nobody can use.
         # Lazy pywin32 import so importing config on a stripped interpreter stays cheap when off.
