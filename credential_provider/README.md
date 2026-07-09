@@ -31,9 +31,9 @@ Output: `build\Release\FaceCredentialProvider.dll`.
 To remove: `.\register.ps1 -Action unregister`.
 
 Registration writes:
-- `HKCR\CLSID\{F8A0B4D9-...}` — COM class
-- `HKCR\CLSID\{F8A0B4D9-...}\InprocServer32` — DLL path, Apartment threading
-- `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{F8A0B4D9-...}`
+- `HKCR\CLSID\{8414D7B6-D536-461B-B31B-ADF77B3A8974}` — COM class
+- `HKCR\CLSID\{8414D7B6-D536-461B-B31B-ADF77B3A8974}\InprocServer32` — DLL path, Apartment threading
+- `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{8414D7B6-D536-461B-B31B-ADF77B3A8974}`
   — enables the CP in LogonUI
 
 After (un)registering, lock the workstation (Win+L) and the new "Face Unlock"
@@ -42,10 +42,11 @@ tile should appear.
 ## How it talks to the Python service
 
 1. User selects the Face Unlock tile on lock screen.
-2. `SetSelected` returns `*pbAutoLogon = TRUE`, so LogonUI immediately calls
+2. `SetSelected` returns `*pbAutoLogon = FALSE`, so the scan does NOT start
+   automatically; the user presses the submit arrow, which triggers
    `GetSerialization`.
 3. `GetSerialization` opens `\\.\pipe\FaceUnlock`, sends
-   `{"cmd":"unlock"}`, and waits up to 45 s.
+   `{"cmd":"unlock"}`, and waits up to 12 s.
 4. `FaceService` performs the camera capture + DeepFace verify + liveness
    check, decrypts the DPAPI password blob, and returns
    `{"ok":true,"username":"...","password":"...","domain":"..."}`.
