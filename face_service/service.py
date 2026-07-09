@@ -73,10 +73,63 @@ log = logging.getLogger(__name__)
 CAMERA_OPEN_PAUSE_S = 0.3
 
 
-def _build_sa_everyone() -> win32security.SECURITY_ATTRIBUTES:
-    """Allow LogonUI (SYSTEM) and any logged-in user to connect to the pipe."""
+# Well-known SID for the lockscreen Credential Provider: LogonUI loads the CP DLL as SYSTEM.
+SYSTEM_SID_STRING = "S-1-5-18"
+
+
+def _current_user_sid_string() -> str:
+    """String SID (S-1-5-21-...) of the account this process runs as (SELF).
+
+    OpenProcessToken(current, TOKEN_QUERY) -> GetTokenInformation(TokenUser) -> ConvertSidToStringSid.
+    Raises on failure so a missing/broken SID fails loud at pipe creation rather than silently
+    dropping back to an unusable descriptor.
+    """
+    th = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
+    finally:
+        win32api.CloseHandle(th)
+    return win32security.ConvertSidToStringSid(sid)
+
+
+def _build_sa_everyone_legacy() -> win32security.SECURITY_ATTRIBUTES:
+    """LEGACY (rollback path, cfg.pipe_hardened_sd=False): NULL DACL = allow ALL (Everyone).
+
+    Kept verbatim so the hardened default in _build_pipe_sa can be turned off without a code change.
+    """
     sd = win32security.SECURITY_DESCRIPTOR()
     sd.SetSecurityDescriptorDacl(1, None, 0)  # NULL DACL = allow all (OK for named pipe on localhost)
+    sa = win32security.SECURITY_ATTRIBUTES()
+    sa.SECURITY_DESCRIPTOR = sd
+    sa.bInheritHandle = 0
+    return sa
+
+
+def _build_pipe_sa(cfg: Config) -> win32security.SECURITY_ATTRIBUTES:
+    """Security attributes for the named pipe.
+
+    cfg.pipe_hardened_sd=False -> legacy NULL DACL (Everyone), for rollback.
+    True (default) -> an explicit descriptor built from an SDDL string:
+      * DACL: SELF (this user) = GENERIC_ALL -- owner/server; GA is needed so the per-connection
+              re-create of the pipe instance works under the SELF token (FILE_CREATE_PIPE_INSTANCE).
+              SYSTEM = GENERIC_READ|GENERIC_WRITE -- the lockscreen CP (LogonUI) connects as SYSTEM
+              (not bare GR: a duplex client needs read+write+SYNCHRONIZE, which GRGW maps in).
+              NO Everyone ACE -> every OTHER non-admin user is denied by the implicit deny.
+      * SACL: a Medium mandatory label with NoReadUp+NoWriteUp -> a same-user LOW-integrity process
+              cannot read/write the pipe; SYSTEM and our Medium clients sit at/above Medium so they
+              pass. ME (Medium) is deliberate -- labelling LW (Low) would defeat the point.
+    SetEntriesInAcl is not exported by pywin32, so the descriptor is assembled from SDDL via
+    ConvertStringSecurityDescriptorToSecurityDescriptor (present in pywin32 312).
+    """
+    if not cfg.pipe_hardened_sd:
+        return _build_sa_everyone_legacy()
+    self_sid = _current_user_sid_string()
+    sddl = (
+        f"D:(A;;GA;;;{self_sid})(A;;GRGW;;;{SYSTEM_SID_STRING})"
+        "S:(ML;;NRNW;;;ME)"
+    )
+    sd = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+        sddl, win32security.SDDL_REVISION_1)
     sa = win32security.SECURITY_ATTRIBUTES()
     sa.SECURITY_DESCRIPTOR = sd
     sa.bInheritHandle = 0
@@ -632,7 +685,7 @@ class FaceService:
         return {"ok": False, "reason": "unknown-command"}
 
     def _serve_one(self) -> None:
-        sa = _build_sa_everyone()
+        sa = _build_pipe_sa(self.cfg)
         handle = win32pipe.CreateNamedPipe(
             PIPE_NAME,
             win32pipe.PIPE_ACCESS_DUPLEX,
