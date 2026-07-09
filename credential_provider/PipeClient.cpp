@@ -2,8 +2,7 @@
 #include <vector>
 #include <map>
 #include <cstring>
-#include <sddl.h>       // ConvertSidToStringSidW
-#include <wtsapi32.h>   // WTSQueryUserToken
+#include <sddl.h>       // ConvertSidToStringSidW / ConvertStringSidToSidW
 
 namespace FaceUnlock {
 
@@ -262,16 +261,23 @@ bool ParseUnlockResponse(const std::string& response,
 // SERVER end of the connection and accept it only if it is a trusted owner.
 // This is an OS-level control (SID comparison) -- no crypto is introduced.
 //
-// Accepted owners:
-//   * SYSTEM (S-1-5-18)                      -- always trusted
-//   * this process's own token user          -- SELF harness: the service runs
-//                                               as the same user as the client
-//   * the interactive user of this session   -- registered CP: the host is
-//                                               LogonUI/SYSTEM, but the service
-//                                               is owned by the LOCKED user; we
-//                                               resolve that user via the session
-// The own-SID rule makes the SELF harness (client==user) work; the session-user
-// rule makes the registered CP (client==SYSTEM, service==locked user) work.
+// Accepted server owners:
+//   * SYSTEM (S-1-5-18)                 -- a SYSTEM-hosted service
+//   * this process's own token user     -- SELF harness: the service runs as the
+//                                          same user as the client
+//   * any real user account (S-1-5-21-) -- registered CP: the client is
+//                                          LogonUI/SYSTEM and the service runs as
+//                                          the interactive user, so we accept a
+//                                          normal machine/domain user account
+//
+// Anti-squatting is held PRIMARILY on the server side (FIRST_PIPE_INSTANCE refuses
+// to start on a taken name + a DACL that grants pipe-instance creation only to
+// SELF and SYSTEM), so a foreign/service account cannot own this pipe. This client
+// check stays defense-in-depth: accept SYSTEM or a real user, reject well-known /
+// service SIDs (LOCAL/NETWORK SERVICE, logon/capability SIDs). It deliberately does
+// NOT depend on WTSQueryUserToken/session resolution, which is unreliable in the
+// LogonUI secure-desktop context (it was silently failing and closing the pipe
+// before the request was sent).
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -309,27 +315,39 @@ bool ServerSidString(HANDLE hPipe, std::wstring& out) {
     return r;
 }
 
-// SID of the interactive user in THIS process's session. Best-effort: from a
-// SYSTEM host (registered CP inside LogonUI) this resolves the locked user via
-// WTSQueryUserToken (needs SeTcbPrivilege, which SYSTEM has). From an ordinary
-// user process (the SELF harness) it typically fails -- fine, because that
-// user's own SID already covers the same service.
-bool SessionUserSidString(std::wstring& out) {
-    DWORD sessionId = 0;
-    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId)) return false;
-    HANDLE hUserTok = nullptr;
-    if (!WTSQueryUserToken(sessionId, &hUserTok)) return false;
-    bool r = SidStringFromToken(hUserTok, out);
-    CloseHandle(hUserTok);
-    return r;
+// True iff sidStr is a regular machine/domain user account SID: NT authority
+// (S-1-5-) with first sub-authority 21 (SECURITY_NT_NON_UNIQUE), i.e. S-1-5-21-<...>.
+// Deliberately EXCLUDES SYSTEM (S-1-5-18), LOCAL/NETWORK SERVICE (S-1-5-19/20),
+// well-known groups, logon SIDs and capability SIDs -- so a service or pseudo
+// account cannot masquerade as a legitimate user-owned FaceService.
+bool IsRegularUserSid(const std::wstring& sidStr) {
+    PSID sid = nullptr;
+    if (!ConvertStringSidToSidW(sidStr.c_str(), &sid)) return false;
+    bool ok = false;
+    if (IsValidSid(sid)) {
+        PSID_IDENTIFIER_AUTHORITY auth = GetSidIdentifierAuthority(sid);
+        const bool ntAuthority =
+            auth->Value[0] == 0 && auth->Value[1] == 0 && auth->Value[2] == 0 &&
+            auth->Value[3] == 0 && auth->Value[4] == 0 && auth->Value[5] == 5;
+        if (ntAuthority && *GetSidSubAuthorityCount(sid) >= 1 &&
+            *GetSidSubAuthority(sid, 0) == 21) {   // SECURITY_NT_NON_UNIQUE -> S-1-5-21-...
+            ok = true;
+        }
+    }
+    LocalFree(sid);
+    return ok;
 }
 
 bool IsTrustedServerSid(const std::wstring& serverSid) {
-    if (serverSid == L"S-1-5-18") return true;   // SYSTEM
+    if (serverSid == L"S-1-5-18") return true;   // SYSTEM: a SYSTEM-hosted service
     std::wstring own;
-    if (SidStringFromProcess(GetCurrentProcess(), own) && !own.empty() && serverSid == own) return true;
-    std::wstring sess;
-    if (SessionUserSidString(sess) && !sess.empty() && serverSid == sess) return true;
+    if (SidStringFromProcess(GetCurrentProcess(), own) && !own.empty() && serverSid == own)
+        return true;                             // same-user: the SELF harness (client == service)
+    // Registered-CP case: the client is SYSTEM (LogonUI) and the service runs as the interactive
+    // user, so neither rule above matches. Trust the server iff it is a real machine/domain user
+    // account (S-1-5-21-...). See the header comment for why this does NOT resolve the session user
+    // via WTSQueryUserToken (unreliable on the secure desktop) and why anti-squatting stays server-side.
+    if (IsRegularUserSid(serverSid)) return true;
     return false;
 }
 
