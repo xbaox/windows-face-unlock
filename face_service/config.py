@@ -132,6 +132,21 @@ class Config:
     watchdog_fail_threshold: int = 3        # consecutive ping failures before a restart
     watchdog_interval_s: float = 30.0       # seconds between pings in the watchdog self-loop
     watchdog_pause_ttl_s: float = 300.0     # deliberate-stop pause lifetime; self-heals after this
+    # --- Stage 4: named-pipe perimeter hardening (Batch 1; channel boundary = DACL + SID-gate) ---
+    # Explicit pipe security descriptor (SELF=GA, SYSTEM=GRGW, no Everyone ACE, + a Medium mandatory
+    # label NoReadUp/NoWriteUp) instead of the legacy NULL DACL that granted Everyone. Default on;
+    # set False only to roll back to the legacy NULL-DACL pipe (_build_sa_everyone_legacy).
+    pipe_hardened_sd: bool = True
+    # FILE_FLAG_FIRST_PIPE_INSTANCE on the server (refuse to start if the pipe name is already taken
+    # -- a squatter) PLUS the client-side server-SID check in tools/pipe_client.py (verify the server
+    # runs as SELF or SYSTEM before sending). Both live under this one toggle. Default on.
+    pipe_first_instance: bool = True
+    # SID-gate on the unlock command (Stage 4 Step 5): when True, only a caller whose token SID is
+    # SYSTEM (S-1-5-18) -- the lockscreen Credential Provider -- may invoke unlock; any other caller
+    # gets {"ok":false,"reason":"not-authorized"} before load_password. Default FALSE: Stage 4 has no
+    # real CP yet and dev tests connect as SELF; Stage 5 flips this True. Only unlock is gated (other
+    # commands are scoped by the Batch-1 pipe DACL).
+    pipe_unlock_require_system: bool = False
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
@@ -223,6 +238,28 @@ class Config:
             raise ValueError("watchdog_interval_s must be in (0, 3600]")
         if not (0.0 < self.watchdog_pause_ttl_s <= 3600.0):
             raise ValueError("watchdog_pause_ttl_s must be in (0, 3600]")
+        # Stage 4: the pipe perimeter toggles must be real booleans (a stray int/str would silently
+        # take a truthy branch and pick the wrong descriptor / flag). Fail loud, like the checks above.
+        if not isinstance(self.pipe_hardened_sd, bool):
+            raise ValueError("pipe_hardened_sd must be a boolean")
+        if not isinstance(self.pipe_first_instance, bool):
+            raise ValueError("pipe_first_instance must be a boolean")
+        if not isinstance(self.pipe_unlock_require_system, bool):
+            raise ValueError("pipe_unlock_require_system must be a boolean")
+        # If the hardened descriptor is requested, the current user's SID MUST resolve -- the DACL is
+        # built from it (SELF=GA). Fail loud here rather than fall through to a pipe nobody can use.
+        # Lazy pywin32 import so importing config on a stripped interpreter stays cheap when off.
+        if self.pipe_hardened_sd:
+            try:
+                import win32api, win32con, win32security  # noqa: PLC0415
+                _th = win32security.OpenProcessToken(
+                    win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+                _sid = win32security.GetTokenInformation(_th, win32security.TokenUser)[0]
+                if not win32security.ConvertSidToStringSid(_sid):
+                    raise ValueError("current-user SID resolved empty")
+            except Exception as e:
+                raise ValueError(
+                    f"pipe_hardened_sd=True but the current-user SID did not resolve: {e}")
         if self.adaptive_gallery:
             # Anti-screen is the PRIMARY replay defense for adaptation; the distance ceiling
             # alone leaves only ~0.005 cosine below replay-of-self (~0.155 vs ceiling ~0.15),

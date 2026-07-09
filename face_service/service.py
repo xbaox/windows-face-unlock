@@ -73,10 +73,87 @@ log = logging.getLogger(__name__)
 CAMERA_OPEN_PAUSE_S = 0.3
 
 
-def _build_sa_everyone() -> win32security.SECURITY_ATTRIBUTES:
-    """Allow LogonUI (SYSTEM) and any logged-in user to connect to the pipe."""
+# Well-known SID for the lockscreen Credential Provider: LogonUI loads the CP DLL as SYSTEM.
+SYSTEM_SID_STRING = "S-1-5-18"
+
+# CreateNamedPipe openMode flag (anti-squatting, Stage 4 Step 4): CreateNamedPipe fails if an
+# instance of the name already exists. pywin32 312 does not export it, so define the literal.
+FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+
+
+def _current_user_sid_string() -> str:
+    """String SID (S-1-5-21-...) of the account this process runs as (SELF).
+
+    OpenProcessToken(current, TOKEN_QUERY) -> GetTokenInformation(TokenUser) -> ConvertSidToStringSid.
+    Raises on failure so a missing/broken SID fails loud at pipe creation rather than silently
+    dropping back to an unusable descriptor.
+    """
+    th = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
+    finally:
+        win32api.CloseHandle(th)
+    return win32security.ConvertSidToStringSid(sid)
+
+
+def _pipe_client_sid_string(handle) -> "str | None":
+    """String SID of the process on the CLIENT end of a connected pipe handle, or None on any
+    failure (client already gone, OpenProcess denied, ...). Server-side symmetric twin of
+    tools/pipe_client._server_sid_string. No impersonation -- reading identity needs no privilege."""
+    try:
+        pid = win32pipe.GetNamedPipeClientProcessId(handle)
+        ph = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            th = win32security.OpenProcessToken(ph, win32con.TOKEN_QUERY)
+            try:
+                sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
+            finally:
+                win32api.CloseHandle(th)
+        finally:
+            win32api.CloseHandle(ph)
+        return win32security.ConvertSidToStringSid(sid)
+    except Exception:
+        return None
+
+
+def _build_sa_everyone_legacy() -> win32security.SECURITY_ATTRIBUTES:
+    """LEGACY (rollback path, cfg.pipe_hardened_sd=False): NULL DACL = allow ALL (Everyone).
+
+    Kept verbatim so the hardened default in _build_pipe_sa can be turned off without a code change.
+    """
     sd = win32security.SECURITY_DESCRIPTOR()
     sd.SetSecurityDescriptorDacl(1, None, 0)  # NULL DACL = allow all (OK for named pipe on localhost)
+    sa = win32security.SECURITY_ATTRIBUTES()
+    sa.SECURITY_DESCRIPTOR = sd
+    sa.bInheritHandle = 0
+    return sa
+
+
+def _build_pipe_sa(cfg: Config) -> win32security.SECURITY_ATTRIBUTES:
+    """Security attributes for the named pipe.
+
+    cfg.pipe_hardened_sd=False -> legacy NULL DACL (Everyone), for rollback.
+    True (default) -> an explicit descriptor built from an SDDL string:
+      * DACL: SELF (this user) = GENERIC_ALL -- owner/server; GA is needed so the per-connection
+              re-create of the pipe instance works under the SELF token (FILE_CREATE_PIPE_INSTANCE).
+              SYSTEM = GENERIC_READ|GENERIC_WRITE -- the lockscreen CP (LogonUI) connects as SYSTEM
+              (not bare GR: a duplex client needs read+write+SYNCHRONIZE, which GRGW maps in).
+              NO Everyone ACE -> every OTHER non-admin user is denied by the implicit deny.
+      * SACL: a Medium mandatory label with NoReadUp+NoWriteUp -> a same-user LOW-integrity process
+              cannot read/write the pipe; SYSTEM and our Medium clients sit at/above Medium so they
+              pass. ME (Medium) is deliberate -- labelling LW (Low) would defeat the point.
+    SetEntriesInAcl is not exported by pywin32, so the descriptor is assembled from SDDL via
+    ConvertStringSecurityDescriptorToSecurityDescriptor (present in pywin32 312).
+    """
+    if not cfg.pipe_hardened_sd:
+        return _build_sa_everyone_legacy()
+    self_sid = _current_user_sid_string()
+    sddl = (
+        f"D:(A;;GA;;;{self_sid})(A;;GRGW;;;{SYSTEM_SID_STRING})"
+        "S:(ML;;NRNW;;;ME)"
+    )
+    sd = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+        sddl, win32security.SDDL_REVISION_1)
     sa = win32security.SECURITY_ATTRIBUTES()
     sa.SECURITY_DESCRIPTOR = sd
     sa.bInheritHandle = 0
@@ -491,7 +568,7 @@ class FaceService:
                 self._release_camera()
         return {"ok": True, "config": asdict(new_cfg)}
 
-    def _handle(self, req: dict) -> dict:
+    def _handle(self, req: dict, handle=None) -> dict:
         cmd = req.get("cmd")
         if cmd == "ping":
             return {"ok": True, "pong": True}
@@ -564,6 +641,15 @@ class FaceService:
             return resp
 
         if cmd == "unlock":
+            # Stage 4 Step 5 SID-gate (default OFF): when enabled, only a SYSTEM caller -- the
+            # lockscreen Credential Provider -- may invoke unlock. Runs BEFORE lockout/verify/
+            # load_password so no password is ever returned to a non-SYSTEM caller. Only unlock is
+            # gated; every other command is scoped by the Batch-1 pipe DACL.
+            if self.cfg.pipe_unlock_require_system:
+                sid = _pipe_client_sid_string(handle)
+                if sid != SYSTEM_SID_STRING:
+                    log.warning("unlock rejected: caller not SYSTEM (sid=%s)", sid)
+                    return {"ok": False, "reason": "not-authorized"}
             rem = self._lockout.remaining()
             if rem > 0:
                 self._audit.write("unlock", {"verdict": "LOCKED_OUT", "match": False,
@@ -632,14 +718,38 @@ class FaceService:
         return {"ok": False, "reason": "unknown-command"}
 
     def _serve_one(self) -> None:
-        sa = _build_sa_everyone()
-        handle = win32pipe.CreateNamedPipe(
-            PIPE_NAME,
-            win32pipe.PIPE_ACCESS_DUPLEX,
-            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-            win32pipe.PIPE_UNLIMITED_INSTANCES,
-            65536, 65536, 0, sa,
-        )
+        sa = _build_pipe_sa(self.cfg)
+        open_mode = win32pipe.PIPE_ACCESS_DUPLEX
+        if self.cfg.pipe_first_instance:
+            # Refuse to bind if the name is already taken (a squatter). Safe for our per-connection
+            # re-create: the serve loop CloseHandle()s the previous instance in the finally below
+            # BEFORE this next CreateNamedPipe, so no instance of OURS exists at this point -- any
+            # same-name instance found here is therefore foreign.
+            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE
+        try:
+            handle = win32pipe.CreateNamedPipe(
+                PIPE_NAME,
+                open_mode,
+                win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+                win32pipe.PIPE_UNLIMITED_INSTANCES,
+                65536, 65536, 0, sa,
+            )
+        except pywintypes.error as e:
+            # FIRST_PIPE_INSTANCE -> the name is occupied by someone else. Loud log + clean stop so
+            # the serve loop exits (no silent tight crash-loop). The watchdog will retry the start,
+            # and each refusal is logged, so a persistent squatter is visible rather than hidden.
+            if self.cfg.pipe_first_instance and e.winerror in (
+                    winerror.ERROR_ACCESS_DENIED, winerror.ERROR_ALREADY_EXISTS,
+                    winerror.ERROR_PIPE_BUSY):
+                log.error("pipe name %s occupied (winerror=%d) -- refusing to start "
+                          "(possible squatter)", PIPE_NAME, e.winerror)
+                self._stop.set()
+                try:
+                    win32event.SetEvent(self._stop_event)
+                except Exception:
+                    pass
+                return
+            raise
         try:
             try:
                 win32pipe.ConnectNamedPipe(handle, None)
@@ -665,7 +775,7 @@ class FaceService:
             req = json.loads(data.decode("utf-8"))
             log.info("request cmd=%s", req.get("cmd"))
             try:
-                resp = self._handle(req)
+                resp = self._handle(req, handle)
             except Exception as e:
                 log.exception("handler error")
                 resp = {"ok": False, "reason": f"exception: {e}"}
