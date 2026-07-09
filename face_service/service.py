@@ -865,6 +865,13 @@ class FaceService:
             # request -> just return so the loop re-checks _stop.
             if self._stop.is_set():
                 return
+            # Stage-5 5c diagnostic: record every accepted connection BEFORE the read, with the
+            # client's (non-sensitive) identity from _pipe_client_diag (PID / image / IL / session /
+            # openable -- no impersonation, no password/request content). A client that opens the
+            # pipe then bails on its OWN pre-write check (e.g. the CP's client-side server-SID
+            # verification) shows up here as "connection accepted" with NO following "request cmd=..."
+            # line; image=LogonUI.exe + openable=no marks the real lockscreen CP.
+            log.info("connection accepted (%s)", _pipe_client_diag(handle))
             try:
                 _hr, data = win32file.ReadFile(handle, 65536)
             except pywintypes.error as e:
@@ -872,6 +879,11 @@ class FaceService:
                 # request to handle; return cleanly rather than logging a pipe error.
                 if e.winerror in (winerror.ERROR_BROKEN_PIPE, winerror.ERROR_PIPE_NOT_CONNECTED,
                                   winerror.ERROR_NO_DATA):
+                    # Stage-5 5c diagnostic: connected but closed before sending a request. Paired
+                    # with the "connection accepted" line above and NO "request cmd=..." between
+                    # them, this is the signature of a client that bailed after its own pre-write
+                    # checks -- i.e. the request never left the client.
+                    log.info("connection closed before request (winerror=%d)", e.winerror)
                     return
                 raise
             if not data:
