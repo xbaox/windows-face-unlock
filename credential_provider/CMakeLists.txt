@@ -26,6 +26,7 @@ target_link_libraries(FaceCredentialProvider PRIVATE
     ole32
     oleaut32
     advapi32
+    wtsapi32
 )
 
 set_target_properties(FaceCredentialProvider PROPERTIES

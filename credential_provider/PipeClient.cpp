@@ -2,6 +2,8 @@
 #include <vector>
 #include <map>
 #include <cstring>
+#include <sddl.h>       // ConvertSidToStringSidW
+#include <wtsapi32.h>   // WTSQueryUserToken
 
 namespace FaceUnlock {
 
@@ -254,6 +256,85 @@ bool ParseUnlockResponse(const std::string& response,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Client-side pipe-server identity check (defense-in-depth against a squatter
+// owning the \\.\pipe\FaceUnlock name). We read the SID of the process on the
+// SERVER end of the connection and accept it only if it is a trusted owner.
+// This is an OS-level control (SID comparison) -- no crypto is introduced.
+//
+// Accepted owners:
+//   * SYSTEM (S-1-5-18)                      -- always trusted
+//   * this process's own token user          -- SELF harness: the service runs
+//                                               as the same user as the client
+//   * the interactive user of this session   -- registered CP: the host is
+//                                               LogonUI/SYSTEM, but the service
+//                                               is owned by the LOCKED user; we
+//                                               resolve that user via the session
+// The own-SID rule makes the SELF harness (client==user) work; the session-user
+// rule makes the registered CP (client==SYSTEM, service==locked user) work.
+// ---------------------------------------------------------------------------
+namespace {
+
+bool SidStringFromToken(HANDLE hToken, std::wstring& out) {
+    DWORD len = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &len);  // query required size
+    if (len == 0) return false;
+    std::vector<BYTE> buf(len);
+    if (!GetTokenInformation(hToken, TokenUser, buf.data(), len, &len)) return false;
+    const TOKEN_USER* tu = reinterpret_cast<const TOKEN_USER*>(buf.data());
+    LPWSTR s = nullptr;
+    if (!ConvertSidToStringSidW(tu->User.Sid, &s)) return false;
+    out = s;
+    LocalFree(s);
+    return true;
+}
+
+bool SidStringFromProcess(HANDLE hProcess, std::wstring& out) {
+    HANDLE htok = nullptr;
+    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &htok)) return false;
+    bool r = SidStringFromToken(htok, out);
+    CloseHandle(htok);
+    return r;
+}
+
+// SID of the process on the SERVER end of an open pipe handle:
+// GetNamedPipeServerProcessId -> OpenProcess(QUERY_LIMITED) -> token -> SID.
+bool ServerSidString(HANDLE hPipe, std::wstring& out) {
+    ULONG pid = 0;
+    if (!GetNamedPipeServerProcessId(hPipe, &pid)) return false;
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hp) return false;
+    bool r = SidStringFromProcess(hp, out);
+    CloseHandle(hp);
+    return r;
+}
+
+// SID of the interactive user in THIS process's session. Best-effort: from a
+// SYSTEM host (registered CP inside LogonUI) this resolves the locked user via
+// WTSQueryUserToken (needs SeTcbPrivilege, which SYSTEM has). From an ordinary
+// user process (the SELF harness) it typically fails -- fine, because that
+// user's own SID already covers the same service.
+bool SessionUserSidString(std::wstring& out) {
+    DWORD sessionId = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId)) return false;
+    HANDLE hUserTok = nullptr;
+    if (!WTSQueryUserToken(sessionId, &hUserTok)) return false;
+    bool r = SidStringFromToken(hUserTok, out);
+    CloseHandle(hUserTok);
+    return r;
+}
+
+bool IsTrustedServerSid(const std::wstring& serverSid) {
+    if (serverSid == L"S-1-5-18") return true;   // SYSTEM
+    std::wstring own;
+    if (SidStringFromProcess(GetCurrentProcess(), own) && !own.empty() && serverSid == own) return true;
+    std::wstring sess;
+    if (SessionUserSidString(sess) && !sess.empty() && serverSid == sess) return true;
+    return false;
+}
+
+}  // anonymous namespace
+
 static bool OverlappedWait(HANDLE pipe, OVERLAPPED& ov, DWORD timeoutMs, DWORD& transferred) {
     DWORD wr = WaitForSingleObject(ov.hEvent, timeoutMs);
     if (wr != WAIT_OBJECT_0) {
@@ -268,7 +349,9 @@ static bool OverlappedWait(HANDLE pipe, OVERLAPPED& ov, DWORD timeoutMs, DWORD& 
 bool PipeCall(const std::wstring& pipeName,
               const std::string& requestJson,
               std::string& response,
-              DWORD timeoutMs) {
+              DWORD timeoutMs,
+              bool verifyServer,
+              ServerTrust* trust) {
     // Total deadline for the whole transaction.
     const DWORD startTick = GetTickCount();
     auto remaining = [&]() -> DWORD {
@@ -292,6 +375,23 @@ bool PipeCall(const std::wstring& pipeName,
             Sleep(200);
         } else {
             return false;
+        }
+    }
+
+    // Anti-squatting: verify the SERVER end is a trusted owner BEFORE sending
+    // anything on this exact handle (same-connection -> no TOCTOU window).
+    if (verifyServer) {
+        std::wstring serverSid;
+        bool haveSid = ServerSidString(h, serverSid);
+        bool trusted = haveSid && IsTrustedServerSid(serverSid);
+        if (trust) {
+            trust->checked = true;
+            trust->trusted = trusted;
+            trust->serverSid = haveSid ? serverSid : std::wstring();
+        }
+        if (!trusted) {
+            CloseHandle(h);
+            return false;  // refuse: do NOT send the request to an untrusted server
         }
     }
 
@@ -332,15 +432,19 @@ bool PipeCall(const std::wstring& pipeName,
 bool RequestUnlock(std::wstring& username,
                    std::wstring& password,
                    std::wstring& domain,
-                   std::string& errorOut) {
+                   std::string& errorOut,
+                   ServerTrust* trust) {
     const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlock";
     // 12s total: if the service is dead or the user is not visible, fail fast
     // so the user can switch to the password/PIN tile without feeling stuck.
     const DWORD kUnlockTimeoutMs = 12000;
 
     std::string resp;
-    if (!PipeCall(pipe, "{\"cmd\":\"unlock\"}", resp, kUnlockTimeoutMs)) {
-        errorOut = "pipe-unavailable";
+    ServerTrust localTrust;
+    ServerTrust* t = trust ? trust : &localTrust;
+    if (!PipeCall(pipe, "{\"cmd\":\"unlock\"}", resp, kUnlockTimeoutMs, /*verifyServer=*/true, t)) {
+        // Distinguish an untrusted-server refusal from a plain transport failure.
+        errorOut = (t->checked && !t->trusted) ? "server-untrusted" : "pipe-unavailable";
         return false;
     }
     return ParseUnlockResponse(resp, username, password, domain, errorOut);
