@@ -115,7 +115,8 @@ def test_sid_helpers():
         try:
             sh = _make_pipe(name, None)
             win32pipe.ConnectNamedPipe(sh, None)
-            res["client_sid"] = _pipe_client_sid_string(sh)   # service reads the CLIENT SID
+            win32file.ReadFile(sh, 64)                        # ImpersonateNamedPipeClient needs a prior read
+            res["client_sid"] = _pipe_client_sid_string(sh)   # service reads the CLIENT SID (via impersonation)
             time.sleep(0.2)
             win32pipe.DisconnectNamedPipe(sh); win32file.CloseHandle(sh)
         except Exception as e:
@@ -126,6 +127,7 @@ def test_sid_helpers():
     ch = win32file.CreateFile(name, win32con.GENERIC_READ | win32con.GENERIC_WRITE,
                               0, None, win32con.OPEN_EXISTING, 0, None)
     res["server_sid"] = _server_sid_string(ch)                # client reads the SERVER SID
+    win32file.WriteFile(ch, b"unlock-selftest")               # give the server a message to impersonate
     time.sleep(0.1)
     win32file.CloseHandle(ch)
     th.join(5)

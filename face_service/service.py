@@ -98,22 +98,38 @@ def _current_user_sid_string() -> str:
 
 def _pipe_client_sid_string(handle) -> "str | None":
     """String SID of the process on the CLIENT end of a connected pipe handle, or None on any
-    failure (client already gone, OpenProcess denied, ...). Server-side symmetric twin of
-    tools/pipe_client._server_sid_string. No impersonation -- reading identity needs no privilege."""
+    failure (client already gone, cannot impersonate, ...).
+
+    Uses ImpersonateNamedPipeClient: the pipe subsystem hands the server the client's token
+    directly, so the caller's SID is read WITHOUT OpenProcess. That matters because the service runs
+    as a Limited user, and OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) on a SYSTEM client (the
+    lockscreen CP inside LogonUI) is denied -- the old GetNamedPipeClientProcessId->OpenProcess chain
+    therefore resolved a genuine SYSTEM caller to None and wrongly failed the SID-gate. Reading the
+    SID needs no privilege (SecurityIdentification suffices; the CP opens the pipe without
+    SECURITY_SQOS_PRESENT, so the default SecurityImpersonation is offered). The unlock handler has
+    already read the request off this handle before the gate runs, so the impersonation precondition
+    (a message must have been read) is met, and impersonation happens on that same serve thread.
+
+    RevertToSelf is MANDATORY on every exit path: otherwise this serve thread would keep running
+    under the client's token and the subsequent WriteFile / next connection would use it."""
+    impersonated = False
     try:
-        pid = win32pipe.GetNamedPipeClientProcessId(handle)
-        ph = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        win32security.ImpersonateNamedPipeClient(handle)
+        impersonated = True
+        th = win32security.OpenThreadToken(win32api.GetCurrentThread(), win32con.TOKEN_QUERY, True)
         try:
-            th = win32security.OpenProcessToken(ph, win32con.TOKEN_QUERY)
-            try:
-                sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
-            finally:
-                win32api.CloseHandle(th)
+            sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
         finally:
-            win32api.CloseHandle(ph)
+            win32api.CloseHandle(th)
         return win32security.ConvertSidToStringSid(sid)
     except Exception:
         return None
+    finally:
+        if impersonated:
+            try:
+                win32security.RevertToSelf()
+            except Exception:
+                pass
 
 
 def _client_image_name(pid) -> str:
