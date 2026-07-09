@@ -26,6 +26,17 @@ IFACEMETHODIMP_(ULONG) FaceCredentialProvider::AddRef()  { return InterlockedInc
 IFACEMETHODIMP_(ULONG) FaceCredentialProvider::Release() { LONG c = InterlockedDecrement(&m_cRef); if (c == 0) delete this; return c; }
 
 IFACEMETHODIMP FaceCredentialProvider::SetUsageScenario(CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus, DWORD) {
+    // Never offer the face tile in a remote (RDP) session: there is no local
+    // camera to scan, so the tile could only ever fail. Refusing the scenario
+    // here means no credential is created and no tile is shown -- the user
+    // still has the standard password/PIN tiles (we stay additive, never a
+    // filter). GetSystemMetrics(SM_REMOTESESSION) is the documented remote-
+    // session probe. The CP reads no TOML config, so RDP-off is hardcoded in
+    // C++ (there is deliberately no cp_disable_on_rdp config knob).
+    if (GetSystemMetrics(SM_REMOTESESSION) != 0) {
+        return E_NOTIMPL;
+    }
+
     // We only participate in logon and unlock.
     switch (cpus) {
         case CPUS_LOGON:
