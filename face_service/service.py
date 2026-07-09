@@ -116,6 +116,93 @@ def _pipe_client_sid_string(handle) -> "str | None":
         return None
 
 
+def _client_image_name(pid) -> str:
+    """Base image name (e.g. 'LogonUI.exe') for a PID via a Toolhelp snapshot. Needs NO OpenProcess,
+    so it resolves SYSTEM processes a Limited-user service cannot open (which is the whole point:
+    a rejected SYSTEM caller still shows its image). '?' on any failure; never raises."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class _PE32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+        k = ctypes.windll.kernel32
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == -1:
+            return "?"
+        try:
+            e = _PE32W()
+            e.dwSize = ctypes.sizeof(_PE32W)
+            if k.Process32FirstW(snap, ctypes.byref(e)):
+                while True:
+                    if e.th32ProcessID == pid:
+                        return e.szExeFile or "?"
+                    if not k.Process32NextW(snap, ctypes.byref(e)):
+                        break
+        finally:
+            k.CloseHandle(snap)
+    except Exception:
+        pass
+    return "?"
+
+
+def _integrity_label(token) -> str:
+    """Map a token's mandatory-integrity RID to a label ('Medium'/'System'/...). '?' on failure."""
+    try:
+        sid = win32security.GetTokenInformation(token, win32security.TokenIntegrityLevel)[0]
+        rid = sid.GetSubAuthority(sid.GetSubAuthorityCount() - 1)
+        return {0x0000: "Untrusted", 0x1000: "Low", 0x2000: "Medium", 0x2100: "MediumPlus",
+                0x3000: "High", 0x4000: "System", 0x5000: "Protected"}.get(rid, hex(rid))
+    except Exception:
+        return "?"
+
+
+def _pipe_client_diag(handle) -> str:
+    """Non-sensitive description of the CLIENT process for the unlock-rejection log:
+    'pid=<n> image=<exe> integrity=<level> session=<n> openable=<yes|no>'. Diagnostic only -- it
+    logs no password or request content, and never raises (every field degrades to '?').
+
+    image + session are read WITHOUT OpenProcess (Toolhelp snapshot + ProcessIdToSessionId) so they
+    resolve even for a SYSTEM client (LogonUI) that a Limited-user service cannot OpenProcess.
+    'openable=no' on such a client is itself the tell that the caller outranks the service -- i.e.
+    image=LogonUI.exe + sid=None + openable=no == the real lockscreen CP, whereas
+    image=unlock_harness.exe + sid=<user> + openable=yes == the SELF test harness."""
+    try:
+        pid = win32pipe.GetNamedPipeClientProcessId(handle)
+    except Exception:
+        return "pid=? (client-pid-unavailable)"
+    image = _client_image_name(pid)
+    session = "?"
+    try:
+        import win32ts  # type: ignore
+        session = str(win32ts.ProcessIdToSessionId(pid))
+    except Exception:
+        pass
+    integrity = "?"
+    openable = "no"
+    try:
+        ph = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        openable = "yes"
+        try:
+            th = win32security.OpenProcessToken(ph, win32con.TOKEN_QUERY)
+            try:
+                integrity = _integrity_label(th)
+            finally:
+                win32api.CloseHandle(th)
+        finally:
+            win32api.CloseHandle(ph)
+    except Exception:
+        pass
+    return f"pid={pid} image={image} integrity={integrity} session={session} openable={openable}"
+
+
 def _build_sa_everyone_legacy() -> win32security.SECURITY_ATTRIBUTES:
     """LEGACY (rollback path, cfg.pipe_hardened_sd=False): NULL DACL = allow ALL (Everyone).
 
@@ -648,7 +735,8 @@ class FaceService:
             if self.cfg.pipe_unlock_require_system:
                 sid = _pipe_client_sid_string(handle)
                 if sid != SYSTEM_SID_STRING:
-                    log.warning("unlock rejected: caller not SYSTEM (sid=%s)", sid)
+                    log.warning("unlock rejected: caller not SYSTEM (sid=%s %s)",
+                                sid, _pipe_client_diag(handle))
                     return {"ok": False, "reason": "not-authorized"}
             rem = self._lockout.remaining()
             if rem > 0:
