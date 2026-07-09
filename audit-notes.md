@@ -118,8 +118,8 @@
 * **Этап 1:** движок ONNX/InsightFace (YuNet+ArcFace, GPU), один детект, early-exit, CPU-фолбэк. База — числа бенчмарка стока (Шаг 9).
 * **Этап 2:** активный liveness (blink+жест), анти-экран, rate-limit+lockout, аудит-лог, режимы Быстрый/Параноик.
 * **Этап 3:** надёжность (мульти-условный энролл, адаптивная галерея, низкий свет, занятая камера, watchdog).
-* **Этап 4:** харднинг канала — DACL SELF+SYSTEM (C1), FIRST\_PIPE\_INSTANCE (C2), nonce+подпись (C3,C4), закрыть DoS-команды (C5); опц. TPM-seal пароля (§2).
-* **Этап 5:** Credential Provider (C++, VS2022+CMake), свой GUID, защищённый протокол, таймаут, фолбэк, RDP-off, регистрация. ⚠️ ЛОКСКРИН.
+* **Этап 4 (DONE ✅):** харднинг канала — явный DACL `SELF+SYSTEM` + Medium mandatory-label (C1), `FIRST_PIPE_INSTANCE` + проверка server-SID клиентом (C2), SID-гейт `unlock`→SYSTEM (C3/C5; дефолт OFF, активируется в Этапе 5), per-install энтропия + авто-миграция v1→v2 (§2). **nonce/подпись (C3,C4) СНЯТЫ** как избыточные к OS-границе (обоснование — секция «Этап 4 … Threat-model (пересмотр)»). DoS-команды (C5) режет DACL. Остаток → Этап 5.
+* **Этап 5:** Credential Provider (C++, VS2022+CMake), свой GUID, защищённый протокол, таймаут, фолбэк, RDP-off, регистрация. ⚠️ ЛОКСКРИН. **Перенесено из Этапа 4:** SYSTEM-custody выдачи пароля (доминирующий same-user риск), флип `pipe_unlock_require_system=true`, опц. TPM-seal.
 * **Этап 6:** UX (визард PySide6, трей, RU/EN).
 * **Этап 7:** упаковка/подпись/uninstaller/чеклист + **напомнить Bao выключить System Protection**.
 
@@ -181,3 +181,46 @@
 - (d) Repo-wide EOL-нормализация → **Этап 5/6** (из handoff).
 
 **Анти-отравление (напоминание):** adaptive-галерея по умолчанию OFF; включать только при `anti_screen=true`; ceiling якорится на enrollment-базу; при любом сомнении в чистоте — `clear_adaptive()` или ре-энролл (жёсткий откат). Сквозное напоминание про System Protection до Этапа 7 — см. блок вверху файла.
+
+\---
+
+## Этап 4 — харднинг канала/хранения (Stage 4 — channel/storage hardening) — DONE ✅
+
+> Ветка `stage4-hardening` (после `07e0830`; готова к мержу в `master`, ещё **НЕ слита / НЕ запушена**). Дата: 2026-07-09.
+> Коммиты: `2b955a8` (Шаг 3: DACL пайпа), `557e9de` (Шаг 4: анти-сквоттинг), `3d72edc` (Шаг 5: SID-гейт `unlock`), `07e0830` (Шаг 6: custody энтропии); `efc8b85` — воспроизводимые selftest'ы Этапа 4.
+
+**Что сделано по шагам (все дефолты — безопасны и прозрачны; поведение по умолчанию не меняется):**
+
+- **Шаг 3 — явный DACL пайпа** (`service.py`, `_build_pipe_sa`): NULL DACL (`SetSecurityDescriptorDacl(1,None,0)` = Everyone) заменён на descriptor из SDDL — **SELF=GA** (владелец/сервер, чтобы per-connection re-create инстанса шёл под токеном SELF), **SYSTEM=GRGW** (локскрин-CP коннектится как SYSTEM), **без Everyone-ACE**, плюс **Medium mandatory-label (NoReadUp/NoWriteUp)** против same-user low-IL процессов. Старое тело сохранено как `_build_sa_everyone_legacy` (откат через `pipe_hardened_sd=false`). Собран через `ConvertStringSecurityDescriptorToSecurityDescriptor` (в pywin32 312 `SetEntriesInAcl` не экспортится → SDDL). Живой descriptor пайпа: `D:(A;;FA;;;<SELF>)(A;;0x12019f;;;SY)S:(ML;;NWNR;;;ME)`. (C1, часть C5.)
+- **Шаг 4 — анти-сквоттинг** (`service.py`, `tools/pipe_client.py`): в `openMode` добавлен `FILE_FLAG_FIRST_PIPE_INSTANCE` (литерал `0x00080000` — pywin32 312 его не экспортит) под `pipe_first_instance`. Если имя пайпа уже занято (сквоттер) — `CreateNamedPipe` падает → **loud log + чистый выход** (не тихий краш-луп; watchdog ретраит, каждый отказ залогирован). Безопасно для per-connection re-create: цикл `CloseHandle`-ит прошлый инстанс ДО следующего `CreateNamedPipe`, так что своего инстанса в этот момент нет (доказано: 10 reconnect подряд). Клиент (`pipe_client`, эмуляция Stage-5 CP): перед отправкой проверяет **server-SID ∈ {SELF, SYSTEM}** через `GetNamedPipeServerProcessId` → токен; mismatch → отказ, запрос не шлётся. `presence_monitor`/`watchdog` не трогали (доверенные SELF-циклы). (C2.)
+- **Шаг 5 — SID-гейт на `unlock`** (`service.py`): новый `pipe_unlock_require_system` (дефолт **FALSE**). Включённый — требует токен-SID клиента == **SYSTEM (S-1-5-18)**; любой другой (вкл. нечитаемый → `None`) получает `{"ok":false,"reason":"not-authorized"}` **ДО** lockout / verify / `load_password` (пароль и камера не задействованы). Читает SID сервер-сайд `_pipe_client_sid_string` (`GetNamedPipeClientProcessId`→токен, без impersonation — чтение identity не требует привилегий). Гейт **ТОЛЬКО на `unlock`**; прочие команды (`shutdown`/`reset_lockout`/`pause_camera`/`resume_camera`/`reload_config`/`verify`/`status`/`ping`/`presence`/`build_enrollment`) не тронуты — их режет DACL Шага 3, трей-Quit (`shutdown`) как SELF работает. Дефолт FALSE намеренно: реального CP (SYSTEM) в Этапе 4 нет, dev-тест как SELF; **Этап 5 флипнет в True**. (C3, часть C5.)
+- **Шаг 6 — custody энтропии** (`credentials.py`): публичный хардкод `ENTROPY=b"face-unlock:v1"` для НОВЫХ шифрований заменён на per-install `os.urandom(32)` в `pipe_entropy.bin` (рождается под protected-DACL `D:P(A;;FA;;;<SELF>)(A;;FA;;;SY)` — без Everyone/наследования, тем же SDDL-механизмом что пайп). Блоб версионируется префиксом `b"v2:"` (v1-DPAPI-блоб начинается с DPAPI-magic, никогда с этого префикса → детект однозначен). **Одноразовая авто-миграция v1→v2** в `load_password`: расшифровать старой энтропией → пере-шифровать per-install секретом → атомарная перезапись (`temp`+`os.replace`). `load_password` **никогда не бросает** — любой сбой → `None`, как при отсутствии блоба (unlock деградирует на ввод пароля; риск лок-аута 0, счётчик к этому моменту уже улажен). DPAPI остаётся user-scope. Константа `ENTROPY` оставлена — нужна для чтения/миграции v1, для новых шифрований не используется. (§2.)
+
+**Threat-model (пересмотр — честно; это ядро этапа):**
+
+Изначальный план (§1, C3/C4; MASTER-TZ §6/§7) требовал nonce + подпись ответа. По ходу Этапа 4 — **сознательный разворот, не пропуск:**
+
+- **Граница канала = OS-контроли, не крипта.** Явный DACL (SELF+SYSTEM, без Everyone) + Medium mandatory-label (режет same-user low-IL) отсекают *другого не-админ юзера* от самого пайпа; `FIRST_PIPE_INSTANCE`+loud-fail закрывают сквоттинг имени; клиент проверяет server-SID; SID-гейт `unlock`→SYSTEM (Этап 5) держит пароль только для локскрин-CP. Всё это — токен-SID проверки, **ноль крипты, ноль новых зависимостей**.
+- **nonce/подпись СНЯТЫ как избыточные.** Общий ключ, читаемый обоими концами (SELF-сервис И SYSTEM-CP), *не аутентифицирует* — кто читает ключ, тот и подделает MAC. Чужого не-админ юзера уже режет DACL (он не откроет ни пайп, ни ключ-файл). Same-user malware читает и ключ, И DPAPI-блоб напрямую — подпись не помогает. SYSTEM всемогущ. HMAC добавил бы лишь целостность/анти-реплей, но у одноразового message-пайпа за закрытым DACL реплеить нечего. Асимметрия имела бы смысл только для обратного канала (CP проверяет сервер) — там дешевле бесплатная проверка `GetNamedPipeServerProcessId`-SID (уже сделана), без вендоринга крипто-C++. **Это сознательное отклонение от DoD §6/§7 — предложенный дифф в handoff Этапа 4.**
+- **Остаточный риск (ДОМИНИРУЮЩИЙ): same-user disclosure.** DPAPI user-scope блоб расшифровывается тем же юзером **мимо** пайпа/сервиса/лица (прочитал `credentials.bin` + вызвал `CryptUnprotectData`). Фикс энтропии (Шаг 6) — лишь **speed-bump** (файловый секрет вместо публичной константы: «скопируй константу с GitHub» → «прочитай локальный файл в рантайме»), **НЕ фикс**. Настоящий фикс = **SYSTEM-custody выдачи пароля** (расшифровка только в SYSTEM-компоненте после верифицированного матча; у юзер-процесса нет пути к паролю) → **design-item Этапа 5**.
+- **TPM отложен:** в pywin32 нет NCrypt/Platform-Crypto-Provider-обёртки (достижимо только через `ctypes`, нетривиально); и без SYSTEM-custody TPM-seal same-user не мешает (тот же юзер всё равно расшифрует). Берём в Этап 5 вместе с custody.
+- **Local admin = bypass-by-design** (владение пайпом / SeDebug сервиса / стать SYSTEM) — вне уровня «convenience-grade+»; в модель угроз не берём.
+- **Итог границы:** Этап 4 честно защищает от *другого не-админ локального юзера* (и same-user low-IL через mandatory-label). Same-user-под-своей-учёткой и local-admin — вне канала; это **custody-вопрос**, вынесен в Этап 5.
+
+**Локи целы (git-сверка `16a0101..HEAD`):** тронуты 4 файла — `config.py` (3 append-only поля + fail-loud validate), `service.py` (`_build_pipe_sa`+legacy+SID-хелперы, `FIRST_PIPE_INSTANCE`+squatter-refuse, SID-гейт+проброс handle), `tools/pipe_client.py` (server-SID проверка), `credentials.py` (per-install энтропия+миграция). НЕ в диффе (ни в `+`, ни в `−`): `verify_frame`, `_prep_cuda_dlls`, `threshold`/`0.32`, liveness-числа (`HF_THRESH`/`EAR_THRESH`/`SCREEN_DOUBT_FRAC`/`STRONG_MARGIN`), QC/adaptive/low-light/camera/watchdog-константы. `credential_provider/`, `installer/`, `presence_monitor/` — **0 изменений**.
+
+**Новые config-поля Этапа 4 (append-only, дефолты безопасны/прозрачны):**
+
+| Поле | Дефолт | Смысл |
+|-|-|-|
+| `pipe_hardened_sd` | `true` | явный DACL SELF+SYSTEM + Medium-label вместо legacy NULL DACL (`false` = откат) |
+| `pipe_first_instance` | `true` | `FIRST_PIPE_INSTANCE` на сервере + проверка server-SID в `pipe_client` |
+| `pipe_unlock_require_system` | `false` | гейт `unlock`→только SYSTEM-caller; **дефолт OFF** (нет CP в Этапе 4; Этап 5 → `true`) |
+
+**Зависимости:** `requirements.lock` == venv `pip freeze` — **ноль новых зависимостей** (актуален, не трогали). Вся крипта — stdlib `hmac`/`hashlib` при необходимости; `pywin32` уже был. Плюс этапа.
+
+**Selftest'ы Этапа 4 (воспроизводимые, camera-free, temp-home):** `tools/pipe_hardening_selftest.py` (descriptor-SDDL, live server/client-SID, unlock SID-гейт), `tools/credentials_selftest.py` (fresh v2 + locked `pipe_entropy.bin`, миграция v1→v2, corrupt/missing→None, DACL SELF+SYSTEM), агрегатор `tools/stage4_selftest.py` (`python -m tools.stage4_selftest`). Прогон на venv 3.12: **STAGE 4 SELFTESTS: ALL OK**.
+
+**Регресс Этапов 2–3 (venv 3.12):** 12 pure selftest'ов зелёные (`adaptive`/`audit`/`camera_busy`/`enroll_qc`/`liveness`/`liveness_verdict`/`lockout`/`lowlight_boost`/`lowlight_gate`/`lowlight_probe`/`threshold_recommend`/`watchdog`) + `shutdown_integration` OK (shutdown+Ctrl+Break без 233 против хардненного сервиса).
+
+**Оставлено Bao на живой прогон:** watchdog-restart (нужен зарегистрированный `FaceUnlock-Watchdog` + kill-then-start; на dev-машине задачи не зарегистрированы) и `camera_busy_integration` (реальная камера). **На реальной машине при первом чтении обновлённым сервисом `~/.face-unlock/credentials.bin`** произойдёт одноразовая миграция v1→v2 + создание `pipe_entropy.bin` — by design (тесты гнались на temp-home, реальный профиль не тронут).
