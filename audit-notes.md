@@ -227,14 +227,14 @@
 
 \---
 
-## Этап 5 — Credential Provider (C++) + локскрин — closeout (мерж отложен)
+## Этап 5 — Credential Provider (C++) + локскрин — DONE ✅
 
-> Ветка `stage5-credential-provider` (после `e527ab6`; **НЕ слита в `master`** — мерж отложен как отдельный шаг closeout'а). Дата: 2026-07-10.
+> Ветка `stage5-credential-provider` — **слита в `master` fast-forward** на closeout'е 2026-07-17. Дата живого прогона: 2026-07-10.
 > Коммиты: `58928ce` (Шаг 2: переписан JSON-парсер `PipeClient.cpp` + юнит-тест `tests/test_parser.cpp`), `3d01357` (Шаг 3: клиентская проверка server-SID — **позже переписана**, см. C), `88550cc` (Шаг 4: RDP-off в `SetUsageScenario`, аддитивность + bounded timeout), `38c6cb2` (Шаг 5: README под реальный код), `daee6af` (Шаг 6b: живой `unlock_harness`), `89bcc38` + `f4655c2` (5c: диагностика), `bab8705` (5d: **FIX** серверного SID-резолвера), `e527ab6` (5e: **FIX** клиентской проверки доверия).
 
-**Основная цель этапа достигнута: вход лицом с реального локскрина работает вживую.** Живой прогон 2026-07-10 01:04:07 — `connection accepted (pid=31256 image=LogonUI.exe integrity=? session=? openable=no)` → `request cmd=unlock` → `verify verdict=PASS matches=5/2 best=0.080 margin=0.240 blink=0 screen=0/5 sceneL=76.1 mode=fast`; в `audit.jsonl` тот же момент — `outcome: "granted"`. Гейт `pipe_unlock_require_system` включён в живом конфиге (`~/.face-unlock/config.toml`); дефолт в репо (`config.py`) **не менялся** — `config.py` не в диффе ветки, флип дефолта остаётся отдельным шагом.
+**Основная цель этапа достигнута: вход лицом с реального локскрина работает вживую.** Живой прогон 2026-07-10 01:04:07 — `connection accepted (pid=31256 image=LogonUI.exe integrity=? session=? openable=no)` → `request cmd=unlock` → `verify verdict=PASS matches=5/2 best=0.080 margin=0.240 blink=0 screen=0/5 sceneL=76.1 mode=fast`; в `audit.jsonl` тот же момент — `outcome: "granted"`. Гейт `pipe_unlock_require_system` на момент прогона был включён через живой конфиг (`~/.face-unlock/config.toml`); на closeout'е дефолт в репо флипнут `False`→`True` — единственная правка `config.py` (см. финал раздела).
 
-**Локи целы (git-сверка `master..HEAD`, 10 файлов):** `credential_provider/*` (парсер + тесты, server-SID, RDP-off, README), `face_service/service.py` (диагностика + SID-резолвер), `tools/pipe_hardening_selftest.py` (адаптирован под импересонацию: клиент теперь пишет сообщение, которое сервер читает ДО импересонации). НЕ в диффе (ни в `+`, ни в `−`): `verify_frame`, `_prep_cuda_dlls`, `threshold`/`0.32`, liveness-числа (`HF_THRESH`/`EAR_THRESH`/`SCREEN_DOUBT_FRAC`/`STRONG_MARGIN`), QC/adaptive/low-light/camera/watchdog-константы. `face_service/config.py`, `credentials.py`, `installer/`, `presence_monitor/` — **0 изменений**.
+**Локи целы (git-сверка `master..HEAD`, 10 файлов этапа + closeout-флип в `config.py`):** `credential_provider/*` (парсер + тесты, server-SID, RDP-off, README), `face_service/service.py` (диагностика + SID-резолвер), `tools/pipe_hardening_selftest.py` (адаптирован под импересонацию: клиент теперь пишет сообщение, которое сервер читает ДО импересонации). НЕ в диффе (ни в `+`, ни в `−`): `verify_frame`, `_prep_cuda_dlls`, `threshold`/`0.32`, liveness-числа (`HF_THRESH`/`EAR_THRESH`/`SCREEN_DOUBT_FRAC`/`STRONG_MARGIN`), QC/adaptive/low-light/camera/watchdog-константы. `face_service/config.py` — ровно **одна** правка (closeout-флип дефолта `pipe_unlock_require_system` `False`→`True`); `credentials.py`, `installer/`, `presence_monitor/` — **0 изменений**.
 
 **B. Санкционированные правки в периметре Этапа 4 — ОБОСНОВАННОЕ ОТКЛОНЕНИЕ:**
 
@@ -262,4 +262,4 @@
 - `wtsapi32` остался в линковке (`credential_provider/CMakeLists.txt`, `credential_provider/tests/CMakeLists.txt`) после удаления `WTSQueryUserToken` в `e527ab6` — мёртвая запись. → чистка, Этап 6/7.
 - Комментарий-шапка в `PipeClient.cpp` («a foreign account cannot own this pipe») наследует ту же переоценку анти-сквоттинга, что разобрана выше. → правка комментария, Этап 6.
 
-**Перенесено дальше:** SYSTEM-custody выдачи пароля (доминирующий same-user риск, из Этапа 4) — **НЕ сделан**; опц. TPM-seal — **НЕ сделан**. Мерж ветки, флип дефолта `pipe_unlock_require_system` в репо и перевод статуса проекта — **отдельные шаги closeout'а**, в этот коммит не входят.
+**Closeout выполнен (2026-07-17):** дефолт `pipe_unlock_require_system` флипнут `False`→`True` в `config.py` (до этого гейт включался только через живой конфиг `~/.face-unlock/config.toml`), статус Этапа 5 → **DONE** (здесь и в MASTER-TZ), ветка влита в `master` (**fast-forward**). **НЕ сделано (осознанно перенесено):** SYSTEM-custody выдачи пароля (доминирующий same-user риск, из Этапа 4) и опц. TPM-seal — **design-items, Этап 6/7/8**.
