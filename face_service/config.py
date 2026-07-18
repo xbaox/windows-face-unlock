@@ -143,10 +143,11 @@ class Config:
     pipe_first_instance: bool = True
     # SID-gate on the unlock command (Stage 4 Step 5): when True, only a caller whose token SID is
     # SYSTEM (S-1-5-18) -- the lockscreen Credential Provider -- may invoke unlock; any other caller
-    # gets {"ok":false,"reason":"not-authorized"} before load_password. Default FALSE: Stage 4 has no
-    # real CP yet and dev tests connect as SELF; Stage 5 flips this True. Only unlock is gated (other
-    # commands are scoped by the Batch-1 pipe DACL).
-    pipe_unlock_require_system: bool = False
+    # gets {"ok":false,"reason":"not-authorized"} before load_password. Default TRUE since the Stage 5
+    # closeout: the lockscreen CP (SYSTEM) is the only legitimate unlock caller, so the gate ships on
+    # -- secure-by-default; dev harnesses connecting as SELF opt out via config. Only unlock is gated
+    # (other commands are scoped by the Batch-1 pipe DACL).
+    pipe_unlock_require_system: bool = True
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
