@@ -17,7 +17,7 @@ from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Callable
 
-from face_service.config import Config, CONFIG_PATH, LOG_PATH, PRESENCE_MODES
+from face_service.config import Config, CONFIG_PATH, LOG_PATH, LIVENESS_MODES, PRESENCE_MODES
 from face_service.i18n import LANGUAGES, get_language, set_language, t
 
 from .monitor import PresenceMonitor, pipe_call
@@ -176,6 +176,7 @@ SETTINGS_FIELDS: list[tuple[str, str, object]] = [
     ("verify_frames",             "int",        (1, 30)),
     ("verify_required",           "int",        (1, 30)),
     ("anti_spoofing",             "bool",       None),
+    ("liveness_mode",             "combo",      LIVENESS_MODES),
     ("camera_index",              "int",        (0, 10)),
     ("camera_warmup_frames",      "int",        (0, 60)),
     ("persistent_camera",         "bool",       None),

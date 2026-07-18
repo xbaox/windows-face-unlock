@@ -146,6 +146,9 @@ _EN: dict[str, str] = {
     "field.anti_spoofing": "Anti-spoofing (liveness)",
     "field.anti_spoofing.desc": "If on, blocks flat photos and videos of your face using MiniFASNet. Requires torch. Turn off only if liveness fails in low light.",
 
+    "field.liveness_mode": "Liveness mode",
+    "field.liveness_mode.desc": "'fast' = a live challenge (blink / head gesture) is asked for only when a match is in doubt — subsecond unlock when confident. 'paranoid' = the challenge is required on every unlock, even a confident match (slower, strongest anti-replay).",
+
     "field.camera_index": "Camera index",
     "field.camera_index.desc": "OpenCV VideoCapture index. 0 = default webcam. Try 1 or 2 if you have multiple cameras.",
 
@@ -933,6 +936,8 @@ _RU: dict[str, str] = {
     "field.verify_frames": "Разблокировка: кадров снять",
     "field.verify_required": "Разблокировка: совпадений нужно",
     "field.anti_spoofing": "Анти-спуфинг (живость)",
+    "field.liveness_mode": "Режим проверки живости",
+    "field.liveness_mode.desc": "«fast» — живой отклик (моргание / жест головой) запрашивается только при сомнении в совпадении; при уверенном распознавании разблокировка за доли секунды. «paranoid» — отклик обязателен при каждой разблокировке, даже при уверенном совпадении (медленнее, максимальная защита от повтора).",
     "field.camera_index": "Индекс камеры",
     "field.camera_warmup_frames": "Кадры прогрева камеры",
     "field.persistent_camera": "Держать камеру открытой",
