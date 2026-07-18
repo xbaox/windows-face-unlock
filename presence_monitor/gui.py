@@ -79,7 +79,11 @@ class StatusWindow:
             ttk.Label(frm, text=t(label_key) + ":", width=18, anchor="e").grid(
                 row=i, column=0, sticky="e", padx=4, pady=2
             )
-            v = tk.StringVar(value="—")
+            # master= matters: several Tk roots can coexist in this process
+            # (Status / Settings / enroll). A master-less Variable binds to the
+            # FIRST live root's Tcl interpreter, so widgets in THIS window
+            # would reference an unset variable and render empty.
+            v = tk.StringVar(master=self.root, value="—")
             self.vars[key] = v
             ttk.Label(frm, textvariable=v, anchor="w").grid(
                 row=i, column=1, sticky="we", padx=4, pady=2
@@ -218,16 +222,16 @@ class SettingsWindow:
             )
             var: tk.Variable
             if kind == "bool":
-                var = tk.BooleanVar(value=bool(current))
+                var = tk.BooleanVar(master=self.root, value=bool(current))
                 w: tk.Widget = ttk.Checkbutton(frm, variable=var)
             elif kind == "combo":
-                var = tk.StringVar(value=str(current))
+                var = tk.StringVar(master=self.root, value=str(current))
                 w = ttk.Combobox(
                     frm, textvariable=var, values=list(extras or ()),
                     state="readonly", width=22,
                 )
             elif kind == "combo_lang":
-                var = tk.StringVar()
+                var = tk.StringVar(master=self.root)
                 code_to_display = {
                     code: f"{emoji}  {name_}" for code, name_, emoji in LANGUAGES
                 }
@@ -241,11 +245,11 @@ class SettingsWindow:
                 w._lang_display_to_code = display_to_code  # type: ignore[attr-defined]
             elif kind == "int":
                 lo, hi = extras  # type: ignore[misc]
-                var = tk.IntVar(value=int(current))
+                var = tk.IntVar(master=self.root, value=int(current))
                 w = ttk.Spinbox(frm, from_=lo, to=hi, textvariable=var, width=10)
             elif kind == "float":
                 lo, hi = extras  # type: ignore[misc]
-                var = tk.DoubleVar(value=float(current))
+                var = tk.DoubleVar(master=self.root, value=float(current))
                 w = ttk.Spinbox(
                     frm, from_=lo, to=hi, increment=0.01,
                     textvariable=var, width=10, format="%.3f",
