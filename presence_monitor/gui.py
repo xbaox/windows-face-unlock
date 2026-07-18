@@ -8,6 +8,7 @@ Every field has a small ⓘ button whose click shows a messagebox with the
 localised description, and whose hover shows the same text as a tooltip.
 """
 from __future__ import annotations
+import gc
 import logging
 import threading
 import time
@@ -68,6 +69,7 @@ class StatusWindow:
         self.root.title(t("status.title"))
         self.root.geometry("560x480")
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
         self._refresh_loop()
 
     def _build(self) -> None:
@@ -164,6 +166,12 @@ class StatusWindow:
         os.startfile(str(LOG_PATH.parent))  # type: ignore[attr-defined]
 
     def _close(self) -> None:
+        # Drop the last Variable refs BEFORE destroy, in this window's Tk
+        # thread: their __del__ then runs against a live interpreter. A GC
+        # from another thread finding Variables of a dead root raises
+        # "main thread is not in main loop" and can abort the process
+        # (Tcl_AsyncDelete). Every close path must end here.
+        self.vars.clear()
         self.root.destroy()
 
     def run(self) -> None:
@@ -202,6 +210,7 @@ class SettingsWindow:
         self.cfg = Config.load()
         self.widgets: dict[str, tuple[str, tk.Variable]] = {}
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build(self) -> None:
         frm = ttk.Frame(self.root, padding=12)
@@ -276,7 +285,7 @@ class SettingsWindow:
         btns.grid(row=len(SETTINGS_FIELDS) + 2, column=0, columnspan=3, sticky="we")
         save_btn = ttk.Button(btns, text=t("settings.btn.save"), command=self._save)
         save_btn.pack(side="right", padx=4)
-        cancel_btn = ttk.Button(btns, text=t("settings.btn.cancel"), command=self.root.destroy)
+        cancel_btn = ttk.Button(btns, text=t("settings.btn.cancel"), command=self._close)
         cancel_btn.pack(side="right", padx=4)
         reload_btn = ttk.Button(btns, text=t("settings.btn.reload"), command=self._reload_from_disk)
         reload_btn.pack(side="left", padx=4)
@@ -337,6 +346,11 @@ class SettingsWindow:
                 log.exception("on_saved callback failed")
 
         messagebox.showinfo(t("settings.title"), t("settings.saved"), parent=self.root)
+        self._close()
+
+    def _close(self) -> None:
+        # Same teardown rationale as StatusWindow._close.
+        self.widgets.clear()
         self.root.destroy()
 
     def run(self) -> None:
@@ -419,12 +433,19 @@ def _launch_singleton(key: str, factory: Callable[[], object]) -> None:
         return
 
     def _run():
+        obj = None
         try:
             obj = factory()
             obj.run()  # type: ignore[attr-defined]
         except Exception:
             log.exception("%s window crashed", key)
         finally:
+            # Collect the window's whole object graph (widgets, Variables,
+            # the Tcl interpreter) in ITS OWN thread before it exits: a Tk
+            # interpreter finalized later by another thread's GC aborts the
+            # process with Tcl_AsyncDelete.
+            obj = None
+            gc.collect()
             lock.release()
 
     threading.Thread(target=_run, name=f"{key}-window", daemon=True).start()
