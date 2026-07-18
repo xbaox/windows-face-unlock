@@ -121,6 +121,13 @@ _EN: dict[str, str] = {
     "settings.error": "Cannot save: {err}",
     "settings.info.title": "Info",
 
+    # ---- Settings sections ----
+    "section.general": "General",
+    "section.recognition": "Recognition",
+    "section.liveness": "Liveness & lockout",
+    "section.presence": "Presence",
+    "section.camera": "Camera",
+
     # ---- Settings fields (labels + descriptions) ----
     "field.language": "Interface language",
     "field.language.desc": "The language used for the tray menu, Status and Settings windows. Applied immediately.",
@@ -149,6 +156,15 @@ _EN: dict[str, str] = {
     "field.liveness_mode": "Liveness mode",
     "field.liveness_mode.desc": "'fast' = a live challenge (blink / head gesture) is asked for only when a match is in doubt — subsecond unlock when confident. 'paranoid' = the challenge is required on every unlock, even a confident match (slower, strongest anti-replay).",
 
+    "field.anti_screen": "Anti-screen (replay) check",
+    "field.anti_screen.desc": "During unlock, watches for signs that a screen is being shown to the camera (moiré, glare). A suspicious frame raises doubt and triggers the live challenge.",
+
+    "field.max_face_attempts": "Failed face attempts before lockout",
+    "field.max_face_attempts.desc": "After this many consecutive failed face attempts, face sign-in is locked out temporarily. A successful match resets the counter. PIN and password always keep working.",
+
+    "field.lockout_seconds": "Face lockout duration (seconds)",
+    "field.lockout_seconds.desc": "How long face sign-in stays locked out after too many failures. PIN and password remain available the whole time. 0 = no cooldown.",
+
     "field.camera_index": "Camera index",
     "field.camera_index.desc": "OpenCV VideoCapture index. 0 = default webcam. Try 1 or 2 if you have multiple cameras.",
 
@@ -157,6 +173,9 @@ _EN: dict[str, str] = {
 
     "field.persistent_camera": "Keep camera open between probes",
     "field.persistent_camera.desc": "On = camera stays open, ~0.9s verify, LED always on. Off = camera re-opens per probe, ~3s verify, LED only during probe.",
+
+    "field.low_light_boost": "Low-light exposure boost",
+    "field.low_light_boost.desc": "When the scene is too dark for a trustworthy match, temporarily raise the camera exposure and retry once before refusing with 'too-dark'. The exposure is always restored afterwards.",
 
     "field.warmup_on_start": "Warmup models on service start",
     "field.warmup_on_start.desc": "On = the recognition and liveness models load at service start so the first unlock is fast. Off = faster startup, slower first unlock.",
@@ -955,6 +974,11 @@ _RU: dict[str, str] = {
     "settings.saved": "Сохранено и применено.",
     "settings.error": "Невозможно сохранить: {err}",
     "settings.info.title": "Справка",
+    "section.general": "Общие",
+    "section.recognition": "Распознавание",
+    "section.liveness": "Живость и лимит попыток",
+    "section.presence": "Присутствие",
+    "section.camera": "Камера",
     "field.language": "Язык интерфейса",
     "field.language.desc": "Язык меню в трее и окон «Состояние»/«Настройки». Применяется сразу.",
     "field.presence_mode": "Режим присутствия",
@@ -973,12 +997,20 @@ _RU: dict[str, str] = {
     "field.anti_spoofing.desc": "Если включено, блокирует плоские фото и видео лица (пассивная проверка живости). Отключайте, только если проверка живости стабильно не проходит при слабом освещении.",
     "field.liveness_mode": "Режим проверки живости",
     "field.liveness_mode.desc": "«fast» — живой отклик (моргание / жест головой) запрашивается только при сомнении в совпадении; при уверенном распознавании разблокировка за доли секунды. «paranoid» — отклик обязателен при каждой разблокировке, даже при уверенном совпадении (медленнее, максимальная защита от повтора).",
+    "field.anti_screen": "Антиэкран (защита от показа экрана)",
+    "field.anti_screen.desc": "При разблокировке ищет признаки того, что камере показывают экран (муар, блики). Подозрительный кадр вызывает сомнение и живой отклик (моргание / жест).",
+    "field.max_face_attempts": "Неудач подряд до блокировки лица",
+    "field.max_face_attempts.desc": "После стольких неудачных попыток входа лицом подряд вход лицом временно блокируется. Успешное совпадение сбрасывает счётчик. PIN и пароль работают всегда.",
+    "field.lockout_seconds": "Длительность блокировки лица (с)",
+    "field.lockout_seconds.desc": "Сколько секунд вход лицом остаётся заблокированным после серии неудач. PIN и пароль доступны всё это время. 0 — без паузы.",
     "field.camera_index": "Индекс камеры",
     "field.camera_index.desc": "Индекс камеры в OpenCV VideoCapture. 0 — веб-камера по умолчанию. Если камер несколько, попробуйте 1 или 2.",
     "field.camera_warmup_frames": "Кадры прогрева камеры",
     "field.camera_warmup_frames.desc": "Сколько кадров отбрасывается после открытия камеры, чтобы автоэкспозиция успела настроиться. Увеличьте, если проверки не проходят при тусклом свете.",
     "field.persistent_camera": "Держать камеру открытой",
     "field.persistent_camera.desc": "Вкл — камера остаётся открытой: проверка ~0,9 с, индикатор горит постоянно. Выкл — камера открывается на каждую проверку: ~3 с, индикатор только во время проверки.",
+    "field.low_light_boost": "Повышать экспозицию в темноте",
+    "field.low_light_boost.desc": "Если в кадре слишком темно для надёжного распознавания, временно поднять экспозицию камеры и переснять, прежде чем отказывать с причиной «too-dark». Экспозиция затем восстанавливается.",
     "field.warmup_on_start": "Прогрев моделей при запуске",
     "field.warmup_on_start.desc": "Вкл — модели распознавания и живости загружаются при старте сервиса, и первая разблокировка быстрая. Выкл — быстрее старт, медленнее первая разблокировка.",
     "help.title": "Face Unlock — Справка",
