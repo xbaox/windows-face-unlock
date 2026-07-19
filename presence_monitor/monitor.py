@@ -100,6 +100,15 @@ class PresenceMonitor:
         self._paused.clear()
         self._strikes = 0
         log.info("presence monitor resumed")
+        self.poke_events()
+
+    def poke_events(self) -> None:
+        """Out-of-band _check_service_events (after settings Save / tray
+        Resume) so event toasts don't wait for the next tick. Daemon thread —
+        never blocks the caller; a rare race with the tick thread costs at
+        worst one duplicate toast."""
+        threading.Thread(target=self._check_service_events,
+                         name="event-poll", daemon=True).start()
 
     def is_paused(self) -> bool:
         return self._paused.is_set()
@@ -222,8 +231,19 @@ class PresenceMonitor:
             return
 
         self._strikes += 1
-        self._set_last("absent", f"strike {self._strikes}/{self.cfg.presence_absent_strikes}", mode)
+        suffix = "" if self.cfg.auto_lock else " (auto-lock off)"
+        self._set_last(
+            "absent",
+            f"strike {self._strikes}/{self.cfg.presence_absent_strikes}{suffix}",
+            mode,
+        )
         if self._strikes >= self.cfg.presence_absent_strikes:
+            if not self.cfg.auto_lock:
+                # Observe-only: strikes count and show up in Status (with an
+                # honest "auto-lock off" reason), the machine stays unlocked.
+                log.info("absent %d ticks — auto_lock off, not locking", self._strikes)
+                self._strikes = 0
+                return
             log.warning("absent %d ticks — locking workstation", self._strikes)
             self._strikes = 0
             with self._state_lock:

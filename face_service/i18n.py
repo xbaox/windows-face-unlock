@@ -133,6 +133,9 @@ _EN: dict[str, str] = {
     "field.language": "Interface language",
     "field.language.desc": "The language used for the tray menu, Status and Settings windows. Applied immediately.",
 
+    "field.auto_lock": "Auto-lock when absent",
+    "field.auto_lock.desc": "On = lock the workstation after the configured number of consecutive absent probes. Off = presence is only observed (Status and notifications keep working) and the screen is never locked. Face sign-in works either way.",
+
     "field.presence_mode": "Presence mode",
     "field.presence_mode.desc": "'recognition' = the face must match your enrollment (stronger, catches walk-away AND strangers). 'detection' = any face in frame is enough (lighter, same behaviour as the old AutoFaceLock script).",
 
@@ -1000,6 +1003,8 @@ _RU: dict[str, str] = {
     "section.notifications": "Уведомления",
     "field.language": "Язык интерфейса",
     "field.language.desc": "Язык меню в трее и окон «Состояние»/«Настройки». Применяется сразу.",
+    "field.auto_lock": "Автоблокировка при отсутствии",
+    "field.auto_lock.desc": "Вкл — блокировать машину после заданного числа отсутствий подряд. Выкл — присутствие только наблюдается (статус и уведомления работают), экран не блокируется. Вход лицом работает в обоих случаях.",
     "field.presence_mode": "Режим присутствия",
     "field.presence_mode.desc": "«recognition» — лицо должно совпасть с зарегистрированным (строже: ловит и уход, и чужого). «detection» — достаточно любого лица в кадре (легче; поведение старого скрипта AutoFaceLock).",
     "field.presence_interval_s": "Интервал проверки (с)",

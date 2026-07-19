@@ -59,6 +59,7 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, object]]]] = [
         ("lockout_seconds",         "int",        (0, 3600)),
     ]),
     ("section.presence", [
+        ("auto_lock",               "bool",       None),
         ("presence_mode",           "combo",      PRESENCE_MODES),
         ("presence_interval_s",     "int",        (5, 3600)),
         ("presence_absent_strikes", "int",        (1, 20)),
@@ -373,6 +374,9 @@ class SettingsWindow:
         resp = pipe_call({"cmd": "reload_config"}, timeout_s=3.0)
         if not (resp and resp.get("ok")):
             log.warning("service reload_config failed: %s", resp)
+        # Force an immediate event poll so toasts (lockout, service state)
+        # don't wait out the rest of the current tick interval.
+        self.monitor.poke_events()
 
         if self.on_saved:
             try:
