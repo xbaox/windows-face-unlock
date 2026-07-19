@@ -41,7 +41,8 @@ CAPTURE_COOLDOWN_S = 1.0    # min gap between auto captures
 FACE_STABLE_FRAMES = 3      # face must be seen this many frames before arming capture
 DETECT_EVERY_N_FRAMES = 2   # YuNet is fast but skipping halves CPU
 CAMERA_LEASE_S = 300        # ask service to hand over the camera for this long
-CAMERA_READ_TIMEOUT_MS = 1000  # bounded MSMF open/read so the loop can poll _stop
+CAMERA_READ_TIMEOUT_MS = 1000  # open/read timeout hint; only MSMF honors it, and NOT on
+                               # this hardware -- kept as cross-HW insurance only
                                # (wizard-local; NOT one of the service camera_* knobs)
 
 
@@ -209,12 +210,15 @@ class EnrollWindow:
         """Open the webcam with a bounded read-timeout, storing it on
         ``self._cap``. Returns True on success.
 
-        MSMF is tried FIRST because it honors ``CAP_PROP_*_TIMEOUT_MSEC`` --
-        DSHOW/ANY ignore it. The timeout is what lets the capture loop return
-        from ``read()`` and poll ``self._stop`` instead of blocking forever on
-        a wedged device (which leaked the handle and black-framed the service).
+        DSHOW is tried FIRST: it is the backend this hardware has always used.
+        MSMF was promoted to first in block5-A because it is the only backend
+        that honors ``CAP_PROP_*_TIMEOUT_MSEC``, but on the target webcam the
+        timeout is NOT applied -- read() still blocks forever (measured: 2
+        hangs on MSMF vs 2 on DSHOW, i.e. no improvement). The timeout props
+        below are kept as harmless cross-hardware insurance; the real fix for
+        the wedged-read leak is process isolation (deferred to Stage 7).
         """
-        for backend in (cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY):
+        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
             cap = cv2.VideoCapture(0, backend)
             if not cap.isOpened():
                 cap.release()   # never keep a candidate we didn't accept
@@ -222,9 +226,9 @@ class EnrollWindow:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            # Bounded open/read so teardown can't hang. getattr(): these props
-            # only exist on newer OpenCV; set() may be rejected by a backend --
-            # both are non-fatal (we still poll _stop between reads).
+            # Open/read timeout hint. getattr(): these props only exist on newer
+            # OpenCV; set() may be rejected by a backend -- both are non-fatal.
+            # DSHOW ignores them outright; kept for hardware where MSMF wins.
             for prop_name in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
                 prop = getattr(cv2, prop_name, None)
                 if prop is not None and not cap.set(prop, CAMERA_READ_TIMEOUT_MS):
@@ -507,15 +511,16 @@ class EnrollWindow:
         # webcam before we tear down Tk. Skipping the join would let the
         # daemon thread get cut mid-read(), which on Windows leaks the camera
         # handle and black-frames the service until a full restart (hit in
-        # production 2026-04-21). The bounded read-timeout in _open_capture is
-        # what makes this join reliably complete now.
+        # production 2026-04-21). NOTE: read() is still not reliably
+        # interruptible on this hardware, so the join below can and does time
+        # out -- the real fix is process isolation, deferred to Stage 7.
         self._stop.set()
         self._capture_armed.clear()
         t_cam = self._cam_thread
         if t_cam is not None and t_cam.is_alive():
-            # With the MSMF read-timeout a read returns within ~1 s, so 3 s is
-            # a generous but bounded budget for the loop to see _stop and run
-            # its finally (cap.release()).
+            # Budget for the loop to notice _stop between frames and run its
+            # finally (cap.release()). On a healthy device a read returns in
+            # ~30 ms, so 3 s is generous; on a wedged one it will time out.
             t_cam.join(timeout=3.0)
             if t_cam.is_alive():
                 # Do NOT cross-thread release here: that escalation waits on a
