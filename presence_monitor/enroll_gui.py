@@ -41,6 +41,8 @@ CAPTURE_COOLDOWN_S = 1.0    # min gap between auto captures
 FACE_STABLE_FRAMES = 3      # face must be seen this many frames before arming capture
 DETECT_EVERY_N_FRAMES = 2   # YuNet is fast but skipping halves CPU
 CAMERA_LEASE_S = 300        # ask service to hand over the camera for this long
+CAMERA_READ_TIMEOUT_MS = 1000  # bounded MSMF open/read so the loop can poll _stop
+                               # (wizard-local; NOT one of the service camera_* knobs)
 
 
 def _count_enroll_images() -> int:
@@ -68,6 +70,7 @@ class EnrollWindow:
         self._stop = threading.Event()
         self._capture_armed = threading.Event()
         self._cam_thread: threading.Thread | None = None
+        self._cap: cv2.VideoCapture | None = None
         self._latest_tk_image: ImageTk.PhotoImage | None = None
         self._face_streak = 0
         self._last_capture_ts = 0.0
@@ -79,13 +82,19 @@ class EnrollWindow:
 
         self._build_ui()
         self._refresh_existing_stats()
-        self._set_guide("enroll.guide.idle")
 
-        # Start the preview immediately so the user sees themselves.
-        self._cam_thread = threading.Thread(
-            target=self._camera_loop, name="enroll-camera", daemon=True
-        )
-        self._cam_thread.start()
+        if self._lease_ok:
+            self._set_guide("enroll.guide.idle")
+            # Start the preview immediately so the user sees themselves.
+            self._cam_thread = threading.Thread(
+                target=self._camera_loop, name="enroll-camera", daemon=True
+            )
+            self._cam_thread.start()
+        else:
+            # Lease refused (camera owned by the service / another process): do
+            # NOT open a competing capture. Keep the blank preview frame and
+            # tell the user; the window still closes cleanly (no cam thread).
+            self._set_guide("enroll.error.service_busy")
 
     # ---------------- UI ----------------
 
@@ -196,31 +205,61 @@ class EnrollWindow:
 
     # ---------------- camera thread ----------------
 
-    def _camera_loop(self) -> None:
-        cap = None
-        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
-            candidate = cv2.VideoCapture(0, backend)
-            if candidate.isOpened():
-                candidate.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                candidate.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                candidate.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap = candidate
-                break
-            candidate.release()
+    def _open_capture(self) -> bool:
+        """Open the webcam with a bounded read-timeout, storing it on
+        ``self._cap``. Returns True on success.
 
-        if cap is None:
+        MSMF is tried FIRST because it honors ``CAP_PROP_*_TIMEOUT_MSEC`` --
+        DSHOW/ANY ignore it. The timeout is what lets the capture loop return
+        from ``read()`` and poll ``self._stop`` instead of blocking forever on
+        a wedged device (which leaked the handle and black-framed the service).
+        """
+        for backend in (cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY):
+            cap = cv2.VideoCapture(0, backend)
+            if not cap.isOpened():
+                cap.release()   # never keep a candidate we didn't accept
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Bounded open/read so teardown can't hang. getattr(): these props
+            # only exist on newer OpenCV; set() may be rejected by a backend --
+            # both are non-fatal (we still poll _stop between reads).
+            for prop_name in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
+                prop = getattr(cv2, prop_name, None)
+                if prop is not None and not cap.set(prop, CAMERA_READ_TIMEOUT_MS):
+                    log.debug("%s not accepted by backend %s", prop_name, backend)
+            self._cap = cap
+            return True
+        return False
+
+    def _release_capture(self) -> None:
+        """Release the capture on every exit path (idempotent)."""
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                log.exception("enroll camera release failed")
+
+    def _camera_loop(self) -> None:
+        if not self._open_capture():
             self.root.after(0, lambda: messagebox.showerror(
                 t("enroll.title"), t("enroll.error.camera"),
                 parent=self.root,
             ))
             return
 
+        cap = self._cap
         try:
             frame_idx = 0
             faces: list[tuple[int, int, int, int]] = []
             while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok or frame is None:
+                    # Timed-out / dropped read: NOT fatal. Sleep a beat (in case
+                    # a backend ignored the timeout and returns instantly) and
+                    # loop -- the point is to re-check _stop, not to die.
                     time.sleep(0.05)
                     continue
                 frame_idx += 1
@@ -235,7 +274,7 @@ class EnrollWindow:
                 self._post_preview(annotated)
                 time.sleep(0.03)  # ~30 fps cap
         finally:
-            cap.release()
+            self._release_capture()
 
     def _detect_faces(self, bgr) -> list[tuple[int, int, int, int]]:
         try:
@@ -466,23 +505,30 @@ class EnrollWindow:
     def _on_close(self) -> None:
         # Signal the camera thread first and WAIT for it to release the
         # webcam before we tear down Tk. Skipping the join would let the
-        # daemon thread get cut mid-read(), which on Windows DirectShow
-        # leaks the camera handle and wedges the whole service until a
-        # full process restart (we hit this in production 2026-04-21).
+        # daemon thread get cut mid-read(), which on Windows leaks the camera
+        # handle and black-frames the service until a full restart (hit in
+        # production 2026-04-21). The bounded read-timeout in _open_capture is
+        # what makes this join reliably complete now.
         self._stop.set()
         self._capture_armed.clear()
         t_cam = self._cam_thread
         if t_cam is not None and t_cam.is_alive():
-            # cv2.VideoCapture.read() blocks up to ~30 ms per frame, so
-            # a 3 s budget is generous but still bounded.
+            # With the MSMF read-timeout a read returns within ~1 s, so 3 s is
+            # a generous but bounded budget for the loop to see _stop and run
+            # its finally (cap.release()).
             t_cam.join(timeout=3.0)
             if t_cam.is_alive():
+                # Do NOT cross-thread release here: that escalation waits on a
+                # confirmed process topology (block5 follow-up). Leave the log.
                 log.warning("enroll camera thread did not exit within 3s")
         try:
             self.root.destroy()
         except Exception:
             pass
-        self._release_camera_lease()
+        # Only resume if we actually took the lease -- an unpaired resume would
+        # clear a lease we never set.
+        if self._lease_ok:
+            self._release_camera_lease()
 
     def run(self) -> None:
         self.root.mainloop()
