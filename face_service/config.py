@@ -151,6 +151,10 @@ class Config:
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
+    # --- Stage 6: event-notification gates (tray toasts, presence_monitor UI) ---
+    notify_enroll: bool = True          # toast on enrollment build success/failure
+    notify_lockout: bool = True         # toast when a face-lockout episode starts
+    notify_service_state: bool = False  # toast on service reachable<->unreachable transitions
 
     @classmethod
     def load(cls) -> "Config":
@@ -247,6 +251,13 @@ class Config:
             raise ValueError("pipe_first_instance must be a boolean")
         if not isinstance(self.pipe_unlock_require_system, bool):
             raise ValueError("pipe_unlock_require_system must be a boolean")
+        # Stage 6: notification gates must be real booleans (same rationale).
+        if not isinstance(self.notify_enroll, bool):
+            raise ValueError("notify_enroll must be a boolean")
+        if not isinstance(self.notify_lockout, bool):
+            raise ValueError("notify_lockout must be a boolean")
+        if not isinstance(self.notify_service_state, bool):
+            raise ValueError("notify_service_state must be a boolean")
         # If the hardened descriptor is requested, the current user's SID MUST resolve -- the DACL is
         # built from it (SELF=GA). Fail loud here rather than fall through to a pipe nobody can use.
         # Lazy pywin32 import so importing config on a stripped interpreter stays cheap when off.

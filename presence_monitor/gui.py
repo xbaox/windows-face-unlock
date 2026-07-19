@@ -70,6 +70,11 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, object]]]] = [
         ("low_light_boost",         "bool",       None),
         ("warmup_on_start",         "bool",       None),
     ]),
+    ("section.notifications", [
+        ("notify_enroll",           "bool",       None),
+        ("notify_lockout",          "bool",       None),
+        ("notify_service_state",    "bool",       None),
+    ]),
 ]
 
 
@@ -325,6 +330,9 @@ class SettingsWindow:
         cancel_btn.pack(side="right", padx=4)
         reload_btn = ttk.Button(btns, text=t("settings.btn.reload"), command=self._reload_from_disk)
         reload_btn.pack(side="left", padx=4)
+        # Inline "Saved" feedback — Save keeps the window open (block 4).
+        self._saved_lbl = ttk.Label(btns, text="", foreground="#2a7a2a")
+        self._saved_lbl.pack(side="left", padx=8)
 
     def _reload_from_disk(self) -> None:
         self.cfg = Config.load()
@@ -372,8 +380,10 @@ class SettingsWindow:
             except Exception:
                 log.exception("on_saved callback failed")
 
-        messagebox.showinfo(t("settings.title"), t("settings.saved"), parent=self.root)
-        self._close()
+        # Window stays open: brief inline feedback instead of a modal box.
+        # (A pending fade-out after() dies with the window if it is closed.)
+        self._saved_lbl.configure(text=t("settings.saved"))
+        self.root.after(2000, lambda: self._saved_lbl.configure(text=""))
 
     def _close(self) -> None:
         # Same teardown rationale as StatusWindow._close.

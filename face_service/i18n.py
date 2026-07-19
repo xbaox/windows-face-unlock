@@ -127,6 +127,7 @@ _EN: dict[str, str] = {
     "section.liveness": "Liveness & lockout",
     "section.presence": "Presence",
     "section.camera": "Camera",
+    "section.notifications": "Notifications",
 
     # ---- Settings fields (labels + descriptions) ----
     "field.language": "Interface language",
@@ -180,6 +181,15 @@ _EN: dict[str, str] = {
     "field.warmup_on_start": "Warmup models on service start",
     "field.warmup_on_start.desc": "On = the recognition and liveness models load at service start so the first unlock is fast. Off = faster startup, slower first unlock.",
 
+    "field.notify_enroll": "Enrollment result",
+    "field.notify_enroll.desc": "Show a tray notification when building the face enrollment succeeds or fails.",
+
+    "field.notify_lockout": "Face lockout",
+    "field.notify_lockout.desc": "Show a tray notification when face sign-in gets locked out after repeated failed attempts.",
+
+    "field.notify_service_state": "Service up/down",
+    "field.notify_service_state.desc": "Show a tray notification when the FaceService becomes unreachable or comes back. Off by default: service restarts during updates are routine.",
+
     # ---- Help dialog ----
     "help.title": "Face Unlock — Help",
     "help.intro": "What each tray menu entry does:",
@@ -198,6 +208,14 @@ _EN: dict[str, str] = {
     "update.launching": "Launching the installer. The tray will close in a moment.",
     "update.check_failed": "Could not reach GitHub: {err}",
     "update.no_asset": "Release {tag} has no Windows installer attached yet. Try again later.",
+
+    # ---- Event notifications (tray toasts) ----
+    "notify.update_available": "New version available: {latest}",
+    "notify.enroll_ok": "Face enrollment updated: {n} reference embeddings saved.",
+    "notify.enroll_fail": "Face enrollment failed: {reason}",
+    "notify.lockout": "Too many failed face attempts — face sign-in is locked for {s} s. PIN and password still work.",
+    "notify.service_down": "FaceService is not reachable — presence checks and face unlock are down.",
+    "notify.service_up": "FaceService is reachable again.",
 
     # ---- Enrollment wizard ----
     "enroll.title": "Face Unlock — Enroll face",
@@ -979,6 +997,7 @@ _RU: dict[str, str] = {
     "section.liveness": "Живость и лимит попыток",
     "section.presence": "Присутствие",
     "section.camera": "Камера",
+    "section.notifications": "Уведомления",
     "field.language": "Язык интерфейса",
     "field.language.desc": "Язык меню в трее и окон «Состояние»/«Настройки». Применяется сразу.",
     "field.presence_mode": "Режим присутствия",
@@ -998,11 +1017,11 @@ _RU: dict[str, str] = {
     "field.liveness_mode": "Режим проверки живости",
     "field.liveness_mode.desc": "«fast» — живой отклик (моргание / жест головой) запрашивается только при сомнении в совпадении; при уверенном распознавании разблокировка за доли секунды. «paranoid» — отклик обязателен при каждой разблокировке, даже при уверенном совпадении (медленнее, максимальная защита от повтора).",
     "field.anti_screen": "Антиэкран (защита от показа экрана)",
-    "field.anti_screen.desc": "При разблокировке ищет признаки того, что камере показывают экран (муар, блики). Подозрительный кадр вызывает сомнение и живой отклик (моргание / жест).",
+    "field.anti_screen.desc": "При разблокировке ищет признаки того, что камере показывают экран (муар, блики). Подозрительный кадр вызывает сомнение и запускает живую проверку (моргание/жест).",
     "field.max_face_attempts": "Неудач подряд до блокировки лица",
     "field.max_face_attempts.desc": "После стольких неудачных попыток входа лицом подряд вход лицом временно блокируется. Успешное совпадение сбрасывает счётчик. PIN и пароль работают всегда.",
     "field.lockout_seconds": "Длительность блокировки лица (с)",
-    "field.lockout_seconds.desc": "Сколько секунд вход лицом остаётся заблокированным после серии неудач. PIN и пароль доступны всё это время. 0 — без паузы.",
+    "field.lockout_seconds.desc": "Сколько секунд вход лицом остаётся заблокированным после серии неудач. PIN и пароль доступны всё это время. 0 — без блокировки.",
     "field.camera_index": "Индекс камеры",
     "field.camera_index.desc": "Индекс камеры в OpenCV VideoCapture. 0 — веб-камера по умолчанию. Если камер несколько, попробуйте 1 или 2.",
     "field.camera_warmup_frames": "Кадры прогрева камеры",
@@ -1013,6 +1032,12 @@ _RU: dict[str, str] = {
     "field.low_light_boost.desc": "Если в кадре слишком темно для надёжного распознавания, временно поднять экспозицию камеры и переснять, прежде чем отказывать с причиной «too-dark». Экспозиция затем восстанавливается.",
     "field.warmup_on_start": "Прогрев моделей при запуске",
     "field.warmup_on_start.desc": "Вкл — модели распознавания и живости загружаются при старте сервиса, и первая разблокировка быстрая. Выкл — быстрее старт, медленнее первая разблокировка.",
+    "field.notify_enroll": "Результат регистрации лица",
+    "field.notify_enroll.desc": "Показывать уведомление из трея об успехе или ошибке построения регистрации лица.",
+    "field.notify_lockout": "Блокировка входа лицом",
+    "field.notify_lockout.desc": "Показывать уведомление, когда вход лицом блокируется после серии неудачных попыток.",
+    "field.notify_service_state": "Доступность сервиса",
+    "field.notify_service_state.desc": "Показывать уведомление, когда сервис FaceService пропадает или снова появляется. По умолчанию выключено: рестарты сервиса при обновлении — штатные.",
     "help.title": "Face Unlock — Справка",
     "help.intro": "Описание каждого пункта меню:",
     "help.close": "Закрыть",
@@ -1054,6 +1079,13 @@ _RU: dict[str, str] = {
     "update.launching": "Запуск установщика. Трей сейчас закроется.",
     "update.check_failed": "Не удалось связаться с GitHub: {err}",
     "update.no_asset": "У релиза {tag} пока нет установщика для Windows. Попробуйте позже.",
+
+    "notify.update_available": "Доступна новая версия: {latest}",
+    "notify.enroll_ok": "Регистрация лица обновлена: сохранено {n} эмбеддингов.",
+    "notify.enroll_fail": "Регистрация лица не удалась: {reason}",
+    "notify.lockout": "Слишком много неудачных попыток входа лицом — вход лицом заблокирован на {s} с. PIN и пароль работают.",
+    "notify.service_down": "Сервис FaceService недоступен — проверки присутствия и вход лицом не работают.",
+    "notify.service_up": "Сервис FaceService снова доступен.",
 
     "lang.vi": "Вьетнамский",
     "lang.en": "Английский",

@@ -10,6 +10,7 @@ import pywintypes  # type: ignore
 import win32file  # type: ignore
 
 from face_service.config import Config, PIPE_NAME
+from face_service.i18n import t
 
 from .remote_session import is_remote_context
 
@@ -86,6 +87,10 @@ class PresenceMonitor:
         self._last = TickSnapshot()
         self._lock_count = 0
         self._state_lock = threading.Lock()
+        # Event-notification dedup state: one toast per lockout episode, one
+        # per reachability transition (baseline set silently on first tick).
+        self._svc_reachable: bool | None = None
+        self._lockout_notified = False
 
     def pause(self) -> None:
         self._paused.set()
@@ -136,7 +141,43 @@ class PresenceMonitor:
                 mode=mode or self.cfg.presence_mode,
             )
 
+    def _notify(self, gate: str, message: str) -> None:
+        try:
+            from .tray import notify_event  # lazy: tray imports this module
+            notify_event(gate, message)
+        except Exception:
+            log.exception("event notification failed")
+
+    def _check_service_events(self) -> bool:
+        """Event toasts from the EXISTING ``status`` command (cheap, no
+        camera): service reachable<->unreachable transitions and the start of
+        a face-lockout episode. Returns whether the service answered, so
+        _tick can skip the camera probe instead of burning a second timeout
+        on a dead pipe."""
+        resp = pipe_call({"cmd": "status"}, timeout_s=5.0)
+        reachable = bool(resp and resp.get("ok"))
+        prev, self._svc_reachable = self._svc_reachable, reachable
+        if prev is not None and prev != reachable:
+            self._notify(
+                "notify_service_state",
+                t("notify.service_up") if reachable else t("notify.service_down"),
+            )
+        if reachable:
+            lock = resp.get("lockout") or {}
+            locked = bool(lock.get("locked"))
+            if locked and not self._lockout_notified:
+                self._notify(
+                    "notify_lockout",
+                    t("notify.lockout", s=int(lock.get("remaining_s", 0))),
+                )
+            self._lockout_notified = locked
+        return reachable
+
     def _tick(self) -> None:
+        # 0. Event toasts ride on the existing `status` poll — before the
+        #    pause/remote skips, so notifications work while paused too.
+        reachable = self._check_service_events()
+
         # 1. Skip if paused from the tray
         if self._paused.is_set():
             self._set_last("skipped", "paused")
@@ -157,6 +198,12 @@ class PresenceMonitor:
         # using the machine (stronger "walk-away" security).
 
         # 3. Probe camera via FaceService
+        if not reachable:
+            # Service down (status poll above already burned the wait) —
+            # don't lock blindly and don't repeat the wait on the camera probe.
+            log.warning("presence probe: service unavailable; skipping")
+            self._set_last("error", "service-unavailable")
+            return
         resp = pipe_call({"cmd": "presence"}, timeout_s=20.0)
         if resp is None:
             # Service down — don't lock blindly

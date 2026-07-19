@@ -398,6 +398,18 @@ class EnrollWindow:
         def worker():
             # Call the service — it already has DeepFace loaded and warm.
             resp = pipe_call({"cmd": "build_enrollment"}, timeout_s=120.0)
+            ok = bool(resp and resp.get("ok"))
+            n = int(resp.get("count", 0)) if ok else 0
+            try:
+                # Toast fires even if this window was closed mid-build.
+                from .tray import notify_event  # lazy: avoids an import cycle
+                if ok and n > 0:
+                    notify_event("notify_enroll", t("notify.enroll_ok", n=n))
+                else:
+                    reason = (resp or {}).get("reason") or "no-face"
+                    notify_event("notify_enroll", t("notify.enroll_fail", reason=reason))
+            except Exception:
+                log.exception("enroll notify failed")
             def done():
                 self._building = False
                 self.start_btn.configure(state="normal")
