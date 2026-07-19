@@ -15,6 +15,7 @@ Flow
 6. On close, always ``resume_camera`` so probes come back on.
 """
 from __future__ import annotations
+import gc
 import logging
 import threading
 import time
@@ -108,8 +109,12 @@ class EnrollWindow:
                                 width=PREVIEW_W, height=PREVIEW_H)
         self.preview.pack(pady=(0, 8))
 
-        # Big guidance line
-        self.guide_var = tk.StringVar(value="")
+        # Big guidance line.
+        # master= on every Variable below: several Tk roots live in this
+        # process (tray Status/Settings/Help each open their own), and a
+        # master-less Variable binds to the FIRST live root instead of ours --
+        # the empty-widget bug fixed for the tray windows in block1 (c27a79f).
+        self.guide_var = tk.StringVar(master=self.root, value="")
         guide = ttk.Label(frm, textvariable=self.guide_var,
                           wraplength=PREVIEW_W, justify="center",
                           font=("", 10, "bold"))
@@ -121,7 +126,7 @@ class EnrollWindow:
         self.progress = ttk.Progressbar(prog_row, mode="determinate",
                                         maximum=self._target)
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.progress_var = tk.StringVar(value="0/15")
+        self.progress_var = tk.StringVar(master=self.root, value="0/15")
         ttk.Label(prog_row, textvariable=self.progress_var,
                   width=8, anchor="e").pack(side="right")
 
@@ -130,7 +135,7 @@ class EnrollWindow:
         count_row.pack(fill="x", pady=4)
         ttk.Label(count_row, text=t("enroll.count") + ":",
                   width=22, anchor="w").pack(side="left")
-        self.count_var = tk.IntVar(value=self._target)
+        self.count_var = tk.IntVar(master=self.root, value=self._target)
         self.count_spin = ttk.Spinbox(
             count_row, from_=5, to=40, textvariable=self.count_var,
             width=6, command=self._on_count_changed,
@@ -139,7 +144,7 @@ class EnrollWindow:
         attach_tooltip(self.count_spin, "enroll.count")
 
         # Existing data label
-        self.existing_var = tk.StringVar()
+        self.existing_var = tk.StringVar(master=self.root)
         ttk.Label(frm, textvariable=self.existing_var,
                   foreground="#555").pack(anchor="w", pady=(2, 6))
 
@@ -316,18 +321,28 @@ class EnrollWindow:
         return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
 
     def _post_preview(self, rgb) -> None:
+        # The camera thread prepares ONLY a PIL image and touches NO Tk object.
+        # ImageTk.PhotoImage binds to a Tcl interpreter, so constructing it here
+        # meant a foreign thread reaching into this window's interpreter -- the
+        # same cross-thread hazard that aborted the tray with Tcl_AsyncDelete
+        # (block1 fix2, 7932eb3). It is now built inside apply(), on the
+        # window's own thread.
         try:
             pil = Image.fromarray(rgb)
-            img = ImageTk.PhotoImage(pil)
         except Exception:
             return
 
         def apply():
-            # Hold the reference; ImageTk requires it.
-            self._latest_tk_image = img
+            # Runs on the window's thread, so building the Tk image is safe.
+            if self._stop.is_set():
+                return   # closing: don't hand new Tk state to a dying window
             try:
+                img = ImageTk.PhotoImage(pil)
+                # Hold the reference; ImageTk requires it.
+                self._latest_tk_image = img
                 self.preview.configure(image=img)
-            except tk.TclError:
+            except (tk.TclError, AttributeError, RuntimeError):
+                # Window torn down mid-flight (widgets already nulled/destroyed).
                 pass
 
         try:
@@ -526,6 +541,12 @@ class EnrollWindow:
                 # Do NOT cross-thread release here: that escalation waits on a
                 # confirmed process topology (block5 follow-up). Leave the log.
                 log.warning("enroll camera thread did not exit within 3s")
+        # Separate try blocks: a failure while dropping references must never
+        # cost us the destroy() that actually tears the interpreter down.
+        try:
+            self._teardown_tk_objects()
+        except Exception:
+            log.exception("enroll tk teardown failed")
         try:
             self.root.destroy()
         except Exception:
@@ -534,6 +555,29 @@ class EnrollWindow:
         # clear a lease we never set.
         if self._lease_ok:
             self._release_camera_lease()
+
+    def _teardown_tk_objects(self) -> None:
+        """Drop every Tk reference we hold, BEFORE root.destroy().
+
+        Same rationale as the tray windows (block1 fix2, 7932eb3): with several
+        Tk roots alive in this process, a Variable or PhotoImage finalized later
+        by ANOTHER thread's GC talks to a dead interpreter -- that raises
+        "main thread is not in main loop" and can abort the process with
+        Tcl_AsyncDelete. Releasing them here, on this window's own thread while
+        its interpreter is still alive, keeps finalization deterministic.
+
+        Deliberately independent of the camera thread: this only touches Tk
+        state, so it still runs when that thread is wedged in read() (the
+        leaked-handle debt deferred to Stage 7).
+        """
+        self.guide_var = None
+        self.progress_var = None
+        self.count_var = None
+        self.existing_var = None
+        self._latest_tk_image = None
+        for name in ("preview", "progress", "count_spin",
+                     "start_btn", "build_btn", "wipe_btn"):
+            setattr(self, name, None)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -549,11 +593,20 @@ def open_enroll() -> None:
         return
 
     def _run():
+        obj = None
         try:
-            EnrollWindow().run()
+            obj = EnrollWindow()
+            obj.run()
         except Exception:
             log.exception("enroll window crashed")
         finally:
+            # Collect the window's whole graph (Tk vars, images, the Tcl
+            # interpreter) in ITS OWN thread before that thread exits: an
+            # interpreter finalized later by another thread's GC aborts the
+            # process with Tcl_AsyncDelete. Mirrors gui._launch_singleton,
+            # which open_enroll never got (block1 fix2 landed only in gui.py).
+            obj = None
+            gc.collect()
             _enroll_lock.release()
 
     threading.Thread(target=_run, name="enroll-window", daemon=True).start()
