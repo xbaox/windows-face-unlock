@@ -198,7 +198,21 @@ def main(argv=None) -> int:
             s._maybe_adapt_gallery = lambda r: None
             return s
 
-        cfg = Config()  # low_light_luma_min 45, low_light_boost True, step 2
+        def _svc_cfg():
+            c = Config()
+            # This harness calls _handle({"cmd": "unlock"}) with NO pipe handle, so the
+            # Stage-5 SID gate resolves the client SID to None and refuses with
+            # "not-authorized" before the low-light path is ever reached. The gate is not
+            # what these cases exercise -- same reason and same shape as
+            # tools/camera_busy_selftest.py:173 (block6-A-fix, bc4e25b). The gate keeps its
+            # own dedicated coverage in tools/pipe_hardening_selftest.py:148-160, which
+            # asserts both that it REFUSES a non-SYSTEM caller when on (:148-153) and that
+            # it allows one through when off (:155-160). Test scaffold only: production
+            # behaviour and the Stage-4/5 perimeter are untouched.
+            c.pipe_unlock_require_system = False
+            return c
+
+        cfg = _svc_cfg()  # low_light_luma_min 45, low_light_boost True, step 2
         dark = VerifyOutcome(False, 0.36, True, {"verdict": "NOT_LIVE", "scene_luma": 10.0}, None, 10.0)
 
         # (a) boost lifts scene above floor AND matches -> grant (with stubbed credentials).
@@ -250,7 +264,7 @@ def main(argv=None) -> int:
              "scene >= floor -> no boost, normal no-match (unchanged 3.2 path)")
 
         # (e) toggle off: low_light_boost=False -> boost NOT attempted even in the dark.
-        cfg_off = Config()
+        cfg_off = _svc_cfg()
         cfg_off.low_light_boost = False
         spy = _BoostSpy(dark, {})
         svc = _svc(cfg_off, dark, spy)
