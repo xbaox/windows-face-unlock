@@ -12,7 +12,7 @@ import win32file  # type: ignore
 from face_service.config import Config, PIPE_NAME
 from face_service.i18n import t
 
-from .remote_session import is_remote_context
+from .remote_session import is_remote_context, session_locked
 
 log = logging.getLogger(__name__)
 
@@ -174,12 +174,22 @@ class PresenceMonitor:
         if reachable:
             lock = resp.get("lockout") or {}
             locked = bool(lock.get("locked"))
-            if locked and not self._lockout_notified:
+            if not locked:
+                # Episode over (or never started) -> re-arm for the next one.
+                self._lockout_notified = False
+            elif not self._lockout_notified and not session_locked():
                 self._notify(
                     "notify_lockout",
                     t("notify.lockout", s=int(lock.get("remaining_s", 0))),
                 )
-            self._lockout_notified = locked
+                self._lockout_notified = True
+            # else: the episode is live but the workstation is locked. Do NOT latch
+            # the flag. A Shell_NotifyIcon balloon is invisible on the lock screen
+            # and the OS does not queue it, so firing here would burn the toast
+            # silently -- and a lockout episode ALWAYS starts locked, because it is
+            # raised by the SYSTEM/LogonUI unlock path. Leaving the flag clear makes
+            # the first poll after the user unlocks raise it, with a fresh
+            # remaining_s from that poll's own status response.
         return reachable
 
     def _tick(self) -> None:
