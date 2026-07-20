@@ -38,9 +38,11 @@ function Register-LogonTask {
     $action  = New-ScheduledTaskAction -Execute $pyw -Argument "-m $Script" -WorkingDirectory $root
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $prins   = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
+    # -ExecutionTimeLimit ([TimeSpan]::Zero) serialises to PT0S = "no limit". Without it the task
+    # takes the Windows default of PT72H and the scheduler kills these always-on tasks after 3 days.
+    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $prins -Settings $set -Force | Out-Null
-    Write-Host "Registered task (hidden, pythonw): $Name"
+    Write-Host "Registered task (hidden, pythonw, no time limit): $Name"
 }
 
 Register-LogonTask -Name "FaceUnlock-Service"  -Script "face_service"

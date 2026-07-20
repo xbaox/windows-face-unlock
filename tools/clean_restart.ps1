@@ -1,14 +1,32 @@
 Stop-ScheduledTask -TaskName 'FaceUnlock-Service' -ErrorAction SilentlyContinue
 Stop-ScheduledTask -TaskName 'FaceUnlock-Presence' -ErrorAction SilentlyContinue
 
-Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
-    Where-Object { $_.CommandLine -like '*face_service*' -or $_.CommandLine -like '*presence_monitor*' } |
-    ForEach-Object {
-        Write-Host "Killing PID $($_.ProcessId): $($_.CommandLine)"
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-    }
+# One criterion, reused by the kill and the death-wait below so the two cannot drift apart. It
+# matches BOTH halves of a venv pair: the .venv pythonw.exe launcher stub and the base-interpreter
+# worker it spawns.
+$matching = {
+    Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*face_service*' -or $_.CommandLine -like '*presence_monitor*' }
+}
 
-Start-Sleep 2
+& $matching | ForEach-Object {
+    Write-Host "Killing PID $($_.ProcessId): $($_.CommandLine)"
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+# Death-wait: Stop-Process only SIGNALS. The Local\FaceUnlockService mutex and the
+# FIRST_PIPE_INSTANCE pipe name stay held until the last handle is gone, so starting on a blind
+# delay races a slow-dying process into a mutex-loser exit. Bounded: on timeout warn and start
+# anyway, never hang.
+$sw = [Diagnostics.Stopwatch]::StartNew()
+while ((@(& $matching).Count) -gt 0 -and $sw.Elapsed.TotalSeconds -lt 10) {
+    Start-Sleep -Milliseconds 200
+}
+$left = @(& $matching).Count
+if ($left -gt 0) {
+    Write-Warning "$left face-unlock process(es) still alive after 10s; starting anyway (the new instance may exit as a mutex-loser)"
+}
+
 Start-ScheduledTask -TaskName 'FaceUnlock-Service'
 Start-Sleep 1
 Start-ScheduledTask -TaskName 'FaceUnlock-Presence'
