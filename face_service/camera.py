@@ -1,7 +1,35 @@
 from __future__ import annotations
+import logging
 import time
 import cv2
 import numpy as np
+
+log = logging.getLogger(__name__)
+
+# Open/read timeout hint, mirroring the enrollment wizard's CAMERA_READ_TIMEOUT_MS
+# (presence_monitor/enroll_gui.py, block5-A0). Only MSMF honors these props, and
+# NOT on the target hardware -- kept as cross-hardware insurance so a wedged
+# driver read cannot block the pipe server forever on machines where it IS
+# honored. Deliberately NOT one of the service's camera_* config knobs.
+CAMERA_READ_TIMEOUT_MS = 1000
+
+
+def _apply_timeout_props(cap, backend) -> None:
+    """Best-effort open/read timeout hints. NEVER raises.
+
+    These props only exist on newer OpenCV builds and a backend may reject the
+    ``set()`` outright, so both the lookup and the call are guarded: a missing
+    constant or a failed/raising set must never turn into a failed open.
+    """
+    for prop_name in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
+        prop = getattr(cv2, prop_name, None)
+        if prop is None:
+            continue          # OpenCV too old: nothing to set, not an error
+        try:
+            if not cap.set(prop, CAMERA_READ_TIMEOUT_MS):
+                log.debug("%s not accepted by backend %s", prop_name, backend)
+        except Exception:
+            log.debug("%s set failed on backend %s", prop_name, backend, exc_info=True)
 
 
 class Camera:
@@ -63,6 +91,7 @@ class Camera:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            _apply_timeout_props(cap, backend)
             ok = False
             for _ in range(4):
                 ret, _ = cap.read()
@@ -78,9 +107,20 @@ class Camera:
         return False
 
     def close(self) -> None:
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
+        """Release the capture (idempotent, never raises).
+
+        Swap-then-release, matching the wizard's hardened ``_release_capture``
+        (block5-A0/5-B): the attribute is nulled BEFORE ``release()`` runs, so
+        even a raising release leaves ``self._cap is None`` and the next
+        ``open``/``open_fast`` reopens from scratch instead of short-circuiting
+        on a dead handle.
+        """
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                log.exception("camera release failed")
 
     def read(self) -> np.ndarray | None:
         assert self._cap is not None, "Camera not opened"
