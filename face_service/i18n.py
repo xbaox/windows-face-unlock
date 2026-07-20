@@ -240,11 +240,36 @@ _EN: dict[str, str] = {
     "enroll.confirm.wipe.body": "This will delete all saved enrollment photos and embeddings. Continue?",
     "enroll.error.camera": "Cannot open the camera. Close any other app using it and retry.",
     "enroll.error.service_busy": "Could not pause the Face Unlock service — enrollment may conflict with probes.",
-    "enroll.status.waiting": "Waiting for face…",
-    "enroll.status.ready": "Face detected — ready",
+    "enroll.status.waiting": "No face detected — look at the camera.",
+    "enroll.status.ready": "Good — hold still.",
+    # NOT repurposed: the other ten locales still hold this as a "{i}/{n}"
+    # template, and t() only formats when kwargs are passed -- a no-kwargs
+    # caller would print the braces verbatim there. New prose gets a NEW key.
     "enroll.status.captured": "{i}/{n} shots",
+    "enroll.progress.tip": "Accepted shots. Only frames that pass quality control are counted.",
     "enroll.has.yes": "yes",
     "enroll.has.no": "no",
+
+    # ---- Enrollment coach (live frame advice) ----
+    "enroll.coach.closer": "Move a little closer to the camera.",
+    "enroll.coach.farther": "Move back a little — your face fills too much of the frame.",
+    "enroll.coach.center": "Centre your face in the oval.",
+    "enroll.coach.dark": "Too dark — add some light on your face.",
+    "enroll.coach.bright": "Too bright — reduce the light or move out of the glare.",
+    "enroll.coach.blur": "Hold still — the picture is blurred.",
+
+    # ---- Enrollment rejection reasons (from the service's QC summary) ----
+    "enroll.reason.det": "face detected too weakly",
+    "enroll.reason.blur": "out of focus",
+    "enroll.reason.dark": "too dark",
+    "enroll.reason.bright": "overexposed",
+    "enroll.reason.no_face": "no face found",
+    "enroll.reason.unreadable": "unreadable file",
+    "enroll.reason.crop_failed": "face crop failed",
+    "enroll.reason.unknown": "unknown reason",
+    "enroll.guide.build_rejected": "Not enough usable shots: {why}. Delete and re-capture.",
+    "enroll.guide.build_failed": "Building embeddings failed. See the details in the dialog.",
+    "enroll.build.failed": "Not enough shots passed quality control.\n\nRejected: {why}\n\nRe-capture with steady focus, your face filling the oval, and even lighting.",
 
     # ---- Language names (native) ----
     "lang.vi": "Tiếng Việt",
@@ -1066,11 +1091,31 @@ _RU: dict[str, str] = {
     "enroll.confirm.wipe.body": "Будут удалены все сохранённые снимки регистрации и эмбеддинги. Продолжить?",
     "enroll.error.camera": "Не удалось открыть камеру. Закройте другие приложения, использующие её, и повторите.",
     "enroll.error.service_busy": "Не удалось приостановить сервис Face Unlock — регистрация может конфликтовать с проверками присутствия.",
-    "enroll.status.waiting": "Ожидание лица…",
-    "enroll.status.ready": "Лицо обнаружено",
+    "enroll.status.waiting": "Лицо не обнаружено — смотрите в камеру.",
+    "enroll.status.ready": "Хорошо — не двигайтесь.",
     "enroll.status.captured": "{i}/{n} снимков",
+    "enroll.progress.tip": "Принятые снимки. Считаются только кадры, прошедшие контроль качества.",
     "enroll.has.yes": "есть",
     "enroll.has.no": "нет",
+
+    "enroll.coach.closer": "Придвиньтесь немного ближе к камере.",
+    "enroll.coach.farther": "Отодвиньтесь немного — лицо занимает слишком много кадра.",
+    "enroll.coach.center": "Расположите лицо по центру овала.",
+    "enroll.coach.dark": "Слишком темно — добавьте света на лицо.",
+    "enroll.coach.bright": "Слишком ярко — убавьте свет или уйдите от засветки.",
+    "enroll.coach.blur": "Не двигайтесь — кадр смазан.",
+
+    "enroll.reason.det": "лицо распознано слишком слабо",
+    "enroll.reason.blur": "не в фокусе",
+    "enroll.reason.dark": "слишком темно",
+    "enroll.reason.bright": "пересвет",
+    "enroll.reason.no_face": "лицо не найдено",
+    "enroll.reason.unreadable": "файл не читается",
+    "enroll.reason.crop_failed": "не удалось вырезать лицо",
+    "enroll.reason.unknown": "причина неизвестна",
+    "enroll.guide.build_rejected": "Недостаточно пригодных снимков: {why}. Удалите и переснимите.",
+    "enroll.guide.build_failed": "Не удалось построить эмбеддинги. Подробности — в диалоге.",
+    "enroll.build.failed": "Недостаточно снимков прошло контроль качества.\n\nОтклонено: {why}\n\nПереснимите: чёткий фокус, лицо заполняет овал, ровное освещение.",
 
     "tray.check_update": "Проверить обновления…",
     "tray.check_update.desc": "Спросить GitHub, есть ли новый релиз, и предложить установку.",

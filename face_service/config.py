@@ -54,7 +54,7 @@ class Config:
     verify_required: int = 2          # trong đó cần ≥ N khớp (giảm từ 3 để nhanh hơn)
     presence_interval_s: int = 60
     presence_absent_strikes: int = 2  # vắng mặt liên tiếp trước khi lock
-    # "recognition" = DeepFace ArcFace must match enrolled face (stronger; walk-away + strangers)
+    # "recognition" = InsightFace/ONNX ArcFace embedding must match enrolled face (stronger; walk-away + strangers)
     # "detection"   = YuNet any-face-in-frame is enough (weaker; mimics old AutoFaceLock)
     presence_mode: str = "recognition"
     warmup_on_start: bool = True
