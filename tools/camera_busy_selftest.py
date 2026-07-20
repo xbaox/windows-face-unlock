@@ -165,6 +165,12 @@ def main(argv=None) -> int:
         def _cfg():
             c = Config()
             c.camera_open_retries = 0   # single fast attempt -> no real sleeps in the tests
+            # This harness calls _handle({"cmd":"unlock"}) with NO pipe handle, so the
+            # Stage-5 SID gate resolves the client SID to None and refuses with
+            # "not-authorized" before the camera-busy branch is ever reached. The gate
+            # is not what these cases exercise -- same reason and same shape as
+            # tools/pipe_hardening_selftest.py:155.
+            c.pipe_unlock_require_system = False
             return c
 
         orig_camera = SVC.Camera
