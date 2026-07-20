@@ -185,8 +185,11 @@ def _pipe_client_diag(handle) -> str:
     'pid=<n> image=<exe> integrity=<level> session=<n> openable=<yes|no>'. Diagnostic only -- it
     logs no password or request content, and never raises (every field degrades to '?').
 
-    image + session are read WITHOUT OpenProcess (Toolhelp snapshot + ProcessIdToSessionId) so they
-    resolve even for a SYSTEM client (LogonUI) that a Limited-user service cannot OpenProcess.
+    Only 'image' resolves WITHOUT OpenProcess (Toolhelp snapshot), so it is the one field that
+    survives a SYSTEM client (LogonUI) that a Limited-user service cannot OpenProcess. 'session' is
+    NOT free: ProcessIdToSessionId needs the same PROCESS_QUERY_LIMITED_INFORMATION access, so on
+    such a client it degrades to '?' (a live log confirmed this -- an earlier version of this
+    docstring wrongly grouped session with image).
     'openable=no' on such a client is itself the tell that the caller outranks the service -- i.e.
     image=LogonUI.exe + sid=None + openable=no == the real lockscreen CP, whereas
     image=unlock_harness.exe + sid=<user> + openable=yes == the SELF test harness."""

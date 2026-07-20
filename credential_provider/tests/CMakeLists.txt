@@ -19,7 +19,7 @@ add_executable(test_parser
 )
 target_compile_definitions(test_parser PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
 target_compile_options(test_parser PRIVATE /utf-8)
-target_link_libraries(test_parser PRIVATE advapi32 wtsapi32)
+target_link_libraries(test_parser PRIVATE advapi32)
 
 # Live unlock harness (talks to a running FaceService; prints only a safe,
 # password-masked summary). Guarded so this file also configures before the
@@ -31,5 +31,5 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/unlock_harness.cpp")
     )
     target_compile_definitions(unlock_harness PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
     target_compile_options(unlock_harness PRIVATE /utf-8)
-    target_link_libraries(unlock_harness PRIVATE advapi32 wtsapi32)
+    target_link_libraries(unlock_harness PRIVATE advapi32)
 endif()
