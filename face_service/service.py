@@ -768,7 +768,7 @@ class FaceService:
             return resp
 
         if cmd == "unlock":
-            # Stage 4 Step 5 SID-gate (default OFF): when enabled, only a SYSTEM caller -- the
+            # Stage 4 Step 5 SID-gate (default ON since Stage 5): when enabled, only a SYSTEM caller -- the
             # lockscreen Credential Provider -- may invoke unlock. Runs BEFORE lockout/verify/
             # load_password so no password is ever returned to a non-SYSTEM caller. Only unlock is
             # gated; every other command is scoped by the Batch-1 pipe DACL.
