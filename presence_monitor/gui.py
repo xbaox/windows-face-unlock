@@ -8,16 +8,18 @@ Every field has a small ⓘ button whose click shows a messagebox with the
 localised description, and whose hover shows the same text as a tooltip.
 """
 from __future__ import annotations
+import gc
 import logging
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from dataclasses import asdict
 from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Callable
 
-from face_service.config import Config, CONFIG_PATH, LOG_PATH, PRESENCE_MODES
+from face_service.config import Config, CONFIG_PATH, LOG_PATH, LIVENESS_MODES, PRESENCE_MODES
 from face_service.i18n import LANGUAGES, get_language, set_language, t
 
 from .monitor import PresenceMonitor, pipe_call
@@ -35,6 +37,46 @@ def _format_age(ts: float) -> str:
     if age < 3600:
         return t("status.age.minutes", m=age // 60, s=age % 60)
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+# (section_i18n_key, [(field_name, widget_kind, extras), ...]) — labels and
+# .desc keys come from i18n; this nesting IS the Settings window layout.
+# Everything that only needs "all fields" iterates SETTINGS_FIELDS below.
+SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, object]]]] = [
+    ("section.general", [
+        ("language",                "combo_lang", None),
+    ]),
+    ("section.recognition", [
+        ("threshold",               "float",      (0.05, 1.5)),
+        ("verify_frames",           "int",        (1, 30)),
+        ("verify_required",         "int",        (1, 30)),
+    ]),
+    ("section.liveness", [
+        ("anti_spoofing",           "bool",       None),
+        ("liveness_mode",           "combo",      LIVENESS_MODES),
+        ("anti_screen",             "bool",       None),
+        ("max_face_attempts",       "int",        (1, 20)),
+        ("lockout_seconds",         "int",        (0, 3600)),
+    ]),
+    ("section.presence", [
+        ("auto_lock",               "bool",       None),
+        ("presence_mode",           "combo",      PRESENCE_MODES),
+        ("presence_interval_s",     "int",        (5, 3600)),
+        ("presence_absent_strikes", "int",        (1, 20)),
+    ]),
+    ("section.camera", [
+        ("camera_index",            "int",        (0, 10)),
+        ("camera_warmup_frames",    "int",        (0, 60)),
+        ("persistent_camera",       "bool",       None),
+        ("low_light_boost",         "bool",       None),
+        ("warmup_on_start",         "bool",       None),
+    ]),
+    ("section.notifications", [
+        ("notify_enroll",           "bool",       None),
+        ("notify_lockout",          "bool",       None),
+        ("notify_service_state",    "bool",       None),
+    ]),
+]
 
 
 # (i18n_key, snapshot_key_or_callable) for Status window rows.
@@ -68,6 +110,7 @@ class StatusWindow:
         self.root.title(t("status.title"))
         self.root.geometry("560x480")
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
         self._refresh_loop()
 
     def _build(self) -> None:
@@ -79,7 +122,11 @@ class StatusWindow:
             ttk.Label(frm, text=t(label_key) + ":", width=18, anchor="e").grid(
                 row=i, column=0, sticky="e", padx=4, pady=2
             )
-            v = tk.StringVar(value="—")
+            # master= matters: several Tk roots can coexist in this process
+            # (Status / Settings / enroll). A master-less Variable binds to the
+            # FIRST live root's Tcl interpreter, so widgets in THIS window
+            # would reference an unset variable and render empty.
+            v = tk.StringVar(master=self.root, value="—")
             self.vars[key] = v
             ttk.Label(frm, textvariable=v, anchor="w").grid(
                 row=i, column=1, sticky="we", padx=4, pady=2
@@ -160,26 +207,22 @@ class StatusWindow:
         os.startfile(str(LOG_PATH.parent))  # type: ignore[attr-defined]
 
     def _close(self) -> None:
+        # Drop the last Variable refs BEFORE destroy, in this window's Tk
+        # thread: their __del__ then runs against a live interpreter. A GC
+        # from another thread finding Variables of a dead root raises
+        # "main thread is not in main loop" and can abort the process
+        # (Tcl_AsyncDelete). Every close path must end here.
+        self.vars.clear()
         self.root.destroy()
 
     def run(self) -> None:
         self.root.mainloop()
 
 
-# (field_name, widget_kind, extras) — the label + .desc keys come from i18n.
+# Flat view of SETTINGS_SECTIONS, in layout order — the save/collect/reload
+# path and the smoke tests iterate fields, not sections.
 SETTINGS_FIELDS: list[tuple[str, str, object]] = [
-    ("language",                  "combo_lang", None),
-    ("presence_mode",             "combo",      PRESENCE_MODES),
-    ("presence_interval_s",       "int",        (5, 3600)),
-    ("presence_absent_strikes",   "int",        (1, 20)),
-    ("threshold",                 "float",      (0.05, 1.5)),
-    ("verify_frames",             "int",        (1, 30)),
-    ("verify_required",           "int",        (1, 30)),
-    ("anti_spoofing",             "bool",       None),
-    ("camera_index",              "int",        (0, 10)),
-    ("camera_warmup_frames",      "int",        (0, 60)),
-    ("persistent_camera",         "bool",       None),
-    ("warmup_on_start",           "bool",       None),
+    field for _sec_key, _fields in SETTINGS_SECTIONS for field in _fields
 ]
 
 
@@ -193,10 +236,13 @@ class SettingsWindow:
         self.on_saved = on_saved
         self.root = tk.Tk()
         self.root.title(t("settings.title"))
-        self.root.geometry("620x620")
+        # No fixed geometry: the window sizes itself to the section layout,
+        # so long labels never need a manual resize.
         self.cfg = Config.load()
         self.widgets: dict[str, tuple[str, tk.Variable]] = {}
+        self._lang_display_to_code: dict[str, str] = {}
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build(self) -> None:
         frm = ttk.Frame(self.root, padding=12)
@@ -207,74 +253,87 @@ class SettingsWindow:
             text=t("settings.editing", path=str(CONFIG_PATH)),
             foreground="#555",
             wraplength=560,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ).pack(anchor="w", pady=(0, 8))
 
-        for i, (name, kind, extras) in enumerate(SETTINGS_FIELDS, start=1):
-            current = getattr(self.cfg, name)
-            label_key = f"field.{name}"
-            ttk.Label(frm, text=t(label_key) + ":", anchor="e", width=30).grid(
-                row=i, column=0, sticky="e", padx=4, pady=3
-            )
-            var: tk.Variable
-            if kind == "bool":
-                var = tk.BooleanVar(value=bool(current))
-                w: tk.Widget = ttk.Checkbutton(frm, variable=var)
-            elif kind == "combo":
-                var = tk.StringVar(value=str(current))
-                w = ttk.Combobox(
-                    frm, textvariable=var, values=list(extras or ()),
-                    state="readonly", width=22,
+        # One shared label-column width for every section: measured from the
+        # longest field label in the CURRENT language, so no caption is ever
+        # truncated (labels themselves carry no fixed width).
+        font = tkfont.nametofont("TkDefaultFont")
+        label_px = max(
+            font.measure(t(f"field.{name}") + ":") for name, _, _ in SETTINGS_FIELDS
+        ) + 12
+
+        for sec_key, fields in SETTINGS_SECTIONS:
+            sec = ttk.LabelFrame(frm, text=t(sec_key), padding=(8, 4))
+            sec.pack(fill="x", pady=(0, 6))
+            sec.columnconfigure(0, minsize=label_px)
+            sec.columnconfigure(1, weight=1)
+            for i, (name, kind, extras) in enumerate(fields):
+                current = getattr(self.cfg, name)
+                label_key = f"field.{name}"
+                ttk.Label(sec, text=t(label_key) + ":", anchor="e").grid(
+                    row=i, column=0, sticky="e", padx=4, pady=3
                 )
-            elif kind == "combo_lang":
-                var = tk.StringVar()
-                code_to_display = {
-                    code: f"{emoji}  {name_}" for code, name_, emoji in LANGUAGES
-                }
-                display_to_code = {v: k for k, v in code_to_display.items()}
-                var.set(code_to_display.get(str(current), str(current)))
-                w = ttk.Combobox(
-                    frm, textvariable=var, values=list(code_to_display.values()),
-                    state="readonly", width=22,
-                )
-                # Store the reverse map on the widget for _collect.
-                w._lang_display_to_code = display_to_code  # type: ignore[attr-defined]
-            elif kind == "int":
-                lo, hi = extras  # type: ignore[misc]
-                var = tk.IntVar(value=int(current))
-                w = ttk.Spinbox(frm, from_=lo, to=hi, textvariable=var, width=10)
-            elif kind == "float":
-                lo, hi = extras  # type: ignore[misc]
-                var = tk.DoubleVar(value=float(current))
-                w = ttk.Spinbox(
-                    frm, from_=lo, to=hi, increment=0.01,
-                    textvariable=var, width=10, format="%.3f",
-                )
-            else:
-                continue
-            w.grid(row=i, column=1, sticky="w", padx=4, pady=3)
+                var: tk.Variable
+                if kind == "bool":
+                    var = tk.BooleanVar(master=self.root, value=bool(current))
+                    w: tk.Widget = ttk.Checkbutton(sec, variable=var)
+                elif kind == "combo":
+                    var = tk.StringVar(master=self.root, value=str(current))
+                    w = ttk.Combobox(
+                        sec, textvariable=var, values=list(extras or ()),
+                        state="readonly", width=22,
+                    )
+                elif kind == "combo_lang":
+                    var = tk.StringVar(master=self.root)
+                    code_to_display = {
+                        code: f"{emoji}  {name_}" for code, name_, emoji in LANGUAGES
+                    }
+                    # Reverse map lives on the window (not the widget): with
+                    # sections the combobox is nested, so a child-scan in
+                    # _collect would no longer find it.
+                    self._lang_display_to_code = {
+                        v: k for k, v in code_to_display.items()
+                    }
+                    var.set(code_to_display.get(str(current), str(current)))
+                    w = ttk.Combobox(
+                        sec, textvariable=var, values=list(code_to_display.values()),
+                        state="readonly", width=22,
+                    )
+                elif kind == "int":
+                    lo, hi = extras  # type: ignore[misc]
+                    var = tk.IntVar(master=self.root, value=int(current))
+                    w = ttk.Spinbox(sec, from_=lo, to=hi, textvariable=var, width=10)
+                elif kind == "float":
+                    lo, hi = extras  # type: ignore[misc]
+                    var = tk.DoubleVar(master=self.root, value=float(current))
+                    w = ttk.Spinbox(
+                        sec, from_=lo, to=hi, increment=0.01,
+                        textvariable=var, width=10, format="%.3f",
+                    )
+                else:
+                    continue
+                w.grid(row=i, column=1, sticky="w", padx=4, pady=3)
 
-            ib = InfoButton(frm, i18n_key=label_key + ".desc")
-            ib.grid(row=i, column=2, sticky="w", padx=4, pady=3)
+                ib = InfoButton(sec, i18n_key=label_key + ".desc")
+                ib.grid(row=i, column=2, sticky="w", padx=4, pady=3)
 
-            # Also tooltip the input widget itself.
-            attach_tooltip(w, label_key + ".desc")
+                # Also tooltip the input widget itself.
+                attach_tooltip(w, label_key + ".desc")
 
-            self.widgets[name] = (kind, var)
-
-        frm.columnconfigure(1, weight=1)
-
-        ttk.Separator(frm).grid(
-            row=len(SETTINGS_FIELDS) + 1, column=0, columnspan=3, sticky="we", pady=10
-        )
+                self.widgets[name] = (kind, var)
 
         btns = ttk.Frame(frm)
-        btns.grid(row=len(SETTINGS_FIELDS) + 2, column=0, columnspan=3, sticky="we")
+        btns.pack(fill="x", pady=(8, 0))
         save_btn = ttk.Button(btns, text=t("settings.btn.save"), command=self._save)
         save_btn.pack(side="right", padx=4)
-        cancel_btn = ttk.Button(btns, text=t("settings.btn.cancel"), command=self.root.destroy)
+        cancel_btn = ttk.Button(btns, text=t("settings.btn.cancel"), command=self._close)
         cancel_btn.pack(side="right", padx=4)
         reload_btn = ttk.Button(btns, text=t("settings.btn.reload"), command=self._reload_from_disk)
         reload_btn.pack(side="left", padx=4)
+        # Inline "Saved" feedback — Save keeps the window open (block 4).
+        self._saved_lbl = ttk.Label(btns, text="", foreground="#2a7a2a")
+        self._saved_lbl.pack(side="left", padx=8)
 
     def _reload_from_disk(self) -> None:
         self.cfg = Config.load()
@@ -290,19 +349,10 @@ class SettingsWindow:
 
     def _collect(self) -> Config:
         new = Config.load()
-        # Walk widgets in insertion order; for combo_lang map display→code.
-        row_widgets = list(self.root.winfo_children())[0].winfo_children()  # frm children
         for name, (kind, var) in self.widgets.items():
             if kind == "combo_lang":
-                # Find the widget to consult its display→code map.
-                mapping: dict[str, str] = {}
-                for w in row_widgets:
-                    if getattr(w, "_lang_display_to_code", None):
-                        mapping = w._lang_display_to_code  # type: ignore[attr-defined]
-                        break
                 display_val = var.get()
-                code = mapping.get(display_val, display_val)
-                setattr(new, name, code)
+                setattr(new, name, self._lang_display_to_code.get(display_val, display_val))
             else:
                 setattr(new, name, var.get())
         return new
@@ -324,6 +374,9 @@ class SettingsWindow:
         resp = pipe_call({"cmd": "reload_config"}, timeout_s=3.0)
         if not (resp and resp.get("ok")):
             log.warning("service reload_config failed: %s", resp)
+        # Force an immediate event poll so toasts (lockout, service state)
+        # don't wait out the rest of the current tick interval.
+        self.monitor.poke_events()
 
         if self.on_saved:
             try:
@@ -331,7 +384,14 @@ class SettingsWindow:
             except Exception:
                 log.exception("on_saved callback failed")
 
-        messagebox.showinfo(t("settings.title"), t("settings.saved"), parent=self.root)
+        # Window stays open: brief inline feedback instead of a modal box.
+        # (A pending fade-out after() dies with the window if it is closed.)
+        self._saved_lbl.configure(text=t("settings.saved"))
+        self.root.after(2000, lambda: self._saved_lbl.configure(text=""))
+
+    def _close(self) -> None:
+        # Same teardown rationale as StatusWindow._close.
+        self.widgets.clear()
         self.root.destroy()
 
     def run(self) -> None:
@@ -414,12 +474,19 @@ def _launch_singleton(key: str, factory: Callable[[], object]) -> None:
         return
 
     def _run():
+        obj = None
         try:
             obj = factory()
             obj.run()  # type: ignore[attr-defined]
         except Exception:
             log.exception("%s window crashed", key)
         finally:
+            # Collect the window's whole object graph (widgets, Variables,
+            # the Tcl interpreter) in ITS OWN thread before it exits: a Tk
+            # interpreter finalized later by another thread's GC aborts the
+            # process with Tcl_AsyncDelete.
+            obj = None
+            gc.collect()
             lock.release()
 
     threading.Thread(target=_run, name=f"{key}-window", daemon=True).start()

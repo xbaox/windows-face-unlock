@@ -22,6 +22,26 @@ log = logging.getLogger(__name__)
 
 SET_PASSWORD_CMD = ["-m", "tools.set_password"]
 
+# Live tray icon for event toasts; filled by run_with_tray while it runs.
+_notify_icon: list[pystray.Icon] = []
+
+
+def notify_event(gate: str, message: str) -> None:
+    """Config-gated event toast via the live tray icon.
+
+    Works whenever the tray is running (all windows may be closed). Silent
+    no-op when there is no icon, the ``notify_*`` gate is off in config, or
+    notify itself fails — an event toast must never take the caller down.
+    """
+    try:
+        if not _notify_icon:
+            return
+        if not bool(getattr(Config.load(), gate, False)):
+            return
+        _notify_icon[0].notify(message, t("tray.title"))
+    except Exception:
+        log.exception("notify_event(%s) failed", gate)
+
 # Visual icons that sit after the label text in each tray menu entry.
 # Placed at the end with a tab so they right-align nicely in the Windows
 # context menu font. pystray does not support real per-item icons on
@@ -179,7 +199,7 @@ def run_with_tray(cfg: Config) -> None:
         # Ask the user. Use a small Tk root we immediately destroy afterwards.
         if icon_ref:
             _update_notify(icon_ref[0], t("update.title"),
-                           t("update.up_to_date", v=release.tag))
+                           t("notify.update_available", latest=release.tag))
 
         root = Tk()
         root.withdraw()
@@ -317,4 +337,8 @@ def run_with_tray(cfg: Config) -> None:
         menu,
     )
     icon_ref.append(icon)
-    icon.run()
+    _notify_icon.append(icon)
+    try:
+        icon.run()
+    finally:
+        _notify_icon.clear()

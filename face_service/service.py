@@ -185,8 +185,11 @@ def _pipe_client_diag(handle) -> str:
     'pid=<n> image=<exe> integrity=<level> session=<n> openable=<yes|no>'. Diagnostic only -- it
     logs no password or request content, and never raises (every field degrades to '?').
 
-    image + session are read WITHOUT OpenProcess (Toolhelp snapshot + ProcessIdToSessionId) so they
-    resolve even for a SYSTEM client (LogonUI) that a Limited-user service cannot OpenProcess.
+    Only 'image' resolves WITHOUT OpenProcess (Toolhelp snapshot), so it is the one field that
+    survives a SYSTEM client (LogonUI) that a Limited-user service cannot OpenProcess. 'session' is
+    NOT free: ProcessIdToSessionId needs the same PROCESS_QUERY_LIMITED_INFORMATION access, so on
+    such a client it degrades to '?' (a live log confirmed this -- an earlier version of this
+    docstring wrongly grouped session with image).
     'openable=no' on such a client is itself the tell that the caller outranks the service -- i.e.
     image=LogonUI.exe + sid=None + openable=no == the real lockscreen CP, whereas
     image=unlock_harness.exe + sid=<user> + openable=yes == the SELF test harness."""
@@ -329,9 +332,18 @@ class FaceService:
         return cam, False
 
     def _release_camera(self) -> None:
-        if self._cam is not None:
-            self._cam.close()
-            self._cam = None
+        """Drop the persistent camera (idempotent, never raises).
+
+        Swap-then-release like ``Camera.close``: ``self._cam`` is nulled BEFORE
+        the close runs, so a raising close cannot leave a dead handle behind for
+        ``_acquire_camera``'s reuse gate to hand back with ``busy=False``.
+        """
+        cam, self._cam = self._cam, None
+        if cam is not None:
+            try:
+                cam.close()
+            except Exception:
+                log.exception("persistent camera release failed")
 
     # ---------- core ops ----------
 
@@ -665,10 +677,15 @@ class FaceService:
         self.recog.cfg = new_cfg
         self._lockout.reconfigure(new_cfg.max_face_attempts, new_cfg.lockout_seconds)
         self._audit.reconfigure(new_cfg.audit_log, new_cfg.audit_max_mb)
-        # Reset camera if camera-affecting settings changed
+        # Reset camera if camera-affecting settings changed. The new cfg is already
+        # applied above, so a failure here must not abort the reload and strand the
+        # OLD camera open under the NEW settings -- log it and carry on.
         if new_cfg.camera_index != old_index or new_cfg.persistent_camera != old_persistent:
-            with self._cam_lock:
-                self._release_camera()
+            try:
+                with self._cam_lock:
+                    self._release_camera()
+            except Exception:
+                log.exception("reload_config: releasing the webcam failed")
         return {"ok": True, "config": asdict(new_cfg)}
 
     def _handle(self, req: dict, handle=None) -> dict:
@@ -707,8 +724,15 @@ class FaceService:
             # number of seconds so the enrollment wizard can own it.
             seconds = float(req.get("seconds", 120))
             self._camera_paused_until = time.time() + max(5.0, seconds)
-            with self._cam_lock:
-                self._release_camera()
+            # The deadline above is already live, so probes have stood down and
+            # the wizard is being told the device is its. The release must
+            # therefore survive any failure: escaping here would leave the webcam
+            # with the service while BOTH sides believe it was handed over.
+            try:
+                with self._cam_lock:
+                    self._release_camera()
+            except Exception:
+                log.exception("pause_camera: releasing the webcam failed")
             log.info("camera leased out for %.0fs (enrollment)", seconds)
             return {"ok": True, "paused_until": self._camera_paused_until}
 
@@ -744,7 +768,7 @@ class FaceService:
             return resp
 
         if cmd == "unlock":
-            # Stage 4 Step 5 SID-gate (default OFF): when enabled, only a SYSTEM caller -- the
+            # Stage 4 Step 5 SID-gate (default ON since Stage 5): when enabled, only a SYSTEM caller -- the
             # lockscreen Credential Provider -- may invoke unlock. Runs BEFORE lockout/verify/
             # load_password so no password is ever returned to a non-SYSTEM caller. Only unlock is
             # gated; every other command is scoped by the Batch-1 pipe DACL.
@@ -941,10 +965,14 @@ class FaceService:
                 if busy:
                     log.info("camera warmup skipped: camera busy (held by another process)")
                 else:
-                    cam.read()
-                    log.info("camera warmup ok (persistent=%s)", self.cfg.persistent_camera)
-                    if not self.cfg.persistent_camera:
-                        cam.close()
+                    # close in a finally: a raising read() must not skip it, or the
+                    # non-persistent path leaks the handle for the process lifetime.
+                    try:
+                        cam.read()
+                        log.info("camera warmup ok (persistent=%s)", self.cfg.persistent_camera)
+                    finally:
+                        if not self.cfg.persistent_camera:
+                            cam.close()
         except Exception as e:
             log.warning("camera warmup failed: %s", e)
 

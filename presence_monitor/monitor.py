@@ -10,8 +10,9 @@ import pywintypes  # type: ignore
 import win32file  # type: ignore
 
 from face_service.config import Config, PIPE_NAME
+from face_service.i18n import t
 
-from .remote_session import is_remote_context
+from .remote_session import is_remote_context, session_locked
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +87,10 @@ class PresenceMonitor:
         self._last = TickSnapshot()
         self._lock_count = 0
         self._state_lock = threading.Lock()
+        # Event-notification dedup state: one toast per lockout episode, one
+        # per reachability transition (baseline set silently on first tick).
+        self._svc_reachable: bool | None = None
+        self._lockout_notified = False
 
     def pause(self) -> None:
         self._paused.set()
@@ -95,6 +100,15 @@ class PresenceMonitor:
         self._paused.clear()
         self._strikes = 0
         log.info("presence monitor resumed")
+        self.poke_events()
+
+    def poke_events(self) -> None:
+        """Out-of-band _check_service_events (after settings Save / tray
+        Resume) so event toasts don't wait for the next tick. Daemon thread —
+        never blocks the caller; a rare race with the tick thread costs at
+        worst one duplicate toast."""
+        threading.Thread(target=self._check_service_events,
+                         name="event-poll", daemon=True).start()
 
     def is_paused(self) -> bool:
         return self._paused.is_set()
@@ -136,7 +150,53 @@ class PresenceMonitor:
                 mode=mode or self.cfg.presence_mode,
             )
 
+    def _notify(self, gate: str, message: str) -> None:
+        try:
+            from .tray import notify_event  # lazy: tray imports this module
+            notify_event(gate, message)
+        except Exception:
+            log.exception("event notification failed")
+
+    def _check_service_events(self) -> bool:
+        """Event toasts from the EXISTING ``status`` command (cheap, no
+        camera): service reachable<->unreachable transitions and the start of
+        a face-lockout episode. Returns whether the service answered, so
+        _tick can skip the camera probe instead of burning a second timeout
+        on a dead pipe."""
+        resp = pipe_call({"cmd": "status"}, timeout_s=5.0)
+        reachable = bool(resp and resp.get("ok"))
+        prev, self._svc_reachable = self._svc_reachable, reachable
+        if prev is not None and prev != reachable:
+            self._notify(
+                "notify_service_state",
+                t("notify.service_up") if reachable else t("notify.service_down"),
+            )
+        if reachable:
+            lock = resp.get("lockout") or {}
+            locked = bool(lock.get("locked"))
+            if not locked:
+                # Episode over (or never started) -> re-arm for the next one.
+                self._lockout_notified = False
+            elif not self._lockout_notified and not session_locked():
+                self._notify(
+                    "notify_lockout",
+                    t("notify.lockout", s=int(lock.get("remaining_s", 0))),
+                )
+                self._lockout_notified = True
+            # else: the episode is live but the workstation is locked. Do NOT latch
+            # the flag. A Shell_NotifyIcon balloon is invisible on the lock screen
+            # and the OS does not queue it, so firing here would burn the toast
+            # silently -- and a lockout episode ALWAYS starts locked, because it is
+            # raised by the SYSTEM/LogonUI unlock path. Leaving the flag clear makes
+            # the first poll after the user unlocks raise it, with a fresh
+            # remaining_s from that poll's own status response.
+        return reachable
+
     def _tick(self) -> None:
+        # 0. Event toasts ride on the existing `status` poll — before the
+        #    pause/remote skips, so notifications work while paused too.
+        reachable = self._check_service_events()
+
         # 1. Skip if paused from the tray
         if self._paused.is_set():
             self._set_last("skipped", "paused")
@@ -157,6 +217,12 @@ class PresenceMonitor:
         # using the machine (stronger "walk-away" security).
 
         # 3. Probe camera via FaceService
+        if not reachable:
+            # Service down (status poll above already burned the wait) —
+            # don't lock blindly and don't repeat the wait on the camera probe.
+            log.warning("presence probe: service unavailable; skipping")
+            self._set_last("error", "service-unavailable")
+            return
         resp = pipe_call({"cmd": "presence"}, timeout_s=20.0)
         if resp is None:
             # Service down — don't lock blindly
@@ -175,8 +241,19 @@ class PresenceMonitor:
             return
 
         self._strikes += 1
-        self._set_last("absent", f"strike {self._strikes}/{self.cfg.presence_absent_strikes}", mode)
+        suffix = "" if self.cfg.auto_lock else " (auto-lock off)"
+        self._set_last(
+            "absent",
+            f"strike {self._strikes}/{self.cfg.presence_absent_strikes}{suffix}",
+            mode,
+        )
         if self._strikes >= self.cfg.presence_absent_strikes:
+            if not self.cfg.auto_lock:
+                # Observe-only: strikes count and show up in Status (with an
+                # honest "auto-lock off" reason), the machine stays unlocked.
+                log.info("absent %d ticks — auto_lock off, not locking", self._strikes)
+                self._strikes = 0
+                return
             log.warning("absent %d ticks — locking workstation", self._strikes)
             self._strikes = 0
             with self._state_lock:

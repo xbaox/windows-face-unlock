@@ -128,9 +128,32 @@ def main(argv=None) -> int:
             s._audit = _AuditStub()
             s._camera_paused_until = 0.0            # _camera_leased_out() -> False
             s._capture_and_verify = lambda: outcome
+            # Neutralise the Step-3.3 boost the same way lowlight_boost_selftest.py:197 does.
+            # A dark scene sends the unlock path through _maybe_boost (service.py:805), and
+            # THIS fake has no _cam_lock, so the real one would raise AttributeError at
+            # service.py:477 -- swallowed by the defensive handler at :492, but it would then
+            # be one added attribute away from calling _acquire_camera() against a real
+            # device in a harness that never patches SVC.Camera. Returning the outcome
+            # unchanged with an empty audit dict is exactly what the swallow produced, so
+            # every assertion below is unaffected (service.py:806 merges {} harmlessly).
+            s._maybe_boost = lambda r: (r, {})
             return s
 
-        cfg = Config()  # low_light_luma_min = 45.0
+        def _svc_cfg():
+            c = Config()
+            # This harness calls _handle({"cmd": "unlock"}) with NO pipe handle, so the
+            # Stage-5 SID gate resolves the client SID to None and refuses with
+            # "not-authorized" before the low-light path is ever reached. The gate is not
+            # what these cases exercise -- same reason and same shape as
+            # tools/camera_busy_selftest.py:173 (block6-A-fix, bc4e25b). The gate keeps its
+            # own dedicated coverage in tools/pipe_hardening_selftest.py:148-160, which
+            # asserts both that it REFUSES a non-SYSTEM caller when on (:148-153) and that
+            # it allows one through when off (:155-160). Test scaffold only: production
+            # behaviour and the Stage-4/5 perimeter are untouched.
+            c.pipe_unlock_require_system = False
+            return c
+
+        cfg = _svc_cfg()  # low_light_luma_min = 45.0
         detail_dark = {"verdict": "PASS", "distance": 0.36, "scene_luma": 10.0}
 
         # (a) too-dark AND recognition WOULD have matched -> still denied, NO lockout touch.
@@ -157,7 +180,7 @@ def main(argv=None) -> int:
              "above floor + no-match -> reason 'no-match', Lockout.record(False) called (unchanged)")
 
         # (d) gate disabled (floor 0): even a dark scene passes through to the normal path.
-        cfg0 = Config()
+        cfg0 = _svc_cfg()
         cfg0.low_light_luma_min = 0.0
         svc = _svc(cfg0, VerifyOutcome(False, 0.50, True, {"verdict": "NOT_LIVE", "scene_luma": 5.0}, None, 5.0))
         resp = svc._handle({"cmd": "unlock"})

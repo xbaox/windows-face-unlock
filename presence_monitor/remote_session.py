@@ -10,7 +10,9 @@ Two tiers of detection:
    and only mean "active remote" when they hold an ESTABLISHED TCP connection
    to a non-loopback peer (UltraViewer, AnyDesk, RustDesk, Parsec, ...).
 
-Also: RDP session via GetSystemMetrics(SM_REMOTESESSION).
+Also: RDP session via GetSystemMetrics(SM_REMOTESESSION), and -- unrelated to
+remoting, but the same kind of ambient session probe -- whether the workstation
+is currently locked (see ``session_locked``).
 """
 from __future__ import annotations
 import ipaddress
@@ -22,6 +24,14 @@ except ImportError:
     psutil = None  # type: ignore
 
 import win32api  # type: ignore
+
+try:
+    import pywintypes  # type: ignore
+    import win32con  # type: ignore
+    import win32service  # type: ignore
+    import winerror  # type: ignore
+except ImportError:  # pragma: no cover - pywin32 is present in every real install
+    win32service = None  # type: ignore
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +59,12 @@ CONNECTION_CHECKED_PROCS = {
 
 SM_REMOTESESSION = 0x1000
 
+# Name of the interactive desktop of a normal, unlocked session. The lock screen
+# and the secure-desktop (UAC) prompt run on "Winlogon", the screen saver on
+# "Screen-saver" -- so anything other than "Default" means the user is not
+# looking at their own desktop right now.
+UNLOCKED_DESKTOP = "Default"
+
 
 def _is_external(addr: str) -> bool:
     if not addr:
@@ -66,6 +82,48 @@ def is_rdp_session() -> bool:
     except Exception as e:
         log.debug("GetSystemMetrics failed: %s", e)
         return False
+
+
+def session_locked() -> bool:
+    """True when the interactive session is NOT on its normal desktop -- i.e. the
+    lock screen (or the secure desktop / screen saver) is up.
+
+    Read the INPUT desktop (the one currently receiving user input) and compare its
+    object name against ``UNLOCKED_DESKTOP``. Cheap by construction: one
+    OpenInputDesktop plus one name query, no sleep and no retry, so it is safe to
+    call from the presence tick.
+    """
+    if win32service is None:
+        # No pywin32 at all -> we cannot tell. Degrade to "not locked" so the caller
+        # keeps its previous behaviour (raise the notification) instead of silently
+        # suppressing it. Failing this way loses nothing that worked before.
+        log.debug("session_locked: win32service unavailable")
+        return False
+    hdesk = None
+    try:
+        hdesk = win32service.OpenInputDesktop(0, False, win32con.DESKTOP_READOBJECTS)
+        name = win32service.GetUserObjectInformation(hdesk, win32service.UOI_NAME)
+    except pywintypes.error as e:
+        if e.winerror == winerror.ERROR_ACCESS_DENIED:
+            # EXPECTED while locked: the input desktop is Winlogon, which an ordinary
+            # process in the user session is not allowed to open. The refusal IS the
+            # signal, so report locked rather than treating it as an error.
+            return True
+        # Any OTHER win32 failure leaves us genuinely unsure. Degrade to "not locked"
+        # (status quo: the notification still fires) rather than swallowing it.
+        log.debug("session_locked: desktop probe failed: %s", e)
+        return False
+    except Exception as e:
+        # Same reasoning as above, for a non-win32 failure.
+        log.debug("session_locked: unexpected failure: %s", e)
+        return False
+    finally:
+        if hdesk is not None:
+            try:
+                hdesk.CloseDesktop()
+            except Exception:
+                pass
+    return name != UNLOCKED_DESKTOP
 
 
 def _proc_has_external_established(proc: "psutil.Process") -> bool:

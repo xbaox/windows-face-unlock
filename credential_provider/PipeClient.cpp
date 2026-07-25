@@ -270,14 +270,32 @@ bool ParseUnlockResponse(const std::string& response,
 //                                          the interactive user, so we accept a
 //                                          normal machine/domain user account
 //
-// Anti-squatting is held PRIMARILY on the server side (FIRST_PIPE_INSTANCE refuses
-// to start on a taken name + a DACL that grants pipe-instance creation only to
-// SELF and SYSTEM), so a foreign/service account cannot own this pipe. This client
-// check stays defense-in-depth: accept SYSTEM or a real user, reject well-known /
-// service SIDs (LOCAL/NETWORK SERVICE, logon/capability SIDs). It deliberately does
-// NOT depend on WTSQueryUserToken/session resolution, which is unreliable in the
-// LogonUI secure-desktop context (it was silently failing and closing the pipe
-// before the request was sent).
+// What the server side does and does NOT buy us (be precise here -- an earlier
+// version of this comment claimed "a foreign account cannot own this pipe", which
+// is not true):
+//   * The hardened DACL applies to an ALREADY-CREATED object. It constrains who may
+//     open (and add instances to) OUR pipe once our server exists; it does NOT
+//     reserve the NAME in advance.
+//   * So there is a COLD WINDOW -- from boot/logon until FaceService binds the name --
+//     in which \\.\pipe\FaceUnlock is simply free, and any S-1-5-21 user on the box
+//     can take it with their own CreateNamedPipe and their own DACL.
+//   * FIRST_PIPE_INSTANCE does not PREVENT that squat. It only guarantees we never
+//     silently share a name someone else already owns: our server refuses to start
+//     and logs loudly, which makes a persistent squatter visible instead of hidden.
+//   * The client rule below accepts ANY real S-1-5-21 account, so in that cold window
+//     a squatter running as another (or the same) local user is trusted -> interposition
+//     is possible. This check rejects only well-known / service SIDs (SYSTEM aside,
+//     LOCAL/NETWORK SERVICE, logon and capability SIDs).
+//
+// What a squatter still cannot do: obtain the password. The client sends only the
+// literal {"cmd":"unlock"} -- no secret travels in the request. A valid password comes
+// back only from the genuine service, which decrypts its own DPAPI-protected store; a
+// squatter has no way to read it and can only return a failure. The realistic worst
+// case is therefore DENIAL OF SERVICE: face unlock fails and the user falls back to PIN.
+//
+// This check also deliberately does NOT depend on WTSQueryUserToken/session resolution,
+// which is unreliable in the LogonUI secure-desktop context (it was silently failing and
+// closing the pipe before the request was sent).
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -346,7 +364,8 @@ bool IsTrustedServerSid(const std::wstring& serverSid) {
     // Registered-CP case: the client is SYSTEM (LogonUI) and the service runs as the interactive
     // user, so neither rule above matches. Trust the server iff it is a real machine/domain user
     // account (S-1-5-21-...). See the header comment for why this does NOT resolve the session user
-    // via WTSQueryUserToken (unreliable on the secure desktop) and why anti-squatting stays server-side.
+    // via WTSQueryUserToken (unreliable on the secure desktop), and for the limits of this rule --
+    // it accepts ANY real user account, so it does not by itself exclude a cold-window squatter.
     if (IsRegularUserSid(serverSid)) return true;
     return false;
 }
