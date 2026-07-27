@@ -208,21 +208,39 @@ bool ParseObject(const std::string& json, std::map<std::string, JsonValue>& out)
     return false;
 }
 
+// Copy a top-level STRING field into `out`. A field that is absent, or present with any
+// other type, leaves `out` untouched -- callers rely on that to keep a default ("." for
+// domain) or an empty string (the gesture fields) rather than inventing a value.
+void TakeString(const std::map<std::string, JsonValue>& obj, const char* key, std::string& out) {
+    auto it = obj.find(key);
+    if (it != obj.end() && it->second.type == JsonValue::STRING) out = it->second.str;
+}
+
 }  // anonymous namespace
 
 // Parse an unlock reply. Exposed (declared in the header) so the offline unit
 // test can exercise it without a live pipe or service. Returns true only for a
 // well-formed success reply with non-empty username AND password.
-bool ParseUnlockResponse(const std::string& response,
-                         std::wstring& username,
-                         std::wstring& password,
-                         std::wstring& domain,
-                         std::string& errorOut) {
+bool ParseUnlockReply(const std::string& response, UnlockReply& out) {
     std::map<std::string, JsonValue> obj;
     if (!ParseObject(response, obj)) {
-        errorOut = "malformed-response";
+        out.reason = "malformed-response";
         return false;
     }
+
+    // Stage 7-i phase 1. Read the gesture section BEFORE branching on ok, and independently
+    // of it: the fields belong to the reply, not to a particular outcome, and a caller that
+    // sees reason "needs-gesture" must be able to tell "the service sent a challenge" from
+    // "the service sent needs-gesture but no usable token" -- which it does by finding these
+    // empty. `prompt` is display text and may be non-ASCII: the service emits it as \uXXXX
+    // (json.dumps defaults to ensure_ascii), ParseString decodes that to UTF-8, and it is
+    // widened here. `ttl_s` is deliberately NOT read -- the client owns its own phase-2
+    // timeout and must not take a duration from the wire.
+    TakeString(obj, "gesture", out.gesture);
+    TakeString(obj, "token", out.token);
+    std::string promptUtf8;
+    TakeString(obj, "prompt", promptUtf8);
+    out.prompt = Utf8ToWide(promptUtf8);
 
     auto itOk = obj.find("ok");
     bool ok = (itOk != obj.end() && itOk->second.type == JsonValue::BOOL && itOk->second.boolean);
@@ -230,7 +248,7 @@ bool ParseUnlockResponse(const std::string& response,
         std::string reason;
         auto itR = obj.find("reason");
         if (itR != obj.end() && itR->second.type == JsonValue::STRING) reason = itR->second.str;
-        errorOut = reason.empty() ? "no-match" : reason;
+        out.reason = reason.empty() ? "no-match" : reason;
         return false;
     }
 
@@ -241,18 +259,32 @@ bool ParseUnlockResponse(const std::string& response,
     const bool haveU = (itU != obj.end() && itU->second.type == JsonValue::STRING && !itU->second.str.empty());
     const bool haveP = (itP != obj.end() && itP->second.type == JsonValue::STRING && !itP->second.str.empty());
     if (!haveU || !haveP) {
-        errorOut = "malformed-response";
+        out.reason = "malformed-response";
         return false;
     }
 
     std::string d;
-    auto itD = obj.find("domain");
-    if (itD != obj.end() && itD->second.type == JsonValue::STRING) d = itD->second.str;
+    TakeString(obj, "domain", d);
 
-    username = Utf8ToWide(itU->second.str);
-    password = Utf8ToWide(itP->second.str);
-    domain   = Utf8ToWide(d.empty() ? "." : d);
+    out.username = Utf8ToWide(itU->second.str);
+    out.password = Utf8ToWide(itP->second.str);
+    out.domain   = Utf8ToWide(d.empty() ? "." : d);
     return true;
+}
+
+// Back-compat wrapper: the pre-Stage-7-i signature, unchanged in behaviour.
+bool ParseUnlockResponse(const std::string& response,
+                         std::wstring& username,
+                         std::wstring& password,
+                         std::wstring& domain,
+                         std::string& errorOut) {
+    UnlockReply r;
+    const bool ok = ParseUnlockReply(response, r);
+    username = r.username;
+    password = r.password;
+    domain   = r.domain;
+    errorOut = r.reason;
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -466,11 +498,7 @@ bool PipeCall(const std::wstring& pipeName,
     return success;
 }
 
-bool RequestUnlock(std::wstring& username,
-                   std::wstring& password,
-                   std::wstring& domain,
-                   std::string& errorOut,
-                   ServerTrust* trust) {
+bool RequestUnlock(UnlockReply& out, ServerTrust* trust) {
     const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlock";
     // 12s total: if the service is dead or the user is not visible, fail fast
     // so the user can switch to the password/PIN tile without feeling stuck.
@@ -481,10 +509,63 @@ bool RequestUnlock(std::wstring& username,
     ServerTrust* t = trust ? trust : &localTrust;
     if (!PipeCall(pipe, "{\"cmd\":\"unlock\"}", resp, kUnlockTimeoutMs, /*verifyServer=*/true, t)) {
         // Distinguish an untrusted-server refusal from a plain transport failure.
-        errorOut = (t->checked && !t->trusted) ? "server-untrusted" : "pipe-unavailable";
+        out.reason = (t->checked && !t->trusted) ? "server-untrusted" : "pipe-unavailable";
         return false;
     }
-    return ParseUnlockResponse(resp, username, password, domain, errorOut);
+    return ParseUnlockReply(resp, out);
+}
+
+namespace {
+// The phase-1 token is data we received over the pipe and are about to paste back into a
+// request document. Constrain it to what the service actually issues (hex) instead of
+// escaping: a token carrying a quote or backslash would otherwise build malformed -- or
+// attacker-shaped -- request JSON. 64 is a generous ceiling over the 32 chars in use.
+bool IsHexToken(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) {
+        const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
+    return true;
+}
+}  // anonymous namespace
+
+bool RequestUnlockGesture(const std::string& token, UnlockReply& out, ServerTrust* trust) {
+    const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlock";
+    // Deliberately NOT kUnlockTimeoutMs: phase 2 waits for a human to blink or turn their
+    // head, and the service's own round is capped well above the passive-unlock budget. A
+    // separate constant so tightening one never silently tightens the other.
+    const DWORD kGestureTimeoutMs = 15000;
+
+    if (!IsHexToken(token)) {
+        out.reason = "gesture-token-invalid";
+        return false;
+    }
+
+    std::string resp;
+    ServerTrust localTrust;
+    ServerTrust* t = trust ? trust : &localTrust;
+    const std::string req = "{\"cmd\":\"unlock_gesture\",\"token\":\"" + token + "\"}";
+    if (!PipeCall(pipe, req, resp, kGestureTimeoutMs, /*verifyServer=*/true, t)) {
+        out.reason = (t->checked && !t->trusted) ? "server-untrusted" : "pipe-unavailable";
+        return false;
+    }
+    return ParseUnlockReply(resp, out);
+}
+
+// Back-compat overload: same call, gesture fields discarded.
+bool RequestUnlock(std::wstring& username,
+                   std::wstring& password,
+                   std::wstring& domain,
+                   std::string& errorOut,
+                   ServerTrust* trust) {
+    UnlockReply r;
+    const bool ok = RequestUnlock(r, trust);
+    username = r.username;
+    password = r.password;
+    domain   = r.domain;
+    errorOut = r.reason;
+    return ok;
 }
 
 }  // namespace FaceUnlock

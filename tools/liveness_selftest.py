@@ -21,7 +21,7 @@ import numpy as np
 from face_service.liveness import (
     EYE_IDX, compute_ear, BlinkDetector, BlinkWindow, EAR_THRESH,
     Challenge, ChallengeState, LivenessChallenge,
-    POSE_PITCH, POSE_YAW, YAW_DELTA, PITCH_DOWN_DELTA, LEFT_IS_NEGATIVE_YAW,
+    POSE_PITCH, POSE_YAW, YAW_DELTA, PITCH_DOWN_DELTA,
     ScreenFeatures, is_screen_features, screen_features, HF_THRESH,
 )
 
@@ -125,8 +125,13 @@ def main():
     check("no-face frames time out cleanly", r and not p)
 
     print("\nHead-pose gesture (LivenessChallenge, forced kind):")
-    left_yaw = NEUTRAL[POSE_YAW] + (-1 if LEFT_IS_NEGATIVE_YAW else 1) * (YAW_DELTA + 10)
-    right_yaw = NEUTRAL[POSE_YAW] + (1 if LEFT_IS_NEGATIVE_YAW else -1) * (YAW_DELTA + 10)
+    # Signs are written out LITERALLY, in terms of what the user physically does, and are no
+    # longer derived from LEFT_IS_NEGATIVE_YAW. Deriving them made these checks tautological --
+    # they passed for either value of the constant, so the inverted turn directions sailed
+    # through here and were only caught on a live lock screen. Live calibration 2026-07-27:
+    # a turn to the user's OWN left reads as a POSITIVE yaw deviation on this hardware.
+    left_yaw = NEUTRAL[POSE_YAW] + (YAW_DELTA + 10)
+    right_yaw = NEUTRAL[POSE_YAW] - (YAW_DELTA + 10)
     down_pitch = NEUTRAL[POSE_PITCH] - (PITCH_DOWN_DELTA + 6)
 
     def run_pose(kind, do_move, timeout=5.0, frames_before=4, move_frames=6, extra_neutral=0):

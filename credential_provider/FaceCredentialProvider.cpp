@@ -6,9 +6,14 @@
 namespace FaceUnlock {
 
 FaceCredentialProvider::FaceCredentialProvider()
-    : m_cRef(1), m_cpus(CPUS_INVALID), m_pCred(nullptr) {}
+    : m_cRef(1), m_cpus(CPUS_INVALID), m_pCred(nullptr),
+      m_events(std::make_shared<ProviderEvents>()) {}
 
 FaceCredentialProvider::~FaceCredentialProvider() {
+    // Drop the sink before releasing the credential: LogonUI may still hold its own reference,
+    // so the credential can outlive us, and it must not call back into a dead provider. The
+    // shared holder makes that safe -- after Clear() the notify is a no-op.
+    m_events->Clear();
     if (m_pCred) { m_pCred->Release(); m_pCred = nullptr; }
 }
 
@@ -43,7 +48,7 @@ IFACEMETHODIMP FaceCredentialProvider::SetUsageScenario(CREDENTIAL_PROVIDER_USAG
         case CPUS_UNLOCK_WORKSTATION:
             m_cpus = cpus;
             if (!m_pCred) {
-                m_pCred = new (std::nothrow) FaceCredential();
+                m_pCred = new (std::nothrow) FaceCredential(m_events);
                 if (!m_pCred) return E_OUTOFMEMORY;
                 HRESULT hr = m_pCred->Initialize(cpus);
                 if (FAILED(hr)) { m_pCred->Release(); m_pCred = nullptr; return hr; }
@@ -57,8 +62,18 @@ IFACEMETHODIMP FaceCredentialProvider::SetUsageScenario(CREDENTIAL_PROVIDER_USAG
 IFACEMETHODIMP FaceCredentialProvider::SetSerialization(const CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION*) {
     return E_NOTIMPL;
 }
-IFACEMETHODIMP FaceCredentialProvider::Advise(ICredentialProviderEvents*, UINT_PTR) { return E_NOTIMPL; }
-IFACEMETHODIMP FaceCredentialProvider::UnAdvise() { return E_NOTIMPL; }
+// Stage 7-i: the gesture round is asynchronous, so we now need the provider-level sink --
+// it is the only way a worker thread can tell LogonUI "re-enumerate, I have a credential".
+// The sink is kept in a shared, mutex-guarded holder (see FaceCredential.h) rather than a
+// bare member, because the credential's worker reads it from another thread.
+IFACEMETHODIMP FaceCredentialProvider::Advise(ICredentialProviderEvents* pcpe, UINT_PTR upAdviseContext) {
+    m_events->Set(pcpe, upAdviseContext);
+    return S_OK;
+}
+IFACEMETHODIMP FaceCredentialProvider::UnAdvise() {
+    m_events->Clear();
+    return S_OK;
+}
 
 IFACEMETHODIMP FaceCredentialProvider::GetFieldDescriptorCount(DWORD* pdwCount) {
     *pdwCount = FIELD_COUNT;
@@ -89,7 +104,12 @@ IFACEMETHODIMP FaceCredentialProvider::GetCredentialCount(DWORD* pdwCount, DWORD
     // submit arrow — saving wear on the camera and avoiding false-attempt
     // counters from racking up while the workstation sits idle.
     *pdwDefault = 0;
-    *pbAutoLogonWithDefault = FALSE;
+    // ...with ONE exception (Stage 7-i): this enumeration is the one CredentialsChanged just
+    // asked for because a scan finished and credentials are waiting. Auto-logging on here is
+    // what turns "the face/gesture round succeeded" into an actual sign-in without a second
+    // click. HasResult() is false in every other enumeration, including the first one, so the
+    // idle lock screen still never fires the camera by itself.
+    *pbAutoLogonWithDefault = (m_pCred && m_pCred->HasResult()) ? TRUE : FALSE;
     return S_OK;
 }
 

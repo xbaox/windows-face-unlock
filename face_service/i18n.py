@@ -271,6 +271,15 @@ _EN: dict[str, str] = {
     "enroll.guide.build_failed": "Building embeddings failed. See the details in the dialog.",
     "enroll.build.failed": "Not enough shots passed quality control.\n\nRejected: {why}\n\nRe-capture with steady focus, your face filling the oval, and even lighting.",
 
+    # ---- Lock-screen gesture prompts (Stage 7-i) ----
+    # Shown on the Credential Provider tile while it waits for the active gesture, so they must
+    # be short enough for a small-text field and readable at a glance. Key suffix == the wire
+    # `gesture` value (liveness.Challenge member, lowercased).
+    "gesture.prompt.blink": "Blink now",
+    "gesture.prompt.turn_left": "Turn your head left",
+    "gesture.prompt.turn_right": "Turn your head right",
+    "gesture.prompt.nod": "Nod your head",
+
     # ---- Language names (native) ----
     "lang.vi": "Tiếng Việt",
     "lang.en": "English",
@@ -1136,6 +1145,11 @@ _RU: dict[str, str] = {
     "notify.lockout": "Слишком много неудачных попыток входа лицом — вход лицом заблокирован на {s} с. PIN и пароль работают.",
     "notify.service_down": "Сервис FaceService недоступен — проверки присутствия и вход лицом не работают.",
     "notify.service_up": "Сервис FaceService снова доступен.",
+
+    "gesture.prompt.blink": "Моргни",
+    "gesture.prompt.turn_left": "Поверни голову влево",
+    "gesture.prompt.turn_right": "Поверни голову вправо",
+    "gesture.prompt.nod": "Кивни головой",
 
     "lang.vi": "Вьетнамский",
     "lang.en": "Английский",
