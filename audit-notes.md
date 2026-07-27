@@ -426,7 +426,7 @@ MASTER §3 предписывает **PySide6**; визард и трей жив
 
 ## Этап 7-i — жест-раунд в Credential Provider — DONE ✅
 
-> Ветка `stage7i-gesture` — **4 рабочих коммита**, влита в `master` **--no-ff**, merge `<MERGE>`. Дата closeout: 2026-07-27.
+> Ветка `stage7i-gesture` — **4 рабочих коммита**, влита в `master` **--no-ff**, merge `231ca39`. Дата closeout: 2026-07-27.
 > `89aaf86` — сервер: дискриминатор `needs-gesture` + команда `unlock_gesture`.
 > `8cbbef2` — парсер CP: `UnlockReply` + 12 кейсов (базовые 16 побайтово те же).
 > `cdbc4d9` — async CP (вариант А): воркер, `CredentialsChanged`, selected-гейт публикации.
