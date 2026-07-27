@@ -1,18 +1,139 @@
-# Copy this to %USERPROFILE%\.face-unlock\config.toml and edit.
+# Face Unlock -- reference configuration.
+#
+# Copy this file to %USERPROFILE%\.face-unlock\config.toml and edit what you
+# need. Every key below is optional: anything you delete falls back to the
+# default shown here, and unknown keys are ignored. If the file is missing
+# entirely, the service runs on these exact values.
+#
+# The values here ARE the defaults in face_service/config.py -- that pairing is
+# enforced by tools/config_example_selftest.py, so this file cannot silently
+# drift from the code. Keep it flat: the groups below are comments, not TOML
+# tables ([section] headers would nest the keys and stop them loading).
+#
+# Restart the service and the tray after editing:
+#     powershell -ExecutionPolicy Bypass -File tools\clean_restart.ps1
 
-model_name = "ArcFace"          # DeepFace model: ArcFace, Facenet512, VGG-Face, ...
-detector_backend = "opencv"     # opencv, retinaface, mtcnn, yunet, ssd
-distance_metric = "cosine"
-threshold = 0.45                # cosine distance; lower = stricter. Tune per camera.
-anti_spoofing = true
 
-camera_index = 0
-verify_frames = 5               # frames captured per verify
-verify_required = 3             # matches needed out of verify_frames
+# --- Recognition -------------------------------------------------------------
+# Engine is InsightFace buffalo_l (ONNX ArcFace embeddings); detection is YuNet.
+# Neither is selectable from config -- there is no model/backend knob.
 
-presence_interval_s = 60        # 1 minute
-presence_absent_strikes = 2     # lock after N consecutive absent ticks
-presence_mode = "recognition"   # "recognition" (DeepFace must match enrolled)
-                                # or "detection" (YuNet any-face-in-frame)
+distance_metric = "cosine"       # embedding distance function
+threshold = 0.32                 # cosine distance cutoff; LOWER = stricter.
+                                 # Measured on the reference webcam: genuine
+                                 # self <= ~0.12, impostor >= ~0.97. Do not
+                                 # raise this without re-measuring both ends.
 
-warmup_on_start = true
+# --- Camera ------------------------------------------------------------------
+
+camera_index = 0                 # OpenCV VideoCapture index; try 1 or 2 if you
+                                 # have several cameras
+camera_warmup_frames = 10        # frames discarded after opening, so auto-
+                                 # exposure has settled before the first capture
+persistent_camera = true         # true  = keep the device open between requests
+                                 #         (~0.9 s verify, LED stays on)
+                                 # false = open per request (~3 s verify, LED
+                                 #         only lights while verifying)
+camera_open_retries = 2          # extra open attempts before reporting the
+                                 # camera as busy (held by another app)
+camera_open_timeout_s = 3.0      # wall-clock budget for that whole retry loop
+
+# --- Unlock ------------------------------------------------------------------
+
+verify_frames = 5                # frames captured per unlock attempt
+verify_required = 2              # of those, how many must pass the threshold
+warmup_on_start = true           # preload models when the service starts, so
+                                 # the first unlock is not the slow one
+
+# --- Liveness ----------------------------------------------------------------
+# Active challenge (blink / head gesture) built on InsightFace landmarks.
+
+liveness_mode = "fast"           # "fast"     = challenge only when the match is
+                                 #              in doubt
+                                 # "paranoid" = challenge on every unlock
+challenge_on_doubt = true        # fast mode: on doubt, escalate to a gesture
+                                 # instead of denying outright
+blink_timeout_s = 4.0            # window for observing a spontaneous blink
+anti_screen = true               # passive replay check (moire / glare of a
+                                 # display held up to the camera)
+
+# --- Lockout and audit -------------------------------------------------------
+
+max_face_attempts = 5            # consecutive face failures before a temporary
+                                 # face lockout. PIN and password keep working.
+lockout_seconds = 300            # how long that lockout lasts
+audit_log = true                 # write one JSONL record per verify / unlock /
+                                 # challenge to %USERPROFILE%\.face-unlock\audit.jsonl
+audit_max_mb = 5.0               # rotate the audit file past this size (2 backups)
+
+# --- Enrollment quality gates ------------------------------------------------
+# Applied per captured frame at enroll time; bad frames are dropped, not stored.
+
+enroll_min_det_score = 0.65      # reject faces the detector is unsure about
+enroll_min_sharpness = 80.0      # blur floor (variance of Laplacian on the crop)
+enroll_luma_min = 55.0           # reject under-exposed crops
+enroll_luma_max = 210.0          # reject blown-out crops
+enroll_min_frames = 3            # fewer surviving frames than this = enroll fails
+
+# --- Adaptive gallery (off by default) ---------------------------------------
+# Lets the gallery follow slow appearance drift. It MUTATES your enrollment, so
+# it is opt-in, and it refuses to run with anti_screen = false.
+
+adaptive_gallery = false         # master toggle
+adaptive_margin = 0.17           # only adapt when distance to the ENROLLMENT
+                                 # baseline <= threshold - this. Must stay below
+                                 # threshold, and widening it moves the ceiling
+                                 # toward replay distance -- keep it tight.
+adaptive_max_size = 10           # cap on stored adaptive embeddings (FIFO)
+adaptive_cooldown_s = 1800.0     # minimum seconds between two adaptations
+
+# --- Low light ---------------------------------------------------------------
+
+low_light_luma_min = 45.0        # below this SCENE luma an unlock is refused as
+                                 # "too dark" rather than trusted. This refusal
+                                 # is lockout-neutral. 0 disables the gate.
+low_light_boost = true           # before refusing, try one exposure bump and
+                                 # re-capture; exposure is always restored
+low_light_exposure_step = 2.0    # EV added to CAP_PROP_EXPOSURE when boosting
+                                 # (driver units; positive = brighter here)
+
+# --- Watchdog ----------------------------------------------------------------
+# The FaceUnlock-Watchdog task pings the service and restarts it if it hangs.
+
+watchdog_ping_timeout_s = 2.0    # per-ping budget; a hung server counts as a fail
+watchdog_fail_threshold = 3      # consecutive failures before a restart
+watchdog_interval_s = 30.0       # seconds between pings
+watchdog_pause_ttl_s = 300.0     # a deliberate shutdown pauses the watchdog for
+                                 # this long, then the pause self-expires
+
+# --- Named-pipe perimeter ----------------------------------------------------
+# Leave these on unless you are debugging the pipe itself.
+
+pipe_hardened_sd = true          # explicit pipe DACL (SELF + SYSTEM only) plus a
+                                 # medium integrity label, instead of a NULL DACL
+pipe_first_instance = true       # refuse to start if the pipe name is already
+                                 # taken, and verify the server SID client-side
+pipe_unlock_require_system = true # only a SYSTEM caller (the lock-screen
+                                 # Credential Provider) may invoke unlock
+
+# --- Presence auto-lock ------------------------------------------------------
+
+auto_lock = true                 # false = observe only: strikes are counted and
+                                 # shown in Status, but the workstation is never
+                                 # locked. Face sign-in works either way.
+presence_mode = "recognition"    # "recognition" = the enrolled face must match
+                                 # "detection"   = any face in frame is enough
+presence_interval_s = 60         # seconds between presence probes
+presence_absent_strikes = 2      # consecutive absent probes before locking
+
+# --- Notifications -----------------------------------------------------------
+
+notify_enroll = true             # toast on enrollment success / failure
+notify_lockout = true            # toast when a face lockout starts
+notify_service_state = false     # toast when the service becomes (un)reachable
+
+# --- Interface ---------------------------------------------------------------
+
+language = "en"                  # UI language code. Default: auto-detected from
+                                 # the system locale on first run. Supported:
+                                 # ar de en es fr hi ja ko pt ru vi zh

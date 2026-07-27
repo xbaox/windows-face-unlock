@@ -22,12 +22,13 @@ $py = "$root\.venv\Scripts\python.exe"
 & $py -m pip install -r "$root\requirements.txt"
 
 # 2. config
+# Only the data directory is created. The config file is deliberately NOT
+# seeded from config.example.toml: with no config.toml the service runs on the
+# defaults compiled into face_service/config.py, whereas a copied example
+# freezes whatever values that file happened to carry at install time -- which
+# is exactly how a stale example became a live behaviour change before.
 $home_cfg = Join-Path $env:USERPROFILE ".face-unlock"
 if (-not (Test-Path $home_cfg)) { New-Item -ItemType Directory -Path $home_cfg | Out-Null }
-if (-not (Test-Path "$home_cfg\config.toml")) {
-    Copy-Item "$root\config.example.toml" "$home_cfg\config.toml"
-    Write-Host "Wrote default config to $home_cfg\config.toml"
-}
 
 if ($SkipAutostart) { Write-Host "Skipping autostart registration."; return }
 
@@ -53,3 +54,7 @@ Write-Host "Next steps:" -ForegroundColor Yellow
 Write-Host "  1. $py -m tools.enroll capture --count 15"
 Write-Host "  2. $py -m tools.set_password"
 Write-Host "  3. (Optional) Build + register the C++ Credential Provider - see credential_provider\README.md"
+Write-Host ""
+Write-Host "Defaults are built in - no config file is needed to run."
+Write-Host "To customise, copy config.example.toml to $home_cfg\config.toml and edit it;"
+Write-Host "every key is optional and anything you leave out keeps its default."
