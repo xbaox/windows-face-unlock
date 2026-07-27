@@ -33,21 +33,10 @@ if (-not (Test-Path $home_cfg)) { New-Item -ItemType Directory -Path $home_cfg |
 if ($SkipAutostart) { Write-Host "Skipping autostart registration."; return }
 
 # 3. Task Scheduler entries
-$pyw = "$root\.venv\Scripts\pythonw.exe"  # windowed (no console) variant
-function Register-LogonTask {
-    param([string]$Name, [string]$Script)
-    $action  = New-ScheduledTaskAction -Execute $pyw -Argument "-m $Script" -WorkingDirectory $root
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-    $prins   = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-    # -ExecutionTimeLimit ([TimeSpan]::Zero) serialises to PT0S = "no limit". Without it the task
-    # takes the Windows default of PT72H and the scheduler kills these always-on tasks after 3 days.
-    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero)
-    Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Principal $prins -Settings $set -Force | Out-Null
-    Write-Host "Registered task (hidden, pythonw, no time limit): $Name"
-}
-
-Register-LogonTask -Name "FaceUnlock-Service"  -Script "face_service"
-Register-LogonTask -Name "FaceUnlock-Presence" -Script "presence_monitor"
+# Delegated to the single registrar: the task list lives in tools\tasks.psd1 and
+# the trigger/principal/settings are defined once in tools\register_tasks.ps1,
+# so setup and the installer cannot drift apart.
+& "$root\tools\register_tasks.ps1" -Mode Dev -Action Register
 
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow

@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER_DIR = REPO_ROOT / "installer"
 CP_DIR = REPO_ROOT / "credential_provider"          # C++ sources
 CP_BUILD_DIR = REPO_ROOT / "build-cp"               # CMake tree for the CP DLL
+TOOLS_DIR = REPO_ROOT / "tools"
 DIST_DIR = REPO_ROOT / "dist"
 BUILD_DIR = REPO_ROOT / "build"                     # PyInstaller work dir, unrelated to CP
 OUTPUT_DIR = REPO_ROOT / "installer_output"
@@ -95,7 +96,7 @@ def step_pyinstaller() -> Path:
 
 
 def step_stage(dist_root: Path, cp_dll: Path | None) -> None:
-    log("step 4/6 — stage CP DLL + docs into dist")
+    log("step 4/6 — stage CP DLL + task registrar + docs into dist")
     if cp_dll and cp_dll.exists():
         dest = dist_root / "credential_provider"
         dest.mkdir(parents=True, exist_ok=True)
@@ -104,6 +105,19 @@ def step_stage(dist_root: Path, cp_dll: Path | None) -> None:
         reg = CP_DIR / "register.ps1"
         if reg.exists():
             shutil.copy2(reg, dest / "register.ps1")
+
+    # Scheduled-task registrar + its declaration. installer.iss invokes this on
+    # install AND on uninstall, and tasks.psd1 is the only place the task list
+    # exists, so the two must travel together or neither is usable. Missing
+    # files are fatal: an installer that cannot register its tasks is not one.
+    post = dist_root / "postinstall"
+    post.mkdir(parents=True, exist_ok=True)
+    for name in ("register_tasks.ps1", "tasks.psd1"):
+        src = TOOLS_DIR / name
+        if not src.exists():
+            raise RuntimeError(f"cannot stage the task registrar: {src} is missing")
+        shutil.copy2(src, post / name)
+
     for doc in ("README.md", "LICENSE", "INSTALL.md"):
         p = REPO_ROOT / doc
         if p.exists():

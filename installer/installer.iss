@@ -10,7 +10,9 @@
 #define MyAppPublisher "Cao Chi Tam"
 #define MyAppURL "https://github.com/caochitam/windows-face-unlock"
 #define MyAppExeName "face_unlock_tray.exe"
-#define MyServiceExe "face_service.exe"
+; NOTE: the service/watchdog executables are deliberately NOT defined here.
+; Scheduled tasks are declared once, in postinstall\tasks.psd1, and this script
+; never names them -- see [Run] / [UninstallRun].
 #define BuildRoot "..\dist\WindowsFaceUnlock"
 
 [Setup]
@@ -48,13 +50,11 @@ Name: "english";  MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "cp"; Description: "Register the Credential Provider (enables log-in with your face)"; \
   Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); GroupDescription: "Optional components"; Flags: unchecked
-Name: "startuptray"; Description: "Start the Face Unlock tray at sign-in"; GroupDescription: "Windows integration"
 
 [Files]
-; The whole PyInstaller output. Inno Setup will recurse.
+; The whole PyInstaller output, which already includes postinstall\ (the task
+; registrar and its declaration, staged there by installer/build.py step 4).
 Source: "{#BuildRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
-; Post-install scripts (task registration etc.) invoked from [Run].
-Source: "postinstall\register_tasks.ps1"; DestDir: "{app}\postinstall"; Flags: ignoreversion
 
 [Dirs]
 ; Writable log/config dir in per-user profile — created on first run anyway,
@@ -64,7 +64,6 @@ Name: "{userappdata}\..\.face-unlock"; Permissions: users-modify
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\{#MyAppName} — Uninstall"; Filename: "{uninstallexe}"
-Name: "{autostartmenu}\Programs\{#MyAppName}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 
 [Registry]
 ; Used by the auto-updater fallback + uninstaller UI.
@@ -76,24 +75,23 @@ Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: 
 Filename: "regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
   Tasks: cp; StatusMsg: "Registering Credential Provider…"; Flags: runhidden
 
-; 2. Create scheduled tasks pointing to the installed executables.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Service ""{app}\{#MyServiceExe}"" -Tray ""{app}\{#MyAppExeName}"""; \
+; 2. Create AND start the scheduled tasks. Task names, executables and settings
+;    all come from postinstall\tasks.psd1 -- this script does not name them, so
+;    adding or removing a task never needs an installer edit. Register also
+;    starts what it registered, which is why there are no schtasks /Run lines.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Register"; \
   StatusMsg: "Registering scheduled tasks…"; Flags: runhidden
 
-; 3. Kick off the tray right away so the user has the systray icon.
-Filename: "schtasks.exe"; Parameters: "/Run /TN ""\FaceUnlock-Service"""; Flags: runhidden skipifsilent
-Filename: "schtasks.exe"; Parameters: "/Run /TN ""\FaceUnlock-Presence"""; Flags: runhidden skipifsilent
-
-; 4. Post-install: if we started under SILENT (autoupdate), re-launch the tray.
+; 3. Post-install: offer to bring the tray window up (it is already running).
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \
   Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Stop and delete scheduled tasks first so files aren't held open.
-Filename: "schtasks.exe"; Parameters: "/End    /TN ""\FaceUnlock-Presence"""; Flags: runhidden
-Filename: "schtasks.exe"; Parameters: "/End    /TN ""\FaceUnlock-Service"""; Flags: runhidden
-Filename: "schtasks.exe"; Parameters: "/Delete /TN ""\FaceUnlock-Presence"" /F"; Flags: runhidden
-Filename: "schtasks.exe"; Parameters: "/Delete /TN ""\FaceUnlock-Service""  /F"; Flags: runhidden
+; Stop and delete the scheduled tasks first so files aren't held open. This
+; walks the SAME postinstall\tasks.psd1 the install used, so a task can never be
+; created by one path and left behind by the other.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Unregister"; \
+  Flags: runhidden
 ; Unregister the Credential Provider if it was installed.
 Filename: "regsvr32.exe"; Parameters: "/u /s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
   Flags: runhidden; Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll'))

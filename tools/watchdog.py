@@ -13,7 +13,9 @@ is gone -- starting on a blind delay races a slow-dying process into a mutex-los
 service that never answers ping (e.g. wedged in a long camera open) is what this catches; a per-ping
 timeout means "no answer" counts as a failure.
 
-Deployed as the Scheduled Task FaceUnlock-Watchdog (see tools/register_watchdog_task.ps1).
+Deployed as the Scheduled Task FaceUnlock-Watchdog, declared in tools/tasks.psd1 and created by
+tools/register_tasks.ps1. DEV LAYOUT ONLY for now: the match below is Name='pythonw.exe', which
+never matches an installed face_service.exe, so the declaration skips this task in Installed mode.
 Run: python -m tools.watchdog
 """
 from __future__ import annotations
