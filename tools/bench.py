@@ -33,8 +33,7 @@ def stats(xs):
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     cfg = Config.load()
-    print(f"config: threshold={cfg.threshold} anti_spoofing={cfg.anti_spoofing} "
-          f"detector={cfg.detector_backend}")
+    print(f"config: threshold={cfg.threshold}")
 
     rec = Recognizer(cfg)
     if not rec.load():

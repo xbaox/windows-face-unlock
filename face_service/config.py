@@ -39,14 +39,11 @@ def _default_language() -> str:
 
 @dataclass
 class Config:
-    model_name: str = "ArcFace"
-    detector_backend: str = "yunet"  # yunet is fast + robust. Alternatives: opencv, retinaface
     distance_metric: str = "cosine"
     threshold: float = 0.32          # ArcFace cosine. Set from Stage-9 measurements on this
                                      # webcam: genuine (self) max ~0.12 over 40 varied frames,
                                      # impostor min ~0.97 -> huge gap; 0.32 keeps self headroom
                                      # (~2.6x) while staying far below any impostor.
-    anti_spoofing: bool = True
     camera_index: int = 0
     camera_warmup_frames: int = 10   # discard N frames after opening for auto-exposure
     persistent_camera: bool = True   # keep VideoCapture open between requests

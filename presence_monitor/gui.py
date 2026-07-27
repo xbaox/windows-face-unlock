@@ -52,7 +52,6 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, object]]]] = [
         ("verify_required",         "int",        (1, 30)),
     ]),
     ("section.liveness", [
-        ("anti_spoofing",           "bool",       None),
         ("liveness_mode",           "combo",      LIVENESS_MODES),
         ("anti_screen",             "bool",       None),
         ("max_face_attempts",       "int",        (1, 20)),
