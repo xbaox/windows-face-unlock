@@ -1,10 +1,11 @@
 #pragma once
 #include <windows.h>
 #include <credentialprovider.h>
+#include <memory>
+
+#include "FaceCredential.h"
 
 namespace FaceUnlock {
-
-class FaceCredential;
 
 class FaceCredentialProvider : public ICredentialProvider {
 public:
@@ -30,6 +31,9 @@ private:
     LONG m_cRef;
     CREDENTIAL_PROVIDER_USAGE_SCENARIO m_cpus;
     FaceCredential* m_pCred;
+    // Shared with the credential so its worker thread can request a re-enumeration without
+    // holding a pointer to this provider (the credential may outlive it -- see FaceCredential.h).
+    std::shared_ptr<ProviderEvents> m_events;
 };
 
 }  // namespace FaceUnlock

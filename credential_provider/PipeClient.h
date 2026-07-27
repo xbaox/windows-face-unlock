@@ -53,6 +53,16 @@ bool PipeCall(const std::wstring& pipeName,
 // phase-1 challenge). `trust`, if non-null, receives the identity-check outcome.
 bool RequestUnlock(UnlockReply& out, ServerTrust* trust = nullptr);
 
+// Stage 7-i phase 2: replay the token from a "needs-gesture" reply so the service runs the
+// identity-bound gesture round, and collect the credentials it grants. Verifies the server
+// identity exactly like RequestUnlock. Bounded by its OWN, longer timeout: the round waits on
+// a human, so the passive-unlock budget does not apply. `token` must be hex (that is what the
+// service issues); anything else is refused locally with reason "gesture-token-invalid" rather
+// than being pasted into the request JSON.
+bool RequestUnlockGesture(const std::string& token,
+                          UnlockReply& out,
+                          ServerTrust* trust = nullptr);
+
 // Back-compat overload: the pre-Stage-7-i signature, kept so the diagnostic harness and
 // existing callers need no change. Thin wrapper over the UnlockReply form; the gesture
 // fields are simply dropped.

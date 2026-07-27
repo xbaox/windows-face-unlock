@@ -515,6 +515,44 @@ bool RequestUnlock(UnlockReply& out, ServerTrust* trust) {
     return ParseUnlockReply(resp, out);
 }
 
+namespace {
+// The phase-1 token is data we received over the pipe and are about to paste back into a
+// request document. Constrain it to what the service actually issues (hex) instead of
+// escaping: a token carrying a quote or backslash would otherwise build malformed -- or
+// attacker-shaped -- request JSON. 64 is a generous ceiling over the 32 chars in use.
+bool IsHexToken(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) {
+        const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
+    return true;
+}
+}  // anonymous namespace
+
+bool RequestUnlockGesture(const std::string& token, UnlockReply& out, ServerTrust* trust) {
+    const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlock";
+    // Deliberately NOT kUnlockTimeoutMs: phase 2 waits for a human to blink or turn their
+    // head, and the service's own round is capped well above the passive-unlock budget. A
+    // separate constant so tightening one never silently tightens the other.
+    const DWORD kGestureTimeoutMs = 15000;
+
+    if (!IsHexToken(token)) {
+        out.reason = "gesture-token-invalid";
+        return false;
+    }
+
+    std::string resp;
+    ServerTrust localTrust;
+    ServerTrust* t = trust ? trust : &localTrust;
+    const std::string req = "{\"cmd\":\"unlock_gesture\",\"token\":\"" + token + "\"}";
+    if (!PipeCall(pipe, req, resp, kGestureTimeoutMs, /*verifyServer=*/true, t)) {
+        out.reason = (t->checked && !t->trusted) ? "server-untrusted" : "pipe-unavailable";
+        return false;
+    }
+    return ParseUnlockReply(resp, out);
+}
+
 // Back-compat overload: same call, gesture fields discarded.
 bool RequestUnlock(std::wstring& username,
                    std::wstring& password,
