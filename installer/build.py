@@ -10,8 +10,9 @@ Runs these steps in order (skipping anything already done):
 
 Intended to run both locally and in CI. Environment:
     INNO_SETUP_ISCC — full path to ISCC.exe (default: search PATH)
-    SKIP_CP        — set to 1 to skip the C++ DLL (weak default when
-                     Visual Studio + CMake aren't available)
+    SKIP_CP        — set to 1 to build a presence-auto-lock-only installer
+                     with no Credential Provider. This is the ONLY way to
+                     skip the DLL; a failing CP build aborts the run.
 """
 from __future__ import annotations
 import hashlib
@@ -23,9 +24,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER_DIR = REPO_ROOT / "installer"
-CP_DIR = REPO_ROOT / "credential_provider"
+CP_DIR = REPO_ROOT / "credential_provider"          # C++ sources
+CP_BUILD_DIR = REPO_ROOT / "build-cp"               # CMake tree for the CP DLL
 DIST_DIR = REPO_ROOT / "dist"
-BUILD_DIR = REPO_ROOT / "build"
+BUILD_DIR = REPO_ROOT / "build"                     # PyInstaller work dir, unrelated to CP
 OUTPUT_DIR = REPO_ROOT / "installer_output"
 
 
@@ -48,25 +50,31 @@ def step_download_weights() -> None:
 
 
 def step_build_cp() -> Path | None:
+    """Build the Credential Provider DLL into build-cp/ (repo root).
+
+    Two deliberate properties:
+
+    * The tree is build-cp/ at the repo root, never a subdirectory of the
+      sources. build-cp/ is what LogonUI's registered CLSID actually points at,
+      and it is NOT wiped first: a build script has no business deleting the
+      DLL the lock screen is currently loading. CMake rebuilds incrementally.
+    * A CP build failure is fatal. It used to be swallowed, so a broken
+      toolchain silently produced an installer whose face tile could never
+      appear. Opting out is now explicit and only via SKIP_CP=1.
+    """
     if os.environ.get("SKIP_CP") == "1":
         log("step 2/6 — skipping Credential Provider DLL (SKIP_CP=1)")
         return None
     log("step 2/6 — build Credential Provider DLL")
-    build_path = CP_DIR / "build"
-    if build_path.exists():
-        shutil.rmtree(build_path, ignore_errors=True)
-    try:
-        run(["cmake", "-B", "build", "-A", "x64", "-G", "Visual Studio 17 2022"],
-            cwd=CP_DIR)
-        run(["cmake", "--build", "build", "--config", "Release"], cwd=CP_DIR)
-    except subprocess.CalledProcessError as e:
-        log(f"CP build failed ({e}); continuing without it. "
-            "Installer will mark CP component as missing.")
-        return None
-    dll = build_path / "Release" / "FaceCredentialProvider.dll"
+    run(["cmake", "-S", CP_DIR.name, "-B", CP_BUILD_DIR.name, "-A", "x64",
+         "-G", "Visual Studio 17 2022"], cwd=REPO_ROOT)
+    run(["cmake", "--build", CP_BUILD_DIR.name, "--config", "Release"], cwd=REPO_ROOT)
+    dll = CP_BUILD_DIR / "Release" / "FaceCredentialProvider.dll"
     if not dll.exists():
-        log(f"CP DLL not found at {dll}; skipping")
-        return None
+        raise RuntimeError(
+            f"cmake reported success but {dll} is missing. Set SKIP_CP=1 to build "
+            "a presence-auto-lock-only installer on purpose."
+        )
     return dll
 
 

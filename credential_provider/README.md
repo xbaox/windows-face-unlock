@@ -15,12 +15,16 @@ Prerequisites:
 - Windows SDK 10 (any recent version)
 
 ```powershell
-cd credential_provider
-cmake -B build -A x64
-cmake --build build --config Release
+# from the repo root
+cmake -S credential_provider -B build-cp -A x64
+cmake --build build-cp --config Release
 ```
 
-Output: `build\Release\FaceCredentialProvider.dll`.
+Output: `build-cp\Release\FaceCredentialProvider.dll`.
+
+That path is not arbitrary: it is the tree the registered CLSID points at, so
+LogonUI loads exactly what you just built. Build here and nowhere else, and do
+not delete `build-cp\` — it holds the live DLL, not disposable output.
 
 ## Register (Administrator PowerShell)
 
