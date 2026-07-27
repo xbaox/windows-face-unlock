@@ -1,12 +1,11 @@
 """End-to-end installer build.
 
-Runs these steps in order (skipping anything already done):
-  1. download model weights (DeepFace ArcFace, MiniFASNet v2 + v1SE)
-  2. build the Credential Provider DLL via CMake (Release x64)
-  3. run PyInstaller on installer/windows_face_unlock.spec
-  4. stage the CP DLL + README + license into the PyInstaller dist folder
-  5. compile installer/installer.iss with Inno Setup
-  6. emit SHA-256 checksums next to the installer
+Runs these steps in order:
+  1. build the Credential Provider DLL via CMake (Release x64) into build-cp/
+  2. run PyInstaller on installer/windows_face_unlock.spec
+  3. stage the CP DLL, the task registrar and the docs into the dist folder
+  4. compile installer/installer.iss with Inno Setup
+  5. emit SHA-256 checksums next to the installer
 
 Intended to run both locally and in CI. Environment:
     INNO_SETUP_ISCC — full path to ISCC.exe (default: search PATH)
@@ -45,11 +44,6 @@ def python_exe() -> str:
     return sys.executable
 
 
-def step_download_weights() -> None:
-    log("step 1/6 — download model weights")
-    run([python_exe(), str(INSTALLER_DIR / "download_weights.py")], cwd=REPO_ROOT)
-
-
 def step_build_cp() -> Path | None:
     """Build the Credential Provider DLL into build-cp/ (repo root).
 
@@ -64,9 +58,9 @@ def step_build_cp() -> Path | None:
       appear. Opting out is now explicit and only via SKIP_CP=1.
     """
     if os.environ.get("SKIP_CP") == "1":
-        log("step 2/6 — skipping Credential Provider DLL (SKIP_CP=1)")
+        log("step 1/5 — skipping Credential Provider DLL (SKIP_CP=1)")
         return None
-    log("step 2/6 — build Credential Provider DLL")
+    log("step 1/5 — build Credential Provider DLL")
     run(["cmake", "-S", CP_DIR.name, "-B", CP_BUILD_DIR.name, "-A", "x64",
          "-G", "Visual Studio 17 2022"], cwd=REPO_ROOT)
     run(["cmake", "--build", CP_BUILD_DIR.name, "--config", "Release"], cwd=REPO_ROOT)
@@ -80,7 +74,7 @@ def step_build_cp() -> Path | None:
 
 
 def step_pyinstaller() -> Path:
-    log("step 3/6 — PyInstaller")
+    log("step 2/5 — PyInstaller")
     for d in (DIST_DIR, BUILD_DIR):
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
@@ -96,7 +90,7 @@ def step_pyinstaller() -> Path:
 
 
 def step_stage(dist_root: Path, cp_dll: Path | None) -> None:
-    log("step 4/6 — stage CP DLL + task registrar + docs into dist")
+    log("step 3/5 — stage CP DLL + task registrar + docs into dist")
     if cp_dll and cp_dll.exists():
         dest = dist_root / "credential_provider"
         dest.mkdir(parents=True, exist_ok=True)
@@ -149,7 +143,7 @@ def _find_iscc() -> str:
 
 
 def step_inno() -> Path:
-    log("step 5/6 — Inno Setup")
+    log("step 4/5 — Inno Setup")
     iscc = _find_iscc()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     run([iscc, str(INSTALLER_DIR / "installer.iss")], cwd=REPO_ROOT)
@@ -161,7 +155,7 @@ def step_inno() -> Path:
 
 
 def step_checksums(installer_path: Path) -> None:
-    log("step 6/6 — SHA-256 checksums")
+    log("step 5/5 — SHA-256 checksums")
     h = hashlib.sha256()
     with installer_path.open("rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -174,7 +168,6 @@ def step_checksums(installer_path: Path) -> None:
 
 
 def main() -> int:
-    step_download_weights()
     cp_dll = step_build_cp()
     dist_root = step_pyinstaller()
     step_stage(dist_root, cp_dll)

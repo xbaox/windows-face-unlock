@@ -1,0 +1,13 @@
+# Build-time only. Deliberately NOT in the repo-root requirements.txt: nothing
+# here is imported by the service, the tray or the tools at runtime, and adding
+# PyInstaller to the runtime set would put a packaging tool on every dev box and
+# in every venv that only wants to run the thing.
+#
+# Install alongside the runtime deps, not instead of them:
+#     pip install -r requirements.txt
+#     pip install -r installer/requirements-build.txt
+#
+# PyInstaller is pinned because spec behaviour (collect_* helpers, MERGE, the
+# bootloader) changes between minor releases and a silent bump would change what
+# ships. Bump deliberately, then rebuild and re-test the installer.
+pyinstaller==6.11.1
