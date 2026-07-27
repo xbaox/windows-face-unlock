@@ -10,13 +10,28 @@ Commands:
       -> {"ok":true,"match":bool,"distance":float,"real":bool}
   {"cmd":"unlock"}             # verify + return credentials on success
       -> {"ok":true,"username":"...","password":"...","domain":"..."}  (on match)
+      -> {"ok":false,"reason":"needs-gesture","gesture":"blink|turn_left|turn_right|nod",
+          "prompt":str,"token":"<32 hex>","ttl_s":float,"distance":float,"real":bool}
+                               # Stage 7-i phase 1: recognized, but liveness wants an ACTIVE
+                               # gesture -> answer with `unlock_gesture` carrying the token.
       -> {"ok":false,"reason":"..."}   # "no-match" | "no-credentials" | "locked-out" (+retry_after_s)
+                                       # | "not-authorized" | "camera-busy" | "too-dark"
+  {"cmd":"unlock_gesture","token":"<32 hex>"}   # Stage 7-i phase 2: run the gesture phase 1
+                               # asked for; credentials only if it is performed BY THE FACE
+                               # THAT MATCHED (non-matching frames are dropped, not fed).
+      -> {"ok":true,"username":"...","password":"...","domain":"..."}
+      -> {"ok":false,"reason":"gesture-failed","challenge":str,"state":str,"identity_frames":int}
+      -> {"ok":false,"reason":"gesture-token-invalid"}   # absent / wrong / expired / already used
+      -> {"ok":false,"reason":"..."}   # "not-authorized" | "locked-out" (+retry_after_s)
+                                       # | "camera-busy" | "no-credentials"
   {"cmd":"reset_lockout"}      # clear the face-auth lockout early (admin / tray / test)
       -> {"ok":true,"lockout":{...}}
   {"cmd":"presence"}           # single-frame presence probe
       -> {"ok":true,"present":bool,"real":bool,"mode":"recognition|detection"}
-  {"cmd":"challenge","kind":"blink|turn_left|turn_right|nod"}   # active-gesture STUB
-                               # (Stage-5 CP; "kind" optional -> random). Not wired to unlock.
+  {"cmd":"challenge","kind":"blink|turn_left|turn_right|nod"}   # active-gesture probe
+                               # ("kind" optional -> random). Dev/diagnostic only: NOT wired to
+                               # unlock and NOT identity-bound -- the authenticating gesture
+                               # round is `unlock_gesture` above.
       -> {"ok":true,"challenge":str,"prompt":str,"passed":bool,"state":str}
   {"cmd":"status"}             # service metadata for GUI
       -> {"ok":true,"uptime_s":float,"config":{...},"enrollment":bool,
@@ -36,6 +51,7 @@ Commands:
 from __future__ import annotations
 import json
 import logging
+import secrets
 import threading
 import time
 from dataclasses import asdict
@@ -72,6 +88,14 @@ log = logging.getLogger(__name__)
 # config (camera_open_retries / camera_open_timeout_s); this small inter-attempt pause is fixed.
 CAMERA_OPEN_PAUSE_S = 0.3
 
+
+# Lifetime of a phase-1 gesture token (Stage 7-i). PROTOCOL knob, not a liveness threshold: it
+# bounds how long the lockscreen has to come back with `unlock_gesture` after being told which
+# gesture to perform. Long enough for the user to read the prompt and react, short enough that a
+# token left behind on an abandoned lockscreen is dead within seconds. Checked at REQUEST time
+# only -- the round itself is then bounded by its own wall-clock cap in _run_challenge, so a
+# gesture that starts in time is never cut short by this.
+GESTURE_TOKEN_TTL_S = 15.0
 
 # Well-known SID for the lockscreen Credential Provider: LogonUI loads the CP DLL as SYSTEM.
 SYSTEM_SID_STRING = "S-1-5-18"
@@ -300,6 +324,11 @@ class FaceService:
         # and verify calls short-circuit until that time passes. The service
         # also releases the persistent camera so the tray can open it.
         self._camera_paused_until: float = 0.0
+        # Stage 7-i gesture round: the single outstanding phase-1 token, or None. ONE slot is
+        # enough because the pipe server is strictly sequential (_serve_one handles one request
+        # at a time), so two unlocks can never be in flight together; a newer unlock simply
+        # replaces the older token. Shape: {"token": str, "kind": str, "expires": monotonic}.
+        self._gesture_slot: dict | None = None
 
     def _camera_leased_out(self) -> bool:
         return time.time() < self._camera_paused_until
@@ -528,14 +557,45 @@ class FaceService:
         except Exception as e:
             log.warning("adaptive update skipped: %s", e)
 
-    def _run_challenge(self, kind_name: str | None = None) -> dict:
-        """Server-side active-gesture loop -- STUB for the Stage-5 Credential Provider.
+    def _release_credentials(self) -> "dict | None":
+        """THE single point at which stored credentials leave this service.
+
+        Both grant paths (`unlock` on a PASS verdict, `unlock_gesture` on a passed identity-bound
+        gesture) funnel through here, so there is exactly one place to audit when asking "where
+        can the password get out?". Returns the ready success payload, or None when there is no
+        usable stored blob -- the caller maps that to reason "no-credentials" and owns its own
+        audit/lockout bookkeeping (the two commands write different audit events).
+
+        Deliberately does NOT gate on anything itself: every precondition (SYSTEM caller, lockout,
+        camera, verdict / gesture outcome) is enforced by the caller BEFORE this is reached.
+        """
+        creds = load_password()
+        if not creds:
+            return None
+        return {
+            "ok": True,
+            "username": creds["u"],
+            "password": creds["p"],
+            "domain": creds.get("d", "."),
+        }
+
+    def _run_challenge(self, kind_name: str | None = None, *, identity: bool = False) -> dict:
+        """Server-side active-gesture loop.
 
         Issues one challenge (random, or the requested ``kind``: blink|turn_left|turn_right|nod)
         and drives it to PASS/FAIL over camera frames using ``analyze_frame`` landmarks/pose.
-        NOT wired to unlock at Stage 2 (the lockscreen is passive); this exists so the CP can
-        call the same loop unchanged at Stage 5. The pipe server is sequential, so this holds
-        the camera for the duration of the gesture -- acceptable for the stub / camera test.
+        The pipe server is sequential, so this holds the camera for the duration of the gesture.
+
+        ``identity=False`` (the `challenge` command) is the original diagnostic behaviour, byte
+        for byte: every analyzed frame is fed to the task and the reply carries no extra keys.
+
+        ``identity=True`` (Stage 7-i `unlock_gesture`) binds the gesture to the RECOGNIZED face:
+        a frame whose embedding does not match is dropped outright -- not fed to the task at all.
+        Without that, the two signals are independent and separable: a photo of the enrolled user
+        supplies the matching frames while a live impostor beside it supplies the motion, and the
+        round passes. Dropping the frame closes the seam, and because the task's deadline runs on
+        wall-clock, non-matching frames still burn the budget -- which IS the binding. Adds
+        ``identity_frames`` (matching frames actually fed) and ``distance_best`` to the reply.
         """
         from .liveness import Challenge, GESTURE_TIMEOUT_S, LivenessChallenge
 
@@ -555,6 +615,9 @@ class FaceService:
         # if the camera stalls we must not block the pipe forever.
         wall_deadline = time.monotonic() + self.cfg.blink_timeout_s + GESTURE_TIMEOUT_S + 2.0
 
+        identity_frames = 0            # matching frames actually fed to the task (identity mode)
+        distance_best: float | None = None   # best distance over every frame that HAD a face
+
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
@@ -573,20 +636,103 @@ class FaceService:
                     except Exception as e:
                         log.warning("challenge analyze error: %s", e)
                         continue
+                    if a.face and (distance_best is None or a.distance < distance_best):
+                        distance_best = a.distance
+                    if identity:
+                        # Identity binding: a non-matching frame is NOT the enrolled user, so it
+                        # does not exist as far as the gesture task is concerned. Skipping the
+                        # feed (rather than merely not counting it) is the point -- it stops an
+                        # impostor's motion from ever reaching the task.
+                        if not a.is_match:
+                            continue
+                        identity_frames += 1
                     ch.feed(a.landmark, a.pose)
             finally:
                 if not self.cfg.persistent_camera:
                     cam.close()
 
-        log.info("challenge kind=%s passed=%s state=%s",
-                 issued.name.lower(), ch.passed, ch.state.name)
-        return {
+        log.info("challenge kind=%s passed=%s state=%s%s",
+                 issued.name.lower(), ch.passed, ch.state.name,
+                 (" identity_frames=%d best=%s" %
+                  (identity_frames,
+                   "n/a" if distance_best is None else "%.3f" % distance_best)) if identity else "")
+        resp = {
             "ok": True,
             "challenge": issued.name.lower(),
             "prompt": ch.prompt,
             "passed": ch.passed,
             "state": ch.state.name.lower(),
         }
+        if identity:
+            # Extra keys ONLY in identity mode, so the `challenge` command's reply is unchanged.
+            resp["identity_frames"] = identity_frames
+            resp["distance_best"] = (None if distance_best is None else round(distance_best, 4))
+        return resp
+
+    def _prompt_for(self, kind_name: str) -> str:
+        """Localized gesture prompt for the CURRENT cfg.language.
+
+        Mirrors i18n.t()'s fallback chain (language -> English -> raw key) but resolves the
+        language from cfg on every call instead of i18n's process-global _current_lang: this
+        service never calls set_language (only the tray process does), and reload_config can
+        change cfg.language at runtime, so anything cached at startup would go stale.
+        """
+        from .i18n import DEFAULT_LANG, TRANSLATIONS
+        key = f"gesture.prompt.{kind_name}"
+        table = TRANSLATIONS.get(self.cfg.language) or TRANSLATIONS[DEFAULT_LANG]
+        return table.get(key) or TRANSLATIONS[DEFAULT_LANG].get(key, key)
+
+    def _issue_gesture_token(self) -> tuple[str, str, str]:
+        """Pick a random gesture, arm the one-shot token slot, return (kind, prompt, token).
+
+        The kind is drawn with `secrets` (not `random`) so an observer cannot predict which
+        gesture the next lockscreen attempt will demand. Overwrites any previous slot: the newest
+        phase-1 reply is the only one that can be answered.
+        """
+        from .liveness import ALL_KINDS
+        kind = secrets.choice(ALL_KINDS).name.lower()
+        token = secrets.token_hex(16)          # 32 hex chars
+        self._gesture_slot = {"token": token, "kind": kind,
+                              "expires": time.monotonic() + GESTURE_TOKEN_TTL_S}
+        return kind, self._prompt_for(kind), token
+
+    def _take_gesture_token(self, token) -> "dict | None":
+        """Validate AND consume the one-shot gesture token; returns the slot, or None.
+
+        Burning the slot before the round runs is what makes the token one-shot: a FAILED round
+        cannot be retried on the same token, it costs a fresh phase 1. A wrong token deliberately
+        does NOT clear a live slot, so a bogus request cannot cancel a legitimate pending gesture.
+        compare_digest keeps the comparison constant-time -- this is a bearer token.
+        """
+        slot = self._gesture_slot
+        if slot is None:
+            return None
+        if time.monotonic() >= slot["expires"]:
+            self._gesture_slot = None          # expired: drop the dead slot
+            return None
+        # isascii() before compare_digest: on str inputs compare_digest REJECTS non-ASCII with a
+        # TypeError, and this value comes straight off the wire -- without the guard a token of
+        # "é" would raise out of the handler and answer "exception: ...". Our tokens are hex.
+        if (not isinstance(token, str) or not token.isascii()
+                or not secrets.compare_digest(token, slot["token"])):
+            return None
+        self._gesture_slot = None              # one-shot: burn BEFORE the round runs
+        return slot
+
+    def _audit_gesture(self, *, challenge=None, passed=None, identity_frames=None,
+                       distance_best=None, reason=None) -> None:
+        """One `unlock_gesture` audit record, with a STABLE key set.
+
+        Every branch writes all five fields (absent ones as null) so the JSONL stays greppable
+        without per-branch shape guessing. The token is NEVER recorded.
+        """
+        self._audit.write("unlock_gesture", {
+            "challenge": challenge,
+            "passed": passed,
+            "identity_frames": identity_frames,
+            "distance_best": distance_best,
+            "reason": reason,
+        })
 
     def _presence_probe(self) -> tuple[bool, bool]:
         """(present, real) — semantics depend on config.presence_mode.
@@ -819,24 +965,100 @@ class FaceService:
             if too_dark:
                 self._audit.write("unlock", {**r.detail, "outcome": "too-dark"})
                 return {"ok": False, "reason": ll_reason, "distance": r.distance, "real": r.real}
-            # Don't count an enrollment-lease skip as a real failed attempt.
-            if not self._camera_leased_out():
+            # Stage 7-i phase 1. NEEDS_GESTURE means "recognized, but liveness wants an active
+            # gesture" -- until now indistinguishable from a real no-match on the wire. The
+            # verdict name is read straight from the burst detail, which already carries it
+            # (_analyze_burst), so VerifyOutcome keeps its shape and the verify/audit records are
+            # untouched. .get() is deliberate: a detail dict WITHOUT a verdict (the camera-lease
+            # skip writes "SKIPPED", a future path might write nothing) falls through to the old
+            # no-match path -- fail closed, never into the gesture path.
+            needs_gesture = r.detail.get("verdict") == "NEEDS_GESTURE"
+            # Don't count an enrollment-lease skip as a real failed attempt. A gesture escalation
+            # is not an attempt either -- it is a question we just asked, and phase 2 records its
+            # own outcome; counting it here would burn the whole strike budget on paranoid, where
+            # EVERY recognized face escalates.
+            if not self._camera_leased_out() and not needs_gesture:
                 self._lockout.record(r.match)
+            if needs_gesture:
+                kind, prompt, token = self._issue_gesture_token()
+                # Audit records the gesture but NEVER the token.
+                self._audit.write("unlock", {**r.detail, "outcome": "needs-gesture",
+                                             "gesture": kind})
+                return {"ok": False, "reason": "needs-gesture", "gesture": kind,
+                        "prompt": prompt, "token": token, "ttl_s": GESTURE_TOKEN_TTL_S,
+                        "distance": r.distance, "real": r.real}
             if not r.match:
                 self._audit.write("unlock", {**r.detail, "outcome": "no-match"})
                 return {"ok": False, "reason": "no-match", "distance": r.distance, "real": r.real}
-            creds = load_password()
-            if not creds:
+            granted = self._release_credentials()
+            if granted is None:
                 self._audit.write("unlock", {**r.detail, "outcome": "no-credentials"})
                 return {"ok": False, "reason": "no-credentials"}
             self._audit.write("unlock", {**r.detail, "outcome": "granted"})
             self._maybe_adapt_gallery(r)
-            return {
-                "ok": True,
-                "username": creds["u"],
-                "password": creds["p"],
-                "domain": creds.get("d", "."),
-            }
+            return granted
+
+        if cmd == "unlock_gesture":
+            # Stage 7-i phase 2: answer the gesture phase 1 asked for. The gate ORDER is a clone
+            # of unlock's, using the SAME helpers, so this command sits behind exactly the same
+            # perimeter and cannot become a way around the SYSTEM gate: identity check first,
+            # then lockout, then the one-shot token, and only then the camera. _release_credentials
+            # is unreachable until all four have passed.
+            if self.cfg.pipe_unlock_require_system:
+                sid = _pipe_client_sid_string(handle)
+                if sid != SYSTEM_SID_STRING:
+                    log.warning("unlock_gesture rejected: caller not SYSTEM (sid=%s %s)",
+                                sid, _pipe_client_diag(handle))
+                    return {"ok": False, "reason": "not-authorized"}
+            rem = self._lockout.remaining()
+            if rem > 0:
+                self._audit_gesture(reason="locked-out")
+                return {"ok": False, "reason": "locked-out", "retry_after_s": round(rem, 1)}
+            slot = self._take_gesture_token(req.get("token"))
+            if slot is None:
+                # Absent / wrong / expired / already-burnt token. NOT a strike: this is a protocol
+                # state, not a failed face attempt -- the camera never even opened.
+                self._audit_gesture(reason="gesture-token-invalid")
+                return {"ok": False, "reason": "gesture-token-invalid"}
+            resp = self._run_challenge(slot["kind"], identity=True)
+            if not resp.get("ok"):
+                # The round never ran. "camera-busy" stays itself and stays lockout-NEUTRAL, like
+                # everywhere else (a busy device is environment, not a failed match). Anything
+                # else here is an engine-level refusal (e.g. enrollment vanished mid-session);
+                # it is reported as a plain gesture-failed -- the wire deliberately does not
+                # distinguish failure causes -- with the real reason kept in the log and audit.
+                raw = resp.get("reason") or "gesture-failed"
+                if raw == "camera-busy":
+                    self._audit_gesture(challenge=slot["kind"], reason="camera-busy")
+                    return {"ok": False, "reason": "camera-busy"}
+                log.warning("unlock_gesture round did not run: %s", raw)
+                self._lockout.record(False)
+                self._audit_gesture(challenge=slot["kind"], reason=raw)
+                return {"ok": False, "reason": "gesture-failed", "challenge": slot["kind"],
+                        "state": "failed", "identity_frames": 0}
+            frames = int(resp.get("identity_frames") or 0)
+            best = resp.get("distance_best")
+            # Two conditions, no new numbers: the task itself passed AND enough MATCHING frames
+            # were fed (cfg.verify_required, the same bar the passive burst uses).
+            passed = bool(resp.get("passed")) and frames >= self.cfg.verify_required
+            if not passed:
+                self._lockout.record(False)
+                self._audit_gesture(challenge=resp.get("challenge"), passed=resp.get("passed"),
+                                    identity_frames=frames, distance_best=best,
+                                    reason="gesture-failed")
+                return {"ok": False, "reason": "gesture-failed",
+                        "challenge": resp.get("challenge"), "state": resp.get("state"),
+                        "identity_frames": frames}
+            self._lockout.record(True)
+            granted = self._release_credentials()
+            if granted is None:
+                self._audit_gesture(challenge=resp.get("challenge"), passed=True,
+                                    identity_frames=frames, distance_best=best,
+                                    reason="no-credentials")
+                return {"ok": False, "reason": "no-credentials"}
+            self._audit_gesture(challenge=resp.get("challenge"), passed=True,
+                                identity_frames=frames, distance_best=best, reason="granted")
+            return granted
 
         if cmd == "reset_lockout":
             # Admin / tray / test: clear the face lockout early.
