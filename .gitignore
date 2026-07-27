@@ -1,18 +1,15 @@
-face-unlock-MASTER-TZ.md
-stage-*-TZ.md
-audit-notes.md
-stage1-benchmark.md
-requirements.lock
 .venv/
 __pycache__/
 *.pyc
-stage-2-RESUME.md
-stage-2-RESUME.md
 .idea/
 
+# Build output: PyInstaller work dir + dist, Inno Setup artefacts.
+/build/
+/dist/
+/installer_output/
+
 # C++ build trees (CMake output, not sources).
-# NOTE: build-cp/ holds the LIVE credential-provider DLL that LogonUI loads at
-# the lock screen -- ignore it, but do NOT delete it. The build-cp vs the
-# documented credential_provider/build path drift is a Stage-7 debt.
+# build-cp/ holds the LIVE credential-provider DLL that LogonUI loads at the
+# lock screen -- ignore it, but do NOT delete it.
 build-cp/
 build-tests/
