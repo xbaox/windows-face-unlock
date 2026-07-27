@@ -21,7 +21,9 @@
 #include <string>
 #include <cstdio>
 
+using FaceUnlock::ParseUnlockReply;
 using FaceUnlock::ParseUnlockResponse;
+using FaceUnlock::UnlockReply;
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -71,6 +73,37 @@ static void CaseReject(const char* label, const std::string& resp, const char* e
         std::printf("        expected reject%s%s, got ok=%d err=%s\n",
                     expectErr ? " err=" : "", expectErr ? expectErr : "",
                     (int)ok, err.c_str());
+    }
+}
+
+// Expect a REJECTED parse (no credentials) whose UnlockReply carries the given Stage-7-i
+// phase-1 section. Pass nullptr for a field that must come back EMPTY -- the parser must
+// never invent a value. Also asserts no credential leaked out of a non-ok reply.
+static void CaseGesture(const char* label, const std::string& resp, const char* expectReason,
+                        const char* expectGesture, const wchar_t* expectPrompt,
+                        const char* expectToken) {
+    const std::string wantG = expectGesture ? expectGesture : "";
+    const std::wstring wantP = expectPrompt ? expectPrompt : L"";
+    const std::string wantT = expectToken ? expectToken : "";
+    UnlockReply r;
+    bool ok = ParseUnlockReply(resp, r);
+    bool good = !ok && r.reason == expectReason && r.gesture == wantG
+                && r.prompt == wantP && r.token == wantT
+                && r.username.empty() && r.password.empty();
+    if (good) {
+        ++g_pass;
+        std::printf("  PASS  %s\n", label);
+    } else {
+        ++g_fail;
+        std::printf("  FAIL  %s\n", label);
+        std::printf("        ok=%d reason exp=[%s] got=[%s]\n",
+                    (int)ok, expectReason, r.reason.c_str());
+        std::printf("        gesture exp=[%s] got=[%s]\n", wantG.c_str(), r.gesture.c_str());
+        std::printf("        prompt  exp=[%s] got=[%s]\n",
+                    ToUtf8(wantP).c_str(), ToUtf8(r.prompt).c_str());
+        std::printf("        token   exp=[%s] got=[%s]\n", wantT.c_str(), r.token.c_str());
+        std::printf("        creds leaked: user=[%s] pass_len=%d\n",
+                    ToUtf8(r.username).c_str(), (int)r.password.size());
     }
 }
 
@@ -153,7 +186,91 @@ int main() {
     CaseReject("ok as string is not truthy",
                R"({"ok":"true","username":"u","password":"x"})", nullptr);
 
+    // Baseline gate: everything above is the pre-Stage-7-i suite, unchanged. It must still be
+    // exactly 16 cases, all green, before any of the new ones run.
+    const int baseTotal = g_pass + g_fail;
+    std::printf("  ---- baseline suite: %d/%d green (expected 16/16) ----\n", g_pass, baseTotal);
+    if (baseTotal != 16 || g_fail != 0) {
+        ++g_fail;
+        std::printf("  FAIL  baseline suite is not 16/16 green\n");
+    }
+
+    std::printf("\nStage 7-i: phase-1 gesture section\n");
     std::printf("-----------------------------\n");
-    std::printf("PASS=%d  FAIL=%d\n", g_pass, g_fail);
+
+    // The real phase-1 reply. The service json.dumps()es with ensure_ascii, so a localized
+    // prompt arrives as \uXXXX -- here the RU "Моргни" (blink). Input below is the exact ASCII
+    // wire form; it must decode to the Cyrillic string.
+    CaseGesture("needs-gesture: RU prompt via \\u escapes + token + gesture",
+                "{\"ok\":false,\"reason\":\"needs-gesture\",\"gesture\":\"blink\","
+                "\"prompt\":\"\\u041c\\u043e\\u0440\\u0433\\u043d\\u0438\","
+                "\"token\":\"0123456789abcdef0123456789abcdef\",\"ttl_s\":15.0,"
+                "\"distance\":0.086,\"real\":true}",
+                "needs-gesture", "blink", L"Моргни", "0123456789abcdef0123456789abcdef");
+
+    // An EN prompt and a different kind, with the numeric fields in front of the strings.
+    CaseGesture("needs-gesture: EN prompt, turn_left, reordered fields",
+                R"({"distance":0.25,"real":true,"ttl_s":15.0,"ok":false,)"
+                R"("token":"aaaaaaaabbbbbbbbccccccccdddddddd","reason":"needs-gesture",)"
+                R"("prompt":"Turn your head left","gesture":"turn_left"})",
+                "needs-gesture", "turn_left", L"Turn your head left",
+                "aaaaaaaabbbbbbbbccccccccdddddddd");
+
+    // needs-gesture with the phase-1 fields present but EMPTY -> the caller must be able to see
+    // that there is nothing to act on (it treats this as a plain failure).
+    CaseGesture("needs-gesture: empty gesture/prompt/token stay empty",
+                R"({"ok":false,"reason":"needs-gesture","gesture":"","prompt":"","token":""})",
+                "needs-gesture", nullptr, nullptr, nullptr);
+
+    // Same, with the fields absent entirely rather than empty.
+    CaseGesture("needs-gesture: absent gesture/prompt/token stay empty",
+                R"({"ok":false,"reason":"needs-gesture","distance":0.1,"real":true})",
+                "needs-gesture", nullptr, nullptr, nullptr);
+
+    // Wrong-typed fields must NOT be coerced -- a numeric token comes back empty, not "12345".
+    CaseGesture("needs-gesture: wrong-typed token is ignored, not coerced",
+                R"({"ok":false,"reason":"needs-gesture","gesture":"nod","token":12345,)"
+                R"("prompt":"Nod your head"})",
+                "needs-gesture", "nod", L"Nod your head", nullptr);
+
+    // Phase-2 failure. "challenge" is a DIFFERENT key from "gesture": it must not bleed into
+    // the gesture field, or a failed round would look like a fresh challenge.
+    CaseGesture("gesture-failed: 'challenge' does not populate 'gesture'",
+                R"({"ok":false,"reason":"gesture-failed","challenge":"nod","state":"failed",)"
+                R"("identity_frames":1})",
+                "gesture-failed", nullptr, nullptr, nullptr);
+
+    CaseGesture("gesture-token-invalid surfaces verbatim",
+                R"({"ok":false,"reason":"gesture-token-invalid"})",
+                "gesture-token-invalid", nullptr, nullptr, nullptr);
+
+    // A prompt carrying JSON delimiters must not break the surrounding structure.
+    CaseGesture("needs-gesture: prompt with quotes/braces survives",
+                R"({"ok":false,"reason":"needs-gesture","gesture":"blink",)"
+                R"("prompt":"Blink }{:,\"now","token":"ffffffffffffffffffffffffffffffff"})",
+                "needs-gesture", "blink", L"Blink }{:,\"now",
+                "ffffffffffffffffffffffffffffffff");
+
+    // The ok:true contract is untouched by the new fields: a grant still grants...
+    CaseOk("ok:true still grants when phase-1 fields ride along",
+           R"({"ok":true,"username":"alice","password":"s3cret","gesture":"blink","token":"ab"})",
+           L"alice", L"s3cret", L".");
+
+    // ...and still refuses an empty password, gesture fields or not.
+    CaseReject("phase-1 fields do not relax the ok:true contract",
+               R"({"ok":true,"username":"alice","password":"","gesture":"blink","token":"ab"})",
+               "malformed-response");
+
+    // The back-compat 5-arg wrapper must pass the new reasons through unchanged.
+    CaseReject("legacy wrapper surfaces reason 'needs-gesture'",
+               R"({"ok":false,"reason":"needs-gesture","gesture":"nod","token":"ab"})",
+               "needs-gesture");
+    CaseReject("legacy wrapper surfaces reason 'gesture-failed'",
+               R"({"ok":false,"reason":"gesture-failed","challenge":"blink"})",
+               "gesture-failed");
+
+    std::printf("-----------------------------\n");
+    std::printf("PASS=%d  FAIL=%d  (baseline 16 + Stage 7-i %d)\n",
+                g_pass, g_fail, g_pass + g_fail - baseTotal);
     return g_fail == 0 ? 0 : 1;
 }
