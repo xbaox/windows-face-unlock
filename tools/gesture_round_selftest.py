@@ -284,7 +284,12 @@ def test_gate_order():
 
 _WARMUP = object()          # consumed by _run_challenge's two drain reads, never analyzed
 _BASE_POSE = (-13.0, -3.0)  # neutral pitch/yaw as measured on this webcam
-_TURN_LEFT_POSE = (-13.0, -3.0 - (YAW_DELTA + 17.0))   # well past YAW_DELTA from the baseline
+# Live calibration 2026-07-27 on the production camera: a turn to the user's OWN left reads as a
+# POSITIVE yaw deviation on this hardware. The sign is written out literally, in terms of what
+# the user physically does, and deliberately NOT derived from LEFT_IS_NEGATIVE_YAW -- deriving it
+# would make the case pass for either value of the constant, which is how the inverted turn
+# directions reached a live lock screen in the first place.
+_TURN_LEFT_POSE = (-13.0, -3.0 + (YAW_DELTA + 17.0))   # user turns to their LEFT, past YAW_DELTA
 _NOD_POSE = (-13.0 - (PITCH_DOWN_DELTA + 6.0), -3.0)
 
 

@@ -45,7 +45,15 @@ POSE_ROLL = 2    # tilt
 YAW_DELTA = 20.0
 PITCH_DOWN_DELTA = 10.0
 GESTURE_BASELINE_FRAMES = 3
-LEFT_IS_NEGATIVE_YAW = True   # confirmed on camera: left turn -> yaw ~ -37
+LEFT_IS_NEGATIVE_YAW = False  # Live lock-screen calibration 2026-07-27 on the production
+                              # camera: the earlier "left turn -> yaw ~ -37" reading had the
+                              # sign the wrong way round against the USER, so both turn
+                              # challenges asked for one direction and only accepted the other
+                              # (prompt "turn right" + a real right turn -> gesture-failed with
+                              # the face held all round). InsightFace's pose convention on this
+                              # hardware reports a POSITIVE yaw deviation when the user turns to
+                              # their OWN left. Sign confirmed by a lock-screen run; prompt /
+                              # kind / audit now all mean what the user physically does.
 
 BLINK_TIMEOUT_S = 4.0
 GESTURE_TIMEOUT_S = 5.0
