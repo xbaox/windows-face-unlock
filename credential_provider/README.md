@@ -51,9 +51,12 @@ tile should appear.
    `GetSerialization`.
 3. `GetSerialization` opens `\\.\pipe\FaceUnlock`, sends
    `{"cmd":"unlock"}`, and waits up to 12 s.
-4. `FaceService` performs the camera capture + DeepFace verify + liveness
-   check, decrypts the DPAPI password blob, and returns
-   `{"ok":true,"username":"...","password":"...","domain":"..."}`.
+4. `FaceService` performs the camera capture, the InsightFace recognition
+   check and liveness, decrypts the DPAPI password blob, and returns
+   `{"ok":true,"username":"...","password":"...","domain":"..."}`. When
+   liveness wants an active gesture it answers `needs-gesture` with a
+   single-use token instead, and the tile completes the round with
+   `unlock_gesture` before any credential is released.
 5. The CP packs those into a `KERB_INTERACTIVE_UNLOCK_LOGON` and returns
    `CPGSR_RETURN_CREDENTIAL_FINISHED`. LogonUI performs the actual logon.
 
@@ -63,8 +66,11 @@ tile should appear.
   the DPAPI blob is encrypted with the *user* key, the Python service (which
   runs in the user session) is the one that decrypts it and passes plaintext
   over the pipe — the CP itself never touches DPAPI. The pipe is local-only
-  and uses a NULL DACL, which is fine but you should understand the threat
-  model before deploying widely.
+  and carries an explicit security descriptor: `SELF` and `SYSTEM` only, no
+  `Everyone` ACE, plus a medium integrity label. On top of that the `unlock`
+  command is refused unless the caller's token SID is `SYSTEM` (`S-1-5-18`),
+  which is what LogonUI loads this DLL as. Understand that the plaintext
+  password still crosses the pipe before deploying widely.
 - This is a **skeleton**: no custom tile bitmap, no localisation, no progress
   UI while the service captures frames, and only the single "unlock /
   interactive logon" scenario is implemented. The Microsoft

@@ -7,7 +7,7 @@ the source of.**
 
 Keywords: *windows face unlock, windows face login, face recognition
 windows, webcam login windows, howdy windows, windows hello alternative,
-credential provider face, deepface windows, arcface windows, auto lock
+credential provider face, insightface windows, arcface windows, auto lock
 when away, presence monitor, walk-away lock, face id for pc.*
 
 | | |
@@ -15,19 +15,53 @@ when away, presence monitor, walk-away lock, face id for pc.*
 | Platform | Windows 10 / 11 x64 |
 | Python   | 3.11 or 3.12 |
 | License  | MIT |
-| Models   | ArcFace + MiniFASNet (DeepFace) + YuNet (OpenCV Zoo) |
+| Models   | InsightFace `buffalo_l` (ArcFace ONNX) + YuNet (OpenCV Zoo) |
+| Runtime  | ONNX Runtime — CUDA when available, CPU otherwise |
+
+## What this is, and what it is not
+
+Read this before you decide to rely on it.
+
+This is a **convenience-grade** face login with **real** anti-spoofing. It runs
+on an ordinary RGB webcam, which means it has **no infrared sensor and no TPM
+binding** — so it is *not* Windows Hello and cannot be. Hello's security
+guarantee comes from IR depth sensing plus hardware-backed key storage;
+neither exists here.
+
+What it does have:
+
+- an **active** liveness challenge (blink or head gesture), not just a passive
+  photo check, and the gesture must be performed **by the face that matched**
+- a passive anti-screen check that flags a display being held up to the camera
+- a hardened local IPC channel, and credential release gated to `SYSTEM`
+
+What that buys you: a flat photo, a phone screen and a recorded video all fail.
+What it does not buy you: resistance to a 3-D mask, to a determined attacker
+with your unlocked machine, or to malware already running as you.
+
+**Your PIN and password always keep working.** The face tile is an addition to
+the lock screen, never a replacement, and every failure path falls back to
+them. Treat face sign-in as convenience; treat the PIN as the real credential.
+
+> **First sign-in after any reboot is your PIN — by design.** All three
+> background tasks are *logon* tasks, so the service does not exist until you
+> have signed in once. Face sign-in is available from the next lock onward.
 
 ## Features at a glance
 
 - **Log in with your face** from the Windows lock screen via a proper
   Credential Provider tile (C++ DLL), not a user-mode hack.
-- **Walk-away auto-lock**: every minute the tray process probes the webcam;
-  if your enrolled face isn't there, `LockWorkStation()` fires.
+- **Walk-away auto-lock**: the tray process probes the webcam on an interval;
+  if your enrolled face isn't there for N consecutive probes,
+  `LockWorkStation()` fires. Can be set to observe-only.
 - **Two presence modes**: strict (must match the enrolled face, blocks
   strangers) or lightweight (any face is enough, replaces old AutoFaceLock
   scripts).
-- **Anti-spoofing** (liveness, MiniFASNet) blocks flat photos and videos
-  of your face.
+- **Active liveness**: blink detection and randomised head-pose gestures
+  (turn left / turn right / nod) on InsightFace landmarks, plus a passive
+  anti-screen (moiré / glare) check.
+- **Two liveness modes**: `fast` asks for a gesture only when the match is in
+  doubt; `paranoid` demands one on every unlock.
 - **Remote-session aware**: skips auto-lock when the session is RDP, or
   when TeamViewer / AnyDesk / RustDesk / Parsec / Chrome Remote Desktop /
   Quick Assist / UltraViewer hold an active remote connection.
@@ -38,6 +72,8 @@ when away, presence monitor, walk-away lock, face id for pc.*
   Deutsch, 日本語, 한국어, Русский, Português, العربية, हिन्दी. Switch
   from the tray, applies live.
 - **DPAPI-encrypted** Windows password storage (user scope).
+- **Rate limiting**: consecutive face failures trigger a temporary face
+  lockout. PIN and password are never locked out.
 
 ## Install (end user)
 
@@ -45,8 +81,10 @@ Grab the latest installer from the
 [**Releases page**](https://github.com/caochitam/windows-face-unlock/releases)
 and double-click it. Requires Windows 10/11 x64, admin rights, any webcam.
 
-- ~350–500 MB installer — it bundles Python, TensorFlow CPU, PyTorch CPU,
-  DeepFace, OpenCV, YuNet + MiniFASNet models. No other downloads.
+- The installer bundles Python, the ONNX runtime and the YuNet detector. The
+  recognition models (`buffalo_l`, a few hundred MB) are fetched on first use
+  and are **not** currently shipped inside the installer — the first warmup
+  needs an internet connection.
 - Not yet code-signed, so SmartScreen will say **"Unknown publisher"**.
   Click **More info → Run anyway**. Signing application to SignPath is in
   progress — when approved the signed installer will replace unsigned.
@@ -66,41 +104,51 @@ An open-source, auditable replacement for closed-source webcam-login utilities
 
 | Component             | Language | Runs as                 | Role                                                                 |
 |-----------------------|----------|-------------------------|----------------------------------------------------------------------|
-| `face_service`        | Python   | User session (always)   | Camera + DeepFace + liveness + DPAPI; exposes a named pipe.          |
-| `presence_monitor`    | Python   | User session (tray)     | Every 60 s, probe presence; if absent → `LockWorkStation()`.         |
+| `face_service`        | Python   | User session (always)   | Camera + recognition + liveness + DPAPI; exposes a named pipe.       |
+| `presence_monitor`    | Python   | User session (tray)     | Probes presence on an interval; if absent → `LockWorkStation()`.     |
 | `credential_provider` | C++      | LogonUI (SYSTEM)        | Windows Credential Provider tile that calls the service on unlock.   |
 
 Plus two CLI tools: `tools.enroll` (capture reference photos) and
 `tools.set_password` (store your Windows password encrypted with DPAPI).
 
-## Why three pieces?
+### Why three pieces?
 
 Windows lock-screen authentication runs in an isolated session as `SYSTEM`,
-which cannot comfortably load TensorFlow / open the webcam. The C++
-Credential Provider is therefore a thin shim that communicates with the
-heavyweight Python service over a local named pipe. This is the same pattern
-Howdy uses on Linux with PAM.
+which cannot comfortably load a full inference stack or open the webcam. The
+C++ Credential Provider is therefore a thin shim that talks to the Python
+service over a local named pipe. This is the same pattern Howdy uses on Linux
+with PAM.
 
-## Features
+### The unlock handshake
 
-- **ArcFace (DeepFace) face recognition** with cosine-distance thresholding
-- **Anti-spoofing (liveness)** via DeepFace's built-in `anti_spoofing=True`
-  (MiniFASNet) — blocks flat photos of your face
-- **DPAPI-protected** Windows password storage (user scope)
-- **Multi-frame voting** for unlock: N out of M frames must match
-- **Presence auto-lock** every minute, with *remote-context exclusion*:
-  skips when the session is RDP or when TeamViewer / AnyDesk / RustDesk /
-  Parsec / Chrome Remote Desktop / Quick Assist / UltraViewer are actively
-  connected. Also skips when input was received recently or when paused
-  from the tray icon.
-- **Two presence modes** (`presence_mode` in config):
-  - `recognition` (default) — enrolled face must match (strong; walk-away +
-    stranger detection).
-  - `detection` — *any* face in frame is enough, via YuNet (weaker; replaces
-    the old standalone AutoFaceLock script).
-- **System tray management UI** (pystray + tkinter) — Status dashboard,
-  Settings editor, Enroll / Set-password shortcuts, Pause/Resume, and a
-  single Quit that stops both service and tray cleanly.
+The lock-screen tile does not simply ask "is this you?" and take the answer:
+
+1. The Credential Provider sends `unlock`.
+2. If recognition matches and liveness is satisfied, credentials come back.
+3. If liveness wants proof of life, the service instead answers
+   `needs-gesture` with a randomly chosen gesture, a short-lived single-use
+   token, and a prompt to display.
+4. The tile performs the gesture round and replies `unlock_gesture` with that
+   token. Frames that do **not** match the enrolled face are dropped rather
+   than fed to the gesture detector, so the gesture cannot be performed by
+   somebody else standing next to you.
+5. Only then are credentials released.
+
+A token is single-use and expires in seconds, so one abandoned at the lock
+screen is worthless.
+
+### The channel
+
+The named pipe is not open to the world:
+
+- an explicit security descriptor grants **`SELF` and `SYSTEM` only**, plus a
+  medium integrity label — there is no `Everyone` ACE
+- `FILE_FLAG_FIRST_PIPE_INSTANCE` makes the service refuse to start if the pipe
+  name is already taken, so a squatter cannot impersonate it, and the client
+  verifies the server's SID before sending
+- the `unlock` command is **gated to `SYSTEM`** (`S-1-5-18`), the account
+  LogonUI loads the Credential Provider as. Any other caller is refused with
+  `not-authorized` before the password blob is ever touched
 
 ## Requirements
 
@@ -108,6 +156,8 @@ Howdy uses on Linux with PAM.
 - Python 3.11 or 3.12
 - Webcam
 - (For Credential Provider) Visual Studio 2022 + CMake
+- (Optional) An NVIDIA GPU. Recognition uses the CUDA execution provider when
+  one is present and falls back to CPU with a warning otherwise.
 
 ## Install (Python parts)
 
@@ -116,9 +166,23 @@ Howdy uses on Linux with PAM.
 .\setup.ps1
 ```
 
-This creates `.\.venv`, installs dependencies, writes a default config to
-`%USERPROFILE%\.face-unlock\config.toml`, and registers Task Scheduler jobs
-that run `face_service` and `presence_monitor` at logon.
+This creates `.\.venv`, installs dependencies, and registers the three Task
+Scheduler jobs below. It deliberately does **not** write a config file: with no
+`config.toml` the service runs on the defaults compiled into the code, which
+cannot go stale. To customise, copy
+[`config.example.toml`](config.example.toml) to
+`%USERPROFILE%\.face-unlock\config.toml` and keep only the keys you change.
+
+### Scheduled tasks
+
+Three logon tasks, declared in `tools\tasks.psd1` and created by
+`tools\register_tasks.ps1` — the only script that knows their names:
+
+| Task | Role |
+|---|---|
+| `FaceUnlock-Service`  | the pipe server |
+| `FaceUnlock-Presence` | the tray icon and the presence probe |
+| `FaceUnlock-Watchdog` | pings the service and restarts it if it hangs |
 
 ## Enroll your face + store password
 
@@ -126,6 +190,9 @@ that run `face_service` and `presence_monitor` at logon.
 .\.venv\Scripts\python -m tools.enroll capture --count 15
 .\.venv\Scripts\python -m tools.set_password
 ```
+
+Captured frames are quality-gated on detector confidence, sharpness and
+exposure, so blurry or badly lit ones are dropped rather than stored.
 
 Rebuild embeddings any time with:
 
@@ -137,7 +204,7 @@ Rebuild embeddings any time with:
 
 See [credential_provider/README.md](credential_provider/README.md). You will
 need Visual Studio 2022. Without this, the presence-lock still works — you
-just unlock with your password like usual.
+just unlock with your PIN or password like usual.
 
 ## Quick test (no Credential Provider needed)
 
@@ -149,7 +216,7 @@ just unlock with your password like usual.
 .\.venv\Scripts\python -m presence_monitor
 ```
 
-Trigger a manual unlock probe:
+Trigger a manual verification probe:
 
 ```powershell
 # Named-pipe one-shot client from PowerShell
@@ -161,15 +228,16 @@ $w.Write('{"cmd":"verify"}'); $p.WaitForPipeDrain()
 $r.ReadToEnd()
 ```
 
+`unlock` will refuse this client with `not-authorized` — that is the SYSTEM
+gate doing its job. Use `verify` to check recognition health.
+
 ## Configuration reference
 
-See [config.example.toml](config.example.toml). Key knobs:
-
-- `threshold` — cosine distance cutoff. Lower = stricter. Tune after enrolling.
-- `verify_frames` / `verify_required` — multi-frame voting.
-- `presence_interval_s` — how often to probe (default 60).
-- `presence_absent_strikes` — lock after N consecutive absent ticks (default 2,
-  so effective lock timeout is `interval * strikes` = 2 minutes).
+[`config.example.toml`](config.example.toml) is the single reference: it lists
+every setting with its real default and a comment on each, and a self-test
+fails the build if it ever disagrees with the code. Start there. The knobs
+worth understanding first are `liveness_mode`, `auto_lock` and
+`persistent_camera`.
 
 ## Security notes
 
@@ -179,19 +247,20 @@ Read these before trusting the CP for daily unlock:
    protects it from other users and from offline disk inspection, but **not**
    from malware running as you. If your attacker model includes that, use a
    smart card or Windows Hello proper.
-2. The pipe currently uses a NULL DACL (any local user can connect). This is
-   acceptable for a personal machine but consider tightening to `SELF` +
-   `SYSTEM` in `_build_sa_everyone()` if multiple accounts share the PC.
-3. Anti-spoofing blocks 2-D photos but **not 3-D masks or deepfake screens**.
-4. The credential provider skeleton uses a hard-coded GUID from this repo —
+2. Liveness blocks flat photos, phone screens and replayed video, but **not
+   3-D masks**. See "What this is, and what it is not" above.
+3. The credential provider skeleton uses a hard-coded GUID from this repo —
    **generate your own** before sharing builds.
+4. The lock-screen call has a hard 12-second timeout and fails closed to the
+   password tile, so a hung or missing service can never lock you out.
 
 ## Credits / prior art
 
 This project draws on ideas from:
 
 - [boltgolt/howdy](https://github.com/boltgolt/howdy) — Linux/PAM face login
-- [serengil/deepface](https://github.com/serengil/deepface) — recognition + liveness
+- [deepinsight/insightface](https://github.com/deepinsight/insightface) — the
+  recognition and landmark models
 - [ageitgey/face_recognition](https://github.com/ageitgey/face_recognition) — dlib wrapper
 - Microsoft's [SampleCredentialProvider](https://github.com/microsoft/Windows-classic-samples/tree/main/Samples/CredentialProvider)
   — reference implementation for `ICredentialProvider`
