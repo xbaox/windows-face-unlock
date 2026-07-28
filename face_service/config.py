@@ -117,6 +117,19 @@ class Config:
     # loop; open() itself keeps its robust 3x3 zombie recovery for enrollment / warmup.
     camera_open_retries: int = 2         # extra open attempts after the first before declaring busy
     camera_open_timeout_s: float = 3.0   # wall-clock budget for the whole open-retry loop (seconds)
+    # --- Stage 7b: persistent-camera self-heal (post-hoc; the KNOWN_ISSUES #1 signature) ---
+    # A wedged owner elsewhere on the machine can hand the device back in a state where our
+    # capture opens "successfully" and then reads nothing, or reads all-black frames. With
+    # persistent_camera=True that capture is CACHED and reused for the process lifetime, because
+    # the reuse gate only checks that a handle exists. The service deliberately does NOT probe-read
+    # to detect this up front: a probe read can itself wedge on this hardware, and the pipe server
+    # is sequential, so a hanging probe would take the whole service down. Instead it judges the
+    # reads that ALREADY happened and drops the cache afterwards, so the next request opens fresh.
+    # camera_black_luma is a BLACK-FRAME floor, NOT a darkness gate: a genuinely dark room measures
+    # ~10 scene luma (Step 3.1) and must not look broken, so this sits far below
+    # low_light_luma_min and only catches the ~0 of a capture that is no longer seeing anything.
+    camera_black_luma: float = 2.0          # burst scene luma <= this counts as a black capture
+    camera_reopen_cooldown_s: float = 30.0  # min seconds between two self-heals (anti-thrash)
     # --- Stage 3: watchdog (Step 5; external Scheduled-Task supervisor pings the pipe) ---
     # tools.watchdog pings the existing `ping` command every watchdog_interval_s; after
     # watchdog_fail_threshold consecutive failures (each bounded by watchdog_ping_timeout_s -- a
@@ -232,6 +245,13 @@ class Config:
             raise ValueError("camera_open_retries must be in [0, 10]")
         if not (0.0 < self.camera_open_timeout_s <= 30.0):
             raise ValueError("camera_open_timeout_s must be in (0, 30]")
+        # Persistent-camera self-heal (7b): a black-frame floor that must stay a floor (not a
+        # darkness gate -- the upper bound keeps it well under low_light_luma_min), and a positive,
+        # bounded anti-thrash cooldown. Fail loud rather than silently clamp, like the checks above.
+        if not (0.0 < self.camera_black_luma <= 50.0):
+            raise ValueError("camera_black_luma must be in (0, 50]")
+        if not (0.0 < self.camera_reopen_cooldown_s <= 600.0):
+            raise ValueError("camera_reopen_cooldown_s must be in (0, 600]")
         # Watchdog bounds (Step 5): positive/bounded timeouts, an integer failure threshold >= 1.
         if not (0.0 < self.watchdog_ping_timeout_s <= 30.0):
             raise ValueError("watchdog_ping_timeout_s must be in (0, 30]")

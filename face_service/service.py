@@ -327,6 +327,10 @@ class FaceService:
         self._ctrl_handler = None   # keep a ref so SetConsoleCtrlHandler's callback isn't GC'd
         self._cam_lock = threading.Lock()
         self._cam: Camera | None = None  # kept open when persistent_camera=True
+        # monotonic timestamp of the last persistent-camera self-heal (_note_camera_health).
+        # 0.0 means "never healed": time.monotonic() on Windows counts from boot, so the very
+        # first heal is never suppressed unless the service starts within the cooldown of boot.
+        self._cam_heal_at = 0.0
         self._started_at = time.time()
         # When the enrollment wizard is running it needs exclusive access to
         # the webcam. ``_camera_paused_until`` holds an epoch timestamp: probes
@@ -383,6 +387,53 @@ class FaceService:
             except Exception:
                 log.exception("persistent camera release failed")
 
+    def _note_camera_health(self, frames_ok: int, luma_max: "float | None", where: str) -> bool:
+        """Drop a poisoned persistent-camera cache AFTER the fact. Returns True if it was dropped.
+
+        The KNOWN_ISSUES #1 signature: an owner wedged elsewhere on the machine leaves the device
+        in a state where our capture opens "successfully" and then reads nothing, or reads
+        all-black frames -- and with ``persistent_camera=True`` ``_acquire_camera`` caches that
+        capture and reuses it for the process lifetime, since its reuse gate only checks that a
+        handle exists. Nothing here probes the device to find that out BEFORE using it: a probe
+        read can wedge exactly like the real ones do, and the pipe server is sequential, so a
+        stuck probe would cost every later request. This judges the reads that already happened.
+
+        Trigger: no frame arrived at all, or the brightest frame of the burst was at/below
+        ``cfg.camera_black_luma``. ``cfg.camera_reopen_cooldown_s`` then rate-limits the heal, so a
+        device that is simply gone is not reopened once per request.
+
+        Dropping the cache is all this does -- reopening is left to the next ``_acquire_camera``,
+        which builds a BRAND-NEW ``Camera``. That matters: ``Camera.open_fast`` short-circuits when
+        the object already holds a handle, and a fresh object has none, so the dead capture cannot
+        be handed back. Recovery is best-effort, not a promise: if the wedged owner still holds the
+        device the fresh open just reports busy, and the caller sees the usual "camera-busy".
+
+        Call with ``_cam_lock`` NOT held -- it takes that lock itself, and ``threading.Lock`` is
+        not reentrant. Reading ``self._cam`` unlocked is safe here because the pipe server handles
+        one request at a time, on this thread.
+        """
+        if not self.cfg.persistent_camera or self._cam is None:
+            return False                      # nothing cached, so nothing to poison
+        if frames_ok == 0:
+            reason = "zero-frames"
+        elif luma_max is not None and luma_max <= self.cfg.camera_black_luma:
+            reason = "black-burst"
+        else:
+            return False
+        now = time.monotonic()
+        since = now - self._cam_heal_at
+        if since < self.cfg.camera_reopen_cooldown_s:
+            log.info("camera heal suppressed (cooldown): where=%s reason=%s %.1fs since last heal "
+                     "(cooldown %.1fs)", where, reason, since, self.cfg.camera_reopen_cooldown_s)
+            return False
+        with self._cam_lock:
+            self._release_camera()
+        self._cam_heal_at = now
+        log.warning("camera cache dropped for self-heal: where=%s reason=%s frames_ok=%d luma=%s",
+                    where, reason, frames_ok,
+                    "n/a" if luma_max is None else "%.2f" % luma_max)
+        return True
+
     # ---------- core ops ----------
 
     def _capture_and_verify(self) -> VerifyOutcome:
@@ -398,12 +449,40 @@ class FaceService:
         the ``challenge`` command for the Stage-5 Credential Provider. Runs the full burst (no
         early-exit) so every frame gets a chance to flag a screen and to catch a spontaneous
         blink; that burst is still subsecond.
+
+        Camera self-heal (KNOWN_ISSUES #1): when the burst reads nothing, or reads black, the
+        cached persistent capture is dropped (``_note_camera_health``) and the WHOLE burst is
+        retried ONCE against a freshly opened device. The retry is transparent -- callers see a
+        single VerifyOutcome, so `verify`/`unlock` still write one audit record and touch the
+        lockout counter at most once, on the final result. Exactly one retry, no recursion: if the
+        second burst is dead too, that is the answer, and the cooldown keeps the next request from
+        reopening again immediately.
         """
         if self._camera_leased_out():
             log.info("verify skipped: camera leased out to enrollment")
             return VerifyOutcome(False, 1.0, False,
                                  {"verdict": "SKIPPED", "reason": "camera-leased"})
 
+        r = self._locked_burst()
+        if r.camera_busy:
+            return r                          # device held elsewhere: nothing of ours to heal
+        if not self._note_camera_health(r.detail.get("frames_ok", 0), r.scene_luma, "verify-burst"):
+            return r
+        r2 = self._locked_burst()
+        # The heal dropped the cache, so the acquire above built a new Camera. If even that could
+        # not open, the device is genuinely unavailable -- report the FIRST outcome rather than
+        # turning a plain bad burst into "camera-busy" on the way out.
+        if r2.camera_busy:
+            return r
+        return r2._replace(detail={**r2.detail, "healed": True})
+
+    def _locked_burst(self) -> VerifyOutcome:
+        """One acquire -> burst -> release cycle under ``_cam_lock``.
+
+        Split out of ``_capture_and_verify`` so the self-heal can run the same cycle a second time
+        without recursion, and so the health check itself runs with the lock released (it takes
+        ``_cam_lock``, which is not reentrant). The busy path is unchanged from before the split.
+        """
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
@@ -429,6 +508,7 @@ class FaceService:
         screen_flagged = 0
         screen_checked = 0
         scene_luma_max = None   # brightest scene luma seen this burst (Stage 3.2); None if no frame read
+        frames_ok = 0           # frames that actually arrived (camera-health telemetry, 7b)
         blink = BlinkDetector()
 
         # drain stale buffered frames
@@ -438,6 +518,7 @@ class FaceService:
             frame = cam.read()
             if frame is None:
                 continue
+            frames_ok += 1
             # Scene brightness is face-INDEPENDENT: compute it for every captured frame
             # (incl. no-face ones) and keep the MAX, so a transient dip or a frame where
             # the face was briefly lost can't trip the low-light gate on its own.
@@ -494,6 +575,9 @@ class FaceService:
             "screen_flagged": screen_flagged,
             "screen_checked": screen_checked,
             "scene_luma": round(scene_luma_max, 2) if scene_luma_max is not None else None,
+            # Additive camera-health telemetry (7b): how many of cfg.verify_frames reads actually
+            # returned a frame. 0 with a cached persistent camera is the KNOWN_ISSUES #1 signature.
+            "frames_ok": frames_ok,
             "mode": self.cfg.liveness_mode,
             "latency_ms": round(latency_ms, 1),
         }
@@ -626,6 +710,7 @@ class FaceService:
 
         identity_frames = 0            # matching frames actually fed to the task (identity mode)
         distance_best: float | None = None   # best distance over every frame that HAD a face
+        frames_ok = 0                  # frames that actually arrived (camera-health telemetry, 7b)
 
         with self._cam_lock:
             cam, busy = self._acquire_camera()
@@ -638,6 +723,7 @@ class FaceService:
                     frame = cam.read()
                     if frame is None:
                         continue
+                    frames_ok += 1
                     try:
                         a = self.recog.analyze_frame(frame)
                     except RuntimeError as e:      # e.g. no enrollment
@@ -659,6 +745,14 @@ class FaceService:
             finally:
                 if not self.cfg.persistent_camera:
                     cam.close()
+
+        # Zero-frame check only: no luma, and no retry. A gesture round is fed by whatever the
+        # user does over several seconds, so a dark stretch is normal here and would false-flag a
+        # black burst; and the round is already over -- retrying it would silently re-prompt the
+        # user for a gesture they just performed. Dropping a dead cache still helps the NEXT
+        # request. (The RuntimeError return above bails out before this, on purpose: that is an
+        # engine refusal, e.g. enrollment vanished, not a camera verdict.)
+        self._note_camera_health(frames_ok, None, "challenge")
 
         log.info("challenge kind=%s passed=%s state=%s%s",
                  issued.name.lower(), ch.passed, ch.state.name,
@@ -760,6 +854,15 @@ class FaceService:
         return self._presence_probe_recognition()
 
     def _presence_probe_recognition(self) -> tuple[bool, bool]:
+        # Camera-health telemetry (7b): count the frames that actually arrived and keep the
+        # brightest scene luma among them, then judge AFTER the lock is dropped --
+        # _note_camera_health takes _cam_lock and threading.Lock is not reentrant. ``scene_luma``
+        # is the SAME canonical helper the verify burst uses, so the two paths can never disagree
+        # about what "black" means. The result is accumulated instead of returned from inside the
+        # lock for that reason; the values themselves are what this returned before.
+        frames_ok = 0
+        luma_max: "float | None" = None
+        result = (False, False)
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
@@ -772,18 +875,29 @@ class FaceService:
                     frame = cam.read()
                     if frame is None:
                         continue
+                    frames_ok += 1
+                    sl = scene_luma(frame)
+                    luma_max = sl if luma_max is None else max(luma_max, sl)
                     try:
                         ok, _dist, real = self.recog.verify_frame(frame)
                     except Exception:
                         continue
                     if ok:
-                        return True, real
+                        result = (True, real)
+                        break
             finally:
                 if not self.cfg.persistent_camera:
                     cam.close()
-        return False, False
+        # No retry on this path: the probe runs on a timer, so the next tick already gets the
+        # fresh camera, and absence-strike policy stays entirely the caller's business.
+        self._note_camera_health(frames_ok, luma_max, "probe-recog")
+        return result
 
     def _presence_probe_detection(self) -> tuple[bool, bool]:
+        # Same camera-health bookkeeping as the recognition probe above, same reasons.
+        frames_ok = 0
+        luma_max: "float | None" = None
+        result = (False, True)
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
@@ -796,16 +910,21 @@ class FaceService:
                     frame = cam.read()
                     if frame is None:
                         continue
+                    frames_ok += 1
+                    sl = scene_luma(frame)
+                    luma_max = sl if luma_max is None else max(luma_max, sl)
                     try:
                         if self.detector.has_face(frame):
-                            return True, True
+                            result = (True, True)
+                            break
                     except Exception as e:
                         log.warning("detector error: %s", e)
                         continue
             finally:
                 if not self.cfg.persistent_camera:
                     cam.close()
-        return False, True
+        self._note_camera_health(frames_ok, luma_max, "probe-detect")
+        return result
 
     # ---------- pipe ----------
 

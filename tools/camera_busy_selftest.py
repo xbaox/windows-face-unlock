@@ -153,10 +153,14 @@ def main(argv=None) -> int:
                 self.records.append((event, dict(record)))
 
         def _svc(cfg):
+            # __new__ bypasses __init__, so this mirrors the __init__ state that the paths under
+            # test actually touch: a field added there has to be added here too, or the first case
+            # that reaches it fails with AttributeError instead of testing anything.
             s = FaceService.__new__(FaceService)
             s.cfg = cfg
             s._cam = None
             s._cam_lock = threading.Lock()
+            s._cam_heal_at = 0.0
             s._lockout = _LockoutSpy()
             s._audit = _AuditStub()
             s._camera_paused_until = 0.0

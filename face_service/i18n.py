@@ -175,6 +175,12 @@ _EN: dict[str, str] = {
     "field.persistent_camera": "Keep camera open between probes",
     "field.persistent_camera.desc": "On = camera stays open, ~0.9s verify, LED always on. Off = camera re-opens per probe, ~3s verify, LED only during probe.",
 
+    "field.camera_black_luma": "Black-frame luma threshold",
+    "field.camera_black_luma.desc": "A frame whose average brightness is at or below this counts as black. When a whole capture burst comes back black -- or no frames arrive at all -- the kept-open camera is dropped and reopened on the next request (self-heal). Deliberately far below the low-light floor: a genuinely dark room is not a broken camera.",
+
+    "field.camera_reopen_cooldown_s": "Camera self-heal cooldown (seconds)",
+    "field.camera_reopen_cooldown_s.desc": "Minimum time between two such self-heals, so a camera that stays dead is not reopened on every single request.",
+
     "field.low_light_boost": "Low-light exposure boost",
     "field.low_light_boost.desc": "When the scene is too dark for a trustworthy match, temporarily raise the camera exposure and retry once before refusing with 'too-dark'. The exposure is always restored afterwards.",
 
@@ -1053,6 +1059,10 @@ _RU: dict[str, str] = {
     "field.camera_warmup_frames.desc": "Сколько кадров отбрасывается после открытия камеры, чтобы автоэкспозиция успела настроиться. Увеличьте, если проверки не проходят при тусклом свете.",
     "field.persistent_camera": "Держать камеру открытой",
     "field.persistent_camera.desc": "Вкл — камера остаётся открытой: проверка ~0,9 с, индикатор горит постоянно. Выкл — камера открывается на каждую проверку: ~3 с, индикатор только во время проверки.",
+    "field.camera_black_luma": "Порог чёрного кадра (luma)",
+    "field.camera_black_luma.desc": "Кадр со средней яркостью не выше этого значения считается чёрным. Если чёрной вернулась вся серия захвата — или кадры не пришли вовсе — открытая камера сбрасывается и открывается заново на следующем запросе (самолечение). Порог намеренно намного ниже порога темноты: по-настоящему тёмная комната — это не сломанная камера.",
+    "field.camera_reopen_cooldown_s": "Кулдаун самолечения камеры (с)",
+    "field.camera_reopen_cooldown_s.desc": "Минимальный интервал между двумя такими сбросами, чтобы камера, которая остаётся мёртвой, не переоткрывалась на каждом запросе.",
     "field.low_light_boost": "Повышать экспозицию в темноте",
     "field.low_light_boost.desc": "Если в кадре слишком темно для надёжного распознавания, временно поднять экспозицию камеры и переснять, прежде чем отказывать с причиной «too-dark». Экспозиция затем восстанавливается.",
     "field.warmup_on_start": "Прогрев моделей при запуске",

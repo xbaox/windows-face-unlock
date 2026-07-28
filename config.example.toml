@@ -37,6 +37,14 @@ persistent_camera = true         # true  = keep the device open between requests
 camera_open_retries = 2          # extra open attempts before reporting the
                                  # camera as busy (held by another app)
 camera_open_timeout_s = 3.0      # wall-clock budget for that whole retry loop
+camera_black_luma = 2.0          # a capture burst whose brightest frame is at or
+                                 # below this scene luma counts as a BLACK (dead)
+                                 # capture, and the cached camera is dropped so the
+                                 # next request opens a fresh one. Far below
+                                 # low_light_luma_min on purpose: a genuinely dark
+                                 # room is not a broken camera
+camera_reopen_cooldown_s = 30.0  # minimum seconds between two such self-heals, so a
+                                 # device that stays dead is not reopened per request
 
 # --- Unlock ------------------------------------------------------------------
 
