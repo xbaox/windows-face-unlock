@@ -7,8 +7,17 @@ Commands:
   {"cmd":"ping"}
       -> {"ok":true,"pong":true}
   {"cmd":"verify"}
-      -> {"ok":true,"match":bool,"distance":float,"real":bool}
+      -> {"ok":true,"match":bool,"distance":float,"real":bool,"verdict":str}
+                               # "verdict" is the liveness verdict name: PASS | NEEDS_GESTURE |
+                               # NOT_LIVE (from the burst), or SKIPPED (camera leased / busy).
+                               # It exists because match:false alone is ambiguous -- in paranoid
+                               # EVERY recognized face verdicts NEEDS_GESTURE, so a genuine user
+                               # and a stranger both report match:false. Diagnostic/telemetry
+                               # only: it grants nothing and gates nothing.
   {"cmd":"unlock"}             # verify + return credentials on success
+                               # UNCHANGED by the verify addition above: unlock keeps its own,
+                               # older discriminator (reason "needs-gesture" + gesture/prompt/
+                               # token below), and no verdict field was added to any reply here.
       -> {"ok":true,"username":"...","password":"...","domain":"..."}  (on match)
       -> {"ok":false,"reason":"needs-gesture","gesture":"blink|turn_left|turn_right|nod",
           "prompt":str,"token":"<32 hex>","ttl_s":float,"distance":float,"real":bool}
@@ -900,7 +909,14 @@ class FaceService:
         if cmd == "verify":
             r = self._capture_and_verify()
             self._audit.write("verify", r.detail)
-            return {"ok": True, "match": r.match, "distance": r.distance, "real": r.real}
+            # "verdict" is additive: the four legacy keys keep their names, types and values, so
+            # an older client that ignores unknown keys is unaffected. The value is read from the
+            # burst detail (which already carries it) with .get(), so a detail dict that somehow
+            # lacks one yields null rather than raising out of the handler. `unlock` is NOT given
+            # the same field -- its needs-gesture reply already distinguishes the cases, and its
+            # shape is part of the Credential Provider contract.
+            return {"ok": True, "match": r.match, "distance": r.distance, "real": r.real,
+                    "verdict": r.detail.get("verdict")}
 
         if cmd == "presence":
             present, real = self._presence_probe()
