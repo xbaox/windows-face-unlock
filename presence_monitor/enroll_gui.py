@@ -19,6 +19,7 @@ Flow
 """
 from __future__ import annotations
 import logging
+import os
 import threading
 import time
 import tkinter as tk
@@ -37,7 +38,11 @@ from face_service.i18n import set_language, t
 from .monitor import pipe_call
 from .widgets import InfoButton, Tooltip, attach_tooltip
 
-log = logging.getLogger(__name__)
+# Explicit name, NOT __name__: this module is also the process entry point, and under
+# `python -m presence_monitor.enroll_gui` __name__ is "__main__" -- which would label every line
+# in enroll.log as "__main__" and make it ungreppable against the tray's own logs. Pinning the
+# canonical dotted name keeps records identical whether the module is imported or run.
+log = logging.getLogger("presence_monitor.enroll_gui")
 
 PREVIEW_W = 480
 PREVIEW_H = 360
@@ -970,7 +975,12 @@ def main() -> int:
         # default is English, so without this the wizard would ignore the user's saved language.
         # EnrollWindow loads its own Config for the QC/camera knobs; this second read is the
         # cheap price of not reshaping its constructor.
-        set_language(Config.load().language)
+        cfg = Config.load()
+        set_language(cfg.language)
+        # One startup line: enroll.log is a fresh file per run, so this is what tells you which
+        # process and which settings produced everything below it.
+        log.info("enroll wizard starting: pid=%s lang=%s camera_index=%s",
+                 os.getpid(), cfg.language, cfg.camera_index)
         EnrollWindow().run()
     except Exception:
         log.exception("enroll wizard crashed")
