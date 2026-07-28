@@ -25,6 +25,8 @@
     Register    register (overwriting) every declared task, then start it.
     Unregister  stop and remove every declared task.
     Start       start every declared task.
+    Restart     stop the tasks, kill leftover processes with the death-wait,
+                start them again. Touches no registration at all.
 
 .PARAMETER InstallDir
     Required for -Mode Installed: the directory holding the frozen exes.
@@ -42,13 +44,15 @@
     .\register_tasks.ps1 -Mode Installed -InstallDir "C:\Program Files\WindowsFaceUnlock"
 .EXAMPLE
     .\register_tasks.ps1 -Action Unregister
+.EXAMPLE
+    .\register_tasks.ps1 -Action Restart
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Dev', 'Installed')]
     [string]$Mode = 'Dev',
 
-    [ValidateSet('Register', 'Unregister', 'Start')]
+    [ValidateSet('Register', 'Unregister', 'Start', 'Restart')]
     [string]$Action = 'Register',
 
     [string]$InstallDir,
@@ -255,11 +259,22 @@ if ($Action -eq 'Unregister') {
 else {
     Write-Host "Planned tasks:"
     foreach ($fuItem in $fuPlan) {
+        if ($fuExisting -contains $fuItem.Name) {
+            $fuStateText = if ($Action -eq 'Restart') { 'registered (will be stopped, then started)' }
+                           else { 'registered (will be overwritten)' }
+        }
+        else {
+            $fuStateText = if ($Action -eq 'Restart') { 'NOT REGISTERED -- restart cannot create it; run -Action Register' }
+                           else { 'not registered (will be created)' }
+        }
         Write-Host ("  - {0}" -f $fuItem.Name)
         Write-Host ("      Execute          : {0}" -f $fuItem.Execute)
         Write-Host ("      Argument         : {0}" -f $(if ($fuItem.Argument) { $fuItem.Argument } else { '(none)' }))
         Write-Host ("      WorkingDirectory : {0}" -f $fuItem.WorkingDirectory)
-        Write-Host ("      Currently        : {0}" -f $(if ($fuExisting -contains $fuItem.Name) { 'registered (will be overwritten)' } else { 'not registered (will be created)' }))
+        Write-Host ("      Currently        : {0}" -f $fuStateText)
+    }
+    if ($Action -eq 'Restart') {
+        Write-Host "  (Restart touches no registration: no task is created, overwritten or removed.)"
     }
 }
 
@@ -286,17 +301,42 @@ if ($DryRun) {
 # PHASE B -- commit. Everything below this point changes the system.
 # ===========================================================================
 
+# Defined here, below the dry-run gate, on purpose: it contains Stop-Process,
+# and keeping every mutating call textually inside phase B is what makes the
+# "dry-run path is clean" check a one-line AST walk instead of a judgement call.
+#
+# Stop-Process only SIGNALS. The Local\FaceUnlockService mutex and the
+# FIRST_PIPE_INSTANCE pipe name stay held until the last handle closes, so
+# starting on a blind delay races a slow-dying process into a mutex-loser exit.
+# Bounded -- on timeout warn and continue, never hang.
+function Stop-FuAndWait {
+    $fuRunning = @(Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -CommandLineNeedles $fuNeedles)
+    if (-not $fuRunning) { return }
+
+    Write-Host ("Stopping {0} running Face Unlock process(es)..." -f $fuRunning.Count)
+    $fuRunning | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+    $fuStopwatch = [Diagnostics.Stopwatch]::StartNew()
+    while ($fuStopwatch.Elapsed.TotalSeconds -lt $fuDeathWaitSec) {
+        if (-not (Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -CommandLineNeedles $fuNeedles)) {
+            break
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    $fuLeft = @(Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -CommandLineNeedles $fuNeedles)
+    if ($fuLeft) {
+        Write-Warning ("{0} process(es) still alive after {1}s; continuing anyway (a new instance may exit as a mutex-loser)" -f `
+                       $fuLeft.Count, $fuDeathWaitSec)
+    }
+}
+
 Write-Host ""
 
 if ($Action -eq 'Unregister') {
     # Destruction is the intent here, so ordering carries no invariant: stop the
     # processes first so nothing holds files, then remove declared and orphaned
     # tasks alike.
-    $fuRunning = @(Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -CommandLineNeedles $fuNeedles)
-    if ($fuRunning) {
-        Write-Host ("Stopping {0} running Face Unlock process(es)..." -f $fuRunning.Count)
-        $fuRunning | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
+    Stop-FuAndWait
     foreach ($fuName in @($fuDeclaredSet + $fuOrphans)) {
         Unregister-ScheduledTask -TaskName $fuName -Confirm:$false -ErrorAction SilentlyContinue
         Write-Host ("Unregistered: {0}" -f $fuName)
@@ -310,6 +350,27 @@ if ($Action -eq 'Start') {
         Start-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
         Write-Host ("Started: {0}" -f $fuItem.Name)
     }
+    exit 0
+}
+
+if ($Action -eq 'Restart') {
+    # B3 + B4 only -- deliberately NO B1/B2. A restart must never touch a
+    # registration: that way a typo in the declaration or a moved venv cannot
+    # cost you a working set of tasks while you were only trying to bounce the
+    # service.
+    #
+    # Stop-ScheduledTask first: killing the process alone can leave the
+    # scheduler still believing the task is Running, and Start-ScheduledTask on
+    # a Running task is a silent no-op.
+    foreach ($fuItem in $fuPlan) {
+        Stop-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
+    }
+    Stop-FuAndWait
+    foreach ($fuItem in $fuPlan) {
+        Start-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
+        Write-Host ("Restarted: {0}" -f $fuItem.Name)
+    }
+    Write-Host "Done."
     exit 0
 }
 
@@ -333,29 +394,8 @@ foreach ($fuName in $fuOrphans) {
     Write-Host ("Removed orphan (not in the declaration): {0}" -f $fuName)
 }
 
-# B3: stop what is still running from the previous registration. Stop-Process
-# only SIGNALS: the Local\FaceUnlockService mutex and the FIRST_PIPE_INSTANCE
-# pipe name stay held until the last handle closes, so starting on a blind delay
-# races a slow-dying process into a mutex-loser exit. Bounded -- on timeout warn
-# and continue, never hang.
-$fuRunning = @(Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -CommandLineNeedles $fuNeedles)
-if ($fuRunning) {
-    Write-Host ("Stopping {0} running Face Unlock process(es)..." -f $fuRunning.Count)
-    $fuRunning | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-
-    $fuStopwatch = [Diagnostics.Stopwatch]::StartNew()
-    while ($fuStopwatch.Elapsed.TotalSeconds -lt $fuDeathWaitSec) {
-        if (-not (Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -CommandLineNeedles $fuNeedles)) {
-            break
-        }
-        Start-Sleep -Milliseconds 200
-    }
-    $fuLeft = @(Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -CommandLineNeedles $fuNeedles)
-    if ($fuLeft) {
-        Write-Warning ("{0} process(es) still alive after {1}s; starting anyway (a new instance may exit as a mutex-loser)" -f `
-                       $fuLeft.Count, $fuDeathWaitSec)
-    }
-}
+# B3: stop what is still running from the previous registration.
+Stop-FuAndWait
 
 # B4
 foreach ($fuItem in $fuPlan) {

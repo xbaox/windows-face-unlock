@@ -1,33 +1,16 @@
-Stop-ScheduledTask -TaskName 'FaceUnlock-Service' -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName 'FaceUnlock-Presence' -ErrorAction SilentlyContinue
+# Restart the Face Unlock tasks: stop them, kill any leftover processes with
+# the bounded death-wait, start them again.
+#
+# This is a thin wrapper. The task list, the process-matching criterion and the
+# death-wait all live in register_tasks.ps1 + tasks.psd1, so there is exactly
+# one definition of each. It used to be a hand-rolled copy that named two of the
+# three tasks and carried its own kill filter.
+#
+# Pass -DryRun to see the plan without touching anything.
+[CmdletBinding()]
+param(
+    [switch]$DryRun
+)
 
-# One criterion, reused by the kill and the death-wait below so the two cannot drift apart. It
-# matches BOTH halves of a venv pair: the .venv pythonw.exe launcher stub and the base-interpreter
-# worker it spawns.
-$matching = {
-    Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*face_service*' -or $_.CommandLine -like '*presence_monitor*' }
-}
-
-& $matching | ForEach-Object {
-    Write-Host "Killing PID $($_.ProcessId): $($_.CommandLine)"
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-}
-
-# Death-wait: Stop-Process only SIGNALS. The Local\FaceUnlockService mutex and the
-# FIRST_PIPE_INSTANCE pipe name stay held until the last handle is gone, so starting on a blind
-# delay races a slow-dying process into a mutex-loser exit. Bounded: on timeout warn and start
-# anyway, never hang.
-$sw = [Diagnostics.Stopwatch]::StartNew()
-while ((@(& $matching).Count) -gt 0 -and $sw.Elapsed.TotalSeconds -lt 10) {
-    Start-Sleep -Milliseconds 200
-}
-$left = @(& $matching).Count
-if ($left -gt 0) {
-    Write-Warning "$left face-unlock process(es) still alive after 10s; starting anyway (the new instance may exit as a mutex-loser)"
-}
-
-Start-ScheduledTask -TaskName 'FaceUnlock-Service'
-Start-Sleep 1
-Start-ScheduledTask -TaskName 'FaceUnlock-Presence'
-Write-Host "Started."
+& (Join-Path $PSScriptRoot 'register_tasks.ps1') -Action Restart -DryRun:$DryRun
+exit $LASTEXITCODE
