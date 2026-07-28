@@ -12,6 +12,9 @@ Exit code 0 = all green, 1 = at least one failure.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:  # repo layout on the target machine
     from face_service.liveness import verdict, Verdict

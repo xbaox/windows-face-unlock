@@ -1,16 +1,17 @@
 import os
-# Prevent TF/Keras from spawning extra worker processes that can steal
-# the named pipe and exhaust resources.
+# Cap native thread pools before anything heavy is imported. An unbounded pool
+# competes with the pipe server thread and makes the first verify slower.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
+# The two TF_* variables are vestigial: TensorFlow left the project in stage 2
+# together with the passive MiniFASNet liveness that needed it, and nothing
+# here imports it any more. They are harmless no-ops on an interpreter that
+# never loads TF. Deleting them is a code change rather than a comment fix, so
+# it is deferred rather than smuggled into a docs-only commit.
 os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
 os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
-# NOTE (stage 1): the recognition engine moved from tf-keras (CPU) to
-# InsightFace on onnxruntime-gpu, so we must NOT hide the GPU anymore.
-# TensorFlow (still used only for passive MiniFASNet liveness) stays on CPU
-# via TF_* thread limits above and native-Windows TF not seeing CUDA, so
-# exposing the GPU here benefits only onnxruntime. Do not re-add
-# CUDA_VISIBLE_DEVICES=-1 or the engine silently falls back to CPU.
-# (Passive TF liveness is removed in stage 2 with active liveness.)
+# Recognition is InsightFace on onnxruntime-gpu (stage 1). Do NOT re-add
+# CUDA_VISIBLE_DEVICES=-1: that variable HIDES every GPU, and the engine then
+# falls back to CPU silently. Removing it is what made GPU inference work.
 
 import multiprocessing
 

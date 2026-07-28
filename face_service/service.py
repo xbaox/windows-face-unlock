@@ -1164,7 +1164,9 @@ class FaceService:
         except Exception as e:
             log.warning("enrollment load: %s", e)
 
-        # Force-load ArcFace + detector + MiniFASNet with a dummy image.
+        # Force-load the InsightFace models (detection, recognition and the two
+        # landmark nets) with a dummy image. There is no separate liveness model
+        # to warm any more -- active liveness rides the same landmarks.
         # Using one of our enrolled photos guarantees a face is present.
         try:
             from .config import ENROLL_DIR
