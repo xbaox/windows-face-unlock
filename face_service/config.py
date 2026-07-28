@@ -117,6 +117,15 @@ class Config:
     # loop; open() itself keeps its robust 3x3 zombie recovery for enrollment / warmup.
     camera_open_retries: int = 2         # extra open attempts after the first before declaring busy
     camera_open_timeout_s: float = 3.0   # wall-clock budget for the whole open-retry loop (seconds)
+    # Hard ceiling on how long we WAIT for ONE open attempt (7b-2). camera_open_timeout_s above
+    # only decides whether another attempt may START; it cannot bound an attempt already running,
+    # and a wedged webcam driver can leave VideoCapture()/read() inside a native call that no
+    # timeout property on this hardware interrupts. Each attempt therefore runs on its own thread
+    # and is waited on for at most this long. Blowing the ceiling is treated as "the device is
+    # stuck": we stop waiting AND stop retrying, because another attempt is just more waiting on
+    # the same stuck device. The native call cannot be cancelled -- it may still be running, and
+    # whatever capture it eventually produces is closed by that thread (see camera_open.py).
+    camera_open_attempt_cap_s: float = 5.0
     # --- Stage 7b: persistent-camera self-heal (post-hoc; the KNOWN_ISSUES #1 signature) ---
     # A wedged owner elsewhere on the machine can hand the device back in a state where our
     # capture opens "successfully" and then reads nothing, or reads all-black frames. With
@@ -245,6 +254,11 @@ class Config:
             raise ValueError("camera_open_retries must be in [0, 10]")
         if not (0.0 < self.camera_open_timeout_s <= 30.0):
             raise ValueError("camera_open_timeout_s must be in (0, 30]")
+        # Per-attempt open ceiling (7b-2): positive and bounded. Deliberately NOT constrained
+        # against camera_open_timeout_s -- the two measure different things (one attempt vs the
+        # whole retry loop), and a cap above the loop budget just means the loop stops first.
+        if not (0.0 < self.camera_open_attempt_cap_s <= 60.0):
+            raise ValueError("camera_open_attempt_cap_s must be in (0, 60]")
         # Persistent-camera self-heal (7b): a black-frame floor that must stay a floor (not a
         # darkness gate -- the upper bound keeps it well under low_light_luma_min), and a positive,
         # bounded anti-thrash cooldown. Fail loud rather than silently clamp, like the checks above.

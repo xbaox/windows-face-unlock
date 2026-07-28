@@ -88,13 +88,15 @@ from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
 from .lockout import Lockout
 from .lowlight import evaluate_low_light, scene_luma
 from .camera_boost import try_exposure_boost
-from .camera_open import open_with_retry
+from .camera_open import BoundedOpener
 from .recognizer import Recognizer
 
 log = logging.getLogger(__name__)
 
-# Pause between bounded camera-open attempts (Stage 3.4). The attempt count / total budget are
-# config (camera_open_retries / camera_open_timeout_s); this small inter-attempt pause is fixed.
+# Pause between camera-open attempts (Stage 3.4). Everything else about the open loop is config
+# (camera_open_retries / camera_open_timeout_s bound how many attempts run, and 7b-2's
+# camera_open_attempt_cap_s bounds how long each is waited for); this small inter-attempt pause is
+# fixed -- it exists to let a driver settle between tries, not to shape the budget.
 CAMERA_OPEN_PAUSE_S = 0.3
 
 
@@ -331,6 +333,11 @@ class FaceService:
         # 0.0 means "never healed": time.monotonic() on Windows counts from boot, so the very
         # first heal is never suppressed unless the service starts within the cooldown of boot.
         self._cam_heal_at = 0.0
+        # Runs each camera-open attempt on its own thread with a hard wait ceiling, and reclaims a
+        # capture that lands after we stopped waiting. One instance for the process: it keeps the
+        # in-flight attempt as state, and the pipe server is sequential so there is never a second
+        # opener running against the same device.
+        self._opener = BoundedOpener()
         self._started_at = time.time()
         # When the enrollment wizard is running it needs exclusive access to
         # the webcam. ``_camera_paused_until`` holds an epoch timestamp: probes
@@ -347,25 +354,33 @@ class FaceService:
         return time.time() < self._camera_paused_until
 
     def _acquire_camera(self):
-        """Open the webcam with a bounded, non-hanging retry (Stage 3.4).
+        """Open the webcam with a bounded-WAIT retry (Stage 3.4; wait ceiling added in 7b-2).
 
         Returns ``(camera, busy)``: ``(Camera, False)`` on success, ``(None, True)`` when the device
         is busy (held by ANOTHER process -- distinct from our own enrollment lease, which the callers
-        check first). Never raises, never hangs (Camera.open_fast + open_with_retry). For the
-        persistent camera ``self._cam`` is set ONLY on success, so a failed open leaves it None and
-        the next call retries cleanly instead of returning a stuck half-open handle. The caller must
-        already hold ``self._cam_lock``.
+        check first). Never raises. For the persistent camera ``self._cam`` is set ONLY on success,
+        so a failed open leaves it None and the next call retries cleanly instead of returning a
+        stuck half-open handle. The caller must already hold ``self._cam_lock``.
+
+        What "bounded" means here, precisely: ``camera_open_retries``/``camera_open_timeout_s``
+        bound how MANY attempts are made, and ``camera_open_attempt_cap_s`` bounds how long we WAIT
+        for each one (``BoundedOpener`` runs it on a thread and joins with that ceiling). It does
+        not mean the driver call is cancelled -- nothing can cancel it. A wedged attempt is left
+        running, the retry loop aborts rather than queueing more waiting on the same stuck device,
+        and if that attempt eventually produces a capture, its own thread closes it. So this returns
+        in bounded time; the DEVICE may still be occupied by the abandoned call for longer, which
+        the caller sees as the usual "camera-busy".
         """
         if self.cfg.persistent_camera and self._cam is not None:
             return self._cam, False
         cam = Camera(self.cfg.camera_index, self.cfg.camera_warmup_frames)
-        ok = open_with_retry(
-            cam.open_fast,
+        ok = self._opener.open(
+            open_fn=cam.open_fast,
+            close_fn=cam.close,
             retries=self.cfg.camera_open_retries,
             pause_s=CAMERA_OPEN_PAUSE_S,
             timeout_s=self.cfg.camera_open_timeout_s,
-            clock=time.monotonic,
-            sleep=time.sleep,
+            cap_s=self.cfg.camera_open_attempt_cap_s,
         )
         if not ok:
             return None, True

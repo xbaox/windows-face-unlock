@@ -75,18 +75,29 @@ class Camera:
                 time.sleep(1.0)  # let the driver flush stuck handles
         raise RuntimeError(f"Cannot open camera index {self.index} ({last_err})")
 
-    def open_fast(self) -> bool:
-        """Bounded single-pass open for the busy-check path (Stage 3 / Step 4).
+    def open_fast(self, deadline: float | None = None) -> bool:
+        """Single-pass open for the busy-check path (Stage 3 / Step 4; deadline added in 7b-2).
 
         One quick pass over the backends with a few reads and NO long sleeps; returns True if a
         frame was grabbed (camera acquired), False if it could not be (e.g. the device is held by
         another process). Unlike ``open()`` it never raises and does NOT run the multi-second
-        zombie-recovery retry -- the service wraps it in its own bounded, config-driven retry loop.
+        zombie-recovery retry -- the service wraps it in its own config-driven retry loop.
         ``open()`` stays the authoritative, robust opener for enrollment / warmup.
+
+        ``deadline`` (monotonic) makes this COOPERATIVELY bounded: it is checked between backends
+        and before each read, and once passed we release the candidate and give up. That is
+        best-effort by construction -- the checks sit between native calls, so a single
+        ``VideoCapture()`` or ``read()`` already inside a wedged driver still runs to completion
+        (no property on this hardware interrupts it). The hard ceiling is the caller's:
+        ``camera_open.BoundedOpener`` waits on a whole attempt for at most ``cap_s`` and reclaims
+        the capture if it lands late. ``None`` keeps the pre-7b-2 behaviour exactly, so the probes
+        and benchmarks that call ``open_fast()`` with no argument are unaffected.
         """
         if self._cap is not None:
             return True
         for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+            if deadline is not None and time.monotonic() >= deadline:
+                return False       # no candidate open yet -- nothing to release
             cap = cv2.VideoCapture(self.index, backend)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -94,6 +105,9 @@ class Camera:
             _apply_timeout_props(cap, backend)
             ok = False
             for _ in range(4):
+                if deadline is not None and time.monotonic() >= deadline:
+                    cap.release()  # candidate we will not finish evaluating
+                    return False
                 ret, _ = cap.read()
                 if ret:
                     ok = True
@@ -101,6 +115,12 @@ class Camera:
             if ok:
                 self._cap = cap
                 for _ in range(self.warmup_frames):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        # A real capture, but under-warmed and out of budget. Hand back nothing
+                        # rather than a half-configured handle; close() nulls _cap for us, so the
+                        # next open starts clean.
+                        self.close()
+                        return False
                     cap.read()
                 return True
             cap.release()

@@ -37,6 +37,14 @@ persistent_camera = true         # true  = keep the device open between requests
 camera_open_retries = 2          # extra open attempts before reporting the
                                  # camera as busy (held by another app)
 camera_open_timeout_s = 3.0      # wall-clock budget for that whole retry loop
+camera_open_attempt_cap_s = 5.0  # hard ceiling on WAITING for ONE open attempt.
+                                 # camera_open_timeout_s only decides whether the
+                                 # NEXT attempt may start; it cannot bound an
+                                 # attempt already inside a native driver call.
+                                 # Blowing this ceiling means the device is treated
+                                 # as wedged: we stop waiting and do NOT retry,
+                                 # because retrying is just more waiting on the
+                                 # same stuck device
 camera_black_luma = 2.0          # a capture burst whose brightest frame is at or
                                  # below this scene luma counts as a BLACK (dead)
                                  # capture, and the cached camera is dropped so the

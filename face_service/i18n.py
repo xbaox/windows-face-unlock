@@ -175,6 +175,9 @@ _EN: dict[str, str] = {
     "field.persistent_camera": "Keep camera open between probes",
     "field.persistent_camera.desc": "On = camera stays open, ~0.9s verify, LED always on. Off = camera re-opens per probe, ~3s verify, LED only during probe.",
 
+    "field.camera_open_attempt_cap_s": "Single open attempt cap (seconds)",
+    "field.camera_open_attempt_cap_s.desc": "Hard ceiling on how long the service waits for ONE attempt to open the camera. A wedged webcam driver can sit inside a native call that no timeout setting interrupts, so each attempt is waited on separately; blowing this ceiling means the device is treated as stuck and no further attempt is made. Raise it only if your camera is genuinely slow to start.",
+
     "field.camera_black_luma": "Black-frame luma threshold",
     "field.camera_black_luma.desc": "A frame whose average brightness is at or below this counts as black. When a whole capture burst comes back black -- or no frames arrive at all -- the kept-open camera is dropped and reopened on the next request (self-heal). Deliberately far below the low-light floor: a genuinely dark room is not a broken camera.",
 
@@ -1059,6 +1062,8 @@ _RU: dict[str, str] = {
     "field.camera_warmup_frames.desc": "Сколько кадров отбрасывается после открытия камеры, чтобы автоэкспозиция успела настроиться. Увеличьте, если проверки не проходят при тусклом свете.",
     "field.persistent_camera": "Держать камеру открытой",
     "field.persistent_camera.desc": "Вкл — камера остаётся открытой: проверка ~0,9 с, индикатор горит постоянно. Выкл — камера открывается на каждую проверку: ~3 с, индикатор только во время проверки.",
+    "field.camera_open_attempt_cap_s": "Потолок одной попытки открытия камеры (с)",
+    "field.camera_open_attempt_cap_s.desc": "Жёсткий предел ожидания ОДНОЙ попытки открыть камеру. Заклинивший драйвер веб-камеры может застрять внутри системного вызова, который не прерывается никакими настройками таймаута, поэтому каждая попытка ожидается отдельно; превышение предела означает, что устройство считается заклинившим, и следующая попытка не делается. Увеличивайте, только если камера действительно долго запускается.",
     "field.camera_black_luma": "Порог чёрного кадра (luma)",
     "field.camera_black_luma.desc": "Кадр со средней яркостью не выше этого значения считается чёрным. Если чёрной вернулась вся серия захвата — или кадры не пришли вовсе — открытая камера сбрасывается и открывается заново на следующем запросе (самолечение). Порог намеренно намного ниже порога темноты: по-настоящему тёмная комната — это не сломанная камера.",
     "field.camera_reopen_cooldown_s": "Кулдаун самолечения камеры (с)",

@@ -67,6 +67,7 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, object]]]] = [
         ("camera_index",            "int",        (0, 10)),
         ("camera_warmup_frames",    "int",        (0, 60)),
         ("persistent_camera",       "bool",       None),
+        ("camera_open_attempt_cap_s", "float",    (0.5, 60.0)),
         ("camera_black_luma",       "float",      (0.1, 50.0)),
         ("camera_reopen_cooldown_s", "float",     (1.0, 600.0)),
         ("low_light_boost",         "bool",       None),

@@ -12,6 +12,9 @@ Covers the busy-camera handling:
   [4] presence -- busy returns benign (True, True) (no absence strikes), verify_frame untouched.
   [5] lease != busy -- a leased unlock returns "no-match" and never even constructs a camera.
   [6] Config.validate -- camera_open_retries / camera_open_timeout_s bounds fail loud.
+  [7] BoundedOpener (7b-2) -- one attempt is waited on for at most cap_s; blowing the ceiling
+      returns at once and does NOT retry; the abandoned attempt closes its own capture when it
+      lands late; a second open is refused while that worker is alive, and works again after.
 
 No camera / no GPU. Run from the repo root:
     python -m tools.camera_busy_selftest
@@ -22,10 +25,11 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from face_service.camera_open import open_with_retry
+from face_service.camera_open import BoundedOpener, open_with_retry
 from face_service.config import Config
 
 
@@ -122,7 +126,9 @@ def main(argv=None) -> int:
                 self.warmup = warmup
                 self._cap = None
 
-            def open_fast(self):
+            def open_fast(self, deadline=None):
+                # Signature mirrors the real one since 7b-2: BoundedOpener always passes a
+                # deadline. The fake ignores it -- it never blocks, so it can never blow a cap.
                 if FakeCamera.next_open:
                     self._cap = object()
                     return True
@@ -161,6 +167,7 @@ def main(argv=None) -> int:
             s._cam = None
             s._cam_lock = threading.Lock()
             s._cam_heal_at = 0.0
+            s._opener = BoundedOpener()
             s._lockout = _LockoutSpy()
             s._audit = _AuditStub()
             s._camera_paused_until = 0.0
@@ -267,12 +274,90 @@ def main(argv=None) -> int:
     t.ok(_raises(_cv(camera_open_timeout_s=-1.0).validate), "timeout -1 -> fail-loud")
     t.ok(_raises(_cv(camera_open_timeout_s=30.1).validate), "timeout 30.1 -> fail-loud")
 
+    # --- 7) BoundedOpener: a hard ceiling on ONE attempt (7b-2, still no camera) -------------
+    print("\n[7] BoundedOpener -- hard wait ceiling on a single open attempt")
+
+    class FakeOpen:
+        """Scripted open_fn/close_fn pair. Records every call, and can sleep so that an attempt
+        outlives the cap -- which is the whole point being tested. No camera, no cv2."""
+
+        def __init__(self, results, sleep_s=0.0):
+            self.results = list(results)
+            self.sleep_s = sleep_s
+            self.calls = 0
+            self.deadlines = []
+            self.closes = 0
+
+        def open_fn(self, deadline):
+            self.calls += 1
+            self.deadlines.append(deadline)
+            if self.sleep_s:
+                time.sleep(self.sleep_s)
+            return self.results.pop(0) if self.results else False
+
+        def close_fn(self):
+            self.closes += 1
+
+    op = BoundedOpener()
+
+    f = FakeOpen([True])
+    t.ok(op.open(open_fn=f.open_fn, close_fn=f.close_fn, retries=2, pause_s=0.0,
+                 timeout_s=9e9, cap_s=1.0) is True and f.calls == 1,
+         "opens on the first attempt -> True, exactly 1 open_fn call")
+    t.ok(len(f.deadlines) == 1, "open_fn is handed a deadline")
+    t.ok(f.closes == 0, "a completed attempt is never closed behind the caller's back")
+
+    f = FakeOpen([False, False, False])
+    t.ok(op.open(open_fn=f.open_fn, close_fn=f.close_fn, retries=2, pause_s=0.0,
+                 timeout_s=9e9, cap_s=1.0) is False and f.calls == 3,
+         "never opens (retries=2) -> False, exactly 3 attempts (same shape as open_with_retry)")
+    t.ok(len(f.deadlines) == 3
+         and all(f.deadlines[i] <= f.deadlines[i + 1] for i in range(2)),
+         "every attempt gets its own, non-decreasing deadline")
+    t.ok(f.closes == 0, "no cap breach -> close_fn never called")
+
+    # An attempt that outlives the ceiling: return at once, do NOT retry, reclaim it later.
+    wedged = FakeOpen([True], sleep_s=0.4)
+    t0 = time.monotonic()
+    got = op.open(open_fn=wedged.open_fn, close_fn=wedged.close_fn, retries=3, pause_s=0.0,
+                  timeout_s=9e9, cap_s=0.05)
+    waited = time.monotonic() - t0
+    t.ok(got is False and wedged.calls == 1,
+         f"attempt outliving the cap -> False and NO retry ({wedged.calls} call, retries=3)")
+    t.ok(waited < 0.25,
+         f"returns at the ceiling, not when the wedged attempt finishes ({waited:.2f}s of 0.4s)")
+
+    blocked = FakeOpen([True])
+    t.ok(op.open(open_fn=blocked.open_fn, close_fn=blocked.close_fn, retries=0, pause_s=0.0,
+                 timeout_s=9e9, cap_s=1.0) is False and blocked.calls == 0,
+         "a second open while that worker is still in flight -> False, its open_fn NOT called")
+
+    time.sleep(0.5)   # let the abandoned attempt finish and run its own cleanup
+    t.ok(wedged.closes == 1,
+         "the abandoned attempt closed its capture exactly once, from its own thread")
+
+    again = FakeOpen([True])
+    t.ok(op.open(open_fn=again.open_fn, close_fn=again.close_fn, retries=0, pause_s=0.0,
+                 timeout_s=9e9, cap_s=1.0) is True and again.calls == 1,
+         "once the wedged worker has exited, the next open works again")
+    t.ok(again.closes == 0, "and that clean open is not closed behind the caller's back")
+
+    # Bounds for the knob this section exercises. Same shape as [6]'s checks, kept here rather
+    # than added to [6] so that section stays exactly as it was.
+    t.ok(_raises(_cv(camera_open_attempt_cap_s=0.0).validate), "cap 0 -> fail-loud")
+    t.ok(_raises(_cv(camera_open_attempt_cap_s=-1.0).validate), "cap -1 -> fail-loud")
+    t.ok(not _raises(_cv(camera_open_attempt_cap_s=60.0).validate),
+         "cap 60 validates (upper bound)")
+    t.ok(_raises(_cv(camera_open_attempt_cap_s=60.1).validate), "cap 60.1 -> fail-loud")
+
     print()
     if t.fail:
         print(f"CAMERA-BUSY SELFTEST FAILED: {t.fail} check(s) failed.")
         return 1
-    print("CAMERA-BUSY SELFTEST OK: bounded open never hangs; busy -> clean 'camera-busy' "
-          "(no exception, no half-open, lockout-neutral); lease stays distinct.")
+    print("CAMERA-BUSY SELFTEST OK: the open loop is attempt-bounded AND each attempt is "
+          "wait-capped (wedged -> no retry, late capture reclaimed, no second attempt in "
+          "flight); busy -> clean 'camera-busy' (no exception, no half-open, lockout-neutral); "
+          "lease stays distinct.")
     return 0
 
 
