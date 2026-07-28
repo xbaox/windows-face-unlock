@@ -1,7 +1,8 @@
 """Enrollment wizard — live camera preview, auto-capture, build embeddings.
 
-Replaces the old ``python -m tools.enroll capture`` console flow. Runs in
-the tray process so it can share i18n, widgets, and the FaceService pipe.
+Replaces the old ``python -m tools.enroll capture`` console flow. Runs as
+its OWN process (``python -m presence_monitor.enroll_gui``), spawned by the
+tray; see ``main()`` at the bottom for why that matters.
 
 Flow
 ----
@@ -16,7 +17,6 @@ Flow
 6. On close, always ``resume_camera`` so probes come back on.
 """
 from __future__ import annotations
-import gc
 import logging
 import threading
 import time
@@ -31,7 +31,7 @@ from PIL import Image, ImageTk
 from face_service.config import ENROLL_DIR, EMBED_PATH, Config
 from face_service.detector import FaceDetector
 from face_service.enroll_qc import frame_quality, qc_reasons
-from face_service.i18n import t
+from face_service.i18n import set_language, t
 
 from .monitor import pipe_call
 from .widgets import InfoButton, Tooltip, attach_tooltip
@@ -385,11 +385,16 @@ class EnrollWindow:
         that honors ``CAP_PROP_*_TIMEOUT_MSEC``, but on the target webcam the
         timeout is NOT applied -- read() still blocks forever (measured: 2
         hangs on MSMF vs 2 on DSHOW, i.e. no improvement). The timeout props
-        below are kept as harmless cross-hardware insurance; the real fix for
-        the wedged-read leak is process isolation (deferred to Stage 7).
+        below are kept as harmless cross-hardware insurance; the wedged-read
+        leak itself is contained by running this wizard in its own process
+        (see ``main()``), so a stuck thread dies with it.
+
+        The device comes from ``cfg.camera_index``, the same knob the service
+        opens with -- a hardcoded 0 here would fight the service for a
+        different camera on a multi-cam machine.
         """
         for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
-            cap = cv2.VideoCapture(0, backend)
+            cap = cv2.VideoCapture(self._cfg.camera_index, backend)
             if not cap.isOpened():
                 cap.release()   # never keep a candidate we didn't accept
                 continue
@@ -826,9 +831,13 @@ class EnrollWindow:
         # webcam before we tear down Tk. Skipping the join would let the
         # daemon thread get cut mid-read(), which on Windows leaks the camera
         # handle and black-frames the service until a full restart (hit in
-        # production 2026-04-21). NOTE: read() is still not reliably
-        # interruptible on this hardware, so the join below can and does time
-        # out -- the real fix is process isolation, deferred to Stage 7.
+        # production 2026-04-21). read() is still not reliably interruptible
+        # on this hardware, so the join below can and does time out -- but
+        # that is no longer terminal: this window owns its process, so
+        # returning from main() ends it and the OS releases the camera handle
+        # unconditionally, wedged thread or not. That is what actually closes
+        # KNOWN_ISSUES #1; the polite path below just makes the common case
+        # clean instead of relying on process teardown every time.
         self._stop.set()
         self._capture_armed.clear()
         t_cam = self._cam_thread
@@ -883,30 +892,49 @@ class EnrollWindow:
         self.root.mainloop()
 
 
-# Singleton launcher — one wizard at a time.
-_enroll_lock = threading.Lock()
+def main() -> int:
+    """Process entry point: ``python -m presence_monitor.enroll_gui``.
+
+    The wizard used to run on a daemon thread inside the tray process. It does not any more, and
+    the reason is the whole point of this module's isolation: ``cv2.VideoCapture.read()`` is not
+    reliably interruptible on this hardware, so a wedged camera thread never ran its
+    ``finally: cap.release()`` and kept the physical device inside the TRAY's address space --
+    every later verify then read black frames, and with ``persistent_camera=True`` that black
+    capture got cached (KNOWN_ISSUES #1). Releasing it from another thread was not an option
+    either: ``VideoCapture`` is not thread-safe, and a native crash would take presence
+    monitoring -- i.e. walk-away locking -- down with it.
+
+    Owning a process solves it by construction. Closing the window returns from here, the process
+    exits, and the OS reclaims the camera handle no matter what state the native call is stuck in.
+    It also removes the crash hole the old in-thread launcher had: a window that died before
+    setting ``_stop`` left its camera thread looping inside the tray forever.
+
+    Tk lives on the MAIN thread here (the camera stays a worker), which is what Tk wants anyway.
+
+    Logging goes to its own ``enroll.log`` beside ``presence.log`` -- same level, format and
+    handlers as the presence process, but a separate file, because two processes appending to one
+    log file interleave badly on Windows.
+    """
+    from face_service.config import LOG_PATH
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(LOG_PATH.with_name("enroll.log"), encoding="utf-8"),
+                  logging.StreamHandler()],
+    )
+    try:
+        # i18n state is per-process: the tray's set_language() never ran here, and the module
+        # default is English, so without this the wizard would ignore the user's saved language.
+        # EnrollWindow loads its own Config for the QC/camera knobs; this second read is the
+        # cheap price of not reshaping its constructor.
+        set_language(Config.load().language)
+        EnrollWindow().run()
+    except Exception:
+        log.exception("enroll wizard crashed")
+        return 1
+    return 0
 
 
-def open_enroll() -> None:
-    if not _enroll_lock.acquire(blocking=False):
-        log.info("enroll window already open; skipping duplicate")
-        return
-
-    def _run():
-        obj = None
-        try:
-            obj = EnrollWindow()
-            obj.run()
-        except Exception:
-            log.exception("enroll window crashed")
-        finally:
-            # Collect the window's whole graph (Tk vars, images, the Tcl
-            # interpreter) in ITS OWN thread before that thread exits: an
-            # interpreter finalized later by another thread's GC aborts the
-            # process with Tcl_AsyncDelete. Mirrors gui._launch_singleton,
-            # which open_enroll never got (block1 fix2 landed only in gui.py).
-            obj = None
-            gc.collect()
-            _enroll_lock.release()
-
-    threading.Thread(target=_run, name="enroll-window", daemon=True).start()
+if __name__ == "__main__":
+    raise SystemExit(main())

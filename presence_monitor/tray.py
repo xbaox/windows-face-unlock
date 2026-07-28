@@ -13,7 +13,6 @@ import pystray
 from face_service.config import Config, LOG_PATH
 from face_service.i18n import LANGUAGES, get_language, set_language, t
 
-from .enroll_gui import open_enroll
 from .gui import open_help, open_settings, open_status
 from .monitor import PresenceMonitor, pipe_call
 from .updater import check_latest, current_version, download_and_launch
@@ -21,9 +20,15 @@ from .updater import check_latest, current_version, download_and_launch
 log = logging.getLogger(__name__)
 
 SET_PASSWORD_CMD = ["-m", "tools.set_password"]
+ENROLL_CMD = ["-m", "presence_monitor.enroll_gui"]
 
 # Live tray icon for event toasts; filled by run_with_tray while it runs.
 _notify_icon: list[pystray.Icon] = []
+
+# The live re-enroll wizard child, or empty. A list for the same reason as _notify_icon above:
+# the module-level helpers rebind it without needing `global`. KEEPING the Popen is the point --
+# _launch_tool throws its handle away, which is exactly why a stuck wizard could never be stopped.
+_enroll_proc: list[subprocess.Popen] = []
 
 
 def notify_event(gate: str, message: str) -> None:
@@ -98,6 +103,60 @@ def _launch_tool(args: list[str]) -> None:
         log.exception("failed to launch tool: %s", args)
 
 
+def _enroll_alive() -> bool:
+    """True while the spawned wizard is still running (poll() is None until it exits)."""
+    return bool(_enroll_proc) and _enroll_proc[0].poll() is None
+
+
+def _launch_enroll() -> None:
+    """Spawn the re-enroll wizard as its OWN process, and KEEP the handle.
+
+    Deliberately not _launch_tool: that one opens a console window (set_password is an interactive
+    console tool) and discards its Popen. The wizard is a GUI, so it runs under pythonw with no
+    console at all, and its handle is kept so Quit can terminate it.
+
+    Why a process rather than the old daemon thread: closing the window ends the process and the
+    OS releases the camera handle even when the capture thread is wedged inside a native read(),
+    which an in-process wizard could never guarantee (KNOWN_ISSUES #1).
+
+    TODO(packaging): a frozen build has no ``-m`` entry point -- the wizard is bundled into the
+    tray EXE as a hiddenimport, so that layout needs a ``sys.frozen`` branch that re-execs
+    ``sys.executable`` with a flag. That belongs to the packaging block; this is the dev path.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    venv_py = repo_root / ".venv" / "Scripts" / "pythonw.exe"
+    py = str(venv_py) if venv_py.exists() else sys.executable
+    try:
+        proc = subprocess.Popen(
+            [py, *ENROLL_CMD],
+            cwd=str(repo_root),
+            creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+        )
+    except Exception:
+        log.exception("failed to launch the enroll wizard")
+        return
+    _enroll_proc[:] = [proc]
+    log.info("enroll wizard started (pid=%s)", proc.pid)
+
+
+def _terminate_enroll() -> None:
+    """Best-effort stop of a live wizard when the tray exits. Never raises.
+
+    A wizard outliving the tray would keep holding the webcam with nothing left to reclaim it, so
+    Quit takes it down too. Bounded: wait() can time out (the wedged-read case), and that is
+    logged and accepted rather than allowed to stall the shutdown.
+    """
+    if not _enroll_alive():
+        return
+    proc = _enroll_proc[0]
+    try:
+        log.info("terminating the enroll wizard (pid=%s)", proc.pid)
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        log.exception("terminating the enroll wizard failed")
+
+
 def _save_language(code: str) -> None:
     """Persist the language choice so it survives service restart."""
     try:
@@ -150,7 +209,13 @@ def run_with_tray(cfg: Config) -> None:
         open_help()
 
     def on_enroll(icon, item):
-        open_enroll()
+        # One wizard at a time. The live child IS the lock now, replacing the old in-process
+        # _enroll_lock -- and unlike that lock it cannot be left stuck held, because a crashed
+        # window is a dead process and poll() stops returning None.
+        if _enroll_alive():
+            log.info("enroll wizard already running (pid=%s); ignoring", _enroll_proc[0].pid)
+            return
+        _launch_enroll()
 
     def on_set_password(icon, item):
         _launch_tool(SET_PASSWORD_CMD)
@@ -267,6 +332,9 @@ def run_with_tray(cfg: Config) -> None:
     def on_quit(icon, item):
         log.info("Quit requested from tray")
         monitor.stop()
+        # Before the service teardown: the wizard holds the webcam under a lease, so taking it
+        # down first is what lets the device come back at all.
+        _terminate_enroll()
         threading.Thread(target=_stop_service_process, daemon=True).start()
         icon.stop()
 
