@@ -23,15 +23,31 @@
 
 .EXAMPLE
     .\register.ps1 -Action register
+.PARAMETER DryRun
+    Preflight only. Resolves the DLL, prints both probe candidates and which
+    of them exists, prints the exact regsvr32 command line that would run, and
+    reports the current state of the registry keys the verification checks --
+    then exits 0 without executing anything. Nothing is registered,
+    unregistered or written.
+
+    Elevation is still required: a dry run that skipped the admin check would
+    not be validating the conditions the real run executes under.
+
 .EXAMPLE
     .\register.ps1 -Action unregister
+.EXAMPLE
+    .\register.ps1 -DryRun
+.EXAMPLE
+    .\register.ps1 -Action unregister -DryRun
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('register', 'unregister')]
     [string]$Action = 'register',
 
-    [string]$DllPath
+    [string]$DllPath,
+
+    [switch]$DryRun
 )
 
 Set-StrictMode -Version Latest
@@ -59,6 +75,8 @@ $candidates = @(
     (Join-Path $PSScriptRoot 'FaceCredentialProvider.dll'),                     # installed layout: next to this script
     (Join-Path $PSScriptRoot '..\build-cp\Release\FaceCredentialProvider.dll')  # dev layout: repo build tree
 )
+$candidateLabels = @('installed layout: next to this script',
+                     'dev layout: repo build tree')
 
 if ($DllPath) {
     if (-not (Test-Path -LiteralPath $DllPath -PathType Leaf)) {
@@ -90,12 +108,54 @@ else {
 Write-Host "DLL:    $resolved"
 Write-Host "Action: $Action"
 
-# --- run regsvr32 ------------------------------------------------------------
+# --- build the command -------------------------------------------------------
 # The path is quoted inside the argument so directories with spaces
 # (e.g. C:\Program Files\WindowsFaceUnlock) survive the command line.
 $quoted = '"' + $resolved + '"'
 $regsvrArgs = if ($Action -eq 'register') { @('/s', $quoted) } else { @('/u', '/s', $quoted) }
 
+# --- dry-run gate ------------------------------------------------------------
+# Everything above this point only reads: Test-Path, Resolve-Path, Write-Host.
+# Every call that changes the machine is below it, so "is the dry-run path
+# clean" is answerable by walking the AST rather than by reading carefully.
+if ($DryRun) {
+    Write-Host ""
+    Write-Host "=== DRY RUN - preflight only, nothing will be executed ===" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Elevation           : satisfied (#Requires -RunAsAdministrator let this start)"
+    Write-Host "Host                : 64-bit PowerShell"
+    Write-Host ""
+    if ($DllPath) {
+        Write-Host "DLL source          : -DllPath was supplied explicitly"
+    }
+    else {
+        Write-Host "DLL candidates, in probe order:"
+        for ($i = 0; $i -lt $candidates.Count; $i++) {
+            $mark = if (Test-Path -LiteralPath $candidates[$i] -PathType Leaf) { 'FOUND  ' } else { 'missing' }
+            Write-Host ("  [{0}] {1}" -f $mark, $candidates[$i])
+            Write-Host ("            {0}" -f $candidateLabels[$i])
+        }
+    }
+    Write-Host ("Selected            : {0}" -f $resolved)
+    Write-Host ""
+    Write-Host "Command that WOULD run:"
+    Write-Host ("  regsvr32.exe {0}" -f ($regsvrArgs -join ' '))
+    Write-Host ""
+    Write-Host "Verification key (this one gates the exit code):"
+    Write-Host ("  {0}" -f $CpKey)
+    Write-Host ("    now      : {0}" -f $(if (Test-Path -LiteralPath $CpKey) { 'PRESENT' } else { 'ABSENT' }))
+    Write-Host ("    required : {0} after a successful '{1}'" -f `
+                $(if ($Action -eq 'register') { 'PRESENT' } else { 'ABSENT' }), $Action)
+    Write-Host ""
+    Write-Host "COM class key (reported only, does not gate the exit code):"
+    Write-Host ("  {0}" -f $ClsidKey)
+    Write-Host ("    now      : {0}" -f $(if (Test-Path -LiteralPath $ClsidKey) { 'PRESENT' } else { 'ABSENT' }))
+    Write-Host ""
+    Write-Host "DRY RUN - no registration was changed and no registry key was written." -ForegroundColor Cyan
+    exit 0
+}
+
+# --- run regsvr32 ------------------------------------------------------------
 $proc = Start-Process -FilePath 'regsvr32.exe' -ArgumentList $regsvrArgs `
                       -Wait -PassThru -WindowStyle Hidden
 if ($proc.ExitCode -ne 0) {
