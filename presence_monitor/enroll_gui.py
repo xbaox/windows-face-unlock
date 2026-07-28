@@ -6,7 +6,8 @@ tray; see ``main()`` at the bottom for why that matters.
 
 Flow
 ----
-1. ``pause_camera`` on the FaceService so we own the webcam.
+1. ``pause_camera`` on the FaceService so we own the webcam, re-armed
+   periodically for as long as the window lives.
 2. Open the camera in a background thread and publish BGR frames.
 3. Render each frame with a green box around detected faces (YuNet).
 4. When capture is armed and a face has been visible long enough, save
@@ -43,7 +44,15 @@ PREVIEW_H = 360
 CAPTURE_COOLDOWN_S = 1.0    # min gap between auto captures
 FACE_STABLE_FRAMES = 3      # face must be seen this many frames before arming capture
 DETECT_EVERY_N_FRAMES = 2   # YuNet is fast but skipping halves CPU
-CAMERA_LEASE_S = 300        # ask service to hand over the camera for this long
+CAMERA_LEASE_S = 120        # ask the service to hand the camera over for this long. SHORT on
+                            # purpose, and only workable because of the renewal below: the lease
+                            # is the sole thing keeping the service off the webcam, and nothing
+                            # cancels it if this wizard dies without sending resume_camera. So it
+                            # doubles as the worst-case hostage window -- a dead wizard gives the
+                            # camera back within CAMERA_LEASE_S, while a live one just keeps
+                            # re-arming. The old 300 was five minutes of blindness for that case.
+LEASE_RENEW_S = 45          # re-arm interval. Comfortably under CAMERA_LEASE_S so two renewals
+                            # in a row can fail before the lease actually lapses.
 CAMERA_READ_TIMEOUT_MS = 1000  # open/read timeout hint; only MSMF honors it, and NOT on
                                # this hardware -- kept as cross-HW insurance only
                                # (wizard-local; NOT one of the service camera_* knobs)
@@ -371,6 +380,30 @@ class EnrollWindow:
             return False
         return True
 
+    def _renew_camera_lease(self) -> None:
+        """Re-arm the lease, so it never outlives this wizard by more than CAMERA_LEASE_S.
+
+        Driven from the camera loop rather than a timer thread, and that is the design: the loop
+        is already what has to keep running for the preview to be alive, so a wedged loop simply
+        stops renewing -- which is exactly when we WANT the lease to lapse and the device to go
+        back to the service.
+
+        A failed renewal is logged and otherwise ignored; ``_lease_ok`` is deliberately NOT
+        cleared. The expected cause is the service restarting mid-enrollment, and the next renewal
+        then takes the lease again from scratch. That also repairs the restart case, which used to
+        have no cure: a restarted service grabs the webcam in its warmup with no memory of our
+        lease (the lease lives only in its RAM), and the next re-arm takes it back through the
+        normal pause_camera handler. Worst-case contention is one renewal interval.
+
+        Honest cost: pipe_call blocks THIS loop for up to its timeout when the service is down, so
+        the preview can hitch for up to 3s once every LEASE_RENEW_S. Accepted deliberately -- the
+        alternative is a second thread racing the same pipe for the same lease.
+        """
+        resp = pipe_call({"cmd": "pause_camera", "seconds": CAMERA_LEASE_S}, timeout_s=3.0)
+        if not (resp and resp.get("ok")):
+            # Once per LEASE_RENEW_S at worst, so this cannot spam the log.
+            log.warning("camera lease renewal failed (service down or busy?): %s", resp)
+
     def _release_camera_lease(self) -> None:
         pipe_call({"cmd": "resume_camera"}, timeout_s=3.0)
 
@@ -434,7 +467,16 @@ class EnrollWindow:
             self._warm_quality()
             frame_idx = 0
             faces: list = []
+            # Monotonic, not wall-clock: a clock adjustment mid-enrollment must not skip or stall
+            # the renewal. _lease_ok is checked even though the thread only starts when the lease
+            # was taken -- an unpaired pause_camera would hand us a device we never asked for.
+            next_renew = time.monotonic() + LEASE_RENEW_S
             while not self._stop.is_set():
+                if self._lease_ok and time.monotonic() >= next_renew:
+                    self._renew_camera_lease()
+                    # Re-read the clock: the call above can burn up to its timeout, and scheduling
+                    # from BEFORE it would make a slow/failing renewal fire again immediately.
+                    next_renew = time.monotonic() + LEASE_RENEW_S
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     # Timed-out / dropped read: NOT fatal. Sleep a beat (in case
