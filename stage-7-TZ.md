@@ -2,7 +2,7 @@
 
 > Читать ПЕРВЫМ при старте нового окна архитектора.
 > Приложения: `face-unlock-MASTER-TZ.md`, `audit-notes.md` (реестр §J–M + «Этап 7-i»).
-> Составлено Claude Code по итогам блока 7a, ветка `stage7-packaging`.
+> Составлено Claude Code по итогам блоков 7a и 7a-bis, ветка `stage7-packaging`.
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### Ветка
 
-`stage7-packaging` (НЕ master), базируется на `master 0cd65b1`. **10 коммитов.**
+`stage7-packaging` (НЕ master), базируется на `master 0cd65b1`. **16 коммитов.**
 
 ### 7a — A–I, принято архитектором
 
@@ -38,21 +38,23 @@
 
 **Горячая перерегистрация поверх живой системы НЕ проводилась** — сознательно отложена в 7b как управляемый эксперимент. Причина: сразу после B3-kill живых процессов с persistent-камерой случился инцидент (двум инстансам подряд клинило камеру/инициализацию). Гипотеза — жёсткий kill при живой капче провоцирует клин следующего `open`/`read`. Подробности — §2.
 
-### ⚠ 7a-bis J–N — НА ВЕТКЕ ОТСУТСТВУЕТ
+### O — handoff
 
-Вводная 7a-bis описывает блоки **J–N** как сданные. **Их на ветке нет.** Claude Code не получал по ним ТЗ и не выполнял их. Ветка содержит ровно 10 коммитов, перечисленных выше; между `db9edf2` (I) и `11d5aba` (стоп-фикс) и после него никаких J/K/L/M/N нет.
+| хеш | что |
+|---|---|
+| `640deb5` | `docs(stage7): handoff — architect window rotation` — этот файл |
 
-Проверено по дереву на момент составления файла:
+### 7a-bis — J–N, сданы и приняты архитектором 2026-07-28
 
-- **J (снятие README-лжи про пайп) — НЕ сделано.** `README.md:182-184` по-прежнему утверждает «The pipe currently uses a NULL DACL (any local user can connect)» и предлагает «consider tightening to SELF + SYSTEM in `_build_sa_everyone()`». То же в `credential_provider/README.md:66`. После Этапа 4 это прямая дезинформация по безопасности: `pipe_hardened_sd=True` — дефолт, а `_build_sa_everyone_legacy` — откатной путь.
-- **M (перекодировка `requirements.lock`) — НЕ сделано.** `file requirements.lock` → `Unicode text, UTF-16, little-endian text, with CRLF line terminators`. Файл по-прежнему UTF-16LE с BOM, поэтому держится в `-text` и недиффабелен.
-- K, L, N — содержания не знаю, ТЗ не поступало.
+7a-bis J–N (`62c9c70..1ef92d6`) сданы и приняты архитектором 2026-07-28.
 
-**Что с этим делать новому окну:** либо выдать J–N как отдельный блок (тогда §3 и §4 ниже станут правдой), либо признать их неначатыми и поправить статус. Пункты, которые я по ходу 7a вынес как незакрытые и которые, судя по нумерации, и должны были стать J–N, перечислены в конце §1.
-
-### O — этот коммит
-
-`docs(stage7): handoff — architect window rotation`. Последний коммит блока, хеш — в `git log --oneline -1 stage7-packaging`.
+| блок | хеш | что |
+|---|---|---|
+| J | `62c9c70` | оба README переписаны под реальность; снята дезинформация про `NULL DACL` / `_build_sa_everyone` и старый ML-стек |
+| K | `dbd779f` | комментарии `__main__.py` и `service.py` приведены к факту (доказано comment-only: AST идентичен); трём селфтестам добавлен `sys.path` bootstrap → **18/18** script-style |
+| L | `de1e6f9` | restart-скрипты свёрнуты в `-Action Restart` регистратора (B3+B4, без B1/B2); `restart_service.ps1` удалён, `clean_restart.ps1` — обёртка |
+| M | `389eaf6` | `requirements.lock` перекодирован в UTF-8/LF; пины доказательно не менялись (sha256 нормализованного текста совпал) |
+| N | `1ef92d6` | `-DryRun` для `register.ps1`; доказано по AST: единственный мутирующий вызов ниже гейта. НЕ запускался |
 
 ### План оставшихся блоков
 
@@ -62,17 +64,13 @@
 - **7e SYSTEM-custody** — решить судьбу (+TPM-seal той же судьбой).
 - **7f финал** — security-чеклист MASTER §7 попунктно, доки-свод, судьба `service.py`-рефакторинга, чистая установка/эмуляция, финальный ребут-прогон, мерж `--no-ff`, handoff stage-8; ПОСЛЕДНИМ пунктом — напомнить Bao выключить System Protection на C:.
 
-### Незакрытое из 7a (кандидаты в J–N)
+### Открытое после 7a + 7a-bis
 
-Вынесено Claude Code в докладе по 7a как «за периметром A–I», решения не было:
+Список «за периметром A–I» отработан блоками J–N. Осталось три пункта:
 
-1. **`README.md` в корне** — 11 хитов старого движка: «Models: ArcFace + MiniFASNet (DeepFace)», «bundles TensorFlow CPU, PyTorch CPU», «Anti-spoofing via DeepFace's built-in `anti_spoofing=True`». Плюс ложь про NULL DACL (см. выше).
-2. **`credential_provider/README.md`** — та же ложь про NULL DACL + «DeepFace verify» в описании протокола.
-3. **`face_service/__main__.py:7-9`** — «TensorFlow (still used only for passive MiniFASNet liveness)»; **`service.py:1167`** — «Force-load ArcFace + detector + MiniFASNet». Комментарии в рантайм-файлах.
-4. **3 селфтеста без `sys.path.insert`** (`adaptive`, `enroll_qc`, `liveness_verdict`) — падают при документированном script-style запуске, зелёные через `-m`. Однострочный фикс ×3.
-5. **`tools/clean_restart.ps1` и `tools/restart_service.ps1`** — почти дубликаты друг друга, оба хардкодят имена задач.
-6. **`requirements.lock` в UTF-16LE** — следствие `pip freeze >` в PS 5.1.
-7. **`register.ps1` без `-DryRun`** — тот же класс риска, что уронил регистратор: писан «по чтению», не запускался, имеет разрушительную ветку `unregister`.
+1. **`TF_NUM_INTRAOP_THREADS` / `TF_NUM_INTEROP_THREADS` в `face_service/__main__.py`** — мёртвые переменные: TensorFlow ушёл на Этапе 2. Комментарий рядом теперь честно называет их вестигиальными, но сами строки живы: их удаление — правка кода, а не комментария, и под doc-only санкцию блока K не попадало.
+2. **`tools/watchdog.py:9`** — докстринг ссылается на `tools/clean_restart.ps1` как на носитель критерия матчинга процессов. После L критерий живёт в `tools/register_tasks.ps1`, а `clean_restart.ps1` — тонкая обёртка. Правка докстринга в рантайм-файле, вне периметра L.
+3. **Горячая перерегистрация поверх живой системы** — припаркована в 7b как управляемый эксперимент (см. §2 и план блоков выше).
 
 ---
 
@@ -92,39 +90,26 @@
 
 ---
 
-## §3 — РЕЕСТР ДЛЯ audit-notes «Этап 7» (на closeout этапа)
+## §3 — Статус ветки stage7-packaging на закрытии окна 7a
 
-> ⚠ Примечание составителя: реестр вставлен дословно, как выдан архитектором. Два его пункта описывают работу, которой на ветке НЕТ (см. §1): «requirements.lock … M перекодирует» и «README-ложь … снята в J». Перед вставкой в `audit-notes.md` сверить с деревом.
+16 коммитов (A–I: 1e79fc7..db9edf2; стоп-фикс 11d5aba; O 640deb5; J–N: 62c9c70..1ef92d6), дерево чисто, master 0cd65b1 не тронут. Сдано: EOL-нормализация (* text=auto, 0 crlf/mixed); git-гигиена (.gitignore, 7 веток снесено, stage-2-TZ.md удалён); 45 полей Config (3 инертных кноба сняты); config.example.toml 45/45 + config_example_selftest; setup.ps1 не сеет конфиг; build-cp канон везде, rmtree снят, CI-дубль удалён; register.ps1 переписан (elevation, Start-Process -Wait, реестровая верификация, -DryRun, НЕ запускался — первый прогон 7d); регистраторы 4→1 (tasks.psd1 + register_tasks.ps1, two-phase A/B, -DryRun, -Action Restart; clean_restart.ps1 — обёртка, restart_service.ps1 удалён); DeepFace-пурж упаковки (download_weights удалён, спека на insightface/onnxruntime — сборкой НЕ проверена, requirements-build.txt); INSTALL.md и оба README переписаны под реальность; requirements.lock UTF-8/LF; селфтесты 18/18 script-style.
 
-**PS-уроки:** `[ValidateSet]` прилипает к имени регистронезависимо на весь скоуп — локальное присваивание в одноимённую переменную ревалидируется; `return @(...)` разворачивается — `.Count` падает под StrictMode при ровно одном элементе, обёртка `@()` по месту вызова; AST-парс ловит синтаксис, не семантику скоупа — исполняемый смоук/DryRun обязателен; MSYS bash-grep в репо даёт ложные нули (exit 134) — контроли только надёжным инструментом.
+Живое: холодный смоук регистратора пройден; AtLogOn-прогон после ребута пройден (6 процессов, verify здоров под paranoid); ГОРЯЧАЯ перерегистрация поверх живой системы НЕ гонялась — управляемый эксперимент 7b (камерный инцидент 2026-07-27: kill живых процессов с persistent-камерой → подозрение на клин MSMF/FrameServer, вылечен только ребутом; улики в audit-notes окна 7a).
 
-**Регистратор:** two-phase (A чистая / B commit), инвариант «ошибка A не трогает систему», B2-снятие осиротевших `FaceUnlock-*` одобрено.
-
-**G(3):** watchdog-Installed пропущен осознанно (нет frozen-точки; `_MATCH_PS` не матчит exe) — фикс в 7d.
-
-`requirements.lock` был UTF-16LE (следствие `pip freeze` в PS5.1) — M перекодирует.
-
-`setup.ps1` больше не копирует пример в боевой конфиг — класс «пример дрейфанул → поведение уехало» умер.
-
-Три инертных кноба сняты, полей 45 — база валидатора 7d.
-
-`buffalo_l`: `FaceAnalysis` без `root=`, без пина версии/чексуммы, ~341МБ в `%USERPROFILE%\.insightface` — решение о провижининге в 7d.
-
-README-ложь про NULL DACL/`_build_sa_everyone` снята в J.
+Известные пробелы: watchdog в Installed-раскладке объявлен, но skip (нет frozen-точки + _MATCH_PS не матчит exe) — фикс в 7d; спека не собиралась; горячий смоук за 7b.
 
 ---
 
-## §4 — ПРОМПТ НОВОГО ОКНА АРХИТЕКТОРА
-
-> ⚠ Примечание составителя: вставлен дословно. Строка «7a-bis (J–O) сдан CC» неверна — сдан только O; J–N не выдавались и не выполнялись (§1). Поправить перед использованием.
+## §4 — ПРОМПТ ОКНА 7b
 
 ```
-Прокачиваю caochitam/windows-face-unlock до уровня Windows Hello на ASUS TUF FA507XI — Win11, Python 3.12, RTX 4070, RGB-вебка без ИК, вход по PIN. Форк xbaox/windows-face-unlock, локально C:\dev\windows-face-unlock.
-Приложены: face-unlock-MASTER-TZ.md, audit-notes.md (реестр §J–M + «Этап 7-i»), stage-7-TZ.md — читай ПЕРВЫМ: §1 статус и план блоков, §2 камерные инциденты (материал recon 7b), §3 реестр решений.
-Статус: Этапы 0–6 + 7-i DONE. Этап 7 в работе, ветка stage7-packaging (НЕ master): 7a принят архитектором; 7a-bis (J–O) сдан CC — сводку вставлю вторым сообщением, твоё первое дело — её ревью.
-Роли: ты архитектор (промпты для Claude Code + ревью), CC кодит в СВОЁМ живом окне (контекст 7a/7a-bis у него есть), я релею. По-русски, на «ты», кратко, кода мне не давать — только промпты для CC. Recon → моё ОК → код. Живые команды всегда с нуля (полный cd C:\dev\windows-face-unlock, .\ перед .venv\Scripts\python.exe). CC рантайм не запускает; исключение — register_tasks.ps1/register.ps1 строго с -DryRun после AST-доказательства чистоты dry-run-пути.
-Живой конфиг: paranoid, threshold 0.32, ru, auto_lock=false. Здоровье: 6 процессов (3 пары), задачи PT0S; здоровый verify под paranoid = ok:true, match:false, real:true, distance ~0.19–0.23, сотни мс — это НОРМА режима. Первый вход после любого ребута = PIN by design. Камера может клинить (§2 stage-7-TZ) — откаты там же.
-Заморозки: числа (0.32, STRONG_MARGIN 0.10, все liveness/lockout/adaptive/low-light/camera/watchdog, enroll_qc), verify_frame/_prep_cuda_dlls байт-в-байт, периметр пайпа Этапа 4, C++ CP ЗАМОРОЖЕН (санкция 7-i исчерпана), дефолты config.py — поштучно по санкции. EOL LF, git diff до коммита, ревью-гейт держать, контроль-grep'ы только надёжным инструментом (bash-grep врёт — доказано).
-System Protection на C: включена — выключение ТОЛЬКО последним пунктом приёмки Этапа 7, напомни мне сам.
-Начни: статус-чек (git log --oneline -3 stage7-packaging, git status, процессы — жду 6) → жди сводку 7a-bis → ревью → закрытие 7a → recon-промпт 7b по §2.
+Прокачиваю опенсорс caochitam/windows-face-unlock (face-логин с настоящим Credential Provider) до уровня Windows Hello на ASUS TUF FA507XI — Win11, Python 3.12, RTX 4070, RGB-вебка без ИК, вход по PIN. Форк xbaox/windows-face-unlock, локально C:\dev\windows-face-unlock.
+Приложены: face-unlock-MASTER-TZ.md, audit-notes.md (§K камера — первоисточник; секция «Этап 7» окна 7a — инцидент 2026-07-27), stage-7-TZ.md (§3 — статус ветки после 7a, §2 — план блоков этапа).
+Этап 7 идёт блоками на ветке stage7-packaging (16 коммитов сданы, блок 7a закрыт). Это окно — блок 7b: КАМЕРА. Скоуп: (1) диагностика idle-залипания — кандидат кэш self._cam без health-check (service.py, искать get-cam путь), причина НЕ установлена, не утверждать — проверять; (2) вынос энролл-визарда в отдельный процесс (прецедент tray._launch_tool) + координация владения камерой между сервисом и визардом; (3) реальный open-deadline + cap одиночного open_fast + правка переобещающих комментариев (camera_open.py, config.py, service.py «never hangs»); (4) lease-продление (CAMERA_LEASE_S=300 без продления — долгий энролл переживает свой lease); (5) KNOWN_ISSUES §1 переписать по итогам; (6) управляемый эксперимент «горячая перерегистрация поверх живой системы» (tools\register_tasks.ps1 -Mode Dev -Action Register при 6 живых процессах) — по гипотезе kill живой persistent-капчи клинит Windows Camera Frame Server: сигнатура 2026-07-27 = LED мёртв, open виснет, пайп рвётся (109), лечится ТОЛЬКО ребутом; готовить откат (остановка стека → Restart-Service FrameServer элевированно → подъём), гонять ТОЛЬКО с санкции Bao и не в конце дня; (7) вердикт NEEDS_GESTURE в выводе verify/pipe_client (сейчас match:false под paranoid читается как «не узнал») — правка формы ответа по санкции.
+Процесс: кодит Claude Code (CC, НОВОЕ окно). Ты — архитектор: промпты для CC + ревью. Я релею живьём. Мне по-русски, на «ты», кратко, код НЕ давай — только промпты для CC. Recon → моё ОК → код. Живые команды всегда с нуля (полный cd C:\dev\windows-face-unlock, .\ перед .venv\Scripts\python.exe). CC рантайм не запускает; исключения-санкции: register_tasks.ps1/clean_restart.ps1 ТОЛЬКО с -DryRun после AST-доказательства чистоты пути.
+Состояние: здоровый прод = 6 процессов (Service/Presence/Watchdog ×2, PT0S, одна секунда старта). Живой конфиг: paranoid, threshold 0.32, adaptive_gallery=true, persistent_camera=true (LED горит при живом сервисе — НОРМА), pipe_*=true, auto_lock=false, verify_required=2, ru. Паранойя-здоровье verify = match:false + real:true при distance ~0.2 — это НЕ «не узнал», вердикт живёт в NEEDS_GESTURE (см. скоуп-7). Галерея 30×512.
+Заморозки: числа (0.32, STRONG_MARGIN 0.10, liveness/lockout/adaptive/low-light/camera/watchdog, enroll_qc), verify_frame/_prep_cuda_dlls байт-в-байт, серверный периметр Этапа 4, C++ CP заморожен (санкция 7-i исчерпана); камерные константы правятся ТОЛЬКО через новые поля конфига по санкции поштучно. EOL LF (CR байтами), git diff перед коммитом, ревью-гейт держать, селфтесты на .venv 3.12, контрольные grep'ы только надёжным инструментом (bash-grep врёт — прецедент 7a).
+System Protection на C: ВКЛЮЧЕНА — не трогать (выключение = явный последний пункт приёмки всего Этапа 7).
+Тайминг: первый вход после ЛЮБОГО ребута = PIN (by design). Залипание камеры: distance 1.0 / ~7200мс = старая сигнатура §K; LED мёртв + пайп рвётся = новая сигнатура 2026-07-27, лечится ребутом.
+Начни: статус-чек (git log --oneline -3 на stage7-packaging — жду HEAD с хендофф-коммитом поверх 1ef92d6, git status, процессы — жду 6) + промпт CC на read-only recon камерного пути (service.py get-cam/кэш/lease, camera_open.py, camera.py, enroll_gui.py камерный тред, tray._launch_tool) → покажи → дизайн-ревью → жди моих подтверждений.
 ```
