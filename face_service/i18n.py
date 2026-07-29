@@ -144,6 +144,8 @@ _EN: dict[str, str] = {
 
     "field.presence_absent_strikes": "Absent strikes before lock",
     "field.presence_absent_strikes.desc": "How many consecutive absent probes are needed to trigger LockWorkStation. With interval=60s and strikes=2, the machine locks after ~2 minutes of no face.",
+    "field.presence_fullscreen_strikes": "Fullscreen absence strikes",
+    "field.presence_fullscreen_strikes.desc": "How many consecutive absent probes are needed while a fullscreen app or presentation mode is active (a game, a film, slides). You are demonstrably at the machine there, just not facing the camera, so the walk-away threshold locks too eagerly. With interval=60s and 10, the machine locks after ~10 minutes. 0 = never lock during fullscreen.",
 
     "field.threshold": "Recognition threshold",
     "field.threshold.desc": "Cosine-distance cutoff for face matching. Lower = stricter (fewer false accepts, more false rejects). The default 0.32 was tuned by measurement for this camera/model pair — change it deliberately.",
@@ -1042,6 +1044,8 @@ _RU: dict[str, str] = {
     "field.presence_interval_s.desc": "Как часто монитор опрашивает камеру. 60 — раз в минуту. Меньше — быстрее реакция, но чаще мигает индикатор камеры; больше — меньше износ камеры.",
     "field.presence_absent_strikes": "Отсутствий до блокировки",
     "field.presence_absent_strikes.desc": "Сколько проверок подряд без лица нужно для блокировки (LockWorkStation). При интервале 60 с и значении 2 машина блокируется примерно через 2 минуты отсутствия.",
+    "field.presence_fullscreen_strikes": "Отсутствий до блокировки в полноэкранном режиме",
+    "field.presence_fullscreen_strikes.desc": "Сколько проверок подряд без лица нужно, когда активно полноэкранное приложение или режим презентации (игра, фильм, слайды). В этот момент вы заведомо за машиной, просто не смотрите в камеру, поэтому обычный порог блокирует слишком рано. При интервале 60 с и значении 10 блокировка наступит примерно через 10 минут. 0 — не блокировать в полноэкранном режиме никогда.",
     "field.threshold": "Порог распознавания",
     "field.threshold.desc": "Порог по косинусному расстоянию. Ниже — строже (меньше ложных допусков чужих, больше отказов своему). Значение по умолчанию 0.32 подобрано измерениями под эту связку камеры и модели — меняйте осознанно.",
     "field.verify_frames": "Разблокировка: кадров снять",

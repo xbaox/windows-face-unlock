@@ -21,6 +21,40 @@ def _lock_workstation() -> None:
     ctypes.windll.user32.LockWorkStation()
 
 
+# QUERY_USER_NOTIFICATION_STATE (shellapi.h). Only the three below mean "something is owning the
+# whole screen"; the rest (1 = not present, 5 = accepts notifications, 6 = quiet time,
+# 7 = running Windows Store app) do not, and 4 in that header is QUNS_PRESENTATION_MODE.
+_QUNS_BUSY = 2                       # a full-screen application is running (non-D3D)
+_QUNS_RUNNING_D3D_FULL_SCREEN = 3    # a full-screen D3D application -- i.e. a game
+_QUNS_PRESENTATION_MODE = 4          # presentation mode
+_FULLSCREEN_STATES = frozenset((_QUNS_BUSY, _QUNS_RUNNING_D3D_FULL_SCREEN, _QUNS_PRESENTATION_MODE))
+
+
+def _fullscreen_active() -> bool:
+    """True while a full-screen app or presentation mode owns the screen.
+
+    ``SHQueryUserNotificationState`` is the very signal Windows uses to decide whether a toast may
+    pop, so it already understands games, full-screen video and presentation mode -- far better
+    than anything we would reconstruct from window rectangles. Signature:
+    ``HRESULT SHQueryUserNotificationState(QUERY_USER_NOTIFICATION_STATE *pquns)`` -- one out
+    parameter, S_OK (0) on success.
+
+    FAIL-OPEN by design: no shell32, a non-S_OK HRESULT or an unexpected state all return False,
+    which puts the caller back on the ORDINARY absence threshold. This guard can therefore only
+    ever make locking less eager, never more -- a broken probe degrades to the status quo.
+    """
+    try:
+        state = ctypes.c_int(0)
+        hr = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
+        if hr != 0:
+            log.debug("SHQueryUserNotificationState returned hr=0x%08X", hr & 0xFFFFFFFF)
+            return False
+        return state.value in _FULLSCREEN_STATES
+    except Exception as e:
+        log.debug("SHQueryUserNotificationState failed: %s", e)
+        return False
+
+
 def _get_idle_seconds() -> float:
     """Seconds since last user input (keyboard/mouse)."""
     class LASTINPUTINFO(ctypes.Structure):
@@ -84,6 +118,10 @@ class PresenceMonitor:
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._strikes = 0
+        # True once THIS absence episode has been logged as running on the fullscreen threshold,
+        # so the switch is announced once per episode instead of on every tick. Cleared with the
+        # strikes it belongs to -- see _reset_strikes.
+        self._fs_episode = False
         self._last = TickSnapshot()
         self._lock_count = 0
         self._state_lock = threading.Lock()
@@ -92,13 +130,19 @@ class PresenceMonitor:
         self._svc_reachable: bool | None = None
         self._lockout_notified = False
 
+    def _reset_strikes(self) -> None:
+        """End the current absence episode. The strike count and the fullscreen-episode flag are
+        one state, so they are cleared in one place and can never drift apart."""
+        self._strikes = 0
+        self._fs_episode = False
+
     def pause(self) -> None:
         self._paused.set()
         log.info("presence monitor paused")
 
     def resume(self) -> None:
         self._paused.clear()
-        self._strikes = 0
+        self._reset_strikes()
         log.info("presence monitor resumed")
         self.poke_events()
 
@@ -118,7 +162,7 @@ class PresenceMonitor:
 
     def reload_config(self, cfg: Config) -> None:
         self.cfg = cfg
-        self._strikes = 0
+        self._reset_strikes()
         log.info(
             "presence monitor config reloaded: interval=%ss strikes=%s mode=%s",
             cfg.presence_interval_s, cfg.presence_absent_strikes, cfg.presence_mode,
@@ -193,7 +237,18 @@ class PresenceMonitor:
         return reachable
 
     def _tick(self) -> None:
-        # 0. Event toasts ride on the existing `status` poll — before the
+        # 0. Already on the lock screen? Then there is nothing left to guard: the machine is in the
+        #    state this monitor exists to reach. Skip the WHOLE tick — no status poll, no camera
+        #    probe (so the LED stays dark while nobody is there) — and end the absence episode, so
+        #    the count starts fresh when the user comes back. A failing predicate reports False
+        #    (remote_session.session_locked degrades that way on purpose), which is the status quo.
+        if session_locked():
+            log.debug("skip: session is locked")
+            self._reset_strikes()
+            self._set_last("skipped", "session-locked")
+            return
+
+        # 1. Event toasts ride on the existing `status` poll — before the
         #    pause/remote skips, so notifications work while paused too.
         reachable = self._check_service_events()
 
@@ -207,7 +262,7 @@ class PresenceMonitor:
         remote, reason = is_remote_context()
         if remote:
             log.info("skip: remote context (%s)", reason)
-            self._strikes = 0
+            self._reset_strikes()
             self._set_last("skipped", reason)
             return
 
@@ -236,26 +291,39 @@ class PresenceMonitor:
                  present, resp.get("real"), mode)
 
         if present:
-            self._strikes = 0
+            self._reset_strikes()
             self._set_last("present", f"real={resp.get('real')}", mode)
             return
 
         self._strikes += 1
+        # Which threshold this absence is judged against. Probed only on the ABSENT path: a present
+        # user costs nothing extra, and the answer only ever matters here. A fullscreen app or
+        # presentation mode means the user is demonstrably AT the machine and simply not facing the
+        # camera, so the walk-away threshold is the wrong one; 0 withholds the lock entirely.
+        limit = self.cfg.presence_absent_strikes
+        if _fullscreen_active():
+            limit = self.cfg.presence_fullscreen_strikes
+            if not self._fs_episode:
+                self._fs_episode = True
+                log.info("fullscreen/presentation active — absence threshold %d -> %s",
+                         self.cfg.presence_absent_strikes,
+                         limit if limit > 0 else "never (0 = no lock while fullscreen)")
         suffix = "" if self.cfg.auto_lock else " (auto-lock off)"
         self._set_last(
             "absent",
-            f"strike {self._strikes}/{self.cfg.presence_absent_strikes}{suffix}",
+            (f"strike {self._strikes}/{limit}{suffix}" if limit > 0
+             else f"strike {self._strikes} (fullscreen: never lock){suffix}"),
             mode,
         )
-        if self._strikes >= self.cfg.presence_absent_strikes:
+        if limit > 0 and self._strikes >= limit:
             if not self.cfg.auto_lock:
                 # Observe-only: strikes count and show up in Status (with an
                 # honest "auto-lock off" reason), the machine stays unlocked.
                 log.info("absent %d ticks — auto_lock off, not locking", self._strikes)
-                self._strikes = 0
+                self._reset_strikes()
                 return
             log.warning("absent %d ticks — locking workstation", self._strikes)
-            self._strikes = 0
+            self._reset_strikes()
             with self._state_lock:
                 self._lock_count += 1
             _lock_workstation()

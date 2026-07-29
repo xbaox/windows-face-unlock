@@ -402,6 +402,22 @@ class FaceService:
             except Exception:
                 log.exception("persistent camera release failed")
 
+    def _burst_defect(self, frames_ok: int, luma_max: "float | None") -> "str | None":
+        """The ONE definition of a defective capture burst: ``"zero-frames"``, ``"black-burst"``,
+        or None when the burst looked fine.
+
+        This is the only place ``cfg.camera_black_luma`` is read. Two callers need the same verdict
+        and must never disagree about what "black" means: ``_note_camera_health`` drops the poisoned
+        persistent cache afterwards, and the presence probes refuse to spend an ABSENCE STRIKE on a
+        camera that handed back nothing -- a blind camera is a camera fault, not a missing user.
+        Kept as a pure classifier (no side effects, no lock) so both can call it freely.
+        """
+        if frames_ok == 0:
+            return "zero-frames"
+        if luma_max is not None and luma_max <= self.cfg.camera_black_luma:
+            return "black-burst"
+        return None
+
     def _note_camera_health(self, frames_ok: int, luma_max: "float | None", where: str) -> bool:
         """Drop a poisoned persistent-camera cache AFTER the fact. Returns True if it was dropped.
 
@@ -429,11 +445,8 @@ class FaceService:
         """
         if not self.cfg.persistent_camera or self._cam is None:
             return False                      # nothing cached, so nothing to poison
-        if frames_ok == 0:
-            reason = "zero-frames"
-        elif luma_max is not None and luma_max <= self.cfg.camera_black_luma:
-            reason = "black-burst"
-        else:
+        reason = self._burst_defect(frames_ok, luma_max)
+        if reason is None:
             return False
         now = time.monotonic()
         since = now - self._cam_heal_at
@@ -906,6 +919,16 @@ class FaceService:
         # No retry on this path: the probe runs on a timer, so the next tick already gets the
         # fresh camera, and absence-strike policy stays entirely the caller's business.
         self._note_camera_health(frames_ok, luma_max, "probe-recog")
+        defect = self._burst_defect(frames_ok, luma_max)
+        if not result[0] and defect is not None:
+            # Either no frame arrived at all, or every one that did was black. The DEVICE is blind;
+            # the user is not necessarily gone. Report it the way a busy/leased camera already is
+            # -- present, so the monitor does not spend an absence strike (and eventually a lock)
+            # on a camera fault. The self-heal above has already dropped the cache, so the next
+            # probe opens a fresh one.
+            log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> camera-error, not absence",
+                     defect, frames_ok, "n/a" if luma_max is None else "%.2f" % luma_max)
+            return True, True
         return result
 
     def _presence_probe_detection(self) -> tuple[bool, bool]:
@@ -939,6 +962,12 @@ class FaceService:
                 if not self.cfg.persistent_camera:
                     cam.close()
         self._note_camera_health(frames_ok, luma_max, "probe-detect")
+        defect = self._burst_defect(frames_ok, luma_max)
+        if not result[0] and defect is not None:
+            # Same reasoning as the recognition probe above: a blind camera is a camera fault.
+            log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> camera-error, not absence",
+                     defect, frames_ok, "n/a" if luma_max is None else "%.2f" % luma_max)
+            return True, True
         return result
 
     # ---------- pipe ----------

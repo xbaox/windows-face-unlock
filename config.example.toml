@@ -141,6 +141,9 @@ presence_mode = "recognition"    # "recognition" = the enrolled face must match
                                  # "detection"   = any face in frame is enough
 presence_interval_s = 60         # seconds between presence probes
 presence_absent_strikes = 2      # consecutive absent probes before locking
+presence_fullscreen_strikes = 10 # consecutive absent probes before locking while a
+                                 # fullscreen app / presentation mode is active.
+                                 # 0 = never lock during fullscreen.
 
 # --- Notifications -----------------------------------------------------------
 

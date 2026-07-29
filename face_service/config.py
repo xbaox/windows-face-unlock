@@ -51,6 +51,13 @@ class Config:
     verify_required: int = 2          # trong đó cần ≥ N khớp (giảm từ 3 để nhanh hơn)
     presence_interval_s: int = 60
     presence_absent_strikes: int = 2  # vắng mặt liên tiếp trước khi lock
+    # Absent strikes required while a FULLSCREEN app or presentation mode owns the screen (a game,
+    # a film, slides). The ordinary threshold is tuned for "walked away from the desk"; the same two
+    # ticks during a match or a movie is a FALSE lock, and the user is demonstrably at the machine.
+    # 10 at the default 60s interval is ~10 minutes. 0 = never lock while fullscreen is active
+    # (strikes still accrue and show in Status; only LockWorkStation is withheld). The signal is
+    # SHQueryUserNotificationState -- see presence_monitor/monitor.py::_fullscreen_active.
+    presence_fullscreen_strikes: int = 10
     # "recognition" = InsightFace/ONNX ArcFace embedding must match enrolled face (stronger; walk-away + strangers)
     # "detection"   = YuNet any-face-in-frame is enough (weaker; mimics old AutoFaceLock)
     presence_mode: str = "recognition"
@@ -205,6 +212,14 @@ class Config:
             raise ValueError("presence_interval_s must be >= 5")
         if self.presence_absent_strikes < 1:
             raise ValueError("presence_absent_strikes must be >= 1")
+        # Fullscreen threshold: an integer (bool rejected, like camera_open_retries) and >= 0,
+        # where 0 carries the meaning "never lock while fullscreen" rather than "lock immediately".
+        if isinstance(self.presence_fullscreen_strikes, bool) or \
+                not isinstance(self.presence_fullscreen_strikes, int):
+            raise ValueError("presence_fullscreen_strikes must be an integer")
+        if self.presence_fullscreen_strikes < 0:
+            raise ValueError(
+                "presence_fullscreen_strikes must be >= 0 (0 = never lock while fullscreen)")
         if not (0.0 < self.threshold < 2.0):
             raise ValueError("threshold must be in (0, 2)")
         if self.language not in LANG_CODES:
