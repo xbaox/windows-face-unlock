@@ -507,3 +507,30 @@ left_yaw  = NEUTRAL[POSE_YAW] + (-1 if LEFT_IS_NEGATIVE_YAW else 1) * (YAW_DELTA
 **I. Боевой конфиг Bao на закрытии:** `paranoid`, `threshold 0.32`, `ru`, `auto_lock=false` (dev-преференс, как и было).
 
 **J. Локи целы (git-сверка `master..HEAD`):** в диффе ветки **НЕ изменены** `verify_frame`, `_prep_cuda_dlls`, `threshold`/`0.32`, `STRONG_MARGIN`/`0.10`, `adaptive_margin`, `HF_THRESH`/`EAR_THRESH`/`SCREEN_DOUBT_FRAC`, `YAW_DELTA`/`PITCH_DOWN_DELTA`/`GESTURE_BASELINE_FRAMES`/`BLINK_TIMEOUT_S`/`GESTURE_TIMEOUT_S`, QC/adaptive/low-light/camera/watchdog-константы, `kUnlockTimeoutMs`/`12000`. `_build_pipe_sa` и `FIRST_PIPE_INSTANCE` в дифф не попали ни одной строкой. `config.py`, `recognizer.py`, `lockout.py`, `credentials.py`, `helpers.*`, `dll.cpp`, `guid.h`, `ClassFactory.cpp`, `.def`, `CMakeLists.txt` — **вне диффа целиком**, поэтому GUID и регистрация прежние и пере-`regsvr32` не требовался. Единственное изменение в `liveness.py` — санкционированный флип §F.
+
+---
+
+## Этап 7 — упаковка и надёжность (в работе)
+
+> Ветка `stage7-packaging`. Секция заполняется по мере закрытия блоков;
+> полный свод — на closeout этапа.
+
+**Эксперимент 7b-4 — клин Frame Server: НЕ воспроизведён (2026-07-28)**
+
+Гипотеза, доставшаяся из 7a: жёсткий kill процесса с живой persistent-капчей
+провоцирует клин Windows Camera Frame Server (сигнатура 2026-07-27 — LED мёртв,
+`open` виснет, пайп рвётся `109`, лечится только ребутом).
+
+- **Прогон 1 (до фикса, 19:41)** — воспроизведено ровно условие гипотезы: hard
+  kill живых процессов с persistent-капчей. **Клин не наступил**, LED
+  восстановился, `verify` здоров.
+- **Прогон 2 (после фикса, 20:06)** — graceful-цепочка отработала: сервис вышел
+  сам за **1.3 с**, kill достался только presence/watchdog (камеры не держат),
+  watchdog-пауза записана (`deliberate pause is active -> not restarting`).
+
+**Вердикт:** одиночные чистые прогоны гипотезу не опровергают — инцидент 27.07
+мог быть гонкой, не воспроизводимой по требованию. Но практическая сторона
+закрыта иначе: `fd84f88` ставит graceful pipe-shutdown перед hard kill в обеих
+мутирующих ветках `register_tasks.ps1`, поэтому штатные `Register`/`Restart`
+живую капчу больше не убивают. Прежний запрет на `clean_restart.ps1` снят.
+Подробности и лестница лечения при рецидиве — `KNOWN_ISSUES.md` §2.
