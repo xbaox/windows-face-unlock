@@ -11,8 +11,15 @@ tools/register_tasks.ps1 carries; tools/clean_restart.ps1 is a thin wrapper over
 WAIT for it to actually die, then start the task. The wait is load-bearing: Stop-Process only
 *signals*, and both the mutex and the FIRST_PIPE_INSTANCE pipe name stay held until the last handle
 is gone -- starting on a blind delay races a slow-dying process into a mutex-loser exit. A hung
-service that never answers ping (e.g. wedged in a long camera open) is what this catches; a per-ping
-timeout means "no answer" counts as a failure.
+service that never answers ping (e.g. wedged in a long camera open) is what this catches: the ping
+is bounded by a per-ping budget, and EVERY way of not getting a pong counts as a failure -- a server
+that stays merely BUSY for the whole budget included, because "busy" is exactly what a wedged-but-
+alive instance looks like from outside. See ``ping`` for the failure classes.
+
+CONFIG IS READ ONCE, AT STARTUP, and there is no reload path: editing ~/.face-unlock/config.toml
+changes nothing until the FaceUnlock-Watchdog task itself is restarted. Before Stage 7c-2 the file
+was not read AT ALL -- main() constructed Config() directly, so every watchdog number was the
+built-in default no matter what the file said.
 
 Deployed as the Scheduled Task FaceUnlock-Watchdog, declared in tools/tasks.psd1 and created by
 tools/register_tasks.ps1. DEV LAYOUT ONLY for now: the match below is Name='pythonw.exe', which
@@ -25,7 +32,6 @@ import json
 import logging
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -38,6 +44,16 @@ _POST_START_SETTLE_S = 5.0     # after task start, wait for a mutex-loser to exi
 _UNRECOVERABLE_BACKOFF_S = 120.0  # extra idle when a restart can't bring the service up (see below)
 _DEATH_WAIT_S = 10.0     # upper bound on the post-kill "are they really gone?" poll
 _DEATH_POLL_MS = 200     # how often that poll re-counts (inside ONE powershell, not one per probe)
+
+# Connect-phase retry cadence for ping (7c-2). The pipe server is strictly SEQUENTIAL: it keeps ONE
+# instance and re-creates it per connection (face_service/service.py::_serve_one), so while a request
+# is being served a client gets ERROR_PIPE_BUSY, and in the sliver between that CloseHandle and the
+# next CreateNamedPipe it gets ERROR_FILE_NOT_FOUND. Neither proves the service is dead, so we retry
+# at this cadence INSIDE the same budget instead of failing on the first refusal -- the shape
+# presence_monitor/monitor.py and tools/pipe_client.py already use. This is a cadence, NOT a budget:
+# the budget stays cfg.watchdog_ping_timeout_s, enforced by the deadline, and a server that is busy
+# for the WHOLE budget still fails (see ping).
+_PING_RETRY_SLEEP_S = 0.1
 
 # The ONE process-matching criterion, shared by kill / count / death-wait below so the three can
 # never drift apart. The filter is Name='pythonw.exe' ONLY: prod runs via pythonw (register_tasks.ps1
@@ -74,42 +90,138 @@ _WAIT_DEAD_PS = (
 )
 
 
-def ping(timeout_s: float) -> bool:
-    """True iff the service answered `ping` with pong within ``timeout_s``. A hung server that
-    accepts the connection but never replies is bounded by running the exchange in a worker thread
-    and joining with the timeout -> counts as a failure (which is exactly what should trigger a
-    restart)."""
+def ping(timeout_s: float, pipe_name: str = "") -> "tuple[bool, str | None]":
+    """Ask the service for a pong within ``timeout_s``. Returns ``(ok, reason)``.
+
+    ``reason`` is None on success, otherwise one of:
+
+    * ``"busy"``          -- every connect attempt hit ERROR_PIPE_BUSY until the budget ran out.
+                             This is what a WEDGED-BUT-ALIVE server looks like from outside (Stage-7a
+                             exhibit A: one instance stuck forever inside a single verify), so it
+                             stays a FAILURE. "Busy" must never read as "alive", or the one thing
+                             this supervisor exists for -- restarting a hung service -- never fires.
+    * ``"no-pipe"``       -- connects kept hitting ERROR_FILE_NOT_FOUND: nothing is listening.
+    * ``"reply-timeout"`` -- connected, but the exchange did not finish inside the budget.
+    * ``"bad-reply"``     -- an answer arrived and is not a pong (unparseable, or no ok/pong). Fails
+                             IMMEDIATELY, without retrying: a server that answers wrongly will not
+                             answer better a tenth of a second later.
+    * ``"error: ..."``    -- anything else, carrying the win32 code so the log can be acted on.
+
+    SINGLE-THREADED by construction. The previous version ran the exchange in a worker thread and
+    joined with the timeout: the join returned, but the worker stayed BLOCKED inside the native call
+    -- one leaked daemon thread per timed-out ping, accumulating precisely while the service was
+    wedged. Overlapped I/O bounds the wait with no second thread: on expiry we CancelIo (which
+    cancels this thread's pending op on this handle, and there is exactly one) and then DRAIN it
+    with a blocking GetOverlappedResult. That drain is mandatory, not tidiness: the kernel owns the
+    OVERLAPPED and the read buffer until the cancelled op really ends, so freeing them or closing
+    the handle first is a use-after-free.
+
+    ``timeout_s`` keeps its meaning -- the budget for the WHOLE exchange, connect included, exactly
+    as the old join() bounded the whole worker. ``pipe_name`` exists for the selftest; production
+    passes nothing and gets face_service.config.PIPE_NAME.
+    """
+    import pywintypes
+    import win32con
+    import win32event
     import win32file
     import win32pipe
+    import winerror
     from face_service.config import PIPE_NAME
 
-    box = {"ok": False}
+    name = pipe_name or PIPE_NAME
+    deadline = time.monotonic() + float(timeout_s)
 
-    def _do():
-        h = None
+    def _shut(handle) -> None:
+        try:
+            win32file.CloseHandle(handle)
+        except Exception:
+            pass
+
+    def _sleep_within() -> bool:
+        """Sleep one retry cadence, clamped to what is left. False = the budget is spent."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(_PING_RETRY_SLEEP_S, left))
+        return True
+
+    # --- phase 1: connect. Retry the two refusals that mean "the server is mid-turnover"; every
+    # other win32 failure is reported as-is rather than burning the budget on a hopeless retry.
+    h = None
+    stalled = "no-pipe"          # which refusal we were still getting when the budget ran out
+    while True:
         try:
             h = win32file.CreateFile(
-                PIPE_NAME, win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0, None, win32file.OPEN_EXISTING, 0, None,
+                name, win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0, None, win32file.OPEN_EXISTING, win32con.FILE_FLAG_OVERLAPPED, None,
             )
+        except pywintypes.error as e:
+            if e.winerror == winerror.ERROR_PIPE_BUSY:
+                stalled = "busy"
+            elif e.winerror == winerror.ERROR_FILE_NOT_FOUND:
+                stalled = "no-pipe"
+            else:
+                return False, f"error: connect winerror={e.winerror}"
+            if not _sleep_within():
+                return False, stalled
+            continue
+        try:
             win32pipe.SetNamedPipeHandleState(h, win32pipe.PIPE_READMODE_MESSAGE, None, None)
-            win32file.WriteFile(h, json.dumps({"cmd": "ping"}).encode("utf-8"))
-            _hr, data = win32file.ReadFile(h, 65536)
-            resp = json.loads(data.decode("utf-8"))
-            box["ok"] = bool(resp.get("ok") and resp.get("pong"))
-        except Exception:
-            box["ok"] = False
-        finally:
-            if h is not None:
-                try:
-                    win32file.CloseHandle(h)
-                except Exception:
-                    pass
+        except pywintypes.error:
+            # Same phase, same race: the server tore its instance down between our CreateFile and
+            # this call. Drop the handle and try to catch the next instance inside the budget.
+            _shut(h)
+            h = None
+            stalled = "busy"
+            if not _sleep_within():
+                return False, stalled
+            continue
+        break
 
-    th = threading.Thread(target=_do, daemon=True)
-    th.start()
-    th.join(timeout_s)
-    return box["ok"]   # False if the worker is still blocked (hung server) or the exchange failed
+    # --- phase 2: exchange, bounded by what is LEFT of the same budget.
+    ov = pywintypes.OVERLAPPED()
+    ov.hEvent = win32event.CreateEvent(None, True, False, None)   # manual-reset, unsignalled
+
+    def _await(label: str):
+        """Bytes transferred, or None if the budget expired (then: cancel, drain, report)."""
+        ms = max(0, int((deadline - time.monotonic()) * 1000))
+        if win32event.WaitForSingleObject(ov.hEvent, ms) == win32event.WAIT_OBJECT_0:
+            return win32file.GetOverlappedResult(h, ov, False)
+        win32file.CancelIo(h)
+        try:
+            win32file.GetOverlappedResult(h, ov, True)   # MUST finish before anything is freed
+        except Exception:
+            pass
+        log.debug("ping: %s did not finish within the budget; cancelled and drained", label)
+        return None
+
+    try:
+        win32event.ResetEvent(ov.hEvent)
+        win32file.WriteFile(h, json.dumps({"cmd": "ping"}).encode("utf-8"), ov)
+        if _await("write") is None:
+            return False, "reply-timeout"
+
+        buf = win32file.AllocateReadBuffer(65536)
+        win32event.ResetEvent(ov.hEvent)
+        win32file.ReadFile(h, buf, ov)
+        n = _await("read")
+        if n is None:
+            return False, "reply-timeout"
+
+        try:
+            resp = json.loads(bytes(buf[:n]).decode("utf-8"))
+        except Exception:
+            return False, "bad-reply"
+        if isinstance(resp, dict) and resp.get("ok") and resp.get("pong"):
+            return True, None
+        return False, "bad-reply"
+    except pywintypes.error as e:
+        return False, f"error: exchange winerror={e.winerror}"
+    except Exception as e:
+        return False, f"error: {e!r}"
+    finally:
+        _shut(ov.hEvent)
+        _shut(h)
 
 
 # Both helpers below spawn a console-subsystem binary (schtasks.exe / powershell.exe) while the
@@ -195,12 +307,32 @@ def _setup_logging() -> None:
     )
 
 
+def _load_config():
+    """Read the config ONCE, and never let a broken config file take the supervisor down with it.
+
+    ``Config.load()`` parses ~/.face-unlock/config.toml and RAISES on a malformed or unreadable
+    file. A watchdog that dies there leaves the service unsupervised at exactly the moment someone
+    is hand-editing settings, so a failure is logged LOUDLY and we fall back to the built-in
+    defaults: degraded (the file's values are ignored) but still supervising.
+
+    Read once, at startup, with no reload path -- see the module docstring. Until Stage 7c-2 this
+    was ``Config()``, i.e. the file was never read at all.
+    """
+    from face_service.config import Config
+    try:
+        return Config.load()
+    except Exception as e:
+        log.warning("config load failed (%r) -- falling back to built-in defaults", e)
+        return Config()
+
+
 def main(argv=None) -> int:
+    """Ping / restart loop. Config is read ONCE here and never reloaded (see _load_config)."""
     _setup_logging()
-    from face_service.config import Config, WATCHDOG_PAUSE_PATH
+    from face_service.config import WATCHDOG_PAUSE_PATH
     from face_service.watchdog import should_restart, restart_outcome, is_paused, clear_pause
 
-    cfg = Config()
+    cfg = _load_config()
     interval = cfg.watchdog_interval_s
     timeout = cfg.watchdog_ping_timeout_s
     threshold = cfg.watchdog_fail_threshold
@@ -210,7 +342,8 @@ def main(argv=None) -> int:
     fails = 0
     try:
         while True:
-            if ping(timeout):
+            ok, reason = ping(timeout)
+            if ok:
                 fails = 0
             else:
                 fails += 1
@@ -233,10 +366,10 @@ def main(argv=None) -> int:
                     else:
                         log.info("a service instance is up after restart")
                 elif paused:
-                    log.info("ping failed (%d/%d) but a deliberate pause is active -> not restarting",
-                             fails, threshold)
+                    log.info("ping failed (%d/%d): %s -- but a deliberate pause is active -> "
+                             "not restarting", fails, threshold, reason)
                 else:
-                    log.info("ping failed (%d/%d)", fails, threshold)
+                    log.info("ping failed (%d/%d): %s", fails, threshold, reason)
             time.sleep(interval)
     except KeyboardInterrupt:
         log.info("stopped")
