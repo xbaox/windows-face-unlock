@@ -301,6 +301,53 @@ def _build_pipe_sa(cfg: Config) -> win32security.SECURITY_ATTRIBUTES:
     return sa
 
 
+# ---- presence-probe diagnostics (7c-5). Log-only: nothing here decides anything. ----
+#
+# The probe already receives verify_frame's full return and threw two thirds of it away, so a false
+# absent was undiagnosable: service.log carried "request cmd=presence" and no outcome at all.
+# verify_frame's failure shapes are distinguishable from the tuple ALONE (recognizer.py:369-383):
+# no face -> (False, 1.0, False); anti-screen suppression -> (False, <1.0, False); a real face that
+# simply did not match -> (False, dist, True). An ``ok`` of None marks a frame whose analyze_frame
+# raised. Module-level on purpose: these are pure formatters with no use for self, and keeping them
+# off FaceService means a caller that borrows a probe body (tools/presence_guards_selftest.py does
+# exactly that) does not have to mirror them.
+def _probe_frame_note(ok, dist, real) -> str:
+    if ok is None:
+        return "engine-error"
+    if ok:
+        return "match"
+    if real is False:
+        return "no-face" if dist >= 1.0 else "anti-screen"
+    return "above-threshold"
+
+
+def _fmt_probe_frames(frames) -> str:
+    return "[" + ", ".join(
+        "(%s d=%s real=%s %s)" % (
+            "-" if ok is None else ("T" if ok else "F"),
+            "n/a" if dist is None else "%.3f" % dist,
+            "-" if real is None else ("T" if real else "F"),
+            _probe_frame_note(ok, dist, real),
+        )
+        for ok, dist, real in frames
+    ) + "]"
+
+
+def _probe_hint(frames) -> str:
+    """Roll the per-frame notes up into one "why" -- the counts ARE the explanation."""
+    if not frames:
+        return "no-frames-analysed"
+    counts: dict = {}
+    for ok, dist, real in frames:
+        note = _probe_frame_note(ok, dist, real)
+        counts[note] = counts.get(note, 0) + 1
+    return " ".join("%s=%d" % (k, counts[k]) for k in sorted(counts))
+
+
+def _fmt_luma(luma_max) -> str:
+    return "n/a" if luma_max is None else "%.2f" % luma_max
+
+
 class VerifyOutcome(NamedTuple):
     """Result of one capture burst: the legacy 3-tuple plus a detail dict for the audit log."""
     match: bool
@@ -891,6 +938,7 @@ class FaceService:
         frames_ok = 0
         luma_max: "float | None" = None
         result = (False, False)
+        seen: list = []          # (ok, distance, real) per analysed frame -- diagnostics only
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
@@ -907,9 +955,11 @@ class FaceService:
                     sl = scene_luma(frame)
                     luma_max = sl if luma_max is None else max(luma_max, sl)
                     try:
-                        ok, _dist, real = self.recog.verify_frame(frame)
+                        ok, dist, real = self.recog.verify_frame(frame)
                     except Exception:
+                        seen.append((None, None, None))
                         continue
+                    seen.append((ok, dist, real))
                     if ok:
                         result = (True, real)
                         break
@@ -929,6 +979,16 @@ class FaceService:
             log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> camera-error, not absence",
                      defect, frames_ok, "n/a" if luma_max is None else "%.2f" % luma_max)
             return True, True
+        # Reaching here means the camera-error gate above did NOT fire, so an absent verdict here is
+        # a real "the enrolled face was not seen" -- exactly the case that used to leave no trace.
+        # INFO on absent (rare, and the one worth reading), DEBUG on present (every interval).
+        if result[0]:
+            log.debug("presence probe present (recognition): frames=%s luma_max=%s",
+                      _fmt_probe_frames(seen), _fmt_luma(luma_max))
+        else:
+            log.info("presence probe absent (recognition): frames=%s hint=%s frames_ok=%d "
+                     "luma_max=%s", _fmt_probe_frames(seen), _probe_hint(seen),
+                     frames_ok, _fmt_luma(luma_max))
         return result
 
     def _presence_probe_detection(self) -> tuple[bool, bool]:
@@ -968,6 +1028,14 @@ class FaceService:
             log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> camera-error, not absence",
                      defect, frames_ok, "n/a" if luma_max is None else "%.2f" % luma_max)
             return True, True
+        # Symmetric to the recognition probe. YuNet only answers yes/no, so there are no distances
+        # to report: an absent verdict here means has_face said no on every frame that arrived.
+        if result[0]:
+            log.debug("presence probe present (detection): frames_ok=%d luma_max=%s",
+                      frames_ok, _fmt_luma(luma_max))
+        else:
+            log.info("presence probe absent (detection): frames_ok=%d faces=0 luma_max=%s",
+                     frames_ok, _fmt_luma(luma_max))
         return result
 
     # ---------- pipe ----------
