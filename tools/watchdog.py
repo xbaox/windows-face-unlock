@@ -6,7 +6,8 @@ UNLESS a deliberate-stop pause is active. Reuses the existing `ping` command (no
 Restart is KILL-THEN-START (critical): a hung-but-alive service still holds the
 ``Local\\FaceUnlockService`` single-instance mutex, so a bare ``Start-ScheduledTask`` would spawn an
 instance that instantly exits on ERROR_ALREADY_EXISTS and the service would stay dead. So we kill
-the stray ``face_service`` process first (commandline match, like tools/clean_restart.ps1), then
+the stray ``face_service`` process first (commandline match -- the same criterion the registrar
+tools/register_tasks.ps1 carries; tools/clean_restart.ps1 is a thin wrapper over it), then
 WAIT for it to actually die, then start the task. The wait is load-bearing: Stop-Process only
 *signals*, and both the mutex and the FIRST_PIPE_INSTANCE pipe name stay held until the last handle
 is gone -- starting on a blind delay races a slow-dying process into a mutex-loser exit. A hung
@@ -40,7 +41,8 @@ _DEATH_POLL_MS = 200     # how often that poll re-counts (inside ONE powershell,
 
 # The ONE process-matching criterion, shared by kill / count / death-wait below so the three can
 # never drift apart. The filter is Name='pythonw.exe' ONLY: prod runs via pythonw (register_tasks.ps1
-# / setup.ps1 both launch .venv\Scripts\pythonw.exe), while a DEV instance is
+# launches .venv\Scripts\pythonw.exe; setup.ps1 launches nothing itself, it delegates to that
+# registrar), while a DEV instance is
 # `python.exe -m face_service` (visible console) -- so the watchdog restarts the prod service but
 # does NOT kill a dev instance you are debugging. The watchdog itself (`-m tools.watchdog`) and
 # presence (`-m presence_monitor`) lack "face_service" in their commandline, so they are never
@@ -110,9 +112,21 @@ def ping(timeout_s: float) -> bool:
     return box["ok"]   # False if the worker is still blocked (hung server) or the exchange failed
 
 
+# Both helpers below spawn a console-subsystem binary (schtasks.exe / powershell.exe) while the
+# watchdog itself runs under the scheduled task via pythonw.exe -- a parent with NO console of its
+# own. Without CREATE_NO_WINDOW Windows allocates a BRAND NEW console for each child: those are the
+# black windows that blink on the desktop during a restart. capture_output only redirects the
+# streams, it does not stop the allocation. Same idiom as presence_monitor/tray.py::_launch_enroll.
 def _run(cmd: list, label: str) -> bool:
+    """True iff the command LAUNCHED (no exception). A non-zero exit is LOGGED, not returned as
+    False: restart_service only reports this value, so changing its meaning would change that
+    report. Before this the whole result -- exit code and stderr alike -- was dropped silently."""
     try:
-        subprocess.run(cmd, timeout=30, capture_output=True)
+        out = subprocess.run(cmd, timeout=30, capture_output=True, text=True, errors="replace",
+                             creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
+        if out.returncode != 0:
+            tail = (out.stderr or "").strip()[-200:]
+            log.warning("%s exited %d%s", label, out.returncode, f": {tail}" if tail else "")
         return True
     except Exception as e:
         log.warning("%s failed: %r", label, e)
@@ -120,10 +134,12 @@ def _run(cmd: list, label: str) -> bool:
 
 
 def _run_ps_int(script: str, label: str):
-    """Run a PowerShell snippet and parse its last stdout line as an int (a process count)."""
+    """Run a PowerShell snippet and parse its last stdout line as an int (a process count).
+    CREATE_NO_WINDOW for the same reason as _run above; the parsing is untouched."""
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                             timeout=30, capture_output=True, text=True)
+                             timeout=30, capture_output=True, text=True,
+                             creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
         lines = [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
         if lines and lines[-1].lstrip("-").isdigit():
             return int(lines[-1])
