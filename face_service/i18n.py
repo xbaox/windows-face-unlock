@@ -14,6 +14,26 @@ Usage
 Keys are namespaced by surface: ``tray.*``, ``status.*``, ``settings.*``,
 ``field.<config-name>`` and ``field.<config-name>.desc``, ``lang.<code>``.
 """
+# ---------------------------------------------------------------------------
+# LOCALISATION POLICY (settled in Stage 7c; recorded here so the gaps below
+# read as a decision rather than as unfinished work).
+#
+# * en and ru are the COMPLETE locales and are kept key-for-key equal. That
+#   equality is pinned by a test, not by good intentions --
+#   tools/presence_guards_selftest.py asserts set(_EN) == set(_RU).
+# * The other ten languages are BEST-EFFORT. They carry the strings someone
+#   actually translated; everything else resolves through t()'s fallback
+#   chain (current language -> English -> the raw key), so a missing key
+#   shows English text, never a crash and never an empty label.
+# * NEW keys are added to _EN and _RU only. Filling all twelve locales was
+#   considered and declined: it is ~1160 machine-translated strings for a UI
+#   whose two real audiences read English or Russian, and unreviewed
+#   translations of security wording are worse than an honest English
+#   fallback. Revisit only with a human translator per language.
+# * t() falls back on FALSITY, not on absence: an empty-string translation
+#   also lands on English. Deliberate -- a blank label is a worse bug than a
+#   foreign one, and this keeps "translated to nothing" from shipping.
+# ---------------------------------------------------------------------------
 from __future__ import annotations
 import locale
 import logging
