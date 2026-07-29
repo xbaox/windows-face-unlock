@@ -289,6 +289,12 @@ Write-Host ("Processes matching the kill criterion right now: {0}" -f $fuCandida
 foreach ($fuProc in $fuCandidates) {
     Write-Host ("  pid {0,-7} {1}" -f $fuProc.ProcessId, $fuProc.Name)
 }
+# Only the two actions that actually stop things say how they stop them. Printing this under
+# -Action Start (which stops nothing) or -Action Unregister (which has no graceful step) would
+# describe a strategy that is not going to run.
+if ($Action -eq 'Register' -or $Action -eq 'Restart') {
+    Write-Host "Stop strategy: graceful pipe shutdown first, then task stop, hard kill as fallback."
+}
 
 if ($DryRun) {
     Write-Host ""
@@ -301,9 +307,92 @@ if ($DryRun) {
 # PHASE B -- commit. Everything below this point changes the system.
 # ===========================================================================
 
-# Defined here, below the dry-run gate, on purpose: it contains Stop-Process,
-# and keeping every mutating call textually inside phase B is what makes the
-# "dry-run path is clean" check a one-line AST walk instead of a judgement call.
+# Both functions below live here, under the dry-run gate, on purpose: between them they hold every
+# Stop-Process / Start-Process in this file, and keeping every mutating call textually inside
+# phase B is what makes the "dry-run path is clean" check a one-line AST walk instead of a
+# judgement call.
+
+# Ask the service to stop THROUGH THE PIPE, before anything gets killed.
+#
+# Why: Stop-Process is TerminateProcess. No Python runs, so serve_forever never reaches its
+# trailing _release_camera(), and the `shutdown` handler never writes the watchdog pause -- the
+# supervisor sees an unexplained death rather than a deliberate stop. Asking first makes the
+# service hand its persistent capture back itself.
+#
+# It is also insurance for KNOWN_ISSUES #2: hard-killing the live owner of a persistent capture is
+# the current suspect for wedging the Windows Camera Frame Server, which nothing short of a reboot
+# clears. That link is NOT proven -- this is cheap insurance against it, not a fix for it.
+#
+# Only the service gets this. Presence and the watchdog hold no camera and expose no graceful IPC,
+# so their path stays Stop-ScheduledTask + kill.
+#
+# Never throws: every failure degrades to "fall back to the hard kill", which is exactly what this
+# script did before the function existed.
+function Invoke-GracefulServiceShutdown {
+    # Same interpreter the tasks run under, one file over: the console python.exe beside the
+    # pythonw.exe the Dev layout launches. Gating on pythonw keeps this resolution identical to
+    # the task one. Deliberately NOT a bare "python" while the venv exists -- pywin32 lives in the
+    # venv, and tools/pipe_client.py cannot import win32file without it.
+    $fuVenvPythonw = Join-Path $fuRepoRoot '.venv\Scripts\pythonw.exe'
+    if (Test-Path -LiteralPath $fuVenvPythonw) {
+        $fuClientPy = Join-Path $fuRepoRoot '.venv\Scripts\python.exe'
+    }
+    else {
+        # No venv (Installed layout, or a partial checkout). Try PATH and let it fall into the
+        # fallback if pywin32 is missing there: a graceful path we cannot take costs a hard kill,
+        # not the run.
+        $fuClientPy = 'python'
+    }
+
+    # Only the SERVICE is graceful-stoppable, so only the service is waited for. Derived from the
+    # same declaration everything else uses instead of hardcoding a name: Dev matches the module
+    # on the command line, Installed matches the frozen exe.
+    $fuSvcNeedles  = @('face_service')
+    $fuSvcExeNames = @($fuTasks | Where-Object { $_.DevArgs -like '*face_service*' } |
+                       ForEach-Object { $_.InstalledExe } | Where-Object { $_ })
+
+    Write-Host "Asking the service to shut down over the pipe..."
+    $fuGraceWatch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $fuClient = Start-Process -FilePath $fuClientPy `
+                                  -ArgumentList '-m', 'tools.pipe_client', 'shutdown' `
+                                  -WorkingDirectory $fuRepoRoot `
+                                  -WindowStyle Hidden -PassThru
+    }
+    catch {
+        Write-Warning ("could not start the pipe client ({0}); falling back to hard kill" -f `
+                       $_.Exception.Message)
+        return
+    }
+
+    # pipe_client blocks in ReadFile with NO timeout, so a server that accepts the connection and
+    # then wedges would hang this client forever. Bound it, and kill the CLIENT on timeout --
+    # never the service, which is Stop-FuAndWait's job after the tasks are stopped.
+    if (-not $fuClient.WaitForExit(3000)) {
+        Write-Warning "pipe client did not return within 3s; killing the client and falling back to hard kill"
+        try { $fuClient.Kill() } catch { }
+        return
+    }
+
+    # The client returning only means the request was ANSWERED: the service replies first and
+    # unwinds serve_forever afterwards. Wait for the process to actually be gone -- that is what
+    # proves the camera was released and the mutex / pipe name freed.
+    $fuGracePoll = [Diagnostics.Stopwatch]::StartNew()
+    while ($fuGracePoll.Elapsed.TotalSeconds -lt 5) {
+        if (-not (Get-FuProcess -LayoutMode $Mode -ExeNames $fuSvcExeNames `
+                                -CommandLineNeedles $fuSvcNeedles)) {
+            Write-Host ("graceful shutdown accepted; service exited in {0:N1}s" -f `
+                        $fuGraceWatch.Elapsed.TotalSeconds)
+            return
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    Write-Warning "pipe shutdown failed or timed out; falling back to hard kill"
+}
+
+# The FALLBACK, not the primary stop any more: Invoke-GracefulServiceShutdown runs first and the
+# scheduler is asked next, so by the time this runs it is finishing off whatever ignored both --
+# a wedged service, or presence/watchdog, which have no graceful path at all.
 #
 # Stop-Process only SIGNALS. The Local\FaceUnlockService mutex and the
 # FIRST_PIPE_INSTANCE pipe name stay held until the last handle closes, so
@@ -359,9 +448,11 @@ if ($Action -eq 'Restart') {
     # cost you a working set of tasks while you were only trying to bounce the
     # service.
     #
-    # Stop-ScheduledTask first: killing the process alone can leave the
-    # scheduler still believing the task is Running, and Start-ScheduledTask on
-    # a Running task is a silent no-op.
+    # Graceful first: the service releases its own camera and records a deliberate stop. Then
+    # Stop-ScheduledTask, because killing the process alone can leave the scheduler still
+    # believing the task is Running, and Start-ScheduledTask on a Running task is a silent no-op.
+    # Then the kill, for whatever survived both.
+    Invoke-GracefulServiceShutdown
     foreach ($fuItem in $fuPlan) {
         Stop-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
     }
@@ -394,7 +485,15 @@ foreach ($fuName in $fuOrphans) {
     Write-Host ("Removed orphan (not in the declaration): {0}" -f $fuName)
 }
 
-# B3: stop what is still running from the previous registration.
+# B3: stop what is still running from the previous registration. Three steps, weakest force
+# first: ask the service over the pipe (it then releases its own camera and marks the stop
+# deliberate), tell the scheduler, and only then kill the remainder.
+Invoke-GracefulServiceShutdown
+foreach ($fuItem in $fuPlan) {
+    # SilentlyContinue: after a successful graceful stop some of these are already not running,
+    # and the scheduler says so rather than staying quiet about it.
+    Stop-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
+}
 Stop-FuAndWait
 
 # B4
