@@ -314,8 +314,8 @@ def main(argv=None) -> int:
     finally:
         I.set_language(saved_lang)
     en, ru = I.TRANSLATIONS["en"], I.TRANSLATIONS["ru"]
-    t.ok(len(en) == 200, f"_EN has 200 keys (got {len(en)})")
-    t.ok(len(ru) == 200, f"_RU has 200 keys (got {len(ru)})")
+    t.ok(len(en) == 206, f"_EN has 206 keys (got {len(en)})")
+    t.ok(len(ru) == 206, f"_RU has 206 keys (got {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
 
     # --- 6) the camera-defect gate in the real presence probe -----------------------------------

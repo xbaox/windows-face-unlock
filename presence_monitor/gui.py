@@ -63,6 +63,9 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, object]]]] = [
         ("presence_interval_s",     "int",        (5, 3600)),
         ("presence_absent_strikes", "int",        (1, 20)),
         ("presence_fullscreen_strikes", "int",    (0, 120)),
+        ("presence_soft_margin",     "float",     (0.0, 0.2)),
+        ("presence_uncertain_streak", "int",      (1, 60)),
+        ("presence_confirm_delay_s", "float",     (0.0, 30.0)),
     ]),
     ("section.camera", [
         ("camera_index",            "int",        (0, 10)),

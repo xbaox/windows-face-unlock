@@ -58,6 +58,26 @@ class Config:
     # (strikes still accrue and show in Status; only LockWorkStation is withheld). The signal is
     # SHQueryUserNotificationState -- see presence_monitor/monitor.py::_fullscreen_active.
     presence_fullscreen_strikes: int = 10
+    # --- Stage 7c-6: three-level presence verdict (probe-only; unlock is NOT affected) ---
+    # The probe used to answer a bare yes/no on a single frame passing the SAME bar as unlock, and
+    # two live incidents showed both ways that fails a user sitting at the desk: a working pose puts
+    # the distance just past the threshold, and anti-screen suppresses a match outright at close
+    # range. These three knobs add a middle state instead of loosening any recognition number.
+    #
+    # Soft band ABOVE threshold that still counts as "seen", for the probe ONLY. A frame in
+    # (threshold, threshold + this] with anti-screen happy is a WEAK sighting and keeps the session
+    # alive; the same frame is still not good enough to unlock anything. Deliberately small: at the
+    # default 0.32 this reaches 0.37, well below the ~0.97 impostor floor measured in Stage 1.
+    presence_soft_margin: float = 0.05
+    # A frame inside the soft band that anti-screen flagged is SUSPECT, and a probe made only of
+    # suspect frames is "uncertain" rather than absent -- it never locks on its own. This many
+    # consecutive uncertain probes turn into one absence strike, so a genuinely hostile signal still
+    # converges; 3 at the default 60s interval is ~3 minutes of tolerance.
+    presence_uncertain_streak: int = 3
+    # Before spending an absence strike the monitor waits this long and probes ONCE more: a lock is
+    # expensive and a single bad burst is cheap to double-check. 0 disables the confirmation and
+    # makes an absent probe count immediately (the pre-7c-6 behaviour).
+    presence_confirm_delay_s: float = 2.0
     # "recognition" = InsightFace/ONNX ArcFace embedding must match enrolled face (stronger; walk-away + strangers)
     # "detection"   = YuNet any-face-in-frame is enough (weaker; mimics old AutoFaceLock)
     presence_mode: str = "recognition"
@@ -220,6 +240,18 @@ class Config:
         if self.presence_fullscreen_strikes < 0:
             raise ValueError(
                 "presence_fullscreen_strikes must be >= 0 (0 = never lock while fullscreen)")
+        # 7c-6 probe verdict knobs. The margin is bounded well below any impostor distance -- it
+        # widens what counts as "still here", never what counts as a match.
+        if not (0.0 <= self.presence_soft_margin <= 0.2):
+            raise ValueError("presence_soft_margin must be in [0, 0.2]")
+        if isinstance(self.presence_uncertain_streak, bool) or \
+                not isinstance(self.presence_uncertain_streak, int):
+            raise ValueError("presence_uncertain_streak must be an integer")
+        if self.presence_uncertain_streak < 1:
+            raise ValueError("presence_uncertain_streak must be >= 1")
+        if self.presence_confirm_delay_s < 0.0:
+            raise ValueError(
+                "presence_confirm_delay_s must be >= 0 (0 = no confirmation re-probe)")
         if not (0.0 < self.threshold < 2.0):
             raise ValueError("threshold must be in (0, 2)")
         if self.language not in LANG_CODES:

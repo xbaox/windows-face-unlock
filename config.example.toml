@@ -144,6 +144,12 @@ presence_absent_strikes = 2      # consecutive absent probes before locking
 presence_fullscreen_strikes = 10 # consecutive absent probes before locking while a
                                  # fullscreen app / presentation mode is active.
                                  # 0 = never lock during fullscreen.
+presence_soft_margin = 0.05      # probe only: a face this far PAST threshold still
+                                 # counts as "still here". Never enough to unlock.
+presence_uncertain_streak = 3    # consecutive "uncertain" probes (anti-screen flagged
+                                 # a near face) that add up to one absence strike.
+presence_confirm_delay_s = 2.0   # wait this long and re-probe once before spending an
+                                 # absence strike. 0 = no confirmation.
 
 # --- Notifications -----------------------------------------------------------
 
