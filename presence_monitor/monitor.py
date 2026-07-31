@@ -303,16 +303,17 @@ class PresenceMonitor:
 
         state = _state_of(resp)
         mode = resp.get("mode", self.cfg.presence_mode)
-        log.info("presence probe: state=%s real=%s mode=%s",
-                 state, resp.get("real"), mode)
+        log.info("presence probe: state=%s real=%s mode=%s %s d4=-",
+                 state, resp.get("real"), mode, self._fmt_counters())
 
         if state == "present":
+            counters = self._fmt_counters()      # as OBSERVED, before the reset zeroes them
             self._reset_strikes()
-            self._set_last("present", f"real={resp.get('real')}", mode)
+            self._set_last("present", f"real={resp.get('real')} {counters} d4=-", mode)
             return
 
         if state == "uncertain":
-            self._on_uncertain(mode, "probe")
+            self._on_uncertain(mode, "probe", "-")
             return
 
         # --- state == "absent": confirm before spending a strike (7c-6 / D4) ------------------
@@ -321,7 +322,7 @@ class PresenceMonitor:
         # must end the tick immediately, and it must NOT go on to lock on the way out.
         delay = self.cfg.presence_confirm_delay_s
         if delay <= 0:
-            self._award_strike(mode, "absent")      # confirmation disabled: old behaviour
+            self._award_strike(mode, "absent", "-")   # confirmation disabled: old behaviour
             return
         if self._stop.wait(delay):
             log.debug("absence confirmation abandoned: monitor stopping")
@@ -330,20 +331,32 @@ class PresenceMonitor:
         if resp2 is None:
             # Same rule as the first probe: an unreachable service is not evidence of absence.
             log.warning("absence confirmation: service unavailable; skipping")
-            self._set_last("error", "service-unavailable")
+            self._set_last("error", f"service-unavailable {self._fmt_counters()} d4=unreachable")
             return
         state2 = _state_of(resp2)
         if state2 == "present":
-            log.info("absence retracted by confirmation probe after %.1fs", delay)
+            counters = self._fmt_counters()          # as OBSERVED, before the reset zeroes them
+            log.info("absence retracted by confirmation probe after %.1fs: state=present %s "
+                     "d4=retracted", delay, counters)
             self._reset_strikes()
-            self._set_last("present", "confirm: retracted", mode)
+            self._set_last("present", f"confirm: retracted {counters} d4=retracted", mode)
             return
         if state2 == "uncertain":
-            self._on_uncertain(mode, "confirm")
+            self._on_uncertain(mode, "confirm", "uncertain")
             return
-        self._award_strike(mode, "absent confirmed")
+        self._award_strike(mode, "absent confirmed", "confirmed")
 
-    def _on_uncertain(self, mode: str, origin: str) -> None:
+    def _fmt_counters(self, limit: "int | None" = None) -> str:
+        """The two running counters, in the one format every tick outcome reports them in.
+
+        ``limit`` is passed in only by _award_strike, which is where the fullscreen-aware threshold
+        is resolved; everywhere else the ordinary threshold is the one in force.
+        """
+        return "streak=%d/%d strikes=%d/%s" % (
+            self._uncertain, self.cfg.presence_uncertain_streak, self._strikes,
+            self.cfg.presence_absent_strikes if limit is None else limit)
+
+    def _on_uncertain(self, mode: str, origin: str, d4: str) -> None:
         """One uncertain probe: never locks by itself, but a long enough run converts.
 
         The run is deliberately NOT cleared on conversion -- once it is long enough, every further
@@ -353,16 +366,17 @@ class PresenceMonitor:
         self._uncertain += 1
         m = self.cfg.presence_uncertain_streak
         if self._uncertain < m:
-            log.info("presence uncertain (%s) %d/%d — not counting an absence",
-                     origin, self._uncertain, m)
-            self._set_last("uncertain", f"uncertain {self._uncertain}/{m} ({origin})", mode)
+            log.info("presence tick: state=uncertain (%s) %s d4=%s — not counting an absence",
+                     origin, self._fmt_counters(), d4)
+            self._set_last("uncertain",
+                           f"{self._fmt_counters()} d4={d4} ({origin})", mode)
             return
         # The run IS the confirmation, so this path deliberately skips the D4 re-probe.
-        log.info("presence uncertain (%s) %d/%d — run converts to an absence strike",
-                 origin, self._uncertain, m)
-        self._award_strike(mode, f"uncertain {self._uncertain}/{m}")
+        log.info("presence tick: state=uncertain (%s) %s d4=%s — run converts to an absence strike",
+                 origin, self._fmt_counters(), d4)
+        self._award_strike(mode, f"uncertain {self._uncertain}/{m}", d4)
 
-    def _award_strike(self, mode: str, why: str) -> None:
+    def _award_strike(self, mode: str, why: str, d4: str) -> None:
         """Spend one absence strike, and lock if that reaches the threshold.
 
         The threshold choice and the lock itself are unchanged from 7c-3 -- only HOW a strike is
@@ -381,10 +395,12 @@ class PresenceMonitor:
                          self.cfg.presence_absent_strikes,
                          limit if limit > 0 else "never (0 = no lock while fullscreen)")
         suffix = "" if self.cfg.auto_lock else " (auto-lock off)"
+        counters = self._fmt_counters(limit)
+        log.info("presence tick: state=absent %s d4=%s [%s]", counters, d4, why)
         self._set_last(
             "absent",
-            (f"strike {self._strikes}/{limit} [{why}]{suffix}" if limit > 0
-             else f"strike {self._strikes} (fullscreen: never lock) [{why}]{suffix}"),
+            (f"{counters} d4={d4} [{why}]{suffix}" if limit > 0
+             else f"{counters} d4={d4} (fullscreen: never lock) [{why}]{suffix}"),
             mode,
         )
         if limit > 0 and self._strikes >= limit:
