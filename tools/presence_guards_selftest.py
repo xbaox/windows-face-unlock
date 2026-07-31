@@ -326,19 +326,19 @@ def main(argv=None) -> int:
 
     svc = _StubSvc(cfg, None)                      # every read fails -> no frames at all
     t.ok(svc._burst_defect(0, None) == "zero-frames", "_burst_defect(0, None) == 'zero-frames'")
-    t.ok(svc._presence_probe_recognition() == (True, True),
-         "zero-frame burst -> (True, True) = camera-error, so no absence strike")
+    t.ok(svc._presence_probe_recognition() == ("present", True),
+         "zero-frame burst -> ('present', True) = camera-error, so no absence strike")
     t.ok(svc.heals and svc.heals[0][0] == 0, "self-heal was still notified (frames_ok=0)")
 
     svc = _StubSvc(cfg, black)                     # frames arrive, all of them black
     t.ok(svc._burst_defect(3, 0.0) == "black-burst", "_burst_defect(3, 0.0) == 'black-burst'")
-    t.ok(svc._presence_probe_recognition() == (True, True),
-         "black burst -> (True, True) = camera-error, so no absence strike")
+    t.ok(svc._presence_probe_recognition() == ("present", True),
+         "black burst -> ('present', True) = camera-error, so no absence strike")
 
     svc = _StubSvc(cfg, lit)                       # a normal, well-lit burst with nobody in it
     t.ok(svc._burst_defect(3, 200.0) is None, "_burst_defect on a lit burst -> None (no defect)")
-    t.ok(svc._presence_probe_recognition() == (False, False),
-         "lit burst with no face -> (False, False) = genuine absence, walk-away intact")
+    t.ok(svc._presence_probe_recognition() == ("absent", False),
+         "lit burst with no face -> ('absent', False) = genuine absence, walk-away intact")
     t.ok(cfg.camera_black_luma == 2.0, "camera_black_luma still the frozen 2.0")
 
     # And the monitor half: a probe that reports present spends no strike.

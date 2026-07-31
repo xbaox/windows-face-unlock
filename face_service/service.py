@@ -301,46 +301,79 @@ def _build_pipe_sa(cfg: Config) -> win32security.SECURITY_ATTRIBUTES:
     return sa
 
 
-# ---- presence-probe diagnostics (7c-5). Log-only: nothing here decides anything. ----
+# ---- presence-probe frame classes and verdict (7c-6). PROBE-ONLY: unlock never reaches here. ----
 #
-# The probe already receives verify_frame's full return and threw two thirds of it away, so a false
-# absent was undiagnosable: service.log carried "request cmd=presence" and no outcome at all.
-# verify_frame's failure shapes are distinguishable from the tuple ALONE (recognizer.py:369-383):
+# verify_frame's shapes are distinguishable from its return tuple ALONE (recognizer.py:369-383):
 # no face -> (False, 1.0, False); anti-screen suppression -> (False, <1.0, False); a real face that
-# simply did not match -> (False, dist, True). An ``ok`` of None marks a frame whose analyze_frame
-# raised. Module-level on purpose: these are pure formatters with no use for self, and keeping them
-# off FaceService means a caller that borrows a probe body (tools/presence_guards_selftest.py does
-# exactly that) does not have to mirror them.
-def _probe_frame_note(ok, dist, real) -> str:
+# simply did not match -> (False, dist, True); a match -> (True, dist, True). An ``ok`` of None
+# marks a frame whose analyze_frame raised.
+#
+# Two live incidents killed the old bare yes/no. At 19:49:46 three frames sat at d=0.286-0.306 with
+# real=False -- recognised, but anti-screen suppressed the match at close range. At 19:50:17 three
+# frames sat at d=0.323-0.343 with real=True -- a working pose putting the tail just past 0.32. Both
+# read as "absent" and locked a user who was sitting right there. The classes below add a middle
+# ground instead of moving any recognition number: SUSPECT and WEAK are probe-only concepts.
+#
+# Module-level on purpose: pure functions with no use for self, so a caller that borrows a probe
+# body (tools/presence_guards_selftest.py does exactly that) does not have to mirror them.
+def _probe_frame_class(ok, dist, real, threshold: float, soft_margin: float) -> str:
+    """One frame -> strong / weak / suspect / none / error. ORDER IS LOAD-BEARING.
+
+    ``error`` first: dist is None there and every later comparison would raise. ``strong`` next, so
+    a real match can never be reclassified by the softer rules. ``none`` on dist >= 1.0 before the
+    band checks, because that is verify_frame's "no face at all" sentinel and not a real distance --
+    without this an empty frame would fall into the suspect branch on a wide margin.
+    """
     if ok is None:
-        return "engine-error"
+        return "error"
     if ok:
-        return "match"
-    if real is False:
-        return "no-face" if dist >= 1.0 else "anti-screen"
-    return "above-threshold"
+        return "strong"
+    if dist >= 1.0:
+        return "none"
+    ceiling = float(threshold) + float(soft_margin)
+    if real and threshold < dist <= ceiling:
+        return "weak"
+    if (not real) and dist <= ceiling:
+        return "suspect"
+    return "none"
 
 
-def _fmt_probe_frames(frames) -> str:
+def _probe_verdict(frames, threshold: float, soft_margin: float) -> str:
+    """The burst -> present / uncertain / absent.
+
+    A single strong OR weak frame is enough to say the user is here: absence has to be the absence
+    of ANY sighting. Failing that, a single suspect frame downgrades to ``uncertain`` rather than
+    ``absent`` -- something face-shaped and close was there, and that must not lock on its own. An
+    all-error burst falls through to ``absent``, which is what it did before 7c-6.
+    """
+    classes = [_probe_frame_class(ok, d, r, threshold, soft_margin) for ok, d, r in frames]
+    if any(c in ("strong", "weak") for c in classes):
+        return "present"
+    if any(c == "suspect" for c in classes):
+        return "uncertain"
+    return "absent"
+
+
+def _fmt_probe_frames(frames, threshold: float, soft_margin: float) -> str:
     return "[" + ", ".join(
         "(%s d=%s real=%s %s)" % (
             "-" if ok is None else ("T" if ok else "F"),
             "n/a" if dist is None else "%.3f" % dist,
             "-" if real is None else ("T" if real else "F"),
-            _probe_frame_note(ok, dist, real),
+            _probe_frame_class(ok, dist, real, threshold, soft_margin),
         )
         for ok, dist, real in frames
     ) + "]"
 
 
-def _probe_hint(frames) -> str:
-    """Roll the per-frame notes up into one "why" -- the counts ARE the explanation."""
+def _probe_hint(frames, threshold: float, soft_margin: float) -> str:
+    """Roll the per-frame classes up into one "why" -- the counts ARE the explanation."""
     if not frames:
         return "no-frames-analysed"
     counts: dict = {}
     for ok, dist, real in frames:
-        note = _probe_frame_note(ok, dist, real)
-        counts[note] = counts.get(note, 0) + 1
+        cls = _probe_frame_class(ok, dist, real, threshold, soft_margin)
+        counts[cls] = counts.get(cls, 0) + 1
     return " ".join("%s=%d" % (k, counts[k]) for k in sorted(counts))
 
 
@@ -912,23 +945,31 @@ class FaceService:
             "reason": reason,
         })
 
-    def _presence_probe(self) -> tuple[bool, bool]:
-        """(present, real) — semantics depend on config.presence_mode.
+    def _presence_probe(self) -> tuple[str, bool]:
+        """(state, real) — semantics depend on config.presence_mode.
 
-        recognition: ``present`` = enrolled face detected AND passes anti-spoofing.
+        ``state`` is one of ``"present"`` / ``"uncertain"`` / ``"absent"`` (7c-6). ``uncertain``
+        means something face-shaped and close was seen but anti-screen flagged it: it is NOT a
+        sighting and NOT an absence, and on its own it must never lock. Only the recognition mode
+        can produce it -- detection has no distance and no anti-screen, so it stays two-valued.
+
+        recognition: ``present`` = enrolled face seen at or just past the threshold, anti-screen ok.
         detection:   ``present`` = *any* face detected by YuNet. ``real`` is
                      reported as True (anti-spoofing not evaluated).
+
+        Every benign skip below reports ``present``: the camera being unavailable is not evidence
+        that the user left, and that is exactly what these paths meant before 7c-6 too.
         """
         if self._camera_leased_out():
             log.info("presence probe skipped: camera leased out to enrollment")
-            # Return (True, True) so the monitor doesn't rack up strikes
+            # Report present so the monitor doesn't rack up strikes
             # while the user is enrolling their face.
-            return True, True
+            return "present", True
         if self.cfg.presence_mode == "detection":
             return self._presence_probe_detection()
         return self._presence_probe_recognition()
 
-    def _presence_probe_recognition(self) -> tuple[bool, bool]:
+    def _presence_probe_recognition(self) -> tuple[str, bool]:
         # Camera-health telemetry (7b): count the frames that actually arrived and keep the
         # brightest scene luma among them, then judge AFTER the lock is dropped --
         # _note_camera_health takes _cam_lock and threading.Lock is not reentrant. ``scene_luma``
@@ -943,7 +984,7 @@ class FaceService:
             cam, busy = self._acquire_camera()
             if busy:
                 log.info("presence probe skipped: camera busy (held by another process)")
-                return True, True   # like leased: don't rack up absence strikes when we can't see
+                return "present", True   # like leased: no strikes when we cannot see
             try:
                 for _ in range(2):
                     cam.read()
@@ -978,21 +1019,30 @@ class FaceService:
             # probe opens a fresh one.
             log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> camera-error, not absence",
                      defect, frames_ok, "n/a" if luma_max is None else "%.2f" % luma_max)
-            return True, True
-        # Reaching here means the camera-error gate above did NOT fire, so an absent verdict here is
-        # a real "the enrolled face was not seen" -- exactly the case that used to leave no trace.
-        # INFO on absent (rare, and the one worth reading), DEBUG on present (every interval).
-        if result[0]:
-            log.debug("presence probe present (recognition): frames=%s luma_max=%s",
-                      _fmt_probe_frames(seen), _fmt_luma(luma_max))
+            return "present", True
+        # Reaching here means the camera-error gate above did NOT fire, so anything short of a
+        # sighting is about the USER, not the device. ``result`` above is the strong-match early
+        # exit and still gates the camera-error branch byte-for-byte; the tri-state verdict is
+        # derived from the frame classes, which also see the weak and suspect frames that
+        # ``result`` cannot represent.
+        threshold, soft = self.cfg.threshold, self.cfg.presence_soft_margin
+        state = _probe_verdict(seen, threshold, soft)
+        # DEBUG on present (every interval on a healthy machine), INFO on the two states worth
+        # reading -- an absence about to cost a strike, and the uncertainty that used to be one.
+        line = ("presence probe %s (recognition): frames=%s hint=%s frames_ok=%d luma_max=%s "
+                "state=%s")
+        args = (state, _fmt_probe_frames(seen, threshold, soft), _probe_hint(seen, threshold, soft),
+                frames_ok, _fmt_luma(luma_max), state)
+        if state == "present":
+            log.debug(line, *args)
         else:
-            log.info("presence probe absent (recognition): frames=%s hint=%s frames_ok=%d "
-                     "luma_max=%s", _fmt_probe_frames(seen), _probe_hint(seen),
-                     frames_ok, _fmt_luma(luma_max))
-        return result
+            log.info(line, *args)
+        return state, state == "present"
 
-    def _presence_probe_detection(self) -> tuple[bool, bool]:
-        # Same camera-health bookkeeping as the recognition probe above, same reasons.
+    def _presence_probe_detection(self) -> tuple[str, bool]:
+        # Same camera-health bookkeeping as the recognition probe above, same reasons. Two-valued by
+        # construction: YuNet answers yes/no with no distance and no anti-screen, so there is no
+        # middle ground to report and "uncertain" can never come out of this path.
         frames_ok = 0
         luma_max: "float | None" = None
         result = (False, True)
@@ -1000,7 +1050,7 @@ class FaceService:
             cam, busy = self._acquire_camera()
             if busy:
                 log.info("presence probe skipped: camera busy (held by another process)")
-                return True, True   # like leased: don't rack up absence strikes when we can't see
+                return "present", True   # like leased: no strikes when we cannot see
             try:
                 for _ in range(2):
                     cam.read()
@@ -1027,16 +1077,19 @@ class FaceService:
             # Same reasoning as the recognition probe above: a blind camera is a camera fault.
             log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> camera-error, not absence",
                      defect, frames_ok, "n/a" if luma_max is None else "%.2f" % luma_max)
-            return True, True
+            return "present", True
         # Symmetric to the recognition probe. YuNet only answers yes/no, so there are no distances
         # to report: an absent verdict here means has_face said no on every frame that arrived.
+        state = "present" if result[0] else "absent"
         if result[0]:
-            log.debug("presence probe present (detection): frames_ok=%d luma_max=%s",
-                      frames_ok, _fmt_luma(luma_max))
+            log.debug("presence probe present (detection): frames_ok=%d luma_max=%s state=%s",
+                      frames_ok, _fmt_luma(luma_max), state)
         else:
-            log.info("presence probe absent (detection): frames_ok=%d faces=0 luma_max=%s",
-                     frames_ok, _fmt_luma(luma_max))
-        return result
+            log.info("presence probe absent (detection): frames_ok=%d faces=0 luma_max=%s state=%s",
+                     frames_ok, _fmt_luma(luma_max), state)
+        # ``real`` stays True on both outcomes -- anti-spoofing is not evaluated in this mode, and
+        # that is exactly what result[1] carried before 7c-6.
+        return state, result[1]
 
     # ---------- pipe ----------
 
@@ -1150,8 +1203,13 @@ class FaceService:
                     "verdict": r.detail.get("verdict")}
 
         if cmd == "presence":
-            present, real = self._presence_probe()
-            return {"ok": True, "present": present, "real": real, "mode": self.cfg.presence_mode}
+            state, real = self._presence_probe()
+            # ``present`` is kept for compatibility and keeps its old meaning exactly: the manual
+            # probes in the tray and the Status window read it, and an older monitor that knows
+            # nothing about ``state`` still sees uncertain as not-present (i.e. the pre-7c-6
+            # behaviour) rather than something it cannot interpret.
+            return {"ok": True, "present": state == "present", "real": real,
+                    "mode": self.cfg.presence_mode, "state": state}
 
         if cmd == "challenge":
             # Active-gesture stub for the Stage-5 Credential Provider (not wired to unlock).

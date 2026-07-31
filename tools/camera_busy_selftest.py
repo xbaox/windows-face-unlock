@@ -9,7 +9,7 @@ Covers the busy-camera handling:
   [3] unlock handler -- BUG (2) reason fixed: a busy webcam yields reason "camera-busy" (NOT
       "exception: Cannot open camera..."), LOCKOUT-NEUTRAL (record untouched), audited; and a
       second busy unlock re-detects busy instead of AssertionError-ing on a broken camera.
-  [4] presence -- busy returns benign (True, True) (no absence strikes), verify_frame untouched.
+  [4] presence -- busy returns benign ("present", True) (no absence strikes), verify_frame untouched.
   [5] lease != busy -- a leased unlock returns "no-match" and never even constructs a camera.
   [6] Config.validate -- camera_open_retries / camera_open_timeout_s bounds fail loud.
   [7] BoundedOpener (7b-2) -- one attempt is waited on for at most cap_s; blowing the ceiling
@@ -220,15 +220,17 @@ def main(argv=None) -> int:
             t.ok(resp2.get("reason") == "camera-busy" and s._lockout.records == [],
                  "2nd busy unlock RE-DETECTS busy (no AssertionError on a broken camera)")
 
-            # --- 4) presence: busy -> benign (True, True) -----------------------------------
-            print("\n[4] presence -- busy -> (True, True), no strikes")
+            # --- 4) presence: busy -> benign ("present", True) ------------------------------
+            # 7c-6 turned the probe's return into (state, real); busy still means "do not punish
+            # the user for a camera we cannot open", which is now spelled "present".
+            print("\n[4] presence -- busy -> ('present', True), no strikes")
             FakeCamera.next_open = False
             s = _svc(_cfg())
-            t.ok(s._presence_probe_recognition() == (True, True),
-                 "recognition presence on busy -> (True, True) (don't punish when we can't see)")
+            t.ok(s._presence_probe_recognition() == ("present", True),
+                 "recognition presence on busy -> ('present', True) (don't punish when blind)")
             s = _svc(_cfg())
-            t.ok(s._presence_probe_detection() == (True, True),
-                 "detection presence on busy -> (True, True)")
+            t.ok(s._presence_probe_detection() == ("present", True),
+                 "detection presence on busy -> ('present', True)")
 
             # --- 5) lease != busy -----------------------------------------------------------
             print("\n[5] enrollment lease is NOT camera-busy")
