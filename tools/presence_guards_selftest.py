@@ -236,8 +236,11 @@ def main(argv=None) -> int:
     t.ok(M.ctypes is saved_ctypes, "real ctypes restored")
 
     # --- 2) which threshold an absence is judged against ----------------------------------------
+    # presence_confirm_delay_s=0 throughout this block: it is about WHICH threshold applies, not
+    # about the 7c-6 confirmation re-probe (pinned in [3]), and a live delay would add a real-time
+    # wait to every one of the ~30 absent ticks below.
     print("[2] threshold selection on the absent path (real _tick)")
-    with _Harness(_cfg(auto_lock=True, presence_fullscreen_strikes=10),
+    with _Harness(_cfg(auto_lock=True, presence_fullscreen_strikes=10, presence_confirm_delay_s=0),
                   present=False, fullscreen=True) as h:
         h.tick(9)
         t.ok(h.locks == 0, f"fullscreen + field 10: no lock through 9 strikes (locks={h.locks})")
@@ -247,20 +250,20 @@ def main(argv=None) -> int:
         t.ok(h.locks == 1, f"locked on the 10th strike (locks={h.locks})")
         t.ok(h.mon._strikes == 0 and h.mon._fs_episode is False, "episode reset after the lock")
 
-    with _Harness(_cfg(auto_lock=True, presence_fullscreen_strikes=0),
+    with _Harness(_cfg(auto_lock=True, presence_fullscreen_strikes=0, presence_confirm_delay_s=0),
                   present=False, fullscreen=True) as h:
         h.tick(15)
         t.ok(h.locks == 0, f"field 0: never locks while fullscreen (locks={h.locks})")
         t.ok(h.mon._strikes == 15, f"strikes still accrue and stay visible (got {h.mon._strikes})")
         t.ok(h.mon._last.result == "absent", "Status still reports absent")
 
-    with _Harness(_cfg(auto_lock=True, presence_fullscreen_strikes=10),
+    with _Harness(_cfg(auto_lock=True, presence_fullscreen_strikes=10, presence_confirm_delay_s=0),
                   present=False, fullscreen=False) as h:
         h.tick(h.cfg.presence_absent_strikes)
         t.ok(h.locks == 1,
              f"fullscreen off: locks at presence_absent_strikes={h.cfg.presence_absent_strikes}")
 
-    with _Harness(_cfg(auto_lock=False, presence_fullscreen_strikes=10),
+    with _Harness(_cfg(auto_lock=False, presence_fullscreen_strikes=10, presence_confirm_delay_s=0),
                   present=False, fullscreen=False) as h:
         h.tick(h.cfg.presence_absent_strikes)
         t.ok(h.locks == 0, "auto_lock off still never locks (unchanged)")
@@ -280,8 +283,12 @@ def main(argv=None) -> int:
 
     with _Harness(_cfg(auto_lock=True), present=False, locked=False) as h:
         h.tick(1)
-        t.ok(h.probe_calls == 1, "unlocked again -> the probe runs on the very next tick")
+        # Default presence_confirm_delay_s=2.0, so an absent tick probes TWICE: the tick's own
+        # probe plus the 7c-6 confirmation re-probe. Both answer absent here, so the strike lands.
+        t.ok(h.probe_calls == 2,
+             f"unlocked -> probe runs on the very next tick, twice with D4 (got {h.probe_calls})")
         t.ok(h.status_calls == 1, "and so does the status poll that feeds notify_service_state")
+        t.ok(h.mon._strikes == 1, f"a confirmed absence spends exactly one strike (got {h.mon._strikes})")
 
     # --- 4) config field ------------------------------------------------------------------------
     print("[4] presence_fullscreen_strikes validation")

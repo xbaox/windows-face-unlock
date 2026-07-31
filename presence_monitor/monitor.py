@@ -55,6 +55,16 @@ def _fullscreen_active() -> bool:
         return False
 
 
+def _state_of(resp: dict) -> str:
+    """Read the probe verdict out of a presence reply, tolerating a pre-7c-6 service.
+
+    The service gained a tri-state ``state`` in 7c-6 and kept ``present`` with its old meaning. An
+    older service sends only ``present``, and folding that to present/absent reproduces exactly the
+    behaviour this monitor had before -- uncertainty simply never occurs.
+    """
+    return resp.get("state") or ("present" if bool(resp.get("present")) else "absent")
+
+
 def _get_idle_seconds() -> float:
     """Seconds since last user input (keyboard/mouse)."""
     class LASTINPUTINFO(ctypes.Structure):
@@ -122,6 +132,10 @@ class PresenceMonitor:
         # so the switch is announced once per episode instead of on every tick. Cleared with the
         # strikes it belongs to -- see _reset_strikes.
         self._fs_episode = False
+        # Consecutive "uncertain" probes (7c-6): a near face that anti-screen flagged. Counted
+        # separately from strikes because uncertainty must NOT lock on its own; it only converts
+        # into strikes once the run is long enough to stop looking like a camera artefact.
+        self._uncertain = 0
         self._last = TickSnapshot()
         self._lock_count = 0
         self._state_lock = threading.Lock()
@@ -131,9 +145,11 @@ class PresenceMonitor:
         self._lockout_notified = False
 
     def _reset_strikes(self) -> None:
-        """End the current absence episode. The strike count and the fullscreen-episode flag are
-        one state, so they are cleared in one place and can never drift apart."""
+        """End the current absence episode. The strike count, the uncertain run and the
+        fullscreen-episode flag are one state, so they are cleared in one place and can never
+        drift apart -- including after a lock, so the next episode starts from zero."""
         self._strikes = 0
+        self._uncertain = 0
         self._fs_episode = False
 
     def pause(self) -> None:
@@ -285,21 +301,77 @@ class PresenceMonitor:
             self._set_last("error", "service-unavailable")
             return
 
-        present = bool(resp.get("present"))
+        state = _state_of(resp)
         mode = resp.get("mode", self.cfg.presence_mode)
-        log.info("presence probe: present=%s real=%s mode=%s",
-                 present, resp.get("real"), mode)
+        log.info("presence probe: state=%s real=%s mode=%s",
+                 state, resp.get("real"), mode)
 
-        if present:
+        if state == "present":
             self._reset_strikes()
             self._set_last("present", f"real={resp.get('real')}", mode)
             return
 
+        if state == "uncertain":
+            self._on_uncertain(mode, "probe")
+            return
+
+        # --- state == "absent": confirm before spending a strike (7c-6 / D4) ------------------
+        # A lock is expensive and a single bad burst is cheap to re-check, so an absent answer is
+        # asked again after a short wait. _stop.wait -- never time.sleep: a Quit arriving mid-wait
+        # must end the tick immediately, and it must NOT go on to lock on the way out.
+        delay = self.cfg.presence_confirm_delay_s
+        if delay <= 0:
+            self._award_strike(mode, "absent")      # confirmation disabled: old behaviour
+            return
+        if self._stop.wait(delay):
+            log.debug("absence confirmation abandoned: monitor stopping")
+            return
+        resp2 = pipe_call({"cmd": "presence"}, timeout_s=20.0)
+        if resp2 is None:
+            # Same rule as the first probe: an unreachable service is not evidence of absence.
+            log.warning("absence confirmation: service unavailable; skipping")
+            self._set_last("error", "service-unavailable")
+            return
+        state2 = _state_of(resp2)
+        if state2 == "present":
+            log.info("absence retracted by confirmation probe after %.1fs", delay)
+            self._reset_strikes()
+            self._set_last("present", "confirm: retracted", mode)
+            return
+        if state2 == "uncertain":
+            self._on_uncertain(mode, "confirm")
+            return
+        self._award_strike(mode, "absent confirmed")
+
+    def _on_uncertain(self, mode: str, origin: str) -> None:
+        """One uncertain probe: never locks by itself, but a long enough run converts.
+
+        The run is deliberately NOT cleared on conversion -- once it is long enough, every further
+        uncertain probe earns another strike, so a persistent signal still converges on a lock at
+        the normal cadence instead of stalling forever one step below the bar.
+        """
+        self._uncertain += 1
+        m = self.cfg.presence_uncertain_streak
+        if self._uncertain < m:
+            log.info("presence uncertain (%s) %d/%d — not counting an absence",
+                     origin, self._uncertain, m)
+            self._set_last("uncertain", f"uncertain {self._uncertain}/{m} ({origin})", mode)
+            return
+        # The run IS the confirmation, so this path deliberately skips the D4 re-probe.
+        log.info("presence uncertain (%s) %d/%d — run converts to an absence strike",
+                 origin, self._uncertain, m)
+        self._award_strike(mode, f"uncertain {self._uncertain}/{m}")
+
+    def _award_strike(self, mode: str, why: str) -> None:
+        """Spend one absence strike, and lock if that reaches the threshold.
+
+        The threshold choice and the lock itself are unchanged from 7c-3 -- only HOW a strike is
+        earned moved. Which threshold this absence is judged against is probed only here: a present
+        user costs nothing extra, and the answer only ever matters on this path. A fullscreen app or
+        presentation mode means the user is demonstrably AT the machine and simply not facing the
+        camera, so the walk-away threshold is the wrong one; 0 withholds the lock entirely.
+        """
         self._strikes += 1
-        # Which threshold this absence is judged against. Probed only on the ABSENT path: a present
-        # user costs nothing extra, and the answer only ever matters here. A fullscreen app or
-        # presentation mode means the user is demonstrably AT the machine and simply not facing the
-        # camera, so the walk-away threshold is the wrong one; 0 withholds the lock entirely.
         limit = self.cfg.presence_absent_strikes
         if _fullscreen_active():
             limit = self.cfg.presence_fullscreen_strikes
@@ -311,18 +383,18 @@ class PresenceMonitor:
         suffix = "" if self.cfg.auto_lock else " (auto-lock off)"
         self._set_last(
             "absent",
-            (f"strike {self._strikes}/{limit}{suffix}" if limit > 0
-             else f"strike {self._strikes} (fullscreen: never lock){suffix}"),
+            (f"strike {self._strikes}/{limit} [{why}]{suffix}" if limit > 0
+             else f"strike {self._strikes} (fullscreen: never lock) [{why}]{suffix}"),
             mode,
         )
         if limit > 0 and self._strikes >= limit:
             if not self.cfg.auto_lock:
                 # Observe-only: strikes count and show up in Status (with an
                 # honest "auto-lock off" reason), the machine stays unlocked.
-                log.info("absent %d ticks — auto_lock off, not locking", self._strikes)
+                log.info("absent %d ticks [%s] — auto_lock off, not locking", self._strikes, why)
                 self._reset_strikes()
                 return
-            log.warning("absent %d ticks — locking workstation", self._strikes)
+            log.warning("absent %d ticks [%s] — locking workstation", self._strikes, why)
             self._reset_strikes()
             with self._state_lock:
                 self._lock_count += 1
