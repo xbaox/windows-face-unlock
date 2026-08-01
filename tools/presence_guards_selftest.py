@@ -122,7 +122,7 @@ class _Harness:
     def __enter__(self) -> "_Harness":
         self._saved = {n: getattr(M, n) for n in
                        ("pipe_call", "_lock_workstation", "session_locked",
-                        "is_remote_context", "_fullscreen_active")}
+                        "_is_session_locked", "is_remote_context", "_fullscreen_active")}
 
         def _pipe_call(req, timeout_s=30.0):
             if req.get("cmd") == "status":
@@ -137,6 +137,9 @@ class _Harness:
 
         M.pipe_call = _pipe_call
         M._lock_workstation = _lock
+        # 7c-7: the tick gate asks _is_session_locked; session_locked stays patched because
+        # _check_service_events still uses it for the lockout-toast gate.
+        M._is_session_locked = lambda: self.locked
         M.session_locked = lambda: self.locked
         M.is_remote_context = lambda: (False, "")
         M._fullscreen_active = lambda: self.fullscreen
@@ -280,6 +283,25 @@ def main(argv=None) -> int:
         t.ok(h.mon._fs_episode is False, "fullscreen episode cleared too")
         t.ok(h.locks == 0, "never locks an already-locked session")
         t.ok(h.mon._last.reason == "session-locked", f"Status says why (got {h.mon._last.reason!r})")
+
+    # 7c-7: a locked tick must not probe AND must not move a counter, whatever it walked in with.
+    with _Harness(_cfg(auto_lock=True), present=False, locked=True) as h:
+        h.mon._strikes, h.mon._uncertain = 1, 2
+        h.tick(2)
+        t.ok(h.probe_calls == 0 and h.status_calls == 0,
+             f"locked tick calls no pipe at all (probe={h.probe_calls} status={h.status_calls})")
+        t.ok(h.mon._strikes == 0 and h.mon._uncertain == 0,
+             f"locked tick carries no counters over (s={h.mon._strikes} u={h.mon._uncertain})")
+        t.ok(h.mon._was_locked is True, "the locked edge is remembered")
+        # ...and the unlock edge clears both, even if a strike was somehow earned while locked.
+        h.locked = False
+        h.mon._strikes, h.mon._uncertain = 1, 2
+        h.present = True
+        h.tick(1)
+        t.ok(h.mon._strikes == 0 and h.mon._uncertain == 0,
+             f"unlock edge resets both (s={h.mon._strikes} u={h.mon._uncertain})")
+        t.ok(h.mon._was_locked is False, "the edge is consumed once, not re-fired")
+        t.ok(h.locks == 0, "no lock is issued across the locked->unlocked transition")
 
     with _Harness(_cfg(auto_lock=True), present=False, locked=False) as h:
         h.tick(1)

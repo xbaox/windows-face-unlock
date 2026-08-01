@@ -21,6 +21,120 @@ def _lock_workstation() -> None:
     ctypes.windll.user32.LockWorkStation()
 
 
+# --- "is this session locked" (7c-7) ---------------------------------------------------------
+#
+# remote_session.session_locked infers the answer from the INPUT DESKTOP: ACCESS_DENIED on
+# OpenInputDesktop, or a desktop name other than "Default", means locked. On this hardware it does
+# not work -- tools/session_lock_probe.log holds 609 samples reading desktop='Default' and NOT ONE
+# reading 'Winlogon', with a single one-sample True that is flanked by False two seconds either
+# side (a blip, not a lock). The live consequence is in presence.log: after the 17:32:47 lock the
+# probe kept running at 17:33:47 while the machine was on the lock screen, earned a strike, and
+# that strike survived the unlock and locked the machine again ~40s later. The same shape is
+# visible on 2026-07-18, two weeks before the gate existed, so this is not a 7c-6 regression --
+# the gate has simply never fired here.
+#
+# So ask the session about itself instead of inferring from a desktop handle:
+# WTSQuerySessionInformation(WTSSessionInfoEx) returns WTSINFOEX_LEVEL1.SessionFlags, which IS the
+# lock state. It is a plain poll (no window and no message loop, which a tray thread cannot host
+# without restructuring), needs no privilege from a medium-IL process, and reports our own session.
+#
+# NOTE the historical wart: on Windows 7 / Server 2008 R2 the LOCK and UNLOCK values are swapped.
+# We target Windows 11, and only the two documented values are trusted -- anything else, including
+# WTS_SESSIONSTATE_UNKNOWN, returns None and lets the caller fall back.
+_WTS_CURRENT_SERVER_HANDLE = 0
+_WTS_CURRENT_SESSION = -1
+_WTS_SESSION_INFO_EX = 25        # WTS_INFO_CLASS.WTSSessionInfoEx
+_WTS_SESSIONSTATE_LOCK = 0
+_WTS_SESSIONSTATE_UNLOCK = 1
+
+
+class _WTSINFOEX_LEVEL1(ctypes.Structure):
+    """WTSINFOEX_LEVEL1_W. Declared IN FULL on purpose: the trailing LARGE_INTEGERs give the
+    struct 8-byte alignment, and that alignment is what puts this union at offset 8 inside
+    WTSINFOEXW. Declaring only the first three fields would silently read from offset 4."""
+    _fields_ = [
+        ("SessionId", ctypes.c_ulong),
+        ("SessionState", ctypes.c_int),
+        ("SessionFlags", ctypes.c_long),
+        ("WinStationName", ctypes.c_wchar * 33),
+        ("UserName", ctypes.c_wchar * 21),
+        ("DomainName", ctypes.c_wchar * 18),
+        ("LogonTime", ctypes.c_longlong),
+        ("ConnectTime", ctypes.c_longlong),
+        ("DisconnectTime", ctypes.c_longlong),
+        ("LastInputTime", ctypes.c_longlong),
+        ("CurrentTime", ctypes.c_longlong),
+        ("IncomingBytes", ctypes.c_ulong),
+        ("OutgoingBytes", ctypes.c_ulong),
+        ("IncomingFrames", ctypes.c_ulong),
+        ("OutgoingFrames", ctypes.c_ulong),
+        ("IncomingCompressedBytes", ctypes.c_ulong),
+        ("OutgoingCompressedBytes", ctypes.c_ulong),
+    ]
+
+
+class _WTSINFOEX(ctypes.Structure):
+    _fields_ = [("Level", ctypes.c_ulong), ("Data", _WTSINFOEX_LEVEL1)]
+
+
+def _session_locked_wts() -> "bool | None":
+    """True/False from the session's own lock flag, or None when it cannot be determined.
+
+    None is not "unlocked": it means this probe has no opinion, and the caller falls back. Every
+    failure mode -- no wtsapi32, a failed call, a short buffer, an unexpected Level, a SessionFlags
+    value outside the two documented ones -- lands there rather than inventing an answer.
+    """
+    buf = ctypes.c_void_p()
+    size = ctypes.c_ulong(0)
+    try:
+        wts = ctypes.windll.wtsapi32
+        ok = wts.WTSQuerySessionInformationW(
+            ctypes.c_void_p(_WTS_CURRENT_SERVER_HANDLE), ctypes.c_int(_WTS_CURRENT_SESSION),
+            ctypes.c_int(_WTS_SESSION_INFO_EX), ctypes.byref(buf), ctypes.byref(size))
+    except Exception as e:
+        log.debug("WTSQuerySessionInformation unavailable: %s", e)
+        return None
+    if not ok or not buf or size.value < ctypes.sizeof(_WTSINFOEX):
+        log.debug("WTSQuerySessionInformation failed (ok=%s size=%s)", ok, size.value)
+        if buf:
+            try:
+                ctypes.windll.wtsapi32.WTSFreeMemory(buf)
+            except Exception:
+                pass
+        return None
+    try:
+        info = ctypes.cast(buf, ctypes.POINTER(_WTSINFOEX)).contents
+        if info.Level != 1:
+            log.debug("WTSINFOEX Level=%d, expected 1", info.Level)
+            return None
+        flags = info.Data.SessionFlags
+    finally:
+        try:
+            ctypes.windll.wtsapi32.WTSFreeMemory(buf)
+        except Exception:
+            pass
+    if flags == _WTS_SESSIONSTATE_LOCK:
+        return True
+    if flags == _WTS_SESSIONSTATE_UNLOCK:
+        return False
+    log.debug("WTSINFOEX SessionFlags=%r is neither LOCK nor UNLOCK", flags)
+    return None
+
+
+def _is_session_locked() -> bool:
+    """The gate's answer. WTS decides when it can; otherwise the old desktop predicate is asked.
+
+    A REPLACEMENT with a safety net rather than an OR of the two: the desktop predicate is the one
+    that has been observed wrong here (both silently False while locked, and once True for a single
+    sample while unlocked), so it must not be able to override an authoritative answer -- it only
+    speaks when WTS has no opinion at all.
+    """
+    wts = _session_locked_wts()
+    if wts is not None:
+        return wts
+    return session_locked()
+
+
 # QUERY_USER_NOTIFICATION_STATE (shellapi.h). Only the three below mean "something is owning the
 # whole screen"; the rest (1 = not present, 5 = accepts notifications, 6 = quiet time,
 # 7 = running Windows Store app) do not, and 4 in that header is QUNS_PRESENTATION_MODE.
@@ -136,6 +250,9 @@ class PresenceMonitor:
         # separately from strikes because uncertainty must NOT lock on its own; it only converts
         # into strikes once the run is long enough to stop looking like a camera artefact.
         self._uncertain = 0
+        # Whether the LAST tick found the session locked, so the locked->unlocked edge can be
+        # noticed once (7c-7) instead of being re-announced every interval.
+        self._was_locked = False
         self._last = TickSnapshot()
         self._lock_count = 0
         self._state_lock = threading.Lock()
@@ -255,14 +372,25 @@ class PresenceMonitor:
     def _tick(self) -> None:
         # 0. Already on the lock screen? Then there is nothing left to guard: the machine is in the
         #    state this monitor exists to reach. Skip the WHOLE tick — no status poll, no camera
-        #    probe (so the LED stays dark while nobody is there) — and end the absence episode, so
-        #    the count starts fresh when the user comes back. A failing predicate reports False
-        #    (remote_session.session_locked degrades that way on purpose), which is the status quo.
-        if session_locked():
-            log.debug("skip: session is locked")
+        #    probe (so the LED stays dark while nobody is there), no confirmation re-probe and no
+        #    strike. See _is_session_locked for why the detector changed in 7c-7.
+        if _is_session_locked():
+            if not self._was_locked:
+                self._was_locked = True
+                log.info("session locked: skipping presence ticks until it is unlocked")
+            else:
+                log.debug("skip: session is locked")
             self._reset_strikes()
             self._set_last("skipped", "session-locked")
             return
+        if self._was_locked:
+            # The belt to the gate's braces. A strike earned just before the lock -- or during it,
+            # if the gate was bypassed by a detector that could not tell -- must not be spent on
+            # the session the user just unlocked with their face. This also covers a manual Win+L,
+            # where strikes accrued before the lock would otherwise survive it.
+            self._was_locked = False
+            log.info("session unlocked: presence counters reset (%s)", self._fmt_counters())
+            self._reset_strikes()
 
         # 1. Event toasts ride on the existing `status` poll — before the
         #    pause/remote skips, so notifications work while paused too.
