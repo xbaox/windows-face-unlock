@@ -54,6 +54,11 @@ class Harness:
             "ok": True,
             "lockout": {"locked": self.locked, "remaining_s": self.remaining_s},
         }
+        # 7c-7: the toast gate now asks _is_session_locked (the authoritative WTS detector with the
+        # desktop predicate only as a fallback). Both names are patched to the same stub -- without
+        # the first one the real detector answers about the developer's own machine and the
+        # desktop_locked knob below stops meaning anything.
+        M._is_session_locked = self._session_locked
         M.session_locked = self._session_locked
 
     def _session_locked(self) -> bool:

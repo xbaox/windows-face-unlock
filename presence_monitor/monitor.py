@@ -354,7 +354,10 @@ class PresenceMonitor:
             if not locked:
                 # Episode over (or never started) -> re-arm for the next one.
                 self._lockout_notified = False
-            elif not self._lockout_notified and not session_locked():
+            # _is_session_locked, not session_locked: this gate exists so a toast is never burned
+            # on the lock screen, and the desktop predicate answers False there on this hardware
+            # (7c-7), which defeated it. The authoritative detector restores the 7c-3 intent.
+            elif not self._lockout_notified and not _is_session_locked():
                 self._notify(
                     "notify_lockout",
                     t("notify.lockout", s=int(lock.get("remaining_s", 0))),
