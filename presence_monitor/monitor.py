@@ -179,17 +179,48 @@ def _state_of(resp: dict) -> str:
     return resp.get("state") or ("present" if bool(resp.get("present")) else "absent")
 
 
-def _get_idle_seconds() -> float:
-    """Seconds since last user input (keyboard/mouse)."""
-    class LASTINPUTINFO(ctypes.Structure):
-        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
 
-    lii = LASTINPUTINFO()
-    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-        return 0.0
-    tick = ctypes.windll.kernel32.GetTickCount()
-    return (tick - lii.dwTime) / 1000.0
+
+def _idle_ms(tick: int, last_input: int) -> int:
+    """Milliseconds since ``last_input``, as UNSIGNED 32-bit arithmetic.
+
+    Both values are DWORD tick counts that wrap every ~49.7 days, and dwTime wraps with them. A
+    plain subtraction goes hugely negative for the ~49.7 days after each wrap, which would read as
+    "input arrived just now, forever" -- the exact failure that turns this feature into a permanent
+    "user is present" and stops the machine ever locking. Masking to 32 bits is what makes the
+    difference correct across the boundary, and it also repairs a signed GetTickCount return.
+    """
+    return (tick - last_input) & 0xFFFFFFFF
+
+
+_input_probe_warned = False
+
+
+def _input_idle_seconds() -> "float | None":
+    """Seconds since the last keyboard/mouse input, or None when it cannot be determined.
+
+    None is not "idle forever" and not "active now": it means this probe has no opinion, and the
+    caller falls back to the camera exactly as if the feature were off. Failing that way round is
+    deliberate -- a broken input probe must never be able to assert presence.
+    """
+    global _input_probe_warned
+    try:
+        lii = _LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            raise OSError("GetLastInputInfo returned 0")
+        ctypes.windll.kernel32.GetTickCount.restype = ctypes.c_uint32
+        tick = int(ctypes.windll.kernel32.GetTickCount())
+    except Exception as e:
+        if not _input_probe_warned:
+            _input_probe_warned = True
+            log.warning("input-idle probe unavailable (%s); presence falls back to the camera", e)
+        else:
+            log.debug("input-idle probe unavailable: %s", e)
+        return None
+    return _idle_ms(tick, int(lii.dwTime)) / 1000.0
 
 
 def pipe_call(req: dict, timeout_s: float = 30.0) -> dict | None:
@@ -395,7 +426,24 @@ class PresenceMonitor:
             log.info("session unlocked: presence counters reset (%s)", self._fmt_counters())
             self._reset_strikes()
 
-        # 1. Event toasts ride on the existing `status` poll — before the
+        # 1. Live input IS presence (7c-8). Typing or moving the mouse proves the user is at the
+        #    machine far better than a frame does, and it proves it while they are looking at a
+        #    phone, reading something on the desk, or simply turned away -- all of which take the
+        #    face out of frame and used to be counted as absence. Deliberately BEFORE the status
+        #    poll: a tick answered by input opens no pipe at all, so an active user costs neither a
+        #    camera wake nor a round trip. Beyond the idle threshold nothing changes and the camera
+        #    decides exactly as before.
+        idle_limit = self.cfg.presence_input_idle_s
+        if idle_limit > 0:
+            idle = _input_idle_seconds()
+            if idle is not None and idle < idle_limit:
+                self._reset_strikes()
+                log.info("presence tick: state=present src=input idle=%.1fs/%.0fs %s d4=-",
+                         idle, idle_limit, self._fmt_counters())
+                self._set_last("present", f"src=input idle={idle:.0f}s/{idle_limit:.0f}s")
+                return
+
+        # 2. Event toasts ride on the existing `status` poll — before the
         #    pause/remote skips, so notifications work while paused too.
         reachable = self._check_service_events()
 
@@ -413,10 +461,11 @@ class PresenceMonitor:
             self._set_last("skipped", reason)
             return
 
-        # NOTE: We deliberately do NOT skip based on keyboard/mouse input.
-        # The goal is pure face-based presence: if the enrolled face is not
-        # in front of the camera, lock — even if someone else is actively
-        # using the machine (stronger "walk-away" security).
+        # NOTE (rewritten in 7c-8; it used to say the opposite). Input is now consulted, but ONLY
+        # as evidence of presence and only above in step 1 -- it can end a tick as present, never
+        # as absent. Reaching here means the input probe stayed silent, so the walk-away property
+        # is unchanged: with nobody typing, an unrecognised face still locks the machine even if
+        # someone else is sitting at it.
 
         # 3. Probe camera via FaceService
         if not reachable:
@@ -434,13 +483,13 @@ class PresenceMonitor:
 
         state = _state_of(resp)
         mode = resp.get("mode", self.cfg.presence_mode)
-        log.info("presence probe: state=%s real=%s mode=%s %s d4=-",
+        log.info("presence probe: state=%s src=camera real=%s mode=%s %s d4=-",
                  state, resp.get("real"), mode, self._fmt_counters())
 
         if state == "present":
             counters = self._fmt_counters()      # as OBSERVED, before the reset zeroes them
             self._reset_strikes()
-            self._set_last("present", f"real={resp.get('real')} {counters} d4=-", mode)
+            self._set_last("present", f"src=camera real={resp.get('real')} {counters} d4=-", mode)
             return
 
         if state == "uncertain":
@@ -497,13 +546,13 @@ class PresenceMonitor:
         self._uncertain += 1
         m = self.cfg.presence_uncertain_streak
         if self._uncertain < m:
-            log.info("presence tick: state=uncertain (%s) %s d4=%s — not counting an absence",
+            log.info("presence tick: state=uncertain src=camera (%s) %s d4=%s — not counting an absence",
                      origin, self._fmt_counters(), d4)
             self._set_last("uncertain",
-                           f"{self._fmt_counters()} d4={d4} ({origin})", mode)
+                           f"src=camera {self._fmt_counters()} d4={d4} ({origin})", mode)
             return
         # The run IS the confirmation, so this path deliberately skips the D4 re-probe.
-        log.info("presence tick: state=uncertain (%s) %s d4=%s — run converts to an absence strike",
+        log.info("presence tick: state=uncertain src=camera (%s) %s d4=%s — run converts to an absence strike",
                  origin, self._fmt_counters(), d4)
         self._award_strike(mode, f"uncertain {self._uncertain}/{m}", d4)
 
@@ -527,11 +576,11 @@ class PresenceMonitor:
                          limit if limit > 0 else "never (0 = no lock while fullscreen)")
         suffix = "" if self.cfg.auto_lock else " (auto-lock off)"
         counters = self._fmt_counters(limit)
-        log.info("presence tick: state=absent %s d4=%s [%s]", counters, d4, why)
+        log.info("presence tick: state=absent src=camera %s d4=%s [%s]", counters, d4, why)
         self._set_last(
             "absent",
-            (f"{counters} d4={d4} [{why}]{suffix}" if limit > 0
-             else f"{counters} d4={d4} (fullscreen: never lock) [{why}]{suffix}"),
+            (f"src=camera {counters} d4={d4} [{why}]{suffix}" if limit > 0
+             else f"src=camera {counters} d4={d4} (fullscreen: never lock) [{why}]{suffix}"),
             mode,
         )
         if limit > 0 and self._strikes >= limit:

@@ -109,11 +109,12 @@ class _Harness:
     """
 
     def __init__(self, cfg: Config, present: bool = False, locked: bool = False,
-                 fullscreen: bool = False):
+                 fullscreen: bool = False, idle: "float | None" = 9999.0):
         self.cfg = cfg
         self.present = present
         self.locked = locked
         self.fullscreen = fullscreen
+        self.idle = idle          # seconds since input; None = the probe has no opinion
         self.locks = 0
         self.status_calls = 0
         self.probe_calls = 0
@@ -122,7 +123,8 @@ class _Harness:
     def __enter__(self) -> "_Harness":
         self._saved = {n: getattr(M, n) for n in
                        ("pipe_call", "_lock_workstation", "session_locked",
-                        "_is_session_locked", "is_remote_context", "_fullscreen_active")}
+                        "_is_session_locked", "is_remote_context", "_fullscreen_active",
+                        "_input_idle_seconds")}
 
         def _pipe_call(req, timeout_s=30.0):
             if req.get("cmd") == "status":
@@ -141,6 +143,9 @@ class _Harness:
         # _check_service_events still uses it for the lockout-toast gate.
         M._is_session_locked = lambda: self.locked
         M.session_locked = lambda: self.locked
+        # 7c-8: default to "the user has been idle for ages" so every pre-existing scenario keeps
+        # reaching the camera exactly as it did; the input scenarios set self.idle themselves.
+        M._input_idle_seconds = lambda: self.idle
         M.is_remote_context = lambda: (False, "")
         M._fullscreen_active = lambda: self.fullscreen
 
@@ -343,8 +348,8 @@ def main(argv=None) -> int:
     finally:
         I.set_language(saved_lang)
     en, ru = I.TRANSLATIONS["en"], I.TRANSLATIONS["ru"]
-    t.ok(len(en) == 206, f"_EN has 206 keys (got {len(en)})")
-    t.ok(len(ru) == 206, f"_RU has 206 keys (got {len(ru)})")
+    t.ok(len(en) == 208, f"_EN has 208 keys (got {len(en)})")
+    t.ok(len(ru) == 208, f"_RU has 208 keys (got {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
 
     # --- 6) the camera-defect gate in the real presence probe -----------------------------------
@@ -375,6 +380,54 @@ def main(argv=None) -> int:
         h.tick(5)
         t.ok(h.locks == 0 and h.mon._strikes == 0,
              f"monitor: a camera-error tick costs no strike (strikes={h.mon._strikes})")
+
+    # --- 7) live input counts as presence (7c-8) ------------------------------------------------
+    print("[7] input fusion: fresh input answers the tick without touching the camera")
+    with _Harness(_cfg(auto_lock=True), present=False, idle=5.0) as h:
+        h.mon._strikes, h.mon._uncertain = 1, 2
+        h.tick(3)
+        t.ok(h.probe_calls == 0 and h.status_calls == 0,
+             f"fresh input opens NO pipe at all (probe={h.probe_calls} status={h.status_calls})")
+        t.ok(h.mon._strikes == 0 and h.mon._uncertain == 0,
+             f"and clears both counters like any present tick (s={h.mon._strikes} u={h.mon._uncertain})")
+        t.ok(h.locks == 0, "never locks while the user is typing")
+        t.ok(h.mon._last.result == "present" and "src=input" in h.mon._last.reason,
+             f"Status attributes it to input (got {h.mon._last.reason!r})")
+
+    # confirm_delay=0 below: these are about WHETHER the camera is consulted, so the D4 re-probe
+    # would only double the counts and add a real-time wait.
+    with _Harness(_cfg(auto_lock=True, presence_confirm_delay_s=0), present=False, idle=60.0) as h:
+        h.tick(1)
+        t.ok(h.probe_calls == 1, f"idle past the threshold -> the camera votes (got {h.probe_calls})")
+        t.ok(h.mon._last.result == "absent" and "src=camera" in h.mon._last.reason,
+             f"and the outcome is attributed to the camera (got {h.mon._last.reason!r})")
+
+    with _Harness(_cfg(auto_lock=True, presence_input_idle_s=0.0, presence_confirm_delay_s=0),
+                  present=False, idle=0.0) as h:
+        probed: list = []
+        M._input_idle_seconds = lambda: probed.append(1) or 0.0
+        h.tick(1)
+        t.ok(not probed, "knob 0.0 -> the input probe is not even called")
+        t.ok(h.probe_calls == 1, "knob 0.0 -> camera-only, exactly the pre-7c-8 behaviour")
+
+    with _Harness(_cfg(auto_lock=True, presence_confirm_delay_s=0), present=False, idle=None) as h:
+        h.tick(1)
+        t.ok(h.probe_calls == 1,
+             "an input probe with no opinion falls back to the camera, it does not assert presence")
+
+    # --- 8) the 32-bit tick wrap ----------------------------------------------------------------
+    print("[8] GetTickCount wrap-around arithmetic")
+    t.ok(M._idle_ms(5_000, 1_000) == 4_000, "ordinary case: 4s of idle")
+    t.ok(M._idle_ms(0, 0) == 0, "no input yet this boot")
+    # 100 ms before the wrap, 50 ms after it -> 150 ms, NOT a huge negative number.
+    t.ok(M._idle_ms(50, 0xFFFFFFFF - 99) == 150, "across the 2**32 boundary -> 150ms")
+    t.ok(M._idle_ms(0, 0xFFFFFFFF) == 1, "exactly one tick across the boundary")
+    # A signed GetTickCount return (ctypes default) is repaired by the same masking.
+    t.ok(M._idle_ms(-1_294_967_296, 3_000_000_000 - 2_000) == 2_000,
+         "a negative (signed-read) tick still yields the true 2000ms")
+    t.ok(all(0 <= M._idle_ms(a, b) <= 0xFFFFFFFF
+             for a, b in ((0, 1), (1, 0), (0xFFFFFFFF, 0), (0, 0xFFFFFFFF))),
+         "the result is always a valid unsigned 32-bit span, never negative")
 
     print()
     print("FAILURES:", t.fail)

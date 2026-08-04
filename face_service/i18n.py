@@ -172,6 +172,8 @@ _EN: dict[str, str] = {
     "field.presence_uncertain_streak.desc": "When a near face is present but the anti-screen check flags it, the probe is 'uncertain' instead of absent and does not lock on its own. This many uncertain probes in a row add up to one absence strike, so a genuinely suspicious signal still converges. With interval=60s and 3, that is ~3 minutes of tolerance.",
     "field.presence_confirm_delay_s": "Absence confirmation delay (seconds)",
     "field.presence_confirm_delay_s.desc": "Before spending an absence strike the monitor waits this long and probes once more: locking is expensive and a single bad capture is cheap to double-check. Only a second absent answer counts. 0 = no confirmation, an absent probe counts immediately.",
+    "field.presence_input_idle_s": "Input counts as presence (seconds)",
+    "field.presence_input_idle_s.desc": "Keyboard or mouse activity newer than this ends the check as 'you are here' without opening the camera at all. Looking at your phone or down at the desk takes your face out of frame while you are plainly still there, and the camera alone used to call that absence. Beyond this many idle seconds the camera decides as before. 0 = ignore input and use the camera only.",
 
     "field.threshold": "Recognition threshold",
     "field.threshold.desc": "Cosine-distance cutoff for face matching. Lower = stricter (fewer false accepts, more false rejects). The default 0.32 was tuned by measurement for this camera/model pair — change it deliberately.",
@@ -1078,6 +1080,8 @@ _RU: dict[str, str] = {
     "field.presence_uncertain_streak.desc": "Когда лицо рядом, но анти-экран его пометил, проверка считается «неуверенной», а не отсутствием, и сама по себе не блокирует. Столько неуверенных проверок подряд складываются в один страйк отсутствия, чтобы по-настоящему подозрительный сигнал всё же сработал. При интервале 60 с и значении 3 это около 3 минут терпимости.",
     "field.presence_confirm_delay_s": "Задержка подтверждения отсутствия (с)",
     "field.presence_confirm_delay_s.desc": "Прежде чем засчитать страйк отсутствия, монитор ждёт это время и делает ещё одну проверку: блокировка обходится дорого, а перепроверить один неудачный кадр дёшево. Страйк засчитывается только при втором «отсутствует» подряд. 0 — без подтверждения, отсутствие засчитывается сразу.",
+    "field.presence_input_idle_s": "Ввод считается присутствием (с)",
+    "field.presence_input_idle_s.desc": "Если с клавиатуры или мыши был ввод свежее этого времени, проверка завершается как «вы на месте» и камера вообще не открывается. Взгляд в телефон или вниз на стол выводит лицо из кадра, хотя вы явно за машиной, — раньше камера в одиночку считала это отсутствием. После этого числа секунд простоя решает камера, как и прежде. 0 — не учитывать ввод, только камера.",
     "field.threshold": "Порог распознавания",
     "field.threshold.desc": "Порог по косинусному расстоянию. Ниже — строже (меньше ложных допусков чужих, больше отказов своему). Значение по умолчанию 0.32 подобрано измерениями под эту связку камеры и модели — меняйте осознанно.",
     "field.verify_frames": "Разблокировка: кадров снять",

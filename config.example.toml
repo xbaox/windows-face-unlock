@@ -150,6 +150,9 @@ presence_uncertain_streak = 3    # consecutive "uncertain" probes (anti-screen f
                                  # a near face) that add up to one absence strike.
 presence_confirm_delay_s = 2.0   # wait this long and re-probe once before spending an
                                  # absence strike. 0 = no confirmation.
+presence_input_idle_s = 45.0     # keyboard/mouse activity newer than this ends the tick
+                                 # as present without opening the camera at all.
+                                 # 0 = ignore input, camera only.
 
 # --- Notifications -----------------------------------------------------------
 

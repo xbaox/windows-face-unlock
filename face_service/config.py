@@ -78,6 +78,14 @@ class Config:
     # expensive and a single bad burst is cheap to double-check. 0 disables the confirmation and
     # makes an absent probe count immediately (the pre-7c-6 behaviour).
     presence_confirm_delay_s: float = 2.0
+    # --- Stage 7c-8: live input counts as presence (monitor-side; the service never sees this) ---
+    # The camera stopped being the only witness. Looking at a phone, reading something on the desk
+    # or just tilting away takes the face out of frame while the user is plainly still there, and
+    # the probe called that absence. Keyboard or mouse activity newer than this many seconds ends
+    # the tick as present WITHOUT opening the camera at all -- input is a stronger presence signal
+    # than a frame, and it costs nothing. Beyond it the camera votes exactly as before. 0 disables
+    # the fusion and restores the camera-only behaviour.
+    presence_input_idle_s: float = 45.0
     # "recognition" = InsightFace/ONNX ArcFace embedding must match enrolled face (stronger; walk-away + strangers)
     # "detection"   = YuNet any-face-in-frame is enough (weaker; mimics old AutoFaceLock)
     presence_mode: str = "recognition"
@@ -252,6 +260,9 @@ class Config:
         if self.presence_confirm_delay_s < 0.0:
             raise ValueError(
                 "presence_confirm_delay_s must be >= 0 (0 = no confirmation re-probe)")
+        if self.presence_input_idle_s < 0.0:
+            raise ValueError(
+                "presence_input_idle_s must be >= 0 (0 = ignore input, camera only)")
         if not (0.0 < self.threshold < 2.0):
             raise ValueError("threshold must be in (0, 2)")
         if self.language not in LANG_CODES:
