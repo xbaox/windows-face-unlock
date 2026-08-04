@@ -192,14 +192,16 @@ failure, so a bad verify cannot lock you out of the password tile.
 
 ### Environment variables
 
-`face_service/__main__.py` sets thread caps so the runtime does not spawn worker
-processes that compete for the pipe:
+`face_service/__main__.py` caps the native thread pool so the runtime does not
+spawn workers that compete with the pipe server thread:
 
 ```
 OMP_NUM_THREADS=1
-TF_NUM_INTRAOP_THREADS=1
-TF_NUM_INTEROP_THREADS=1
 ```
+
+It is set with `setdefault`, so an explicit value in your environment wins.
+onnxruntime's own thread counts are session options, not environment variables,
+and are left at their defaults.
 
 **`CUDA_VISIBLE_DEVICES` is deliberately NOT set.** Setting it to `-1` hides
 every GPU and the engine silently falls back to CPU. An earlier version of this
