@@ -1622,12 +1622,9 @@ class FaceService:
 
 
 def _setup_logging() -> None:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
-    )
+    """service.log, rotated, plus stderr only when there is one (see face_service.logging_setup)."""
+    from .logging_setup import setup_logging
+    setup_logging(LOG_PATH)
 
 
 def main() -> None:

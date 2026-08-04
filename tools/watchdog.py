@@ -296,24 +296,23 @@ def restart_service():
 def _setup_logging() -> None:
     """Same file-logging shape as the service and the presence monitor, in its own watchdog.log.
     Load-bearing under the scheduled task: it runs via pythonw.exe, which has no console, so bare
-    prints went nowhere -- exactly the diagnostics you want after an unattended restart."""
+    prints went nowhere -- exactly the diagnostics you want after an unattended restart. That is
+    also why the stream handler is conditional now: this function used to reason correctly about
+    having no console and then attach one anyway."""
     from face_service.config import LOG_PATH
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH.with_name("watchdog.log"), encoding="utf-8"),
-                  logging.StreamHandler()],
-    )
+    from face_service.logging_setup import setup_logging
+    setup_logging(LOG_PATH.with_name("watchdog.log"))
 
 
 def _load_config():
     """Read the config ONCE, and never let a broken config file take the supervisor down with it.
 
-    ``Config.load()`` parses ~/.face-unlock/config.toml and RAISES on a malformed or unreadable
-    file. A watchdog that dies there leaves the service unsupervised at exactly the moment someone
-    is hand-editing settings, so a failure is logged LOUDLY and we fall back to the built-in
-    defaults: degraded (the file's values are ignored) but still supervising.
+    Since Stage 7d-A ``Config.load()`` degrades to defaults with an ERROR of its own rather than
+    raising, so this is now belt-and-braces: it was written when load() DID raise, and a watchdog
+    that dies there leaves the service unsupervised at exactly the moment someone is hand-editing
+    settings. The except stays because that argument still holds for anything unforeseen -- the
+    supervisor must survive the config file unconditionally. Either way the outcome is the same:
+    degraded (the file's values are ignored) but still supervising.
 
     Read once, at startup, with no reload path -- see the module docstring. Until Stage 7c-2 this
     was ``Config()``, i.e. the file was never read at all.

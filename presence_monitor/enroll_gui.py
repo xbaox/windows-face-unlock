@@ -963,13 +963,8 @@ def main() -> int:
     log file interleave badly on Windows.
     """
     from face_service.config import LOG_PATH
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH.with_name("enroll.log"), encoding="utf-8"),
-                  logging.StreamHandler()],
-    )
+    from face_service.logging_setup import setup_logging
+    setup_logging(LOG_PATH.with_name("enroll.log"))
     try:
         # i18n state is per-process: the tray's set_language() never ran here, and the module
         # default is English, so without this the wizard would ignore the user's saved language.
@@ -977,8 +972,9 @@ def main() -> int:
         # cheap price of not reshaping its constructor.
         cfg = Config.load()
         set_language(cfg.language)
-        # One startup line: enroll.log is a fresh file per run, so this is what tells you which
-        # process and which settings produced everything below it.
+        # One startup line per run. enroll.log is APPENDED to (and rotated at 5 MB), not truncated,
+        # so this is what separates one wizard run from the last and tells you which process and
+        # which settings produced everything below it.
         log.info("enroll wizard starting: pid=%s lang=%s camera_index=%s",
                  os.getpid(), cfg.language, cfg.camera_index)
         EnrollWindow().run()

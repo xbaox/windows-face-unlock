@@ -613,13 +613,8 @@ class PresenceMonitor:
 
 def main() -> None:
     from face_service.config import LOG_PATH
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH.with_name("presence.log"), encoding="utf-8"),
-                  logging.StreamHandler()],
-    )
+    from face_service.logging_setup import setup_logging
+    setup_logging(LOG_PATH.with_name("presence.log"))
     cfg = Config.load()
     from .tray import run_with_tray
     run_with_tray(cfg)
