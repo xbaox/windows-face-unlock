@@ -316,6 +316,27 @@ _EN: dict[str, str] = {
     "gesture.prompt.turn_right": "Turn your head right",
     "gesture.prompt.nod": "Nod your head",
 
+    # ---- Password dialog (presence_monitor/password_gui.py) ----
+    "pwd.title": "Face Unlock — Windows password",
+    "pwd.intro": "The Credential Provider signs you in with this password after your face is "
+                 "recognised. It is encrypted with DPAPI for this Windows account only, and it "
+                 "never leaves this machine.",
+    "pwd.user": "User",
+    "pwd.domain": "Domain",
+    "pwd.password": "Windows password",
+    "pwd.confirm": "Confirm",
+    "pwd.btn.save": "Save",
+    "pwd.btn.clear": "Clear stored password",
+    "pwd.btn.close": "Close",
+    "pwd.status.existing": "A password is already stored for {user}. Saving replaces it.",
+    "pwd.status.none": "No password stored yet.",
+    "pwd.status.saved": "Saved, and read back successfully (DPAPI).",
+    "pwd.status.cleared": "Stored password cleared. Face sign-in cannot log you in until you set "
+                          "one again; PIN and password still work.",
+    "pwd.err.empty": "Enter your Windows password.",
+    "pwd.err.mismatch": "The two entries do not match.",
+    "pwd.err.save": "Could not save: {err}",
+
     # ---- Language names (native) ----
     "lang.vi": "Tiếng Việt",
     "lang.en": "English",
@@ -1191,6 +1212,27 @@ _RU: dict[str, str] = {
     "gesture.prompt.turn_left": "Поверни голову влево",
     "gesture.prompt.turn_right": "Поверни голову вправо",
     "gesture.prompt.nod": "Кивни головой",
+
+    # ---- Password dialog (presence_monitor/password_gui.py) ----
+    "pwd.title": "Face Unlock — пароль Windows",
+    "pwd.intro": "Credential Provider входит в систему этим паролем после того, как лицо "
+                 "распознано. Пароль зашифрован DPAPI и доступен только этой учётной записи "
+                 "Windows; он не покидает эту машину.",
+    "pwd.user": "Пользователь",
+    "pwd.domain": "Домен",
+    "pwd.password": "Пароль Windows",
+    "pwd.confirm": "Подтверждение",
+    "pwd.btn.save": "Сохранить",
+    "pwd.btn.clear": "Удалить сохранённый пароль",
+    "pwd.btn.close": "Закрыть",
+    "pwd.status.existing": "Пароль для {user} уже сохранён. Сохранение заменит его.",
+    "pwd.status.none": "Пароль пока не сохранён.",
+    "pwd.status.saved": "Сохранено и успешно прочитано обратно (DPAPI).",
+    "pwd.status.cleared": "Сохранённый пароль удалён. Вход по лицу не сможет войти за вас, пока "
+                          "вы не зададите пароль снова; PIN и пароль работают по-прежнему.",
+    "pwd.err.empty": "Введите пароль Windows.",
+    "pwd.err.mismatch": "Значения не совпадают.",
+    "pwd.err.save": "Не удалось сохранить: {err}",
 
     "lang.vi": "Вьетнамский",
     "lang.en": "Английский",

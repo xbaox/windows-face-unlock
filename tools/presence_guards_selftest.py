@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import ctypes as _real_ctypes
 import os
+import re
 import sys
 import threading
 
@@ -348,9 +349,18 @@ def main(argv=None) -> int:
     finally:
         I.set_language(saved_lang)
     en, ru = I.TRANSLATIONS["en"], I.TRANSLATIONS["ru"]
-    t.ok(len(en) == 208, f"_EN has 208 keys (got {len(en)})")
-    t.ok(len(ru) == 208, f"_RU has 208 keys (got {len(ru)})")
+    # 208 -> 224 in 7d-E: the 16 pwd.* keys of the new password dialog, which replaces the
+    # console tools.set_password on the frozen layout.
+    t.ok(len(en) == 224, f"_EN has 224 keys (got {len(en)})")
+    t.ok(len(ru) == 224, f"_RU has 224 keys (got {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
+    # Key parity alone never caught a translation that drops or renames a {placeholder}: t()
+    # swallows a failed .format() and returns the raw string, so the damage shows up as an
+    # unsubstituted label at runtime and no test fails. Compare the format fields too.
+    _fields = lambda d: {k: sorted(re.findall(r"\{(\w+)\}", v)) for k, v in d.items()}
+    _en_f, _ru_f = _fields(en), _fields(ru)
+    _drift = sorted(k for k in _en_f if _en_f[k] != _ru_f.get(k))
+    t.ok(not _drift, f"_EN and _RU use the same format placeholders (drift: {_drift or 'none'})")
 
     # --- 6) the camera-defect gate in the real presence probe -----------------------------------
     print("[6] camera defects report camera-error, not absence (real probe body)")

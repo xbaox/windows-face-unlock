@@ -57,6 +57,13 @@ HIDDEN += [
     "face_service.i18n",
     "face_service.detector",
     "face_service._version",
+    "face_service.logging_setup",
+    "presence_monitor.password_gui",
+    # Reached only through presence_monitor/__main__.py --pipe-shutdown, which the installed
+    # register_tasks.ps1 calls instead of `python -m tools.pipe_client shutdown` (there is no
+    # tools/ tree and no interpreter under {app}). Self-contained: stdlib + pywin32 +
+    # face_service.config, all of which are already here.
+    "tools.pipe_client",
 ]
 
 DATAS = []

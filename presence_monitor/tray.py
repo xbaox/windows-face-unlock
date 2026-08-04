@@ -22,6 +22,15 @@ log = logging.getLogger(__name__)
 SET_PASSWORD_CMD = ["-m", "tools.set_password"]
 ENROLL_CMD = ["-m", "presence_monitor.enroll_gui"]
 
+# A frozen bundle has no ``-m`` entry point: the bootloader runs the script the EXE was built from
+# and passes the rest of argv to it, so `face_unlock_tray.exe -m presence_monitor.enroll_gui` would
+# start a SECOND TRAY and hand it an argv it ignores. presence_monitor/__main__.py therefore routes
+# on these flags, and the launchers below re-exec sys.executable (which IS face_unlock_tray.exe
+# when frozen) with the matching one. The dev paths are untouched.
+FROZEN = bool(getattr(sys, "frozen", False))
+ENROLL_FLAG = "--enroll"
+SET_PASSWORD_FLAG = "--set-password"
+
 # Live tray icon for event toasts; filled by run_with_tray while it runs.
 _notify_icon: list[pystray.Icon] = []
 
@@ -88,8 +97,25 @@ def _icon_image(active: bool, paused: bool = False) -> Image.Image:
     return img
 
 
-def _launch_tool(args: list[str]) -> None:
-    """Spawn a tool in a new console window using the same Python that runs us."""
+def _launch_tool(args: list[str], frozen_flag: str = "") -> None:
+    """Spawn a tool in a new console window using the same Python that runs us.
+
+    Frozen builds take the flag branch instead: there is no console to open (the bundle is built
+    windowed), no ``tools/`` tree under {app}, and no interpreter to run ``-m`` with. The frozen
+    counterpart of the console set_password tool is the tkinter dialog in password_gui.py.
+    """
+    if FROZEN:
+        if not frozen_flag:
+            log.error("no frozen entry point for %s -- not launching", args)
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, frozen_flag],
+                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+            )
+        except Exception:
+            log.exception("failed to launch tool: %s", frozen_flag)
+        return
     repo_root = Path(__file__).resolve().parent.parent
     venv_py = repo_root / ".venv" / "Scripts" / "python.exe"
     py = str(venv_py) if venv_py.exists() else sys.executable
@@ -119,10 +145,22 @@ def _launch_enroll() -> None:
     OS releases the camera handle even when the capture thread is wedged inside a native read(),
     which an in-process wizard could never guarantee (KNOWN_ISSUES #1).
 
-    TODO(packaging): a frozen build has no ``-m`` entry point -- the wizard is bundled into the
-    tray EXE as a hiddenimport, so that layout needs a ``sys.frozen`` branch that re-execs
-    ``sys.executable`` with a flag. That belongs to the packaging block; this is the dev path.
+    Frozen builds re-exec this same EXE with ``--enroll`` (routed by presence_monitor/__main__.py)
+    rather than ``-m``, which a bundle does not honour. Everything else is identical, the kept
+    handle included -- that is what lets Quit take a stuck wizard down.
     """
+    if FROZEN:
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, ENROLL_FLAG],
+                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+            )
+        except Exception:
+            log.exception("failed to launch the enroll wizard")
+            return
+        _enroll_proc[:] = [proc]
+        log.info("enroll wizard started (pid=%s, frozen)", proc.pid)
+        return
     repo_root = Path(__file__).resolve().parent.parent
     venv_py = repo_root / ".venv" / "Scripts" / "pythonw.exe"
     py = str(venv_py) if venv_py.exists() else sys.executable
@@ -218,7 +256,7 @@ def run_with_tray(cfg: Config) -> None:
         _launch_enroll()
 
     def on_set_password(icon, item):
-        _launch_tool(SET_PASSWORD_CMD)
+        _launch_tool(SET_PASSWORD_CMD, SET_PASSWORD_FLAG)
 
     def on_open_log(icon, item):
         try:

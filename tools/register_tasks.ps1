@@ -173,13 +173,33 @@ if ($fuDeclErrors) {
     exit 1
 }
 
+# Resolved install root for the Installed layout. A SEPARATE name from the -InstallDir parameter
+# on purpose: see the NAMING RULE above -- nothing in this script assigns to a parameter name.
+$fuInstallDir = $InstallDir
+
 if ($Mode -eq 'Installed') {
-    if (-not $InstallDir) {
-        Write-Host "ERROR: -Mode Installed requires -InstallDir." -ForegroundColor Red
+    if (-not $fuInstallDir) {
+        # Fall back to what the installer recorded. installer.iss writes InstallLocation under
+        # HKLM\SOFTWARE\WindowsFaceUnlock and its own comment claims the value is read back by an
+        # auto-updater fallback -- nothing in the tree ever read it, so this is its first real
+        # consumer. It makes -Action Unregister and clean_restart.ps1 -Mode Installed usable
+        # without re-typing the path; an explicit -InstallDir still wins.
+        $fuInstallDir = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WindowsFaceUnlock' `
+                                          -Name 'InstallLocation' -ErrorAction SilentlyContinue
+                        ).InstallLocation
+        if ($fuInstallDir) {
+            Write-Host ("-InstallDir not given; using " +
+                        "HKLM\SOFTWARE\WindowsFaceUnlock\InstallLocation = $fuInstallDir")
+        }
+    }
+    if (-not $fuInstallDir) {
+        Write-Host ("ERROR: -Mode Installed requires -InstallDir " +
+                    "(and HKLM\SOFTWARE\WindowsFaceUnlock\InstallLocation is not set).") `
+                   -ForegroundColor Red
         exit 1
     }
-    if (-not (Test-Path -LiteralPath $InstallDir -PathType Container)) {
-        Write-Host "ERROR: -InstallDir does not exist: $InstallDir" -ForegroundColor Red
+    if (-not (Test-Path -LiteralPath $fuInstallDir -PathType Container)) {
+        Write-Host "ERROR: -InstallDir does not exist: $fuInstallDir" -ForegroundColor Red
         exit 1
     }
 }
@@ -199,9 +219,9 @@ foreach ($fuTask in $fuTasks) {
             $fuSkipped += [pscustomobject]@{ Name = $fuTask.Name; Reason = $fuTask.SkipReason }
             continue
         }
-        $fuExecute  = Join-Path $InstallDir $fuTask.InstalledExe
+        $fuExecute  = Join-Path $fuInstallDir $fuTask.InstalledExe
         $fuArgument = ''
-        $fuWorkDir  = $InstallDir
+        $fuWorkDir  = $fuInstallDir
     }
 
     # NOTE the name: NOT $action. See the NAMING RULE block above.
@@ -329,19 +349,47 @@ if ($DryRun) {
 # Never throws: every failure degrades to "fall back to the hard kill", which is exactly what this
 # script did before the function existed.
 function Invoke-GracefulServiceShutdown {
-    # Same interpreter the tasks run under, one file over: the console python.exe beside the
-    # pythonw.exe the Dev layout launches. Gating on pythonw keeps this resolution identical to
-    # the task one. Deliberately NOT a bare "python" while the venv exists -- pywin32 lives in the
-    # venv, and tools/pipe_client.py cannot import win32file without it.
-    $fuVenvPythonw = Join-Path $fuRepoRoot '.venv\Scripts\pythonw.exe'
-    if (Test-Path -LiteralPath $fuVenvPythonw) {
-        $fuClientPy = Join-Path $fuRepoRoot '.venv\Scripts\python.exe'
+    # WHICH client, per layout. This used to be dev-only in effect: it shelled out to
+    # `python -m tools.pipe_client shutdown` from $fuRepoRoot, which on an installed machine is
+    # {app} -- a directory with no tools/ tree in it and, usually, no Python on the box at all.
+    # So the graceful path silently degraded to a hard kill on exactly the machines the installer
+    # produces, which is the opposite of where the insurance is wanted.
+    if ($Mode -eq 'Installed') {
+        # The frozen tray exe routes --pipe-shutdown to the same tools.pipe_client entry point
+        # (presence_monitor/__main__.py), so both layouts send the identical request through the
+        # identical client, SID checks included. Name derived from the declaration, not hardcoded.
+        $fuTrayExe = @($fuTasks |
+                       Where-Object { $_.DevArgs -like '*presence_monitor*' } |
+                       ForEach-Object { $_.InstalledExe } |
+                       Where-Object { $_ }) | Select-Object -First 1
+        if (-not $fuTrayExe) {
+            Write-Warning "no frozen tray executable declared; falling back to hard kill"
+            return
+        }
+        $fuClientExe  = Join-Path $fuInstallDir $fuTrayExe
+        $fuClientArgs = @('--pipe-shutdown')
+        $fuClientCwd  = $fuInstallDir
+        if (-not (Test-Path -LiteralPath $fuClientExe -PathType Leaf)) {
+            Write-Warning ("pipe client not found at {0}; falling back to hard kill" -f $fuClientExe)
+            return
+        }
     }
     else {
-        # No venv (Installed layout, or a partial checkout). Try PATH and let it fall into the
-        # fallback if pywin32 is missing there: a graceful path we cannot take costs a hard kill,
-        # not the run.
-        $fuClientPy = 'python'
+        # Same interpreter the tasks run under, one file over: the console python.exe beside the
+        # pythonw.exe the Dev layout launches. Gating on pythonw keeps this resolution identical to
+        # the task one. Deliberately NOT a bare "python" while the venv exists -- pywin32 lives in
+        # the venv, and tools/pipe_client.py cannot import win32file without it.
+        $fuVenvPythonw = Join-Path $fuRepoRoot '.venv\Scripts\pythonw.exe'
+        if (Test-Path -LiteralPath $fuVenvPythonw) {
+            $fuClientExe = Join-Path $fuRepoRoot '.venv\Scripts\python.exe'
+        }
+        else {
+            # No venv (a partial checkout). Try PATH and let it fall into the fallback if pywin32
+            # is missing there: a graceful path we cannot take costs a hard kill, not the run.
+            $fuClientExe = 'python'
+        }
+        $fuClientArgs = @('-m', 'tools.pipe_client', 'shutdown')
+        $fuClientCwd  = $fuRepoRoot
     }
 
     # Only the SERVICE is graceful-stoppable, so only the service is waited for. Derived from the
@@ -354,9 +402,9 @@ function Invoke-GracefulServiceShutdown {
     Write-Host "Asking the service to shut down over the pipe..."
     $fuGraceWatch = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $fuClient = Start-Process -FilePath $fuClientPy `
-                                  -ArgumentList '-m', 'tools.pipe_client', 'shutdown' `
-                                  -WorkingDirectory $fuRepoRoot `
+        $fuClient = Start-Process -FilePath $fuClientExe `
+                                  -ArgumentList $fuClientArgs `
+                                  -WorkingDirectory $fuClientCwd `
                                   -WindowStyle Hidden -PassThru
     }
     catch {
@@ -425,6 +473,13 @@ if ($Action -eq 'Unregister') {
     # Destruction is the intent here, so ordering carries no invariant: stop the
     # processes first so nothing holds files, then remove declared and orphaned
     # tasks alike.
+    #
+    # Graceful FIRST, mirroring Register (B3) and Restart. This path used to be the only stop in
+    # the script that went straight to Stop-FuAndWait -- i.e. uninstalling was the one operation
+    # that ALWAYS hard-killed the live owner of a persistent capture, which is exactly the
+    # condition this function exists to avoid (see its header and KNOWN_ISSUES #2). Removing the
+    # software is a poor moment to leave the Frame Server wedged until the next reboot.
+    Invoke-GracefulServiceShutdown
     Stop-FuAndWait
     foreach ($fuName in @($fuDeclaredSet + $fuOrphans)) {
         Unregister-ScheduledTask -TaskName $fuName -Confirm:$false -ErrorAction SilentlyContinue
