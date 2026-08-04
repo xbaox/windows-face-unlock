@@ -38,12 +38,33 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # requirements.lock, NOT requirements.txt. The latter is mostly >= ranges, so two releases
+      # built from identical repo state could ship different transitive versions -- and the lock
+      # file that exists to prevent exactly that was read by nothing in the build or release path.
+      # PyInstaller stays in its own build-only file: it is not a runtime dependency and has no
+      # business in a venv that only wants to run the service.
       - name: Install Python dependencies
         shell: powershell
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock
           pip install -r installer/requirements-build.txt
+
+      # The spec bundles the buffalo_l pack from the BUILD MACHINE's %USERPROFILE%\.insightface,
+      # so CI has to populate it before PyInstaller runs. Uses insightface's own resolver rather
+      # than a hardcoded URL, so the pack always matches the pinned library version.
+      #
+      # The leftover archive is removed on purpose: insightface extracts buffalo_l.zip and then
+      # does NOT delete it (the os.remove in utils/storage.py is commented out), so leaving it
+      # would put ~275 MB of dead weight next to the 325 MiB that is actually needed.
+      - name: Fetch the buffalo_l recognition models
+        shell: powershell
+        run: |
+          python -c "from insightface.utils.storage import ensure_available; print(ensure_available('models', 'buffalo_l'))"
+          $zip = Join-Path $env:USERPROFILE '.insightface\models\buffalo_l.zip'
+          if (Test-Path $zip) { Remove-Item -Force $zip; Write-Host "removed the extracted buffalo_l.zip" }
+          Get-ChildItem (Join-Path $env:USERPROFILE '.insightface\models\buffalo_l') |
+            Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Install Inno Setup
         shell: powershell

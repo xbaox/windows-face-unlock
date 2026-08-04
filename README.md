@@ -81,10 +81,10 @@ Grab the latest installer from the
 [**Releases page**](https://github.com/caochitam/windows-face-unlock/releases)
 and double-click it. Requires Windows 10/11 x64, admin rights, any webcam.
 
-- The installer bundles Python, the ONNX runtime and the YuNet detector. The
-  recognition models (`buffalo_l`, a few hundred MB) are fetched on first use
-  and are **not** currently shipped inside the installer — the first warmup
-  needs an internet connection.
+- The installer bundles Python, the ONNX runtime, the YuNet detector **and** the
+  `buffalo_l` recognition models (~325 MiB unpacked), so a freshly installed
+  machine signs in offline. Only a dev/source checkout still fetches the models
+  on first warmup.
 - Not yet code-signed, so SmartScreen will say **"Unknown publisher"**.
   Click **More info → Run anyway**. Signing application to SignPath is in
   progress — when approved the signed installer will replace unsigned.

@@ -76,17 +76,41 @@ before building. It does **not** set `SKIP_CP`: a release that cannot build the
 Credential Provider should fail, not ship a face-unlock installer that cannot
 unlock.
 
-## Known gap: the recognition models are not bundled
+## The recognition models are bundled (Stage 7d)
 
-The engine is InsightFace `buffalo_l`, and nothing in this pipeline ships it.
-`FaceAnalysis(name="buffalo_l")` is called without a `root=`, so insightface
-looks in `%USERPROFILE%\.insightface\models\buffalo_l\` and, if that is empty,
-downloads roughly 290 MB from the internet on first use — with no pinned version
-and no checksum. On a fresh machine that download happens the first time the
-service warms up.
+The engine is InsightFace `buffalo_l`. It used to be the pipeline's known gap:
+`FaceAnalysis(name="buffalo_l")` was called without a `root=`, so insightface
+looked in `%USERPROFILE%\.insightface\models\buffalo_l\` and, finding it empty on
+a fresh machine, downloaded the pack over plain HTTP at the first unlock attempt
+— unpinned, unchecksummed, with no timeout, and impossible offline. The spec even
+shipped `requests` and `tqdm` to make that download work.
 
-Provisioning these models with the installer is open work for Stage 7d. Do not
-assume a freshly installed machine can sign in offline.
+Now the five `.onnx` files are shipped as `datas`, and
+`face_service.recognizer.model_root()` points a frozen build at
+`insightface_home/models/buffalo_l` inside the bundle. An installed machine
+therefore needs no network for recognition.
+
+What that costs, and why the numbers differ from the old "~290 MB":
+
+| what | size |
+|---|---|
+| `buffalo_l.zip`, the download | ~275 MiB |
+| the five unpacked `.onnx` — what ships | ~325 MiB |
+| both, which is what an auto-download leaves on disk | ~600 MiB |
+
+Only the unpacked set goes into the installer. The archive is deliberately not
+shipped: nothing reads it, and it would nearly double the download for no gain.
+The release workflow removes it after fetching, because insightface extracts and
+then keeps it (its `os.remove` is commented out).
+
+Only four of the five models are used (`ALLOWED_MODULES` in `recognizer.py`), but
+all five must be present: `FaceAnalysis` globs every `*.onnx` in the directory and
+builds a session for each **before** the filter runs. `genderage.onnx` is 1.3 MiB,
+so there is nothing to save by trimming it.
+
+Both `installer/build.py` (step 0) and the spec itself refuse to build if the pack
+on the build machine is incomplete — an installer without models is precisely the
+defect this replaced.
 
 ## Code signing
 

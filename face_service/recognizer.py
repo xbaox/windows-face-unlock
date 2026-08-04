@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -30,6 +31,60 @@ MODEL_NAME = "buffalo_l"
 # feeds blink (EAR), landmark_3d_68 gives head pose for gesture challenges. One app.get() now
 # yields all of them, so active liveness costs ZERO extra detections (MiniFASNet/DeepFace gone).
 ALLOWED_MODULES = ["detection", "recognition", "landmark_2d_106", "landmark_3d_68"]
+
+# --- model provisioning (Stage 7d-F) ---------------------------------------------------------
+# Every file insightface loads out of buffalo_l. FOUR are load-bearing (ALLOWED_MODULES above);
+# genderage.onnx is discarded by that filter but must still be PRESENT, because FaceAnalysis globs
+# every *.onnx in the directory and builds a full ORT session for each one BEFORE the filter runs.
+# So this is the completeness check, not a wish list: a pack missing any one of the five is broken.
+MODEL_FILES = (
+    "det_10g.onnx",       # detection   (SCRFD)
+    "w600k_r50.onnx",     # recognition (ArcFace, the 512-d embedding)
+    "2d106det.onnx",      # landmark_2d_106 -> blink / EAR
+    "1k3d68.onnx",        # landmark_3d_68  -> head pose for gesture challenges
+    "genderage.onnx",     # unused by us, but loaded-then-discarded by FaceAnalysis
+)
+
+# How long to sit out after a failed engine build before trying again. Without this a machine with
+# no model pack re-entered _lazy_app for EVERY captured frame, and since insightface treats an
+# absent directory as "download it", that was an unbounded ~290 MB HTTP attempt per frame, with
+# nothing user-visible but a generic verify failure.
+_MODEL_RETRY_COOLDOWN_S = 60.0
+
+
+def _bundle_dir() -> Path:
+    """Directory that holds bundled resources: the PyInstaller temp root when frozen, else repo."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    return Path(meipass) if meipass else Path(__file__).resolve().parent.parent
+
+
+def model_root() -> "Path | None":
+    """The ``root=`` to hand FaceAnalysis, or None to accept its own default.
+
+    insightface resolves the pack as ``<root>/models/<name>``. Dev keeps the library default
+    (``~/.insightface``), which setup.ps1 and the first warmup have always populated. A frozen
+    build cannot rely on that -- a freshly installed machine has no ~/.insightface at all -- so it
+    points at the copy the installer ships. The directory is deliberately NOT called "insightface":
+    that name already belongs to the package itself inside the bundle.
+    """
+    if getattr(sys, "frozen", False):
+        return _bundle_dir() / "insightface_home"
+    return None
+
+
+def model_dir() -> Path:
+    """Absolute directory the five model files must live in, for the current layout."""
+    root = model_root()
+    if root is None:
+        root = Path.home() / ".insightface"   # the library default, made explicit for the check
+    return root / "models" / MODEL_NAME
+
+
+def missing_model_files() -> "list[str]":
+    """Names of the required buffalo_l files that are not on disk. Empty list = pack is complete."""
+    here = model_dir()
+    return [name for name in MODEL_FILES if not (here / name).is_file()]
+
 
 _CUDA_DLLS_READY = False
 
@@ -140,6 +195,8 @@ class Recognizer:
         self._refs: np.ndarray | None = None           # matching set = enrollment + adaptive
         self._adaptive = AdaptiveStore(ADAPTIVE_PATH)  # opt-in drift adaptation (separate persist)
         self._app = None                                # cached insightface FaceAnalysis
+        self._app_failed_at = 0.0                       # monotonic; 0.0 = never failed to build
+        self._app_error = ""                            # last build failure, replayed in cooldown
         self._screen = ScreenDetector()                 # anti-screen (hf-only, conservative)
 
     def _refresh_refs(self) -> None:
@@ -157,6 +214,43 @@ class Recognizer:
         if self._app is not None:
             return self._app
 
+        # Rate-limit the REBUILD, not just the download. self._app stays None after a failure, and
+        # analyze_frame calls this once per captured frame, so before 7d-F every frame of every
+        # verify burst re-ran the whole construction -- including insightface's "directory absent
+        # => fetch ~290 MB over HTTP", with no timeout and no backoff. The cooldown replays the
+        # same error instead, so the caller's behaviour is unchanged and the machine stops
+        # hammering the network.
+        if self._app_failed_at:
+            waited = time.monotonic() - self._app_failed_at
+            if waited < _MODEL_RETRY_COOLDOWN_S:
+                raise RuntimeError(self._app_error)
+
+        try:
+            return self._build_app()
+        except Exception as e:
+            self._app_failed_at = time.monotonic()
+            self._app_error = str(e)
+            raise
+
+    def _build_app(self):
+        # Pre-flight the model pack BEFORE constructing FaceAnalysis. Without this an incomplete
+        # or absent pack becomes an HTTP download attempt deep inside the library, and the user
+        # sees only "verify error" in a log file. face_service/detector.py has done exactly this
+        # for YuNet since Stage 3; buffalo_l is the one engine input that never got the same
+        # treatment, which is also why an offline first run has no honest failure message.
+        missing = missing_model_files()
+        if missing:
+            here = model_dir()
+            raise RuntimeError(
+                f"InsightFace model pack '{MODEL_NAME}' is incomplete: "
+                f"{len(missing)} of {len(MODEL_FILES)} files missing from {here} "
+                f"({', '.join(missing)}). "
+                "Face recognition cannot start until the pack is complete. "
+                "Restore it by running the service once with a working internet connection "
+                "(insightface downloads it), or by copying the five .onnx files into that "
+                "directory. PIN and password sign-in are unaffected."
+            )
+
         _prep_cuda_dlls()  # must run before any CUDA session is created
         import onnxruntime as ort
         try:
@@ -167,10 +261,15 @@ class Recognizer:
         from insightface.app import FaceAnalysis
 
         providers, ctx_id = _select_providers(ort)
+        # root= only when frozen: insightface has NO environment override (checked against the
+        # pinned 1.0.1 -- root is a plain constructor default), so this kwarg is the only way to
+        # point it at the bundled copy. Dev omits it and keeps ~/.insightface exactly as before.
+        root = model_root()
         app = FaceAnalysis(
             name=MODEL_NAME,
             allowed_modules=ALLOWED_MODULES,
             providers=providers,
+            **({"root": str(root)} if root is not None else {}),
         )
         app.prepare(ctx_id=ctx_id, det_size=(DET_SIZE, DET_SIZE))
 

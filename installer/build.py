@@ -73,6 +73,35 @@ def step_build_cp() -> Path | None:
     return dll
 
 
+def step_check_models() -> Path:
+    """Fail before PyInstaller if the buffalo_l pack is not complete on this build machine.
+
+    The spec bundles the five recognition models, so the build machine's own
+    %USERPROFILE%\\.insightface IS the source of what ships. Checking here rather
+    than only inside the spec buys a readable failure at the top of the run
+    instead of a stack trace 40 minutes in, and keeps the reason in the build log.
+
+    An installer built without these produces exactly the gap Stage 7d exists to
+    close: a machine that cannot sign in offline and silently retries a ~290 MB
+    download instead of saying so.
+    """
+    log("step 0/5 — check the buffalo_l recognition pack")
+    pack = Path.home() / ".insightface" / "models" / "buffalo_l"
+    names = ("det_10g.onnx", "w600k_r50.onnx", "2d106det.onnx",
+             "1k3d68.onnx", "genderage.onnx")
+    missing = [n for n in names if not (pack / n).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"buffalo_l is incomplete in {pack}: missing {', '.join(missing)}.\n"
+            "The installer ships the recognition models, so this build machine must have a "
+            "complete pack. Populate it (run the service once with an internet connection, or "
+            "copy the five .onnx files there) and re-run."
+        )
+    total = sum((pack / n).stat().st_size for n in names)
+    log(f"buffalo_l complete: {len(names)} files, {total / (1024 * 1024):.0f} MiB")
+    return pack
+
+
 def step_pyinstaller() -> Path:
     log("step 2/5 — PyInstaller")
     for d in (DIST_DIR, BUILD_DIR):
@@ -168,6 +197,7 @@ def step_checksums(installer_path: Path) -> None:
 
 
 def main() -> int:
+    step_check_models()   # cheapest check, and the one that invalidates the whole build
     cp_dll = step_build_cp()
     dist_root = step_pyinstaller()
     step_stage(dist_root, cp_dll)

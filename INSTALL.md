@@ -37,9 +37,27 @@ InsightFace landmark models, so it needs no extra ML dependency.
 
 The engine is InsightFace `buffalo_l`. It is **not** in this repo and not
 downloaded by `setup.ps1`: insightface fetches it into
-`%USERPROFILE%\.insightface\models\buffalo_l\` (~290 MB) the first time the
-service warms up. Budget for that on a fresh machine, and make sure the first
-warmup happens while you are online.
+`%USERPROFILE%\.insightface\models\buffalo_l\` the first time the service warms
+up. Budget for that on a fresh machine, and make sure the first warmup happens
+while you are online.
+
+Sizes, because the usual "~290 MB" is only half the story:
+
+| what | size |
+|---|---|
+| download (`buffalo_l.zip`) | ~275 MiB |
+| the five `.onnx` files, unpacked — what is actually used | ~325 MiB |
+| left on disk after the automatic download | **~600 MiB** |
+
+The download is ~600 MiB on disk rather than ~325 because insightface extracts
+the archive and then keeps it (the `os.remove` in its `utils/storage.py` is
+commented out). Deleting `%USERPROFILE%\.insightface\models\buffalo_l.zip` after
+the first successful warmup is safe and reclaims ~275 MiB.
+
+Since Stage 7d the **installer ships the unpacked pack**, so an installed machine
+needs no download and works offline. Only the dev/source layout fetches at first
+run. If the pack is missing or incomplete the service now says so explicitly in
+`service.log` instead of retrying a download on every camera frame.
 
 The YuNet detector used by `presence_mode = "detection"` **is** bundled, at
 `models/face_detection_yunet_2023mar.onnx`.

@@ -82,6 +82,46 @@ DATAS += [
 ]
 
 # ---------------------------------------------------------------------------
+# The buffalo_l recognition pack (Stage 7d-F).
+#
+# Until now this was the "known gap": FaceAnalysis was constructed with no root=,
+# so a freshly installed machine looked in an empty %USERPROFILE%\.insightface
+# and downloaded ~290 MB over plain HTTP at the first unlock attempt -- unpinned,
+# unchecksummed, and impossible offline. The spec even shipped requests+tqdm to
+# make that download work, which is the packaging equivalent of paving the cow
+# path. Ship the models instead.
+#
+# Layout must satisfy insightface's own resolver, which is <root>/models/<name>:
+# face_service.recognizer.model_root() returns <bundle>/insightface_home when
+# frozen, so the pack lands in insightface_home/models/buffalo_l. The folder is
+# NOT called "insightface" -- that name belongs to the package itself in the
+# bundle.
+#
+# Exactly the five files recognizer.MODEL_FILES lists. The ~275 MB buffalo_l.zip
+# that insightface leaves behind after extracting is deliberately NOT shipped:
+# it is a download artefact, nothing reads it, and it would nearly double the
+# installer for no reason.
+_INSIGHTFACE_PACK = Path.home() / ".insightface" / "models" / "buffalo_l"
+_PACK_DEST = "insightface_home/models/buffalo_l"
+_PACK_FILES = (
+    "det_10g.onnx",
+    "w600k_r50.onnx",
+    "2d106det.onnx",
+    "1k3d68.onnx",
+    "genderage.onnx",
+)
+_pack_missing = [n for n in _PACK_FILES if not (_INSIGHTFACE_PACK / n).is_file()]
+if _pack_missing:
+    raise SystemExit(
+        f"buffalo_l is incomplete in {_INSIGHTFACE_PACK}: missing {', '.join(_pack_missing)}.\n"
+        "The installer must ship the recognition models -- a build without them produces an "
+        "installer whose users cannot sign in offline.\n"
+        "Populate the pack first (run the service once online, or copy the five .onnx files "
+        "there), then rebuild. installer/build.py checks this before PyInstaller is invoked."
+    )
+DATAS += [(str(_INSIGHTFACE_PACK / n), _PACK_DEST) for n in _PACK_FILES]
+
+# ---------------------------------------------------------------------------
 # CUDA runtime.
 #
 # face_service.recognizer._prep_cuda_dlls() walks nvidia.__path__, adds every
