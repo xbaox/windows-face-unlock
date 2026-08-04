@@ -1105,10 +1105,15 @@ class FaceService:
         }
 
     def _reload_config(self) -> dict:
-        new_cfg = Config.load()
+        # strict=True: a good config is already in effect, so a broken file must be REJECTED and
+        # the running one kept. Config.load()'s default degrade-to-defaults is right for a cold
+        # start (nothing to preserve) and wrong here -- it would swap the live service onto
+        # defaults behind the user's back. Both the read/parse and validate() now sit inside the
+        # try: a TOMLDecodeError used to escape as the generic "exception: ..." reply, and a
+        # wrong-TYPED value raises TypeError out of the range comparisons rather than ValueError.
         try:
-            new_cfg.validate()
-        except ValueError as e:
+            new_cfg = Config.load(strict=True)
+        except (ValueError, TypeError) as e:
             return {"ok": False, "reason": f"invalid-config: {e}"}
         old_index = self.cfg.camera_index
         old_persistent = self.cfg.persistent_camera

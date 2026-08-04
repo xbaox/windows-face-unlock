@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import os
 from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
@@ -28,6 +29,12 @@ PIPE_NAME = r"\\.\pipe\FaceUnlock"
 
 PRESENCE_MODES = ("recognition", "detection")
 LIVENESS_MODES = ("fast", "paranoid")
+# Only cosine is implemented: the recognizer compares L2-normalised ArcFace embeddings and every
+# threshold in this file was measured as a cosine distance. The knob predates the ONNX engine and
+# nothing reads it, so any other value is silently ignored -- validate() rejects it loudly instead.
+DISTANCE_METRICS = ("cosine",)
+
+log = logging.getLogger(__name__)
 
 
 def _default_language() -> str:
@@ -214,12 +221,64 @@ class Config:
     auto_lock: bool = True
 
     @classmethod
-    def load(cls) -> "Config":
+    def _degraded(cls, reason: str, strict: bool) -> "Config":
+        """Answer a broken config file: raise under ``strict``, else log and return defaults."""
+        if strict:
+            raise ValueError(reason)
+        log.error("%s -- falling back to built-in defaults", reason)
+        return cls()
+
+    @classmethod
+    def load(cls, strict: bool = False) -> "Config":
+        """Read ``~/.face-unlock/config.toml``, or fall back to built-in defaults.
+
+        DEFAULT (``strict=False``) NEVER RAISES. Every failure mode -- unreadable file, non-UTF-8
+        bytes, malformed TOML, a value that fails ``validate()`` -- is logged at ERROR and
+        answered with a full default ``Config``. The previous behaviour let the exception out,
+        and ``main()`` calls this before the pipe exists, so one stray character in a hand-edited
+        file killed the service at startup and the watchdog then restarted it into the same
+        failure forever. The watchdog already reasoned its way to this fallback for itself
+        (tools/watchdog.py::_load_config); the service now does the same. It is deliberately
+        LOUD: a machine silently running on defaults while the user believes their config is
+        live is its own defect.
+
+        ``strict=True`` raises ``ValueError`` instead of degrading. That is what the live
+        ``reload_config`` path wants: there IS a good config already in effect, so the right
+        answer to a bad file is to reject it and keep the old one, not to swap the running
+        service onto defaults behind the user's back.
+
+        Unknown keys are dropped in both modes (a knob removed by an upgrade must not break the
+        load) but they are now NAMED in a WARNING -- a typo used to be indistinguishable from
+        not setting the key at all.
+        """
         if not CONFIG_PATH.exists():
             APP_DIR.mkdir(parents=True, exist_ok=True)
             return cls()
-        data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+        try:
+            raw = CONFIG_PATH.read_text(encoding="utf-8")
+        except UnicodeDecodeError as e:
+            return cls._degraded(f"{CONFIG_PATH} is not valid UTF-8 ({e})", strict)
+        except OSError as e:
+            return cls._degraded(f"{CONFIG_PATH} could not be read ({e})", strict)
+
+        try:
+            data = tomllib.loads(raw)
+        except Exception as e:
+            return cls._degraded(f"{CONFIG_PATH} is not valid TOML ({e})", strict)
+
+        known = cls.__dataclass_fields__
+        unknown = sorted(k for k in data if k not in known)
+        if unknown:
+            log.warning("%s: %d unknown key(s) ignored: %s",
+                        CONFIG_PATH, len(unknown), ", ".join(unknown))
+
+        cfg = cls(**{k: v for k, v in data.items() if k in known})
+        try:
+            cfg.validate()
+        except (ValueError, TypeError) as e:
+            return cls._degraded(f"{CONFIG_PATH} failed validation ({e})", strict)
+        return cfg
 
     def save(self) -> None:
         if tomli_w is None:
@@ -232,6 +291,45 @@ class Config:
 
     def validate(self) -> None:
         from .i18n import LANG_CODES
+        # Distance metric: declared since Stage 0, read by nothing. The recognizer is hardwired to
+        # cosine over L2-normalised ArcFace embeddings, so a config asking for anything else gets
+        # cosine regardless -- exactly the silent-wrong-behaviour this pass exists to remove.
+        if self.distance_metric not in DISTANCE_METRICS:
+            raise ValueError(
+                f"distance_metric {self.distance_metric!r} is not implemented "
+                f"(only {DISTANCE_METRICS[0]!r} is; the recognizer compares cosine distance)"
+            )
+        # Camera selection and warmup: non-negative integers (bool rejected, as everywhere else).
+        # No upper bound on either -- an exotic multi-camera host is legitimate, and a too-large
+        # warmup only costs time on open, it cannot mis-verify anyone.
+        if isinstance(self.camera_index, bool) or not isinstance(self.camera_index, int):
+            raise ValueError("camera_index must be an integer")
+        if self.camera_index < 0:
+            raise ValueError("camera_index must be >= 0")
+        if isinstance(self.camera_warmup_frames, bool) or \
+                not isinstance(self.camera_warmup_frames, int):
+            raise ValueError("camera_warmup_frames must be an integer")
+        if self.camera_warmup_frames < 0:
+            raise ValueError("camera_warmup_frames must be >= 0")
+        if not isinstance(self.persistent_camera, bool):
+            raise ValueError("persistent_camera must be a boolean")
+        # Verify burst: the service captures verify_frames frames and needs verify_required of them
+        # to match (service.py::_verify). required > frames is not a tuning choice, it is an unlock
+        # that can never succeed -- and it used to be accepted in silence.
+        if isinstance(self.verify_frames, bool) or not isinstance(self.verify_frames, int):
+            raise ValueError("verify_frames must be an integer")
+        if self.verify_frames < 1:
+            raise ValueError("verify_frames must be >= 1")
+        if isinstance(self.verify_required, bool) or not isinstance(self.verify_required, int):
+            raise ValueError("verify_required must be an integer")
+        if self.verify_required < 1:
+            raise ValueError("verify_required must be >= 1")
+        if self.verify_required > self.verify_frames:
+            raise ValueError(
+                "verify_required must be <= verify_frames "
+                f"(got required={self.verify_required} > frames={self.verify_frames} "
+                "=> no unlock could ever succeed)"
+            )
         if self.presence_mode not in PRESENCE_MODES:
             raise ValueError(
                 f"presence_mode must be one of {PRESENCE_MODES}, got {self.presence_mode!r}"
@@ -275,10 +373,21 @@ class Config:
             )
         if self.blink_timeout_s <= 0:
             raise ValueError("blink_timeout_s must be > 0")
+        # Warmup / liveness / audit toggles: real booleans, same rationale as the pipe and notify
+        # gates below -- a stray int or string silently takes a truthy branch and picks the wrong
+        # behaviour. anti_screen in particular gates the primary replay defense.
+        if not isinstance(self.warmup_on_start, bool):
+            raise ValueError("warmup_on_start must be a boolean")
+        if not isinstance(self.challenge_on_doubt, bool):
+            raise ValueError("challenge_on_doubt must be a boolean")
+        if not isinstance(self.anti_screen, bool):
+            raise ValueError("anti_screen must be a boolean")
         if self.max_face_attempts < 1:
             raise ValueError("max_face_attempts must be >= 1")
         if self.lockout_seconds < 0:
             raise ValueError("lockout_seconds must be >= 0")
+        if not isinstance(self.audit_log, bool):
+            raise ValueError("audit_log must be a boolean")
         if self.audit_max_mb <= 0:
             raise ValueError("audit_max_mb must be > 0")
         if not (0.0 <= self.enroll_min_det_score <= 1.0):
@@ -289,6 +398,10 @@ class Config:
             raise ValueError("require 0 <= enroll_luma_min < enroll_luma_max <= 255")
         if self.enroll_min_frames < 1:
             raise ValueError("enroll_min_frames must be >= 1")
+        # Checked OUTSIDE the `if self.adaptive_gallery:` branch below on purpose: a non-bool would
+        # otherwise decide that branch by truthiness and never be examined at all.
+        if not isinstance(self.adaptive_gallery, bool):
+            raise ValueError("adaptive_gallery must be a boolean")
         if not (0.0 < self.adaptive_margin <= 1.0):
             raise ValueError("adaptive_margin must be in (0, 1]")
         if self.adaptive_max_size < 1:
