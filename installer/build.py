@@ -102,6 +102,33 @@ def step_check_models() -> Path:
     return pack
 
 
+def step_sign_cp(dll: Path | None) -> None:
+    """OPTIONAL Authenticode signing of the CP DLL. Off unless SIGN_CP is set.
+
+    SIGN_CP=self          -> a self-signed development certificate
+    SIGN_CP=<thumbprint>  -> a certificate already in CurrentUser\\My / LocalMachine\\My
+
+    Deliberately opt-in and deliberately not defaulted to self-signed: signing
+    with a certificate nobody chose is worse than not signing, and a self-signed
+    DLL is not more trusted than an unsigned one anywhere it matters. Runs before
+    step_stage so the SIGNED file is the one that reaches dist/.
+
+    See credential_provider/SIGNING.md -- including the part where a signature is
+    NOT what makes the lock-screen tile appear.
+    """
+    mode = os.environ.get("SIGN_CP", "").strip()
+    if not mode:
+        return
+    if dll is None:
+        log("SIGN_CP is set but the CP build was skipped; nothing to sign")
+        return
+    script = TOOLS_DIR / "sign_cp.ps1"
+    args = ["-SelfSigned"] if mode.lower() == "self" else ["-Thumbprint", mode]
+    log(f"step 1b/5 — signing the CP DLL ({'self-signed' if args[0] == '-SelfSigned' else mode})")
+    run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", str(script), "-DllPath", str(dll), *args])
+
+
 def step_pyinstaller() -> Path:
     log("step 2/5 — PyInstaller")
     for d in (DIST_DIR, BUILD_DIR):
@@ -199,6 +226,7 @@ def step_checksums(installer_path: Path) -> None:
 def main() -> int:
     step_check_models()   # cheapest check, and the one that invalidates the whole build
     cp_dll = step_build_cp()
+    step_sign_cp(cp_dll)  # no-op unless SIGN_CP is set
     dist_root = step_pyinstaller()
     step_stage(dist_root, cp_dll)
     installer_path = step_inno()
