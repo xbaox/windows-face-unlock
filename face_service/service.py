@@ -49,7 +49,9 @@ Commands:
       -> {"ok":true,"config":{...}}
   {"cmd":"pause_camera","seconds":120}   # release webcam for N seconds so
                                           # the enrollment GUI can own it
-      -> {"ok":true,"paused_until":float}
+      -> {"ok":true,"paused_until":float}  # time.monotonic() deadline: PROCESS-LOCAL, counted
+                                           # from boot, NOT an epoch. Compare it only against
+                                           # this service's own clock; never format it as a date.
   {"cmd":"resume_camera"}                 # clear the camera lease early
       -> {"ok":true}
   {"cmd":"build_enrollment"}              # (re)compute embeddings from ENROLL_DIR
@@ -420,9 +422,16 @@ class FaceService:
         self._opener = BoundedOpener()
         self._started_at = time.time()
         # When the enrollment wizard is running it needs exclusive access to
-        # the webcam. ``_camera_paused_until`` holds an epoch timestamp: probes
+        # the webcam. ``_camera_paused_until`` holds a MONOTONIC deadline: probes
         # and verify calls short-circuit until that time passes. The service
         # also releases the persistent camera so the tray can open it.
+        # Monotonic, not wall clock (7d-C, KNOWN_ISSUES #3): a forward clock step ended the lease
+        # early and handed the device back while the wizard was still shooting, and a backward one
+        # held it past the requested window -- during which the presence probe reports "present"
+        # and absence strikes stop accruing, so the wrong clock cost more than the camera. The
+        # wizard's half of this handshake was already monotonic and said so. As with
+        # ``_cam_heal_at`` above, 0.0 keeps working as "no lease" because monotonic counts from
+        # boot and is therefore always positive.
         self._camera_paused_until: float = 0.0
         # Stage 7-i gesture round: the single outstanding phase-1 token, or None. ONE slot is
         # enough because the pipe server is strictly sequential (_serve_one handles one request
@@ -431,7 +440,7 @@ class FaceService:
         self._gesture_slot: dict | None = None
 
     def _camera_leased_out(self) -> bool:
-        return time.time() < self._camera_paused_until
+        return time.monotonic() < self._camera_paused_until
 
     def _acquire_camera(self):
         """Open the webcam with a bounded-WAIT retry (Stage 3.4; wait ceiling added in 7b-2).
@@ -1167,7 +1176,7 @@ class FaceService:
             # Release the webcam and ignore probe/verify for the requested
             # number of seconds so the enrollment wizard can own it.
             seconds = float(req.get("seconds", 120))
-            self._camera_paused_until = time.time() + max(5.0, seconds)
+            self._camera_paused_until = time.monotonic() + max(5.0, seconds)
             # The deadline above is already live, so probes have stood down and
             # the wizard is being told the device is its. The release must
             # therefore survive any failure: escaping here would leave the webcam
@@ -1181,9 +1190,11 @@ class FaceService:
             return {"ok": True, "paused_until": self._camera_paused_until}
 
         if cmd == "resume_camera":
-            was = self._camera_paused_until
+            # Report what is left of the lease, not the deadline itself: the deadline is a
+            # monotonic since-boot number now and would be meaningless in a log line.
+            remaining = max(0.0, self._camera_paused_until - time.monotonic())
             self._camera_paused_until = 0.0
-            log.info("camera lease cleared (was until %s)", was)
+            log.info("camera lease cleared (%.1fs still remained)", remaining)
             return {"ok": True}
 
         if cmd == "build_enrollment":
