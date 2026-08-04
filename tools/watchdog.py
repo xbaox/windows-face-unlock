@@ -22,9 +22,12 @@ was not read AT ALL -- main() constructed Config() directly, so every watchdog n
 built-in default no matter what the file said.
 
 Deployed as the Scheduled Task FaceUnlock-Watchdog, declared in tools/tasks.psd1 and created by
-tools/register_tasks.ps1. DEV LAYOUT ONLY for now: the match below is Name='pythonw.exe', which
-never matches an installed face_service.exe, so the declaration skips this task in Installed mode.
-Run: python -m tools.watchdog
+tools/register_tasks.ps1. Runs in BOTH layouts since 7d-D: the process-matching criterion is
+chosen from ``sys.frozen`` (see ``_match_ps``), because the dev service is a pythonw.exe with
+"face_service" on its command line while the installed one is a bare face_service.exe -- and a
+matcher that only knew the first made every kill, death-wait and survivor count silently return
+zero on an installed machine.
+Run: python -m tools.watchdog   (dev)   |   face_unlock_watchdog.exe   (installed)
 """
 from __future__ import annotations
 
@@ -55,28 +58,67 @@ _DEATH_POLL_MS = 200     # how often that poll re-counts (inside ONE powershell,
 # for the WHOLE budget still fails (see ping).
 _PING_RETRY_SLEEP_S = 0.1
 
-# The ONE process-matching criterion, shared by kill / count / death-wait below so the three can
-# never drift apart. The filter is Name='pythonw.exe' ONLY: prod runs via pythonw (register_tasks.ps1
-# launches .venv\Scripts\pythonw.exe; setup.ps1 launches nothing itself, it delegates to that
-# registrar), while a DEV instance is
-# `python.exe -m face_service` (visible console) -- so the watchdog restarts the prod service but
-# does NOT kill a dev instance you are debugging. The watchdog itself (`-m tools.watchdog`) and
-# presence (`-m presence_monitor`) lack "face_service" in their commandline, so they are never
-# matched either. NB a healthy venv service is TWO matches, not one: the .venv pythonw.exe launcher
-# stub and the base-interpreter worker it spawns both carry "face_service" on their command line.
-_MATCH_PS = (
-    "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" -ErrorAction SilentlyContinue | "
-    "Where-Object { $_.CommandLine -like '*face_service*' }"
+# Are we the frozen watchdog exe, or `python -m tools.watchdog` out of the repo? Everything
+# layout-dependent below hangs off this one answer. PyInstaller sets sys.frozen on the bundled
+# interpreter; nothing else in this project does.
+INSTALLED = bool(getattr(sys, "frozen", False))
+
+# The frozen service executable. This string has to agree with THREE other places or the watchdog
+# matches nothing: InstalledExe for FaceUnlock-Service in tools/tasks.psd1, the EXE name= in
+# installer/windows_face_unlock.spec, and the -Execute the registrar builds from the former.
+# tools/packaging_selftest.py pins the first two together.
+_INSTALLED_SERVICE_EXE = "face_service.exe"
+
+
+def _match_ps(installed: bool) -> str:
+    """The ONE process-matching criterion, shared by kill / count / death-wait so the three can
+    never drift apart.
+
+    DEV filters Name='pythonw.exe' AND "face_service" in the command line: the registrar launches
+    .venv\\Scripts\\pythonw.exe -m face_service, while a debugging instance is `python.exe -m
+    face_service` with a visible console -- so the watchdog restarts the prod service and does NOT
+    kill the one you are stepping through. The watchdog itself (`-m tools.watchdog`) and presence
+    (`-m presence_monitor`) have no "face_service" in their command line, so they are never matched
+    either. NB a healthy venv service is TWO matches, not one: the .venv pythonw.exe launcher stub
+    and the base-interpreter worker it spawns both carry "face_service" on their command line.
+
+    INSTALLED filters the image name alone. The task runs <InstallDir>\\face_service.exe with NO
+    arguments (tools/register_tasks.ps1), so there is no command-line needle to test -- and the
+    dev-instance exemption is meaningless there, because a repo checkout is not what is running.
+    Matching by image name is also what the registrar's own Get-FuProcess does in Installed mode.
+    """
+    if installed:
+        return ("Get-CimInstance Win32_Process -Filter \"Name='" + _INSTALLED_SERVICE_EXE + "'\" "
+                "-ErrorAction SilentlyContinue")
+    return (
+        "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.CommandLine -like '*face_service*' }"
+    )
+
+
+_MATCH_PS = _match_ps(INSTALLED)
+# How to name the thing we just killed/counted, in a log line. Used everywhere the restart path
+# used to hardcode "pythonw" -- which would have been a lie in the installed layout, and a lie in
+# exactly the logs someone reads after an unattended restart went wrong.
+_PROC_LABEL = _INSTALLED_SERVICE_EXE if INSTALLED else "pythonw face_service"
+# Why a restart can end with nothing running, per layout. Dev has a legitimate suspect the
+# installed layout does not have (a debugging `python -m face_service`, which the matcher spares
+# on purpose); installed has one dev does not (a stale InstallDir or a renamed exe).
+_UNRECOVERABLE_HINT = (
+    "the installed service exe may have been renamed or moved -- check that InstalledExe in "
+    "tools/tasks.psd1 still matches what the FaceUnlock-Service task launches"
+    if INSTALLED else
+    "possibly a dev python.exe '-m face_service' holding the mutex, or a launch misconfig"
 )
-# Kill the stray PROD service by commandline match, then report how many were MATCHED (Stop-Process
-# has no -Wait, so this is a signal count, not a death count -- see _wait_dead).
+# Kill the stray PROD service by the layout's criterion, then report how many were MATCHED
+# (Stop-Process has no -Wait, so this is a signal count, not a death count -- see _wait_dead).
 _KILL_PS = (
     "$p = @(" + _MATCH_PS + "); "
     "$p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
     "$p.Count"
 )
-# Count running prod (pythonw) service instances -- used after a start to tell "a fresh service came
-# up" from "nothing survived (a non-pythonw instance holds the mutex, or the launch is misconfig)".
+# Count running prod service instances -- used after a start to tell "a fresh service came up"
+# from "nothing survived" (something else holds the mutex, or the launch is misconfigured).
 _COUNT_PS = "@(" + _MATCH_PS + ").Count"
 # Poll until nothing matches any more, or the bound elapses; emit the count still standing. The loop
 # lives INSIDE one powershell so a 200 ms cadence costs one process launch, not one per probe.
@@ -271,25 +313,29 @@ def _wait_dead() -> None:
     if left is None:
         log.warning("death-wait probe failed; starting %s anyway", SERVICE_TASK)
     elif left > 0:
-        log.warning("%d pythonw face_service process(es) STILL alive after %gs; starting %s anyway "
-                    "(the new instance may exit as a mutex-loser)", left, _DEATH_WAIT_S, SERVICE_TASK)
+        log.warning("%d %s process(es) STILL alive after %gs; starting %s anyway "
+                    "(the new instance may exit as a mutex-loser)",
+                    left, _PROC_LABEL, _DEATH_WAIT_S, SERVICE_TASK)
     else:
         log.info("all killed processes confirmed gone")
 
 
 def restart_service():
-    """Kill any stray PROD (pythonw) face_service process (frees the mutex), start the service task,
-    and report whether a service instance survived. Returns ``(killed, alive_after_start)``."""
+    """Kill any stray prod service process (frees the mutex), start the service task, and report
+    whether a service instance survived. Returns ``(killed, alive_after_start)``.
+
+    What counts as "the service process" is layout-dependent -- see ``_match_ps``. The task name
+    is not: FaceUnlock-Service is the same in both layouts, so the start step needs no branch."""
     killed = _run_ps_int(_KILL_PS, "kill")
     killed = 0 if killed is None else killed
-    log.info("signalled %d pythonw face_service process(es); waiting for them to exit...", killed)
+    log.info("signalled %d %s process(es); waiting for them to exit...", killed, _PROC_LABEL)
     _wait_dead()   # frees the mutex / pipe name / camera handles BEFORE the new instance starts
     log.info("starting %s...", SERVICE_TASK)
     started = _run(["schtasks", "/run", "/tn", SERVICE_TASK], "schtasks /run")
     time.sleep(_POST_START_SETTLE_S)   # give a mutex-loser time to exit (the check is pre-warmup)
     alive = _run_ps_int(_COUNT_PS, "count")
     alive = 0 if alive is None else alive
-    log.info("after start: %d pythonw face_service running (schtasks ok=%s)", alive, started)
+    log.info("after start: %d %s running (schtasks ok=%s)", alive, _PROC_LABEL, started)
     return killed, alive
 
 
@@ -353,14 +399,15 @@ def main(argv=None) -> int:
                     clear_pause(WATCHDOG_PAUSE_PATH)   # a restart clears the deliberate-stop pause
                     fails = 0
                     if restart_outcome(alive) == "unrecoverable":
-                        # Killed the prod pythonw (if any) and started the task, yet NO service
-                        # instance survived -> the mutex is held by a non-pythonw instance (a dev
-                        # `python -m face_service`, which we spare) or the launch is misconfigured.
-                        # Log clearly and back off so we don't tight-loop a no-op kill-start.
-                        log.error("no service instance survived the task start (killed %d pythonw, "
-                                  "%d running after) -- possibly a dev python.exe '-m face_service' "
-                                  "holding the mutex, or a launch misconfig; backing off %gs",
-                                  killed, alive, _UNRECOVERABLE_BACKOFF_S)
+                        # Killed whatever matched (if anything) and started the task, yet NO
+                        # service instance survived. Log clearly and back off so we don't
+                        # tight-loop a no-op kill-start. The likely cause differs by layout, so
+                        # the hint does too -- a diagnosis that names the wrong layout's failure
+                        # is worse than none, and this line is the one someone reads afterwards.
+                        log.error("no service instance survived the task start (killed %d %s, "
+                                  "%d running after) -- %s; backing off %gs",
+                                  killed, _PROC_LABEL, alive, _UNRECOVERABLE_HINT,
+                                  _UNRECOVERABLE_BACKOFF_S)
                         time.sleep(_UNRECOVERABLE_BACKOFF_S)
                     else:
                         log.info("a service instance is up after restart")
