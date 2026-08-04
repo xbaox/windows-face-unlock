@@ -66,7 +66,15 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\{#MyAppName} — Uninstall"; Filename: "{uninstallexe}"
 
 [Registry]
-; Used by the auto-updater fallback + uninstaller UI.
+; InstallLocation is read by tools\register_tasks.ps1 when -Mode Installed is used without an
+; explicit -InstallDir, so -Action Unregister and clean_restart.ps1 work without re-typing the
+; path. Version is informational: it is what Programs and Features shows, and it is the only
+; on-disk record of which build produced this install.
+;
+; This comment used to claim the values were "used by the auto-updater fallback". They were not --
+; no Python module in the tree imports winreg at all, and the updater compares against the
+; __version__ baked into the executable. Corrected rather than deleted, because the keys ARE
+; written and something does read one of them now.
 Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: "InstallLocation"; ValueData: "{app}"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: "Version";         ValueData: "{#MyAppVersion}"
 

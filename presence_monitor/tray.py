@@ -307,6 +307,13 @@ def run_with_tray(cfg: Config) -> None:
         root = Tk()
         root.withdraw()
         try:
+            # A source checkout cannot be updated by running an installer -- that would install a
+            # separate frozen copy and re-point the tasks at it. Say so instead of offering a
+            # download we would refuse a moment later.
+            if not FROZEN:
+                ok, msg = download_and_launch(release)
+                messagebox.showinfo(t("update.title"), msg)
+                return
             notes = (release.body or "")[:600]
             if messagebox.askyesno(
                 t("update.title"),

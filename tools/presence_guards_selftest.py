@@ -349,10 +349,10 @@ def main(argv=None) -> int:
     finally:
         I.set_language(saved_lang)
     en, ru = I.TRANSLATIONS["en"], I.TRANSLATIONS["ru"]
-    # 208 -> 224 in 7d-E: the 16 pwd.* keys of the new password dialog, which replaces the
-    # console tools.set_password on the frozen layout.
-    t.ok(len(en) == 224, f"_EN has 224 keys (got {len(en)})")
-    t.ok(len(ru) == 224, f"_RU has 224 keys (got {len(ru)})")
+    # 208 -> 224 in 7d-E (16 pwd.* keys for the password dialog) -> 226 in 7d-G (two update.*
+    # keys: a mandatory-checksum refusal and the source-checkout notice).
+    t.ok(len(en) == 226, f"_EN has 226 keys (got {len(en)})")
+    t.ok(len(ru) == 226, f"_RU has 226 keys (got {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
     # Key parity alone never caught a translation that drops or renames a {placeholder}: t()
     # swallows a failed .format() and returns the raw string, so the damage shows up as an

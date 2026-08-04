@@ -3,13 +3,30 @@
 Flow
 ----
 1. ``check_latest()`` hits ``/repos/OWNER/REPO/releases/latest`` on the
-   GitHub API and parses ``tag_name`` + the ``.exe`` asset.
+   GitHub API and parses ``tag_name`` + the installer asset.
 2. If the tag is newer than the bundled ``__version__``, ask the user.
-3. On yes, download the installer to ``%TEMP%``. If a ``*.sha256`` asset
-   is also present, verify it before launching.
+3. On yes, download the installer to ``%TEMP%`` and verify its SHA-256.
 4. Launch Inno Setup with ``/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS``.
    The installer will stop the tray + service itself, replace files, then
    restart everything.
+
+Three properties this deliberately has (Stage 7d-G), because it did not before:
+
+* It points at THIS fork. The owner was the upstream repo, so releases built by
+  this repository's own workflow would never have been offered -- and every
+  installed client would instead have downloaded and silently run, with /SILENT,
+  an executable published by a third party.
+* The checksum is MANDATORY. It used to be skipped entirely when the release
+  carried no ``.sha256`` asset, and skipped again when the checksum body failed
+  to parse; both fell through to launching the executable. Now either of those
+  aborts and deletes the download. This is an integrity check, not an
+  authenticity one -- the hash travels over the same channel as the payload --
+  but "no hash at all" is not a defensible default for something we then run.
+* It only APPLIES an update when frozen. A source checkout is not updatable by
+  running an installer: that would install a second, frozen copy into Program
+  Files and re-point all three scheduled tasks at it, leaving the repo, its
+  .venv and the CLSID-registered build-cp DLL stale but still registered. The
+  dev layout is told where the release is and updates itself with git.
 
 No external dependencies — urllib only. Safe to call from the tray thread
 but the network + download run in a background worker so the UI doesn't
@@ -22,6 +39,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import urllib.error
@@ -35,11 +53,21 @@ from face_service.i18n import t
 
 log = logging.getLogger(__name__)
 
-GITHUB_OWNER = "caochitam"
+# THIS fork, not upstream. Releases are produced by .github/workflows/release.yml in this repo.
+GITHUB_OWNER = "xbaox"
 GITHUB_REPO = "windows-face-unlock"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 USER_AGENT = f"windows-face-unlock/{__version__} (updater)"
-INSTALLER_SUFFIX = ".exe"
+
+# Exactly what installer.iss emits: OutputBaseFilename=WindowsFaceUnlock-Setup-{version}. A bare
+# ".exe" suffix test matched any executable attached to the release, and the old loop had no
+# break, so with more than one the LAST one silently won. First match of this pattern, in the
+# order GitHub returns the assets, is deterministic.
+INSTALLER_RE = re.compile(r"^WindowsFaceUnlock-Setup-.+\.exe$", re.IGNORECASE)
+
+# Applying an update means running an installer, which only makes sense for an installed layout.
+FROZEN = bool(getattr(sys, "frozen", False))
 
 
 @dataclass
@@ -91,17 +119,28 @@ def check_latest(timeout: float = 10.0) -> ReleaseInfo | None:
     assets = payload.get("assets") or []
 
     installer = None
-    checksum_url = None
     for a in assets:
-        name = (a.get("name") or "").lower()
-        if name.endswith(INSTALLER_SUFFIX):
+        if INSTALLER_RE.match(a.get("name") or ""):
             installer = a
-        if name.endswith(".sha256") or name.endswith(".sha256.txt"):
-            checksum_url = a.get("browser_download_url")
+            break                      # first match wins, deterministically
 
     if not (tag and installer):
-        log.info("latest release %s has no installer asset", tag)
+        log.info("latest release %s has no WindowsFaceUnlock-Setup-*.exe asset", tag)
         return None
+
+    # Prefer the checksum that belongs to THIS asset; fall back to a lone .sha256 in the release.
+    installer_name = installer.get("name") or ""
+    checksum_url = None
+    for a in assets:
+        if (a.get("name") or "").lower() == f"{installer_name.lower()}.sha256":
+            checksum_url = a.get("browser_download_url")
+            break
+    if checksum_url is None:
+        for a in assets:
+            name = (a.get("name") or "").lower()
+            if name.endswith(".sha256") or name.endswith(".sha256.txt"):
+                checksum_url = a.get("browser_download_url")
+                break
 
     return ReleaseInfo(
         tag=tag,
@@ -153,15 +192,47 @@ def _expected_sha256(url: str) -> str | None:
     return None
 
 
+def _discard(path: Path) -> None:
+    """Delete a downloaded installer we have decided not to run. Never raises."""
+    try:
+        path.unlink()
+    except Exception:
+        log.warning("could not delete the rejected download %s", path, exc_info=True)
+
+
+def _sweep_old_downloads(tmp_dir: Path, keep: Path) -> None:
+    """Remove installers left by previous updates. Never raises.
+
+    The success path used to keep every downloaded installer forever -- one ~100 MB+ file per
+    update, in a directory nothing ever cleaned and no uninstall path knew about.
+    """
+    for stale in tmp_dir.iterdir():
+        if stale == keep or not stale.is_file():
+            continue
+        try:
+            stale.unlink()
+            log.info("removed a stale downloaded installer: %s", stale.name)
+        except Exception:
+            log.warning("could not remove %s", stale, exc_info=True)
+
+
 def download_and_launch(
     release: ReleaseInfo,
     progress: Callable[[int, int], None] | None = None,
 ) -> tuple[bool, str]:
-    """Download the installer, verify checksum (if any), and spawn it.
+    """Download the installer, verify its checksum, and spawn it.
 
     Returns (ok, message). On ok=True, the caller should exit the tray —
     the installer will kill any lingering processes itself.
+
+    Fail-closed: every path that cannot PROVE the download matches the published hash deletes it
+    and returns False. A source checkout never gets here at all.
     """
+    if not FROZEN:
+        # Running an installer would not update this checkout; it would install a second, frozen
+        # copy beside it and re-point the scheduled tasks at that. Point at the release instead.
+        return False, t("update.source_only", tag=release.tag, url=RELEASES_PAGE_URL)
+
     tmp_dir = Path(tempfile.gettempdir()) / "windows-face-unlock-update"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     dest = tmp_dir / release.asset_name
@@ -169,16 +240,23 @@ def download_and_launch(
     try:
         _download(release.asset_url, dest, progress=progress)
     except Exception as e:
+        _discard(dest)
         return False, t("update.download_failed", err=str(e))
 
-    if release.checksum_url:
-        expected = _expected_sha256(release.checksum_url)
-        if expected and _sha256_of(dest) != expected:
-            try:
-                dest.unlink()
-            except Exception:
-                pass
-            return False, t("update.checksum_failed")
+    # MANDATORY. No asset, an unfetchable body, or one that is not 64 hex chars are all refusals
+    # now -- each of them used to fall through to launching the executable unverified.
+    if not release.checksum_url:
+        _discard(dest)
+        return False, t("update.checksum_missing")
+    expected = _expected_sha256(release.checksum_url)
+    if not expected:
+        _discard(dest)
+        return False, t("update.checksum_missing")
+    if _sha256_of(dest) != expected:
+        _discard(dest)
+        return False, t("update.checksum_failed")
+
+    _sweep_old_downloads(tmp_dir, keep=dest)
 
     # Launch silently. The installer itself signals CloseApplications so
     # any running tray/service gets stopped before files are replaced.
