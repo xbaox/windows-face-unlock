@@ -54,6 +54,19 @@ HIDDEN += [
     "presence_monitor.gui",
     "presence_monitor.updater",
     "presence_monitor.widgets",
+    # THE ENTRY-POINT MODULES THEMSELVES. Not optional, and the reason is subtle
+    # enough to be worth writing down: both __main__.py files reach their real
+    # code through a RELATIVE import (`from .service import main`,
+    # `from .monitor import main`). PyInstaller analyses an entry point as a
+    # top-level SCRIPT, which has no package context, so modulegraph cannot
+    # resolve a leading-dot import and drops it -- silently, with nothing in
+    # warn-*.txt. The first build of this spec produced a face_service.exe whose
+    # bundle contained face_service.config and face_service.i18n (pulled in by
+    # the hidden imports below) but NOT face_service.service, i.e. an executable
+    # that could only have died on its first import. Naming them here restores
+    # the whole transitive graph: recognizer, camera, liveness, lockout, audit.
+    "face_service.service",
+    "presence_monitor.monitor",
     "face_service.i18n",
     "face_service.detector",
     "face_service._version",
