@@ -277,21 +277,48 @@ to restore if needed.
 
 ## 9. Uninstall completely
 
-```powershell
-# Admin PowerShell, from the repo root
-.\credential_provider\register.ps1 -Action unregister
-.\tools\register_tasks.ps1 -Action Unregister
-Remove-Item -Recurse -Force "$env:USERPROFILE\.face-unlock"
-Remove-Item -Recurse -Force .\.venv
-```
-
-`register_tasks.ps1 -Action Unregister` walks the same `tasks.psd1` used to
-create the tasks, so all three go, including the watchdog.
-
-Optionally also remove the downloaded recognition models:
+Use `tools\uninstall.ps1`. It runs in two phases: without `-Force` it only
+INVENTORIES what is on the machine and changes nothing, so you always see the
+list before anything is removed.
 
 ```powershell
-Remove-Item -Recurse -Force "$env:USERPROFILE\.insightface"
+# Admin PowerShell, from the repo root — show what is here, change nothing
+.\tools\uninstall.ps1
+
+# then actually remove it
+.\tools\uninstall.ps1 -Force
 ```
 
-The repo can then be deleted.
+Your enrollment data is **kept** by default: the face embeddings and the
+DPAPI-encrypted Windows password are yours, and a reinstall can reuse them. Add
+the switches for a full wipe:
+
+```powershell
+.\tools\uninstall.ps1 -Force -RemoveData -IncludeModels
+```
+
+| switch | what it adds |
+|---|---|
+| `-RemoveData` | `%USERPROFILE%\.face-unlock` — config, embeddings, `credentials.bin`, audit log, enrollment images |
+| `-IncludeModels` | `%USERPROFILE%\.insightface` — the ~600 MiB model cache, **shared** with any other InsightFace app |
+| `-Mode Installed` | clean a Program Files install instead of this checkout (`-InstallDir` is read from the registry if omitted) |
+
+The script unregisters the Credential Provider *and* deletes both of its registry
+keys directly afterwards, which matters because `register.ps1` refuses to run
+when the DLL is already gone. It ends by re-reading the machine and reporting
+anything that survived, and exits non-zero if something did — a locked file
+usually means a process is still running, so reboot and re-run.
+
+It delegates task removal to `register_tasks.ps1 -Action Unregister`, which walks
+the same `tasks.psd1` used to create them, so all three go including the
+watchdog, and the service is asked to stop over the pipe before anything is
+killed.
+
+`build-cp\` is deliberately left alone — it is repo build output and goes with
+the repo. Unregister before deleting the checkout, or the lock screen keeps a
+registration pointing at a DLL that no longer exists; running this script first
+does that for you.
+
+If you installed from the packaged installer, use **Programs and Features**
+instead; add `/REMOVEDATA` to the uninstaller command line for an unattended
+wipe.

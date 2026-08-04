@@ -57,9 +57,17 @@ Name: "cp"; Description: "Register the Credential Provider (enables log-in with 
 Source: "{#BuildRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Dirs]
-; Writable log/config dir in per-user profile — created on first run anyway,
-; but we pre-create it so the uninstaller can optionally wipe it.
-Name: "{userappdata}\..\.face-unlock"; Permissions: users-modify
+; Writable log/config dir in the per-user profile — created on first run anyway,
+; but pre-created so permissions are right the first time.
+;
+; This used to say {userappdata}\..\.face-unlock, which expands to
+; %APPDATA%\..\.face-unlock = C:\Users\<u>\AppData\.face-unlock -- NOT the
+; directory the application uses, and not the one CurUninstallStepChanged below
+; offers to delete. The installer therefore created a stray empty directory that
+; nothing read and no uninstall path removed, while the real data directory got
+; no pre-created permissions at all. {%USERPROFILE} matches face_service/config.py
+; (Path.home()/".face-unlock") and matches the uninstall code below.
+Name: "{%USERPROFILE}\.face-unlock"; Permissions: users-modify
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -114,6 +122,34 @@ begin
   Result := True;
 end;
 
+{ The user's enrollment data is KEPT unless they say otherwise.
+
+  This runs during an unattended upgrade too: presence_monitor/updater.py launches
+  the installer with /SILENT, and a MsgBox in that context either blocks forever
+  or is answered by nobody. Silently deleting biometric images and the DPAPI
+  credential blob because a dialog could not be shown is the worst of the
+  available outcomes, so silent mode now always keeps the data, and only an
+  interactive uninstall asks. /REMOVEDATA forces removal for scripted teardown.
+
+  tools\uninstall.ps1 is the fuller story (model cache, %TEMP% downloads,
+  leftover verification); this stays deliberately minimal. }
+function WantsDataRemoved(DataDir: string): Boolean;
+begin
+  Result := False;
+  if CmdLineParamExists('/REMOVEDATA') then
+  begin
+    Result := True;
+    exit;
+  end;
+  { UninstallSilent() covers both /SILENT and /VERYSILENT. }
+  if UninstallSilent() then
+    exit;
+  Result := MsgBox('Also remove your saved enrollment data at ' + DataDir + '?'#13#10#13#10
+                   + 'This includes your face embeddings and the encrypted Windows password. '
+                   + 'Choose No to keep them for a future reinstall.',
+                   mbConfirmation, MB_YESNO) = IDYES;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: string;
@@ -124,7 +160,7 @@ begin
     DataDir := ExpandConstant('{%USERPROFILE}\.face-unlock');
     if DirExists(DataDir) then
     begin
-      if MsgBox('Also remove your saved enrollment data at ' + DataDir + '?', mbConfirmation, MB_YESNO) = IDYES then
+      if WantsDataRemoved(DataDir) then
       begin
         Exec(ExpandConstant('{cmd}'), '/C rmdir /S /Q "' + DataDir + '"',
              '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
