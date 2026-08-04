@@ -34,15 +34,20 @@
             Name         = 'FaceUnlock-Watchdog'
             Description  = 'Face Unlock: service supervisor (pings the pipe, restarts on hang)'
             DevArgs      = '-m tools.watchdog'
-            # No frozen entry point exists: installer/windows_face_unlock.spec
-            # builds face_service.exe and face_unlock_tray.exe only. And even
-            # with one, tools/watchdog.py matches the service by
-            # Name='pythonw.exe' + commandline, which never matches an
-            # installed face_service.exe -- so its kill-then-start restart
-            # would be inert. Both must be fixed before this flips on;
-            # registering it now would be supervision in name only.
-            InstalledExe = ''
-            SkipReason   = 'no frozen watchdog executable, and the restart path is dev-layout only'
+            # Enabled in Stage 7d-H. This was '' because BOTH halves were
+            # missing: the spec built no watchdog executable, and
+            # tools/watchdog.py matched the service by Name='pythonw.exe' +
+            # commandline, which never matches an installed face_service.exe --
+            # so its kill-then-start restart would have been inert and every
+            # attempt would still have reported "unrecoverable". Registering it
+            # then would have been supervision in name only, which is worse than
+            # the honest skip, so this line was flipped LAST: 7d-D made the
+            # matcher layout-aware, 7d-H added the third Analysis to
+            # installer/windows_face_unlock.spec, and only then did this change.
+            # Until it is exercised on a real installed machine, treat the
+            # installed restart path as untested rather than proven.
+            InstalledExe = 'face_unlock_watchdog.exe'
+            SkipReason   = ''
         }
     )
 }

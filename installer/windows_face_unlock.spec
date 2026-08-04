@@ -159,7 +159,13 @@ EXCLUDES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Two entry points.
+# Three entry points.
+#
+# The watchdog joined in Stage 7d-H. Without a frozen build of it, tasks.psd1
+# had to declare InstalledExe = '' for FaceUnlock-Watchdog, and the registrar
+# skipped that task -- so every installed machine ran with NO service supervisor
+# at all. Its matcher is layout-aware as of 7d-D, so the exe is now the only
+# thing that was still missing.
 # ---------------------------------------------------------------------------
 service_analysis = Analysis(
     [str(REPO_ROOT / "face_service" / "__main__.py")],
@@ -187,15 +193,39 @@ tray_analysis = Analysis(
     noarchive=False,
 )
 
-# Share Python DLLs + site-packages between the two EXEs to avoid doubling
-# the bundle size.
+watchdog_analysis = Analysis(
+    [str(REPO_ROOT / "tools" / "watchdog.py")],
+    pathex=[str(REPO_ROOT)],
+    binaries=BINARIES,
+    datas=DATAS,
+    # tools/watchdog.py imports face_service.config, face_service.watchdog and
+    # face_service.logging_setup INSIDE functions, so they are named explicitly
+    # rather than trusted to bytecode scanning. It needs neither cv2 nor the
+    # models -- it only pings a named pipe and shells out to powershell -- but
+    # MERGE puts the shared payload in the first analysis anyway.
+    hiddenimports=HIDDEN + [
+        "face_service.config",
+        "face_service.watchdog",
+        "face_service.logging_setup",
+    ],
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=EXCLUDES,
+    cipher=BLOCK_CIPHER,
+    noarchive=False,
+)
+
+# Share Python DLLs + site-packages between the EXEs to avoid multiplying
+# the bundle size. The first member owns the shared payload.
 MERGE(
     (service_analysis, "face_service", "face_service"),
     (tray_analysis, "face_unlock_tray", "face_unlock_tray"),
+    (watchdog_analysis, "watchdog", "face_unlock_watchdog"),
 )
 
 service_pyz = PYZ(service_analysis.pure, service_analysis.zipped_data, cipher=BLOCK_CIPHER)
 tray_pyz = PYZ(tray_analysis.pure, tray_analysis.zipped_data, cipher=BLOCK_CIPHER)
+watchdog_pyz = PYZ(watchdog_analysis.pure, watchdog_analysis.zipped_data, cipher=BLOCK_CIPHER)
 
 service_exe = EXE(
     service_pyz,
@@ -229,6 +259,25 @@ tray_exe = EXE(
     icon=None,
 )
 
+watchdog_exe = EXE(
+    watchdog_pyz,
+    watchdog_analysis.scripts,
+    [],
+    exclude_binaries=True,
+    name="face_unlock_watchdog",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    # Windowed for the same reason as the other two: it runs from a Scheduled
+    # Task with no interactive console, and it already spawns its powershell and
+    # schtasks children with CREATE_NO_WINDOW so nothing flashes on a restart.
+    console=False,
+    windowed=True,
+    disable_windowed_traceback=False,
+    icon=None,
+)
+
 coll = COLLECT(
     service_exe,
     service_analysis.binaries,
@@ -238,6 +287,10 @@ coll = COLLECT(
     tray_analysis.binaries,
     tray_analysis.zipfiles,
     tray_analysis.datas,
+    watchdog_exe,
+    watchdog_analysis.binaries,
+    watchdog_analysis.zipfiles,
+    watchdog_analysis.datas,
     strip=False,
     upx=False,
     upx_exclude=[],
