@@ -172,74 +172,135 @@ function Write-Trace {
     if ($Detail) { Write-Host "  $Detail" -ForegroundColor DarkGray } else { Write-Host '' }
 }
 
+function Get-RegValueOrNull {
+    <#
+    Read one OPTIONAL registry value. Returns $null when the key is missing, the value is
+    missing, or the read fails. Never throws.
+
+    Written after a live -DryRun died here. The obvious form,
+
+        (Get-ItemProperty -Path $k -Name $n -ErrorAction SilentlyContinue).$n
+
+    looks safe because of -ErrorAction, but -ErrorAction only suppresses the ERROR: when the key
+    does not exist the cmdlet returns $null, and $null.Anything is a terminating
+    PropertyNotFoundStrict under `Set-StrictMode -Version Latest`. On a machine that was never
+    installed -- i.e. every dev box -- that killed the whole inventory at the "Installed layout"
+    section and the sections after it were never printed.
+
+    -ErrorAction on the cmdlet is therefore NOT sufficient; the property has to be probed too.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    try {
+        $fuItem = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
+        if ($null -eq $fuItem) { return $null }
+        if (-not $fuItem.PSObject.Properties[$Name]) { return $null }
+        return $fuItem.$Name
+    }
+    catch { return $null }
+}
+
+function Invoke-Section {
+    <#
+    Run one inventory section so that a failure inside it cannot truncate the rest.
+
+    The point of phase A is a COMPLETE picture of the machine. A section that throws must cost
+    that section, not the eight after it -- an inventory that stops early looks identical to an
+    inventory that found nothing, and the operator cannot tell which they are reading.
+    #>
+    param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][scriptblock]$Body)
+    Write-Host ''
+    Write-Host ("=== {0} ===" -f $Title) -ForegroundColor Cyan
+    try { & $Body }
+    catch {
+        Write-Host ("  [ERROR] this section could not be read: {0}" -f $_.Exception.Message) `
+                   -ForegroundColor Red
+        Write-Host '          the inventory continues; treat this section as UNKNOWN, not empty.' `
+                   -ForegroundColor Red
+    }
+}
+
 # ===========================================================================
 # PHASE A -- INVENTORY. Everything below this banner only READS.
 # ===========================================================================
 function Invoke-Inventory {
-    $fuFound = [ordered]@{}
-
-    Write-Host ''
-    Write-Host '=== Scheduled tasks ===' -ForegroundColor Cyan
-    $fuTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
-                 Where-Object { $_.TaskName -like "$fuTaskPrefix*" })
-    $fuFound['tasks'] = $fuTasks
-    if ($fuTasks) {
-        foreach ($fuT in $fuTasks) {
-            Write-Trace ("task {0}" -f $fuT.TaskName) $true ("state=" + $fuT.State)
-        }
+    # Pre-seeded with a safe value for every key. Two reasons: the verification pass at the end
+    # of phase B reads these back and calling .Count on an absent key would be the very fault
+    # this function is being hardened against, and a section that fails must leave a defined
+    # "nothing found" rather than a hole.
+    $fuFound = [ordered]@{
+        tasks  = @()
+        cpKeys = @()
+        appDir = $null
+        venv   = $false
+        data   = $false
+        models = $false
+        temp   = $false
     }
-    else { Write-Trace "no $fuTaskPrefix* tasks" $false }
 
-    Write-Host ''
-    Write-Host '=== Credential Provider registration ===' -ForegroundColor Cyan
-    $fuCpPresent = @()
-    foreach ($fuKey in $fuCpKeys) {
-        $fuIs = Test-Path -LiteralPath $fuKey
-        if ($fuIs) { $fuCpPresent += $fuKey }
-        $fuDetail = ''
-        if ($fuIs -and $fuKey -like '*Classes\CLSID*') {
-            $fuInproc = Join-Path $fuKey 'InprocServer32'
-            if (Test-Path -LiteralPath $fuInproc) {
-                $fuDll = (Get-ItemProperty -LiteralPath $fuInproc -ErrorAction SilentlyContinue).'(default)'
-                if ($fuDll) { $fuDetail = "-> $fuDll" }
+    Invoke-Section 'Scheduled tasks' {
+        $fuTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+                     Where-Object { $_.TaskName -like "$fuTaskPrefix*" })
+        $fuFound['tasks'] = $fuTasks
+        if ($fuTasks) {
+            foreach ($fuT in $fuTasks) {
+                Write-Trace ("task {0}" -f $fuT.TaskName) $true ("state=" + $fuT.State)
             }
         }
-        Write-Trace $fuKey $fuIs $fuDetail
-    }
-    $fuFound['cpKeys'] = $fuCpPresent
-
-    Write-Host ''
-    Write-Host '=== Installed layout ===' -ForegroundColor Cyan
-    $fuAppDir = $InstallDir
-    if (-not $fuAppDir) {
-        $fuAppDir = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WindowsFaceUnlock' `
-                                      -Name 'InstallLocation' -ErrorAction SilentlyContinue
-                    ).InstallLocation
-    }
-    $fuFound['appDir'] = $fuAppDir
-    if ($fuAppDir) {
-        $fuSz = Get-DirSize $fuAppDir
-        Write-Trace $fuAppDir ([bool]$fuSz) $(if ($fuSz) { "{0} files, {1}" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
-    }
-    else { Write-Trace 'no install directory recorded in HKLM' $false }
-    Write-Trace 'HKLM:\SOFTWARE\WindowsFaceUnlock' (Test-Path -LiteralPath 'HKLM:\SOFTWARE\WindowsFaceUnlock') `
-                'written by installer.iss; removed by its own uninstaller'
-
-    Write-Host ''
-    Write-Host '=== Repository (dev layout) ===' -ForegroundColor Cyan
-    foreach ($fuPair in @(@{P = $fuVenvDir; N = '.venv' }, @{P = $fuBuildCp; N = 'build-cp' })) {
-        $fuSz = Get-DirSize $fuPair.P
-        Write-Trace $fuPair.P ([bool]$fuSz) $(if ($fuSz) { "{0} files, {1}" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
-    }
-    $fuFound['venv'] = (Test-Path -LiteralPath $fuVenvDir)
-    if (Test-Path -LiteralPath $fuBuildCp) {
-        Write-Host '     note: build-cp holds the DLL the registered CLSID points at.' -ForegroundColor DarkGray
-        Write-Host '           Unregister the Credential Provider BEFORE deleting the repo,' -ForegroundColor DarkGray
-        Write-Host '           or the lock screen keeps a dangling InprocServer32 path.' -ForegroundColor DarkGray
+        else { Write-Trace "no $fuTaskPrefix* tasks" $false }
     }
 
-    Write-Host ''
-    Write-Host '=== User data ===' -ForegroundColor Cyan
+    Invoke-Section 'Credential Provider registration' {
+        $fuCpPresent = @()
+        foreach ($fuKey in $fuCpKeys) {
+            $fuIs = Test-Path -LiteralPath $fuKey
+            if ($fuIs) { $fuCpPresent += $fuKey }
+            $fuDetail = ''
+            if ($fuIs -and $fuKey -like '*Classes\CLSID*') {
+                $fuInproc = Join-Path $fuKey 'InprocServer32'
+                if (Test-Path -LiteralPath $fuInproc) {
+                    # The default value is optional like any other: a CLSID key can exist with an
+                    # InprocServer32 subkey that has no (default) set, and reading it the naive way
+                    # would take the whole inventory down. Same class as the InstallLocation read.
+                    $fuDll = Get-RegValueOrNull -Path $fuInproc -Name '(default)'
+                    if ($fuDll) { $fuDetail = "-> $fuDll" }
+                }
+            }
+            Write-Trace $fuKey $fuIs $fuDetail
+        }
+        $fuFound['cpKeys'] = $fuCpPresent
+    }
+
+    Invoke-Section 'Installed layout' {
+        $fuAppDir = $InstallDir
+        if (-not $fuAppDir) {
+            $fuAppDir = Get-RegValueOrNull -Path 'HKLM:\SOFTWARE\WindowsFaceUnlock' -Name 'InstallLocation'
+        }
+        $fuFound['appDir'] = $fuAppDir
+        if ($fuAppDir) {
+            $fuSz = Get-DirSize $fuAppDir
+            Write-Trace $fuAppDir ([bool]$fuSz) $(if ($fuSz) { "{0} files, {1}" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
+        }
+        else { Write-Trace 'installed layout: not present (no InstallLocation recorded in HKLM)' $false }
+        $fuVer = Get-RegValueOrNull -Path 'HKLM:\SOFTWARE\WindowsFaceUnlock' -Name 'Version'
+        Write-Trace 'HKLM:\SOFTWARE\WindowsFaceUnlock' (Test-Path -LiteralPath 'HKLM:\SOFTWARE\WindowsFaceUnlock') `
+                    $(if ($fuVer) { "Version=$fuVer; written by installer.iss, removed by its own uninstaller" }
+                      else { 'written by installer.iss; removed by its own uninstaller' })
+    }
+
+    Invoke-Section 'Repository (dev layout)' {
+        foreach ($fuPair in @(@{P = $fuVenvDir; N = '.venv' }, @{P = $fuBuildCp; N = 'build-cp' })) {
+            $fuSz = Get-DirSize $fuPair.P
+            Write-Trace $fuPair.P ([bool]$fuSz) $(if ($fuSz) { "{0} files, {1}" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
+        }
+        $fuFound['venv'] = (Test-Path -LiteralPath $fuVenvDir)
+        if (Test-Path -LiteralPath $fuBuildCp) {
+            Write-Host '     note: build-cp holds the DLL the registered CLSID points at.' -ForegroundColor DarkGray
+            Write-Host '           Unregister the Credential Provider BEFORE deleting the repo,' -ForegroundColor DarkGray
+            Write-Host '           or the lock screen keeps a dangling InprocServer32 path.' -ForegroundColor DarkGray
+        }
+    }
+
+    Invoke-Section 'User data' {
     $fuSz = Get-DirSize $fuDataDir
     Write-Trace $fuDataDir ([bool]$fuSz) $(if ($fuSz) { "{0} files, {1}" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
     $fuFound['data'] = [bool]$fuSz
@@ -272,15 +333,16 @@ function Invoke-Inventory {
             }
         }
     }
+    }
 
-    Write-Host ''
-    Write-Host '=== Caches and downloads ===' -ForegroundColor Cyan
-    $fuSz = Get-DirSize $fuModelDir
-    Write-Trace $fuModelDir ([bool]$fuSz) $(if ($fuSz) { "{0} files, {1} -- SHARED with any InsightFace app" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
-    $fuFound['models'] = [bool]$fuSz
-    $fuSz = Get-DirSize $fuTempDir
-    Write-Trace $fuTempDir ([bool]$fuSz) $(if ($fuSz) { "{0} installer(s), {1}" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
-    $fuFound['temp'] = [bool]$fuSz
+    Invoke-Section 'Caches and downloads' {
+        $fuSz = Get-DirSize $fuModelDir
+        Write-Trace $fuModelDir ([bool]$fuSz) $(if ($fuSz) { "{0} files, {1} -- SHARED with any InsightFace app" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
+        $fuFound['models'] = [bool]$fuSz
+        $fuSz = Get-DirSize $fuTempDir
+        Write-Trace $fuTempDir ([bool]$fuSz) $(if ($fuSz) { "{0} installer(s), {1}" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
+        $fuFound['temp'] = [bool]$fuSz
+    }
 
     return $fuFound
 }

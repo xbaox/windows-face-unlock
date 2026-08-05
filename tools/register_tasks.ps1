@@ -184,9 +184,16 @@ if ($Mode -eq 'Installed') {
         # auto-updater fallback -- nothing in the tree ever read it, so this is its first real
         # consumer. It makes -Action Unregister and clean_restart.ps1 -Mode Installed usable
         # without re-typing the path; an explicit -InstallDir still wins.
-        $fuInstallDir = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WindowsFaceUnlock' `
-                                          -Name 'InstallLocation' -ErrorAction SilentlyContinue
-                        ).InstallLocation
+        # -ErrorAction alone is NOT enough here. When the key does not exist the cmdlet returns
+        # $null, and $null.InstallLocation is a terminating PropertyNotFoundStrict under the
+        # Set-StrictMode -Version Latest at the top of this file. Probe the property too. The
+        # identical idiom killed tools/uninstall.ps1's inventory on its first live run; here it
+        # was latent, because this branch is only reached with -Mode Installed.
+        $fuReg = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WindowsFaceUnlock' `
+                                  -Name 'InstallLocation' -ErrorAction SilentlyContinue
+        if ($fuReg -and $fuReg.PSObject.Properties['InstallLocation']) {
+            $fuInstallDir = $fuReg.InstallLocation
+        }
         if ($fuInstallDir) {
             Write-Host ("-InstallDir not given; using " +
                         "HKLM\SOFTWARE\WindowsFaceUnlock\InstallLocation = $fuInstallDir")
