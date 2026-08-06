@@ -8,6 +8,10 @@ Reproducible checks for the Batch-1/2 channel hardening:
       policy accepts SELF and SYSTEM and rejects a foreign SID; an unusable handle -> None (no raise).
   [4] unlock SID-gate: require_system=True + a non-SYSTEM caller -> not-authorized BEFORE verify /
       load_password (short-circuit, no camera); require_system=False -> the branch runs as before.
+  [5] posture ratchet (7e-2): a reload_config carrying pipe_unlock_require_system / pipe_hardened_sd
+      = false CANNOT weaken a service that booted hardened -- each key stays True, one WARNING per
+      refused key, the rest of the reload still applies. False -> True is allowed, and raises the
+      floor so the pair cannot be walked back down in two steps.
 
 Uses an isolated FACE_UNLOCK_HOME and FaceService.__new__ (no heavy init) so it touches no real
 state and no camera/engine.
@@ -15,6 +19,7 @@ Run:  python -m tools.pipe_hardening_selftest
 Exit 0 = all pass; 1 = a failure.
 """
 from __future__ import annotations
+import logging
 import os
 import sys
 import tempfile
@@ -30,7 +35,7 @@ import win32file      # type: ignore
 import win32pipe      # type: ignore
 import win32security  # type: ignore
 
-from face_service.config import Config
+from face_service.config import CONFIG_PATH, Config
 from face_service import service as svc
 from face_service.service import FaceService, VerifyOutcome, _pipe_client_sid_string
 from tools.pipe_client import _server_sid_allowed, _self_sid_string, _server_sid_string
@@ -65,11 +70,18 @@ class _LockoutSpy:
     def remaining(self): return 0.0
     def record(self, ok): self.records.append(ok)
     def status(self): return {}
+    def reconfigure(self, *a): pass      # _reload_config calls this
 
 
 class _AuditStub:
     def __init__(self): self.records = []
     def write(self, ev, rec): self.records.append((ev, rec))
+    def reconfigure(self, *a): pass      # _reload_config calls this
+
+
+class _RecogStub:
+    """_reload_config re-points the recognizer at the new config; that is all it needs here."""
+    def __init__(self): self.cfg = None
 
 
 def _svc(cfg):
@@ -78,7 +90,41 @@ def _svc(cfg):
     s._lockout = _LockoutSpy()
     s._audit = _AuditStub()
     s._camera_paused_until = 0.0
+    s.recog = _RecogStub()
     return s
+
+
+class _WarnSpy(logging.Handler):
+    """Collect WARNING+ messages from face_service.service for the duration of a block."""
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.msgs: list[str] = []
+
+    def emit(self, record):
+        self.msgs.append(record.getMessage())
+
+    def __enter__(self):
+        logging.getLogger("face_service.service").addHandler(self)
+        return self
+
+    def __exit__(self, *exc):
+        logging.getLogger("face_service.service").removeHandler(self)
+        return False
+
+
+def _write_cfg(**kv):
+    """Write a minimal config.toml into the ISOLATED FACE_UNLOCK_HOME. Keys not named here fall
+    back to Config defaults on load, so both posture keys are always written explicitly."""
+    lines = []
+    for k, v in kv.items():
+        if isinstance(v, bool):
+            lines.append(f"{k} = {'true' if v else 'false'}")
+        elif isinstance(v, str):
+            lines.append(f'{k} = "{v}"')
+        else:
+            lines.append(f"{k} = {v}")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def test_descriptor():
@@ -160,15 +206,68 @@ def test_unlock_gate():
     check("off path DID run verify once", calls["verify"] == 1)
 
 
+def test_posture_ratchet():
+    print("[5] posture ratchet on reload (7e-2)")
+
+    # --- a hardened service is offered a downgraded config on disk -------------------
+    hardened = _svc(Config(pipe_unlock_require_system=True, pipe_hardened_sd=True))
+    _write_cfg(pipe_unlock_require_system=False, pipe_hardened_sd=False,
+               presence_interval_s=77)
+    with _WarnSpy() as spy:
+        resp = hardened._reload_config()
+    refusals = [m for m in spy.msgs if "posture downgrade refused" in m]
+    check("reload still succeeds (refusal is per-key, not a rejected reload)",
+          resp.get("ok") is True, resp)
+    check("pipe_unlock_require_system stays True",
+          hardened.cfg.pipe_unlock_require_system is True)
+    check("pipe_hardened_sd stays True", hardened.cfg.pipe_hardened_sd is True)
+    check("reply reports the values that actually took effect",
+          resp["config"]["pipe_unlock_require_system"] is True
+          and resp["config"]["pipe_hardened_sd"] is True, resp.get("config"))
+    check("the rest of the reload applied normally (presence_interval_s 60 -> 77)",
+          hardened.cfg.presence_interval_s == 77, hardened.cfg.presence_interval_s)
+    check("one loud warning per refused key", len(refusals) == 2, spy.msgs)
+    check("each warning names its key",
+          any("pipe_unlock_require_system" in m for m in refusals)
+          and any("pipe_hardened_sd" in m for m in refusals), refusals)
+
+    # --- tightening at run time is allowed, and raises the floor --------------------
+    soft = _svc(Config(pipe_unlock_require_system=False, pipe_hardened_sd=False))
+    _write_cfg(pipe_unlock_require_system=True, pipe_hardened_sd=True)
+    with _WarnSpy() as spy_up:
+        soft._reload_config()
+    check("False -> True applied (tightening is not refused)",
+          soft.cfg.pipe_unlock_require_system is True and soft.cfg.pipe_hardened_sd is True)
+    check("tightening logs no refusal",
+          not [m for m in spy_up.msgs if "posture downgrade refused" in m], spy_up.msgs)
+    _write_cfg(pipe_unlock_require_system=False, pipe_hardened_sd=False)
+    soft._reload_config()
+    check("no two-step walk-down: after tightening, a downgrade is refused too",
+          soft.cfg.pipe_unlock_require_system is True and soft.cfg.pipe_hardened_sd is True)
+
+    # --- a service that BOOTED soft is not silently hardened behind the operator ----
+    # (the dev workflow in credential_provider/tests/unlock_harness.cpp: the gate is turned
+    # off in config and the service is RESTARTED, so the boot value is the floor.)
+    dev = _svc(Config(pipe_unlock_require_system=False, pipe_hardened_sd=False))
+    _write_cfg(pipe_unlock_require_system=False, pipe_hardened_sd=False)
+    with _WarnSpy() as spy_dev:
+        dev._reload_config()
+    check("boot-soft stays soft (ratchet never invents hardening)",
+          dev.cfg.pipe_unlock_require_system is False and dev.cfg.pipe_hardened_sd is False)
+    check("boot-soft reload logs no refusal",
+          not [m for m in spy_dev.msgs if "posture downgrade refused" in m], spy_dev.msgs)
+
+
 def main() -> int:
     test_descriptor()
     test_sid_helpers()
     test_unlock_gate()
+    test_posture_ratchet()
     if FAILS:
         print(f"\nPIPE-HARDENING SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")
         return 1
     print("\nPIPE-HARDENING SELFTEST OK: hardened DACL + mandatory label; server/client SID reads; "
-          "unlock SID-gate short-circuits a non-SYSTEM caller.")
+          "unlock SID-gate short-circuits a non-SYSTEM caller; reload cannot weaken the posture keys.")
     return 0
 
 

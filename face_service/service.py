@@ -117,6 +117,24 @@ SYSTEM_SID_STRING = "S-1-5-18"
 # instance of the name already exists. pywin32 312 does not export it, so define the literal.
 FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
 
+# The two config keys that ARE the Stage-4 channel perimeter. Both are booleans where True is
+# the hardened value, and both are subject to the reload ratchet in _apply_posture_ratchet.
+#
+# Why a ratchet exists at all (Stage 7e-2): config.toml lives in the profile of the very user
+# whose password is at stake, and `reload_config` is deliberately NOT SID-gated -- only `unlock`
+# and `unlock_gesture` are, every other command being scoped by the pipe DACL instead. Those two
+# facts compose into a way AROUND the SYSTEM gate that needs no SYSTEM at all: write
+# pipe_unlock_require_system = false, send {"cmd":"reload_config"} as SELF, then send
+# {"cmd":"unlock"} as SELF. Same trick disarms the pipe descriptor via pipe_hardened_sd.
+#
+# So reload may only ever TIGHTEN these two. True -> False is refused (loudly, and only for the
+# key concerned); False -> True is applied like any other key. Everything else reloads exactly
+# as it did before.
+#
+# UNCONDITIONAL BY DESIGN -- there is no config flag to disable the ratchet, because such a flag
+# would live in the same file the ratchet exists to distrust.
+POSTURE_KEYS = ("pipe_unlock_require_system", "pipe_hardened_sd")
+
 
 def _current_user_sid_string() -> str:
     """String SID (S-1-5-21-...) of the account this process runs as (SELF).
@@ -433,6 +451,11 @@ class FaceService:
         # ``_cam_heal_at`` above, 0.0 keeps working as "no lease" because monotonic counts from
         # boot and is therefore always positive.
         self._camera_paused_until: float = 0.0
+        # Stage 7e-2 posture ratchet: the boot value of each perimeter key, which is the floor a
+        # later reload can never go under. Captured here, before any request can be served, so the
+        # floor reflects the config this process actually started on rather than whatever the file
+        # says by the time the first reload arrives. Raised (never lowered) by a tightening reload.
+        self._posture_floor = {k: bool(getattr(cfg, k)) for k in POSTURE_KEYS}
         # Stage 7-i gesture round: the single outstanding phase-1 token, or None. ONE slot is
         # enough because the pipe server is strictly sequential (_serve_one handles one request
         # at a time), so two unlocks can never be in flight together; a newer unlock simply
@@ -1113,6 +1136,38 @@ class FaceService:
             "audit": self._audit.status(),
         }
 
+    def _apply_posture_ratchet(self, new_cfg: Config) -> None:
+        """Refuse any RUNTIME weakening of the Stage-4 perimeter keys (see POSTURE_KEYS).
+
+        Mutates ``new_cfg`` IN PLACE so the caller can go on applying it wholesale: the ratchet
+        corrects the two keys it owns and touches nothing else, which is what keeps a poisoned
+        posture value from also becoming a way to block legitimate reloads of everything else.
+
+        The floor is the strongest value seen so far -- the boot value, raised by any tightening
+        reload -- so once a key is True it is True for the lifetime of this process. Comparing
+        against a remembered floor rather than against ``self.cfg`` alone means a key cannot be
+        walked down in two steps, and cannot be lowered by anything that edits ``self.cfg``
+        directly either.
+
+        Refusals are logged at WARNING, one line per key, naming the key: a downgrade attempt is
+        the observable half of the same-user path this closes, and it must not pass silently.
+        """
+        floor = getattr(self, "_posture_floor", None)
+        if floor is None:
+            # Selftests build the service with FaceService.__new__ (project convention: no camera,
+            # no model load), so __init__ never ran. Until the first reload the live config IS the
+            # boot config, so seeding from it here yields exactly the floor __init__ would have set.
+            floor = {k: bool(getattr(self.cfg, k)) for k in POSTURE_KEYS}
+            self._posture_floor = floor
+        for key in POSTURE_KEYS:
+            hardened = floor.get(key, False) or bool(getattr(self.cfg, key))
+            incoming = bool(getattr(new_cfg, key))
+            if hardened and not incoming:
+                setattr(new_cfg, key, True)
+                log.warning("posture downgrade refused: %s stays True", key)
+                incoming = True
+            floor[key] = hardened or incoming
+
     def _reload_config(self) -> dict:
         # strict=True: a good config is already in effect, so a broken file must be REJECTED and
         # the running one kept. Config.load()'s default degrade-to-defaults is right for a cold
@@ -1124,6 +1179,10 @@ class FaceService:
             new_cfg = Config.load(strict=True)
         except (ValueError, TypeError) as e:
             return {"ok": False, "reason": f"invalid-config: {e}"}
+        # Stage 7e-2: correct any attempted weakening of the perimeter keys BEFORE the swap, so
+        # self.cfg is never once assigned a downgraded posture -- not even for the length of this
+        # method -- and so the {"config": ...} reply below reports what actually took effect.
+        self._apply_posture_ratchet(new_cfg)
         old_index = self.cfg.camera_index
         old_persistent = self.cfg.persistent_camera
         self.cfg = new_cfg
