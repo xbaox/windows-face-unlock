@@ -130,13 +130,28 @@ $fuTempDir  = Join-Path ([IO.Path]::GetTempPath()) 'windows-face-unlock-update'
 $fuVenvDir  = Join-Path $fuRepoRoot '.venv'
 $fuBuildCp  = Join-Path $fuRepoRoot 'build-cp'
 
+# The files that hold key material -- matched as a STEM PLUS ANY SUFFIX, not by
+# exact name. The field turned up credentials.bin.bak and credentials.bin.pre-stage4
+# sitting next to the live blob: pre-Stage-4 v1 copies that decrypt with the constant
+# printed in face_service/credentials.py:33, so they do not even need the per-install
+# entropy file. Nothing in this repo writes them, which is exactly why an exact-name
+# list cannot work here -- it can only ever chase the spellings someone has already
+# seen, and a third one would be missed the same way these two were. Anything called
+# <stem>* IS the secret or a copy of it.
+#
+# The match is deliberately loose (prefix, case-insensitive). Mis-classifying a file
+# as a secret costs one line of report; mis-classifying a credential blob as unknown
+# junk is the bug being fixed.
+$fuSecretStems = @('credentials.bin', 'pipe_entropy.bin')
+
 # Files under the data directory that some part of the project writes. Anything
-# else there is reported by name: three copies of the DPAPI credential blob and
-# an orphaned probe log were found in the field with no writer anywhere in the
-# repo, and an uninstaller that silently deletes unknown files is as wrong as one
-# that silently leaves secrets behind.
+# else there is reported by name: an orphaned probe log was found in the field with
+# no writer anywhere in the repo, and an uninstaller that silently deletes unknown
+# files is as wrong as one that silently leaves secrets behind. The secret stems
+# above are deliberately NOT repeated in this list -- Test-FuSecretFile owns them, so
+# every file under the data directory has exactly one classifier.
 $fuKnownData = @(
-    'config.toml', 'embeddings.npz', 'credentials.bin', 'pipe_entropy.bin',
+    'config.toml', 'embeddings.npz',
     'service.log', 'presence.log', 'enroll.log', 'watchdog.log',
     'lockout.json', 'audit.jsonl', 'adaptive.npz', 'watchdog.pause',
     'threshold_samples.json', 'session_lock_probe.log'
@@ -145,6 +160,22 @@ $fuKnownPatterns = @(
     '^audit\.jsonl\.\d+$', '^lowlight_probe_.*\.csv$', '^service\.log\.\d+$',
     '^presence\.log\.\d+$', '^enroll\.log\.\d+$', '^watchdog\.log\.\d+$'
 )
+
+function Test-FuSecretFile {
+    <#
+    True when a data-directory file name is key material: one of $fuSecretStems, or any
+    variant of one (.bak, .pre-stage4, .tmp, .1 -- whatever the next one turns out to
+    be). Case-insensitive, because the file system is.
+
+    PURE by construction: it answers a question about a string. No file system access,
+    no output, nothing to make phase A anything other than a read.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    foreach ($fuStem in $fuSecretStems) {
+        if ($Name.StartsWith($fuStem, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
 
 function Format-Size {
     param([long]$Bytes)
@@ -308,21 +339,41 @@ function Invoke-Inventory {
         Write-Host "     FACE_UNLOCK_HOME is set, so this is NOT the default location." -ForegroundColor DarkGray
     }
     if ($fuSz) {
-        $fuSecret = @('credentials.bin', 'pipe_entropy.bin') |
-                    Where-Object { Test-Path -LiteralPath (Join-Path $fuDataDir $_) }
+        # Enumerated from disk and classified, rather than probed by the two names we
+        # happen to know: that is what let two decryptable credential blobs be reported
+        # as unmanaged junk instead of as secrets.
+        $fuSecret = @(Get-ChildItem -LiteralPath $fuDataDir -File -Force -ErrorAction SilentlyContinue |
+                      Where-Object { Test-FuSecretFile $_.Name })
         $fuEnroll = @(Get-ChildItem -LiteralPath (Join-Path $fuDataDir 'enroll') -File -Force `
                                     -ErrorAction SilentlyContinue)
-        if ($fuSecret) {
-            Write-Host ("     SECRETS: {0} (DPAPI-encrypted, this account only)" -f ($fuSecret -join ', ')) `
-                       -ForegroundColor Yellow
+        if ($fuSecret.Count) {
+            Write-Host ("     SECRETS: {0} (DPAPI-encrypted, this account only)" `
+                        -f (($fuSecret | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+            # A copy is not a lesser secret. Name them separately so the operator sees that
+            # -RemoveData is what clears them and that leaving them is a decision, not a gap.
+            $fuStaleSecret = @($fuSecret | Where-Object { $fuSecretStems -notcontains $_.Name })
+            if ($fuStaleSecret.Count) {
+                Write-Host ("       {0} of those are ORPHANED COPIES -- nothing in this repo writes them:" `
+                            -f $fuStaleSecret.Count) -ForegroundColor Yellow
+                foreach ($fuS in $fuStaleSecret) {
+                    Write-Host ("       - {0}  ({1})" -f $fuS.Name, (Format-Size $fuS.Length)) `
+                               -ForegroundColor Yellow
+                }
+                Write-Host '       Pre-migration copies decrypt with a constant printed in the source;' `
+                           -ForegroundColor Yellow
+                Write-Host '       they are removed with the data directory (-RemoveData).' -ForegroundColor Yellow
+            }
         }
         if ($fuEnroll.Count) {
             Write-Host ("     BIOMETRIC: {0} enrollment image(s)" -f $fuEnroll.Count) -ForegroundColor Yellow
         }
         # Files nothing in the repo claims to write. Named, never auto-deleted.
+        # Secrets are excluded FIRST: a stale credential blob has no writer either, but it
+        # is key material and belongs in the SECRETS block above, not in a junk list.
         $fuUnknown = @(Get-ChildItem -LiteralPath $fuDataDir -File -Force -ErrorAction SilentlyContinue |
                        Where-Object {
                            $fuN = $_.Name
+                           (-not (Test-FuSecretFile $fuN)) -and
                            (-not ($fuKnownData -contains $fuN)) -and
                            (-not ($fuKnownPatterns | Where-Object { $fuN -match $_ }))
                        })
