@@ -130,30 +130,49 @@ $fuTempDir  = Join-Path ([IO.Path]::GetTempPath()) 'windows-face-unlock-update'
 $fuVenvDir  = Join-Path $fuRepoRoot '.venv'
 $fuBuildCp  = Join-Path $fuRepoRoot 'build-cp'
 
-# The files that hold key material -- matched as a STEM PLUS ANY SUFFIX, not by
-# exact name. The field turned up credentials.bin.bak and credentials.bin.pre-stage4
-# sitting next to the live blob: pre-Stage-4 v1 copies that decrypt with the constant
-# printed in face_service/credentials.py:33, so they do not even need the per-install
-# entropy file. Nothing in this repo writes them, which is exactly why an exact-name
-# list cannot work here -- it can only ever chase the spellings someone has already
-# seen, and a third one would be missed the same way these two were. Anything called
-# <stem>* IS the secret or a copy of it.
+# --- What counts as sensitive under the data directory ----------------------
 #
-# The match is deliberately loose (prefix, case-insensitive). Mis-classifying a file
-# as a secret costs one line of report; mis-classifying a credential blob as unknown
-# junk is the bug being fixed.
+# Two kinds, and keeping them apart is the point. Key material is a password: it can
+# be reissued, so losing a copy is bad but recoverable. A face cannot be reissued, so
+# a template or a photograph left on disk is a different and permanently open kind of
+# leftover. They are reported as separate categories for that reason, not merged into
+# one "sensitive" bucket that would let the weaker claim stand in for the stronger.
+#
+# STEMS, not exact names. The field turned up credentials.bin.bak and
+# credentials.bin.pre-stage4 next to the live blob (pre-Stage-4 v1 copies, decryptable
+# with the constant printed in face_service/credentials.py:33) and embeddings.npz.bak
+# next to the live template. Nothing in this repo writes any of them, which is exactly
+# why an exact-name list cannot work: it can only chase spellings someone has already
+# seen, and the next one is missed the same way. Anything called <stem>* IS the thing
+# or a copy of it. The match is deliberately loose (prefix, case-insensitive) --
+# over-classifying costs a line of report, under-classifying is the bug being fixed.
 $fuSecretStems = @('credentials.bin', 'pipe_entropy.bin')
 
-# Files under the data directory that some part of the project writes. Anything
-# else there is reported by name: an orphaned probe log was found in the field with
-# no writer anywhere in the repo, and an uninstaller that silently deletes unknown
-# files is as wrong as one that silently leaves secrets behind. The secret stems
-# above are deliberately NOT repeated in this list -- Test-FuSecretFile owns them, so
+# Face-embedding files. adaptive.npz is here and not in $fuKnownData because it holds
+# the same thing embeddings.npz does -- ArcFace vectors, (M, 512) float32, see
+# face_service/adaptive.py:94 -- and being the ADAPTIVE gallery rather than the
+# enrolled one makes no difference to what it discloses.
+$fuTemplateStems = @('embeddings.npz', 'adaptive.npz')
+
+# Directories under the data directory whose entire contents are enrollment imagery,
+# classified BY LOCATION rather than by name: everything below them, at any depth.
+# The wizard writes full frames as enroll_<ms>.jpg (presence_monitor/enroll_gui.py:698)
+# and the QC probe writes aligned face crops into enroll\_qc_crops (tools/
+# enroll_qc_probe.py:66,102). A raw frame is MORE disclosing than a template -- it is
+# the original, not a derived vector -- so a rule that only knew file names would be
+# protecting the lesser artifact while ignoring the greater.
+$fuBiometricDirs = @('enroll')
+
+# Files at the TOP level of the data directory that some part of the project writes.
+# Anything else there is reported by name: an orphaned probe log was found in the
+# field with no writer anywhere in the repo, and an uninstaller that silently deletes
+# unknown files is as wrong as one that silently leaves secrets behind. Secret and
+# template stems are deliberately NOT repeated here -- Get-FuDataClass owns them, so
 # every file under the data directory has exactly one classifier.
 $fuKnownData = @(
-    'config.toml', 'embeddings.npz',
+    'config.toml',
     'service.log', 'presence.log', 'enroll.log', 'watchdog.log',
-    'lockout.json', 'audit.jsonl', 'adaptive.npz', 'watchdog.pause',
+    'lockout.json', 'audit.jsonl', 'watchdog.pause',
     'threshold_samples.json', 'session_lock_probe.log'
 )
 $fuKnownPatterns = @(
@@ -161,20 +180,43 @@ $fuKnownPatterns = @(
     '^presence\.log\.\d+$', '^enroll\.log\.\d+$', '^watchdog\.log\.\d+$'
 )
 
-function Test-FuSecretFile {
+function Get-FuDataClass {
     <#
-    True when a data-directory file name is key material: one of $fuSecretStems, or any
-    variant of one (.bak, .pre-stage4, .tmp, .1 -- whatever the next one turns out to
-    be). Case-insensitive, because the file system is.
+    Classify ONE entry under the data directory from its path RELATIVE to that
+    directory ('credentials.bin.bak', 'enroll\_qc_crops\x_crop.png'). The single
+    source of truth for sensitivity: the SECRETS block, the BIOMETRIC block and the
+    unmanaged filter all derive from this one answer, so a file cannot be sensitive
+    to one of them and invisible to another.
 
-    PURE by construction: it answers a question about a string. No file system access,
-    no output, nothing to make phase A anything other than a read.
+    Returns exactly one of:
+        'keymaterial'         the DPAPI blob or the entropy that unlocks it, or a copy
+        'biometric:template'  a face-embedding file, or a copy
+        'biometric:image'     anything inside an enrollment image directory
+        $null                 not sensitive; the caller decides known vs unmanaged
+
+    Order is load-bearing. Key material wins first so a credential copy that happens
+    to sit inside enroll\ is still reported as a credential. Location beats stem after
+    that, because everything under enroll\ is imagery whatever it is named.
+
+    PURE by construction: a string goes in, a label comes out. No file system access,
+    no output -- nothing that could make phase A anything other than a read.
     #>
-    param([Parameter(Mandatory)][string]$Name)
+    param([Parameter(Mandatory)][string]$RelPath)
+    $fuParts = $RelPath -split '[\\/]'
+    $fuLeaf  = $fuParts[$fuParts.Count - 1]
+
     foreach ($fuStem in $fuSecretStems) {
-        if ($Name.StartsWith($fuStem, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($fuLeaf.StartsWith($fuStem, [StringComparison]::OrdinalIgnoreCase)) { return 'keymaterial' }
     }
-    return $false
+    if ($fuParts.Count -gt 1) {
+        foreach ($fuDir in $fuBiometricDirs) {
+            if ($fuParts[0] -eq $fuDir) { return 'biometric:image' }
+        }
+    }
+    foreach ($fuStem in $fuTemplateStems) {
+        if ($fuLeaf.StartsWith($fuStem, [StringComparison]::OrdinalIgnoreCase)) { return 'biometric:template' }
+    }
+    return $null
 }
 
 function Format-Size {
@@ -339,16 +381,34 @@ function Invoke-Inventory {
         Write-Host "     FACE_UNLOCK_HOME is set, so this is NOT the default location." -ForegroundColor DarkGray
     }
     if ($fuSz) {
-        # Enumerated from disk and classified, rather than probed by the two names we
-        # happen to know: that is what let two decryptable credential blobs be reported
-        # as unmanaged junk instead of as secrets.
-        $fuSecret = @(Get-ChildItem -LiteralPath $fuDataDir -File -Force -ErrorAction SilentlyContinue |
-                      Where-Object { Test-FuSecretFile $_.Name })
-        $fuEnroll = @(Get-ChildItem -LiteralPath (Join-Path $fuDataDir 'enroll') -File -Force `
-                                    -ErrorAction SilentlyContinue)
+        # ONE RECURSIVE PASS, and every list below is derived from it. The previous
+        # version ran three separate NON-recursive scans -- secrets, enroll count,
+        # unmanaged -- so anything in a subdirectory was invisible to all three at once:
+        # fifteen aligned face crops under enroll\_qc_crops\ appeared in no list at all
+        # while the report still claimed to name everything. A single enumeration plus a
+        # single classifier means a file cannot be counted by one list and missed by
+        # another; the arithmetic printed at the end of this block proves it each run.
+        $fuRoot = $fuDataDir.TrimEnd('\')
+        $fuAll = @(Get-ChildItem -LiteralPath $fuDataDir -File -Force -Recurse -ErrorAction SilentlyContinue |
+                   ForEach-Object {
+                       $fuRel = $_.FullName
+                       if ($fuRel.StartsWith($fuRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                           $fuRel = $fuRel.Substring($fuRoot.Length + 1)
+                       }
+                       [pscustomobject]@{
+                           Rel   = $fuRel
+                           Name  = $_.Name
+                           Sub   = $(if ($fuRel -match '[\\/]') { Split-Path -Parent $fuRel } else { '' })
+                           Bytes = $_.Length
+                           Class = Get-FuDataClass $fuRel
+                       }
+                   })
+        $fuSecret   = @($fuAll | Where-Object { $_.Class -eq 'keymaterial' })
+        $fuTemplate = @($fuAll | Where-Object { $_.Class -eq 'biometric:template' })
+        $fuImage    = @($fuAll | Where-Object { $_.Class -eq 'biometric:image' })
         if ($fuSecret.Count) {
             Write-Host ("     SECRETS: {0} (DPAPI-encrypted, this account only)" `
-                        -f (($fuSecret | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+                        -f (($fuSecret | ForEach-Object { $_.Rel }) -join ', ')) -ForegroundColor Yellow
             # A copy is not a lesser secret. Name them separately so the operator sees that
             # -RemoveData is what clears them and that leaving them is a decision, not a gap.
             $fuStaleSecret = @($fuSecret | Where-Object { $fuSecretStems -notcontains $_.Name })
@@ -356,7 +416,7 @@ function Invoke-Inventory {
                 Write-Host ("       {0} of those are ORPHANED COPIES -- nothing in this repo writes them:" `
                             -f $fuStaleSecret.Count) -ForegroundColor Yellow
                 foreach ($fuS in $fuStaleSecret) {
-                    Write-Host ("       - {0}  ({1})" -f $fuS.Name, (Format-Size $fuS.Length)) `
+                    Write-Host ("       - {0}  ({1})" -f $fuS.Rel, (Format-Size $fuS.Bytes)) `
                                -ForegroundColor Yellow
                 }
                 Write-Host '       Pre-migration copies decrypt with a constant printed in the source;' `
@@ -364,25 +424,53 @@ function Invoke-Inventory {
                 Write-Host '       they are removed with the data directory (-RemoveData).' -ForegroundColor Yellow
             }
         }
-        if ($fuEnroll.Count) {
-            Write-Host ("     BIOMETRIC: {0} enrollment image(s)" -f $fuEnroll.Count) -ForegroundColor Yellow
+        if ($fuTemplate.Count -or $fuImage.Count) {
+            Write-Host '     BIOMETRIC (a face cannot be reissued the way a password can):' `
+                       -ForegroundColor Yellow
+            # Templates are few, so they are named with sizes -- an orphaned copy has to be
+            # identifiable to be deleted.
+            foreach ($fuT in $fuTemplate) {
+                Write-Host ("       template  {0}  ({1})" -f $fuT.Rel, (Format-Size $fuT.Bytes)) `
+                           -ForegroundColor Yellow
+            }
+            # Images are counted per directory, never listed: one enrollment is dozens of
+            # frames, and forty-five paths would bury the rest of this report. Grouping by
+            # subdirectory keeps _qc_crops visible as its own line instead of folding it
+            # into the enrollment count, which is how it went unnoticed in the first place.
+            foreach ($fuG in ($fuImage | Group-Object Sub | Sort-Object Name)) {
+                $fuGBytes = [long](($fuG.Group | Measure-Object -Property Bytes -Sum).Sum)
+                $fuWhere = $(if ($fuG.Name) { $fuG.Name + '\' } else { '.\' })
+                Write-Host ("       images    {0,-24} {1} file(s), {2}" `
+                            -f $fuWhere, $fuG.Count, (Format-Size $fuGBytes)) -ForegroundColor Yellow
+            }
         }
         # Files nothing in the repo claims to write. Named, never auto-deleted.
-        # Secrets are excluded FIRST: a stale credential blob has no writer either, but it
-        # is key material and belongs in the SECRETS block above, not in a junk list.
-        $fuUnknown = @(Get-ChildItem -LiteralPath $fuDataDir -File -Force -ErrorAction SilentlyContinue |
-                       Where-Object {
+        # Sensitive files are excluded FIRST: a stale credential blob or a leftover face
+        # crop has no writer either, but each belongs in its own block above, not in a junk
+        # list. Known names/patterns only count at the TOP level -- a familiar name appearing
+        # inside a subdirectory is not a thing this repo writes, so it stays visible.
+        $fuUnknown = @($fuAll | Where-Object {
                            $fuN = $_.Name
-                           (-not (Test-FuSecretFile $fuN)) -and
-                           (-not ($fuKnownData -contains $fuN)) -and
-                           (-not ($fuKnownPatterns | Where-Object { $fuN -match $_ }))
+                           (-not $_.Class) -and
+                           (($_.Sub -ne '') -or (
+                               (-not ($fuKnownData -contains $fuN)) -and
+                               (-not ($fuKnownPatterns | Where-Object { $fuN -match $_ }))))
                        })
         if ($fuUnknown.Count) {
             Write-Host '     UNMANAGED (no writer anywhere in this repo):' -ForegroundColor Magenta
             foreach ($fuU in $fuUnknown) {
-                Write-Host ("       - {0}  ({1})" -f $fuU.Name, (Format-Size $fuU.Length)) -ForegroundColor Magenta
+                Write-Host ("       - {0}  ({1})" -f $fuU.Rel, (Format-Size $fuU.Bytes)) -ForegroundColor Magenta
             }
         }
+        # The arithmetic, printed every run. Each file lands in exactly one bucket by
+        # construction, so this line is the claim "nothing under the data directory fell
+        # out of the inventory" in a form that can be checked at a glance rather than
+        # trusted. A mismatch against the directory total is itself the finding.
+        $fuAccounted = $fuSecret.Count + $fuTemplate.Count + $fuImage.Count + $fuUnknown.Count
+        Write-Host ("     accounted: {0} secret + {1} template + {2} image + {3} known + {4} unmanaged = {5} of {6} file(s)" `
+                    -f $fuSecret.Count, $fuTemplate.Count, $fuImage.Count,
+                       ($fuAll.Count - $fuAccounted), $fuUnknown.Count, $fuAll.Count, $fuSz.Files) `
+                   -ForegroundColor DarkGray
     }
     }
 
