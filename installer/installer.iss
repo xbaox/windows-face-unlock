@@ -43,13 +43,20 @@ UsePreviousTasks=yes
 
 [Languages]
 ; Inno Setup 6 ships only Default.isl (English) out of the box. The app
-; itself is fully translated into 12 languages at runtime — the installer
+; itself is fully translated into 12 languages at runtime -- the installer
 ; wizard stays English for simplicity.
 Name: "english";  MessagesFile: "compiler:Default.isl"
 
 [Tasks]
+; Deliberately NO Check: on this entry. A task's Check runs while the Select Tasks
+; page is being built, which is BEFORE [Files] copies anything, so the FileExists
+; test that used to live here was False on every FIRST install: the checkbox never
+; appeared, and the regsvr32 entry below -- gated on Tasks: cp -- therefore never
+; ran. The Credential Provider got registered only when reinstalling over an
+; install that already had the DLL on disk, which is the opposite of the intent.
+; The file test moved to the [Run] entry, where it is evaluated at the right time.
 Name: "cp"; Description: "Register the Credential Provider (enables log-in with your face)"; \
-  Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); GroupDescription: "Optional components"; Flags: unchecked
+  GroupDescription: "Optional components"; Flags: unchecked
 
 [Files]
 ; The whole PyInstaller output, which already includes postinstall\ (the task
@@ -57,7 +64,7 @@ Name: "cp"; Description: "Register the Credential Provider (enables log-in with 
 Source: "{#BuildRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Dirs]
-; Writable log/config dir in the per-user profile — created on first run anyway,
+; Writable log/config dir in the per-user profile -- created on first run anyway,
 ; but pre-created so permissions are right the first time.
 ;
 ; This used to say {userappdata}\..\.face-unlock, which expands to
@@ -71,7 +78,7 @@ Name: "{%USERPROFILE}\.face-unlock"; Permissions: users-modify
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\{#MyAppName} — Uninstall"; Filename: "{uninstallexe}"
+Name: "{group}\{#MyAppName} - Uninstall"; Filename: "{uninstallexe}"
 
 [Registry]
 ; InstallLocation is read by tools\register_tasks.ps1 when -Mode Installed is used without an
@@ -87,16 +94,22 @@ Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: 
 Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: "Version";         ValueData: "{#MyAppVersion}"
 
 [Run]
-; 1. Register the Credential Provider DLL (only if the user ticked the task)
+; 1. Register the Credential Provider DLL (only if the user ticked the task).
+;    The Check lives here rather than on the [Tasks] entry because a [Run] Check
+;    is evaluated AFTER [Files] has copied the payload -- see the note in [Tasks].
+;    It keeps the original intent intact: never hand regsvr32 a path that is not
+;    in the layout, which is what a SKIP_CP=1 build produces.
 Filename: "regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
-  Tasks: cp; StatusMsg: "Registering Credential Provider…"; Flags: runhidden
+  Tasks: cp; \
+  Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); \
+  StatusMsg: "Registering Credential Provider..."; Flags: runhidden
 
 ; 2. Create AND start the scheduled tasks. Task names, executables and settings
 ;    all come from postinstall\tasks.psd1 -- this script does not name them, so
 ;    adding or removing a task never needs an installer edit. Register also
 ;    starts what it registered, which is why there are no schtasks /Run lines.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Register"; \
-  StatusMsg: "Registering scheduled tasks…"; Flags: runhidden
+  StatusMsg: "Registering scheduled tasks..."; Flags: runhidden
 
 ; 3. Post-install: offer to bring the tray window up (it is already running).
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \
@@ -116,9 +129,42 @@ Filename: "regsvr32.exe"; Parameters: "/u /s ""{app}\credential_provider\FaceCre
 Type: filesandordirs; Name: "{app}"
 
 [Code]
+
+{ NOT a built-in, despite reading like one. ParamCount, ParamStr and CompareText
+  ARE built in -- all three are in ISCmplr.dll's identifier table, and Inno's own
+  Examples\CodePrepareToInstall.iss calls ParamStr -- but the helper that walks
+  them is a convention each project rolls for itself. This script had called it
+  since it was written while [Code] had never once been compiled, so the first
+  ISCC run in the project's history stopped on it:
+
+      Error on line 139 in installer.iss, Column 6:
+      Unknown identifier 'CmdLineParamExists'
+      Compile aborted.
+
+  Declared at the very top of [Code] deliberately. Pascal Script resolves
+  identifiers in declaration order, so a helper defined after its caller is the
+  same error again. Its only caller is WantsDataRemoved, reached from
+  CurUninstallStepChanged -- that is, from inside the UNINSTALLER, where
+  ParamCount/ParamStr enumerate unins000.exe's own command line rather than
+  Setup's. That is what makes "unins000.exe /REMOVEDATA" reach the branch below. }
+function CmdLineParamExists(const Value: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+  begin
+    if CompareText(ParamStr(I), Value) = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
 function InitializeUninstall(): Boolean;
 begin
-  // Nothing fancy — UninstallRun handles task teardown.
+  // Nothing fancy -- UninstallRun handles task teardown.
   Result := True;
 end;
 
