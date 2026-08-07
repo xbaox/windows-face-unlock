@@ -94,12 +94,25 @@ Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: 
 Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: "Version";         ValueData: "{#MyAppVersion}"
 
 [Run]
+; Every system tool below is named through {sys}, never by bare filename, and that
+; is load-bearing rather than tidy. Setup is a 32-bit process even in 64-bit
+; install mode -- Inno's Setup.e32 and the setup stub this script compiles into are
+; both IMAGE_FILE_MACHINE_I386 -- so a bare "regsvr32.exe" resolves through WOW64
+; file-system redirection to SysWOW64\regsvr32.exe, which is 32-bit and cannot load
+; our x64 DLL at all. The install would have reported success and left the
+; Credential Provider unregistered. {sys} is the 64-bit System32 in 64-bit install
+; mode and is not subject to that redirection.
+;
+; credential_provider\register.ps1:62 already refuses to run in a 32-bit host for
+; exactly this reason ("Refuse rather than lie"). This section had no equivalent
+; guard, and it had never been executed -- the installer had never been built.
+;
 ; 1. Register the Credential Provider DLL (only if the user ticked the task).
 ;    The Check lives here rather than on the [Tasks] entry because a [Run] Check
 ;    is evaluated AFTER [Files] has copied the payload -- see the note in [Tasks].
 ;    It keeps the original intent intact: never hand regsvr32 a path that is not
 ;    in the layout, which is what a SKIP_CP=1 build produces.
-Filename: "regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
+Filename: "{sys}\regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
   Tasks: cp; \
   Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); \
   StatusMsg: "Registering Credential Provider..."; Flags: runhidden
@@ -108,7 +121,7 @@ Filename: "regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCreden
 ;    all come from postinstall\tasks.psd1 -- this script does not name them, so
 ;    adding or removing a task never needs an installer edit. Register also
 ;    starts what it registered, which is why there are no schtasks /Run lines.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Register"; \
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Register"; \
   StatusMsg: "Registering scheduled tasks..."; Flags: runhidden
 
 ; 3. Post-install: offer to bring the tray window up (it is already running).
@@ -119,10 +132,14 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \
 ; Stop and delete the scheduled tasks first so files aren't held open. This
 ; walks the SAME postinstall\tasks.psd1 the install used, so a task can never be
 ; created by one path and left behind by the other.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Unregister"; \
+;
+; {sys} for the same reason as [Run] -- see the note there. The uninstaller is the
+; same 32-bit binary, so an unregister through a bare name would hit the 32-bit
+; regsvr32 and leave the Credential Provider registered after removal.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Unregister"; \
   Flags: runhidden
 ; Unregister the Credential Provider if it was installed.
-Filename: "regsvr32.exe"; Parameters: "/u /s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
+Filename: "{sys}\regsvr32.exe"; Parameters: "/u /s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
   Flags: runhidden; Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll'))
 
 [UninstallDelete]
