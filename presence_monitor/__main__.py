@@ -27,15 +27,31 @@ import sys
 
 
 def main(argv: "list[str] | None" = None) -> int:
+    # Every import below is ABSOLUTE, and that is load-bearing rather than a style
+    # choice. This file is an entry point in both layouts, and the two layouts
+    # disagree about what package it belongs to. `python -m presence_monitor`
+    # imports it as presence_monitor.__main__, where a leading dot resolves.
+    # PyInstaller freezes it as the top-level script `__main__` -- PKG-01.toc
+    # records it as ('__main__', ..., 'PYSOURCE') -- and a top-level script has no
+    # package context, so `from .monitor import main` raises "ImportError:
+    # attempted relative import with no known parent package". That is exactly how
+    # face_unlock_tray.exe died on every start: main() ran, the router reached the
+    # no-flag branch, and the import under it blew up. All three branches carried
+    # the same defect, so --enroll and --set-password were equally dead.
+    #
+    # Naming presence_monitor.monitor in the spec's hiddenimports (9c0123b) put the
+    # module IN the bundle, which is necessary and was not sufficient: it fixed what
+    # modulegraph collected, not what these lines do at runtime. The absolute form
+    # works in both layouts, because either way the package is importable by name.
     args = list(sys.argv[1:] if argv is None else argv)
     flag = args[0] if args else ""
 
     if flag == "--enroll":
-        from .enroll_gui import main as enroll_main
+        from presence_monitor.enroll_gui import main as enroll_main
         return int(enroll_main() or 0)
 
     if flag == "--set-password":
-        from .password_gui import main as password_main
+        from presence_monitor.password_gui import main as password_main
         return int(password_main() or 0)
 
     if flag == "--pipe-shutdown":
@@ -45,7 +61,7 @@ def main(argv: "list[str] | None" = None) -> int:
         return int(pipe_main(["shutdown"]))
 
     # No flag (or an unrecognised one): the tray, exactly as before.
-    from .monitor import main as monitor_main
+    from presence_monitor.monitor import main as monitor_main
     monitor_main()
     return 0
 

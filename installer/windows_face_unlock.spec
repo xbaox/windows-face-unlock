@@ -54,17 +54,34 @@ HIDDEN += [
     "presence_monitor.gui",
     "presence_monitor.updater",
     "presence_monitor.widgets",
-    # THE ENTRY-POINT MODULES THEMSELVES. Not optional, and the reason is subtle
-    # enough to be worth writing down: both __main__.py files reach their real
-    # code through a RELATIVE import (`from .service import main`,
-    # `from .monitor import main`). PyInstaller analyses an entry point as a
-    # top-level SCRIPT, which has no package context, so modulegraph cannot
-    # resolve a leading-dot import and drops it -- silently, with nothing in
-    # warn-*.txt. The first build of this spec produced a face_service.exe whose
-    # bundle contained face_service.config and face_service.i18n (pulled in by
-    # the hidden imports below) but NOT face_service.service, i.e. an executable
-    # that could only have died on its first import. Naming them here restores
-    # the whole transitive graph: recognizer, camera, liveness, lockout, audit.
+    # THE ENTRY-POINT MODULES THEMSELVES. Kept deliberately, and the history is
+    # worth writing down because it cost two blocks.
+    #
+    # PyInstaller analyses an entry point as a top-level SCRIPT with no package
+    # context -- PKG-0{0,1}.toc record both as ('__main__', ..., 'PYSOURCE') --
+    # so a leading-dot import in one of them is unresolvable. Both __main__.py
+    # files used to have exactly that, and it broke the build in TWO independent
+    # ways that look alike and are not.
+    #
+    # The first is a BUILD defect: modulegraph cannot follow the dot, so it drops
+    # the target silently, with nothing in warn-*.txt. The first build of this
+    # spec shipped a face_service.exe whose bundle held face_service.config and
+    # face_service.i18n (they arrive through the hidden imports below) but NOT
+    # face_service.service. Naming the modules here fixed that, and these lines
+    # are why the whole transitive graph -- recognizer, camera, liveness, lockout,
+    # audit -- is in the bundle.
+    #
+    # The second is a RUNTIME defect, and naming a module here never addressed it:
+    # a module present in the PYZ does not make `from .service import main`
+    # legal in a script whose __package__ is empty. That import raised ImportError
+    # on every start, which is how face_unlock_tray.exe died at 7f acceptance and
+    # how face_service.exe would have died had anything launched it directly. The
+    # fix belongs in the entry points, and lives there now: both use the absolute
+    # form. See the comment in each file before shortening one back to a dot.
+    #
+    # These entries stay regardless. presence_monitor.monitor is reached only from
+    # inside a function body, and the graph should not depend on bytecode scanning
+    # finding it.
     "face_service.service",
     "presence_monitor.monitor",
     "face_service.i18n",
