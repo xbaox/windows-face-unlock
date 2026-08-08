@@ -179,6 +179,63 @@ begin
   end;
 end;
 
+{ Stop the running stack BEFORE [Files] overwrites it.
+
+  NOTE FOR WHOEVER EDITS THIS COMMENT: a Pascal Script comment is delimited by
+  braces and they do NOT nest, so the first closing brace ENDS it -- including one
+  that is merely part of a constant being described in prose. Writing the app
+  constant in the usual brace form here does not document the code, it terminates
+  the comment mid-sentence and the remaining words are compiled as statements:
+
+      Error on line 185, Column 65: 'BEGIN' expected.
+
+  That is why the install directory is spelled out in words below rather than as
+  the constant. ExpandConstant does the real work in the code itself.
+
+  Reinstalling over a live install used to abort. CloseApplications=yes asks the
+  Restart Manager to shut down whatever holds a file under the install directory,
+  and the Restart Manager can only close what it knows how to close: a process
+  with a message loop and a window to send WM_CLOSE to. face_unlock_watchdog.exe
+  has neither -- it is a windowless supervisor loop -- so RM reported "Some
+  applications could not be shut down", the wizard offered Abort, and an
+  unattended run (presence_monitor/updater.py launches Setup with /SILENT) took
+  that Abort automatically. /SUPPRESSMSGBOXES would only have made the abort
+  quieter, not rarer.
+
+  So Setup does what the uninstaller has always done: it walks the SAME
+  postinstall\tasks.psd1 through the SAME registrar and unregisters every declared
+  task, which stops the processes and releases the files. A reinstall is therefore
+  unregister -> copy -> register, with [Run] step 2 creating the tasks again from
+  the payload that was just laid down. This script still names no task, so the
+  invariant in [Run]/[UninstallRun] holds here too.
+
+  Gated on the registrar EXISTING, which is what makes this a no-op on a first
+  install: there is no postinstall\ directory under the target yet, nothing is
+  running, and nothing needs stopping.
+
+  A failed unregister is deliberately NOT fatal. Returning a non-empty string
+  aborts the install, and refusing to install because a cleanup step exited
+  non-zero is worse than letting CloseApplications have its turn -- which is
+  exactly the behaviour that was there before this function, i.e. no worse.
+  CloseApplications stays yes for that reason: this is the first line, not the
+  only one. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Registrar: string;
+  AppDir: string;
+  ResultCode: Integer;
+begin
+  Result := '';
+  AppDir := ExpandConstant('{app}');
+  Registrar := AppDir + '\postinstall\register_tasks.ps1';
+  if not FileExists(Registrar) then
+    exit;
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+       '-NoProfile -ExecutionPolicy Bypass -File "' + Registrar + '"'
+       + ' -Mode Installed -InstallDir "' + AppDir + '" -Action Unregister',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 function InitializeUninstall(): Boolean;
 begin
   // Nothing fancy -- UninstallRun handles task teardown.
