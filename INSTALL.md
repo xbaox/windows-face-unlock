@@ -189,6 +189,63 @@ To re-register them all after changing the venv or moving the repo:
 .\tools\register_tasks.ps1 -Action Register
 ```
 
+### The dev checkout and the installed product cannot coexist
+
+This is an invariant, not a preference, and it follows from the fact that both
+layouts are the *same application* pointed at different files. They share every
+singleton it owns:
+
+- the same three task names, `FaceUnlock-Service` / `-Presence` / `-Watchdog`
+  (`tools\tasks.psd1` is the only declaration, used by both `-Mode Dev` and
+  `-Mode Installed`), and `Register-ScheduledTask -Force` overwrites in place —
+  so whichever layout registered last owns all three;
+- the same named pipe `\\.\pipe\FaceUnlock`, opened with `FIRST_PIPE_INSTANCE`;
+- the same single-instance mutex `Local\FaceUnlockService`, so a second service
+  does not race the first — it exits immediately as a mutex-loser;
+- the same data directory `%USERPROFILE%\.face-unlock` — one enrollment, one
+  DPAPI credential blob, one set of logs.
+
+The practical consequence: **stop the dev stack before installing the product,
+and unregister the product before going back to dev.** Running `setup.ps1` on a
+machine that has the installed product does not give you two systems, it gives
+you one system whose tasks now point at the checkout, with the installed
+executables still on disk and nothing running them.
+
+To check which layout owns the tasks right now, without changing anything:
+
+```powershell
+.\tools\register_tasks.ps1 -Action Unregister -DryRun
+```
+
+It prints every declared task, whether it is present, and every matching process
+with its PID — and, being a dry run, stops before the first mutating call.
+
+### Upgrading is a supported path, not a reinstall
+
+Installing a newer setup **over** an existing installation is the intended
+upgrade route, and it is what `presence_monitor\updater.py` does unattended —
+it launches the downloaded installer with `/SILENT`. Two properties make that
+safe as of Stage 7g:
+
+- Setup stops the running stack itself, before it overwrites anything. Its
+  `PrepareToInstall` runs the installed `register_tasks.ps1 -Action Unregister`,
+  which is the same teardown the uninstaller performs. Previously this was left
+  to the Restart Manager, which cannot close a windowless process such as the
+  watchdog: the upgrade stopped at "Some applications could not be shut down",
+  and under `/SILENT` that prompt was answered by nobody.
+- Enrollment data is kept. Only an interactive uninstall asks about removing
+  `%USERPROFILE%\.face-unlock`, and a silent one never deletes it — see
+  `WantsDataRemoved` in `installer\installer.iss`.
+
+If an upgrade still reports that files are in use, the honest check is:
+
+```powershell
+.\tools\register_tasks.ps1 -Mode Installed -Action Unregister
+```
+
+It now exits non-zero and prints the surviving PIDs when the stack does not go
+down, instead of reporting "All tasks removed" unconditionally.
+
 ### First sign-in after a reboot uses your PIN
 
 This is by design, not a fault. All three tasks are **logon** tasks, so the

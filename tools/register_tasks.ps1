@@ -316,10 +316,16 @@ Write-Host ("Processes matching the kill criterion right now: {0}" -f $fuCandida
 foreach ($fuProc in $fuCandidates) {
     Write-Host ("  pid {0,-7} {1}" -f $fuProc.ProcessId, $fuProc.Name)
 }
-# Only the two actions that actually stop things say how they stop them. Printing this under
-# -Action Start (which stops nothing) or -Action Unregister (which has no graceful step) would
-# describe a strategy that is not going to run.
-if ($Action -eq 'Register' -or $Action -eq 'Restart') {
+# Only the actions that actually stop things say how they stop them; printing this under
+# -Action Start, which stops nothing, would describe a strategy that is not going to run.
+#
+# Unregister belongs in this list and was excluded on a premise that is no longer true: the
+# comment here used to read "-Action Unregister (which has no graceful step)". It has one --
+# the branch below opens with Invoke-GracefulServiceShutdown, added so that removing the
+# software stopped being the single path that always hard-killed the live owner of a capture
+# (KNOWN_ISSUES #2). Saying so matters most exactly there, because that branch now also
+# reports whether the stack really went down.
+if ($Action -ne 'Start') {
     Write-Host "Stop strategy: graceful pipe shutdown first, then task stop, hard kill as fallback."
 }
 
@@ -474,6 +480,26 @@ function Stop-FuAndWait {
     }
 }
 
+# READ-ONLY, and deliberately not part of Stop-FuAndWait. Reporting what survived
+# is a different job from killing, and fusing the two is how the old code came to
+# claim success it had not verified: Stop-FuAndWait's own warning was the only
+# statement about survivors, it was bounded by the death-wait, and the caller then
+# printed "All tasks removed" regardless. A counter that cannot kill can be
+# trusted to answer "is the stack down?" -- which is the question the D-series
+# control and PrepareToInstall both actually ask.
+#
+# Get-FuProcess is Get-CimInstance underneath: nothing here mutates. Returns the
+# survivor count; the PIDs are printed because "1 alive" without a PID sent one
+# 7g smoke chasing an unrelated process.
+function Get-FuSurvivorCount {
+    $fuStillUp = @(Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -CommandLineNeedles $fuNeedles)
+    Write-Host ("Face Unlock processes still alive: {0}" -f $fuStillUp.Count)
+    foreach ($fuOne in $fuStillUp) {
+        Write-Host ("  pid {0,-7} {1}" -f $fuOne.ProcessId, $fuOne.Name)
+    }
+    return $fuStillUp.Count
+}
+
 Write-Host ""
 
 if ($Action -eq 'Unregister') {
@@ -493,6 +519,29 @@ if ($Action -eq 'Unregister') {
         Write-Host ("Unregistered: {0}" -f $fuName)
     }
     Write-Host "All declared and orphaned tasks removed."
+
+    # SECOND PASS, and the order is the point. Stop-FuAndWait takes ONE snapshot,
+    # signals everything in it, then merely WAITS -- so anything that appeared
+    # after the snapshot is observed by the death-wait and never actually killed,
+    # and Stop-Process runs with -ErrorAction SilentlyContinue, so a kill that
+    # failed on permissions is indistinguishable in the log from one that worked.
+    # Running the pass again here, with the tasks already gone, is what makes it
+    # final: there is no longer any registration for the scheduler to start a
+    # replacement from, so a survivor now is a real survivor rather than a race.
+    Stop-FuAndWait
+
+    # Then ask, without killing. This used to be the gap: the line above printed
+    # a warning at most, and the exit was unconditionally 0, so "All tasks
+    # removed" was emitted identically whether or not the stack was down. Any
+    # D-series control that trusted this script's output rather than counting
+    # processes itself was reading a message that could not fail.
+    $fuSurvivors = Get-FuSurvivorCount
+    if ($fuSurvivors -gt 0) {
+        Write-Warning ("Unregister did NOT bring the stack down: {0} process(es) still running." -f $fuSurvivors)
+        Write-Warning "Files under the install directory may still be held open. Stop them before installing over this."
+        exit 1
+    }
+    Write-Host "Stack confirmed down: 0 Face Unlock processes."
     exit 0
 }
 

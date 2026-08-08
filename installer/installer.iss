@@ -202,6 +202,25 @@ end;
   that Abort automatically. /SUPPRESSMSGBOXES would only have made the abort
   quieter, not rarer.
 
+  CloseApplications=force was the other half-fix considered, and it is recorded
+  here as REJECTED rather than left for someone to rediscover. The documented
+  behaviour is "Setup will force close when closing applications... Use with care
+  since this may cause the user to lose unsaved work", applied to whatever holds
+  files listed in Files or InstallDelete. Three reasons it is the wrong tool:
+
+    1. It is a hard kill by another name, and it would land on the live owner of
+       a camera capture -- the exact condition KNOWN_ISSUES #2 exists about, and
+       the reason the registrar tries a graceful pipe shutdown FIRST. Trading an
+       aborted install for a wedged Frame Server until reboot is not a trade.
+    2. It is indiscriminate. It closes anything holding a file under the install
+       directory, including a user application that merely has something open
+       there, and the documentation's warning about unsaved work is aimed at
+       precisely that.
+    3. It treats the symptom. Force-closing the processes leaves their scheduled
+       tasks registered, so the machine is briefly in a state the uninstaller
+       never produces: no processes, live registrations. Unregistering is what
+       makes install and uninstall symmetric, which is the property worth having.
+
   So Setup does what the uninstaller has always done: it walks the SAME
   postinstall\tasks.psd1 through the SAME registrar and unregisters every declared
   task, which stops the processes and releases the files. A reinstall is therefore
@@ -213,12 +232,23 @@ end;
   install: there is no postinstall\ directory under the target yet, nothing is
   running, and nothing needs stopping.
 
-  A failed unregister is deliberately NOT fatal. Returning a non-empty string
-  aborts the install, and refusing to install because a cleanup step exited
-  non-zero is worse than letting CloseApplications have its turn -- which is
-  exactly the behaviour that was there before this function, i.e. no worse.
-  CloseApplications stays yes for that reason: this is the first line, not the
-  only one. }
+  A failed unregister IS fatal, and that is a deliberate reversal of how this
+  function was first written. The registrar used to exit 0 no matter what, so
+  there was nothing to react to; as of the same block it re-checks after killing
+  and exits non-zero, printing the surviving PIDs, when the stack is still up.
+  Given a trustworthy signal, stopping is better than continuing: the documented
+  effect of a non-empty Result is that Setup halts on the Preparing to Install
+  page and shows that text, which names the problem, whereas continuing hands the
+  question to the Restart Manager -- and RM on a windowless watchdog is the exact
+  failure this function exists to remove. Under /SILENT nobody would see either
+  message, but one path stops with a logged reason and the other overwrites files
+  belonging to a process that is still running.
+
+  Note the ordering this depends on, which is documented rather than assumed:
+  PrepareToInstall is called BEFORE Setup checks for files being in use when
+  CloseApplications is set to yes. So the stack is stopped first and the in-use
+  check then finds nothing to complain about; CloseApplications stays yes as the
+  second line of defence for anything outside the registrar's remit. }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Registrar: string;
@@ -230,10 +260,29 @@ begin
   Registrar := AppDir + '\postinstall\register_tasks.ps1';
   if not FileExists(Registrar) then
     exit;
-  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-       '-NoProfile -ExecutionPolicy Bypass -File "' + Registrar + '"'
-       + ' -Mode Installed -InstallDir "' + AppDir + '" -Action Unregister',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              '-NoProfile -ExecutionPolicy Bypass -File "' + Registrar + '"'
+              + ' -Mode Installed -InstallDir "' + AppDir + '" -Action Unregister',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := 'Setup could not run the Face Unlock task registrar:' + #13#10
+            + Registrar + #13#10#13#10
+            + 'The existing installation has to be stopped before it can be replaced. '
+            + 'Stop it manually, then run Setup again.';
+    exit;
+  end;
+  if ResultCode <> 0 then
+  begin
+    Result := 'The installed Face Unlock is still running, so Setup will not overwrite it.'
+            + #13#10#13#10
+            + 'The task registrar exited with code ' + IntToStr(ResultCode)
+            + ' after trying twice to stop the stack; it lists the surviving process IDs in its '
+            + 'own output.' + #13#10#13#10
+            + 'Stop it and run Setup again:' + #13#10
+            + '  powershell -NoProfile -ExecutionPolicy Bypass -File "' + Registrar
+            + '" -Mode Installed -Action Unregister';
+    exit;
+  end;
 end;
 
 function InitializeUninstall(): Boolean;
