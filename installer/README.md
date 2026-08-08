@@ -30,6 +30,10 @@ Prerequisites:
 - Visual Studio 2022 Build Tools with the C++ workload, to build the Credential
   Provider DLL. Set `SKIP_CP=1` to deliberately build a
   presence-auto-lock-only installer without it.
+- `cmake` on `PATH`. Build Tools ships one but does not put it there, so a plain
+  shell fails at step 1 with `FileNotFoundError: [WinError 2]` — which reads like
+  a broken CP build rather than a missing tool. It lives under
+  `<BuildTools>\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`.
 
 Steps from the repo root:
 
@@ -47,13 +51,42 @@ Steps from the repo root:
    registered CLSID points at. The tree is **not** wiped first — it holds the DLL
    LogonUI may be loading right now. Skipped only with `SKIP_CP=1`; any other
    failure aborts the build.
-2. PyInstaller against `windows_face_unlock.spec` → two exes (`face_service.exe`,
-   `face_unlock_tray.exe`) sharing one runtime folder in `dist\WindowsFaceUnlock\`.
+2. PyInstaller against `windows_face_unlock.spec` → three exes
+   (`face_service.exe`, `face_unlock_tray.exe`, `face_unlock_watchdog.exe`)
+   sharing one runtime folder in `dist\WindowsFaceUnlock\`.
 3. Stage into that folder: the CP DLL + `register.ps1` under
    `credential_provider\`, the task registrar + `tasks.psd1` under `postinstall\`,
    and the top-level docs.
 4. `ISCC.exe installer\installer.iss` → installer in `installer_output\`.
 5. SHA-256 checksum next to the installer.
+
+### The gate between step 3 and step 4
+
+Do not compile the installer around a bundle nobody has run. Two Stage-7 blocks
+shipped a `dist\` that every check of the day called green and that could not
+start: `face_unlock_tray.exe` died instantly on a relative import in its entry
+script, and `face_service.exe` died ninety seconds in, inside numpy, on a Python
+module that only numpy's C extension imports. Neither is visible in
+`warn-*.txt`, and neither is visible by reading the PYZ — which is exactly how
+both survived a validation pass that consisted of reading the PYZ.
+
+So the gate has two halves, and step 4 waits for both:
+
+```powershell
+.\.venv\Scripts\python tools\verify_frozen_entrypoints.py
+```
+
+is the static half. It walks the entry-point sources for relative imports,
+disassembles the entry bytecode **out of the built EXEs** to ask the artefact the
+same question, checks the PYZ holds every absolute target, and verifies numpy's
+extension has both its native dependencies and every Python module it imports by
+name from C. Exit code 0 means clear to compile.
+
+The other half is a human running the executables out of `dist\` — at minimum
+`face_unlock_tray.exe --set-password` (a dialog must appear) and
+`face_service.exe` (silence; it exits as a mutex-loser if a service is already
+running). A static check proves what was collected. It never proves the result
+runs.
 
 ### Environment knobs
 

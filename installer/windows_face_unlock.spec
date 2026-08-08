@@ -36,6 +36,31 @@ HIDDEN += collect_submodules(
 )
 HIDDEN += collect_submodules("onnxruntime")
 
+# numpy's C extension imports Python modules BY NAME, and modulegraph cannot read
+# inside a .pyd, so those imports are invisible to analysis -- they do not even
+# reach warn-*.txt. PyInstaller's own hook-numpy.py names the class exactly
+# ("Submodules PyInstaller cannot detect (probably because they are only imported
+# by extension modules, which PyInstaller cannot read)") and then lists two:
+# numpy._core._dtype_ctypes and numpy._core._multiarray_tests.
+#
+# That list is short by one for numpy 2.4.4. _multiarray_umath imports
+# numpy._core._exceptions during initialisation, no .py file in numpy imports it
+# (every hit for the name in the package is a test function), and PyInstaller
+# 6.11.1's hook predates this numpy. The module was therefore absent from all
+# three PYZ archives while the .pyd sat on disk intact, byte-identical to the
+# venv copy, with every PE dependency resolvable -- so numpy's own guard fired
+# "Importing the numpy C-extensions failed" about ninety seconds into the first
+# frozen service run, which is when recognition first touches numpy.
+#
+# Collecting the whole of numpy._core rather than naming _exceptions closes the
+# class instead of the instance: everything the C layer reaches for by name lives
+# there, and the next numpy release that adds one will not need a fourth block to
+# discover it. Tests are filtered out; they are the only bulky part.
+HIDDEN += collect_submodules(
+    "numpy._core",
+    filter=lambda name: ".tests" not in name,
+)
+
 # insightface.utils.face_align does `from skimage import transform as trans` at
 # import time, and scikit-image >= 0.20 routes its subpackages through
 # lazy_loader, which defeats PyInstaller's static analysis.
