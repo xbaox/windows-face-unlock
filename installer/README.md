@@ -95,6 +95,30 @@ runs.
 | `SKIP_CP=1`       | Build without the Credential Provider DLL. The installer still offers the task box, but its `FileExists` check will be false so it stays unavailable. |
 | `INNO_SETUP_ISCC` | Full path to `ISCC.exe` if it is not at the default `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`. |
 
+## Serialization rule (hard)
+
+Setup and the uninstaller never run at the same time. This is not a preference:
+whichever starts second breaks, and it takes the first one's work with it. On
+2026-08-08 `unins000.exe /REMOVEDATA` was started while a silent install was
+still running — a message box the silent run could not display was auto-answered
+*Abort*, the install rolled back, and four completed acceptance steps went with
+it.
+
+The only signal that a run has finished is `Log closed` in its Inno log. Not the
+window going away, not the process leaving the task list. The uninstaller needs a
+second signal on top of that, because `unins000.exe` copies itself into `%TEMP%`
+and runs from the copy: the process you can watch exit is the copy, and its exit
+code is not observable from where you started it. For the uninstaller, the
+install directory under `Program Files` disappearing is what says the removal
+actually completed.
+
+A silent run can print nothing for up to fifteen minutes — the bundled models
+alone are ~325 MiB, compressed `lzma2/ultra64`. That is normal, and it is not
+evidence of a hang. Do not interrupt it; `Ctrl+C` leaves a half-written install
+directory and a registration state with no name. When a wait is unavoidable, wait
+in a loop that echoes progress, so that "still working" and "wedged" stay
+distinguishable from each other.
+
 ## CI build
 
 `.github/workflows/release.yml` reproduces the local pipeline on `windows-2022`
