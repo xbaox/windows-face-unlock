@@ -124,9 +124,22 @@ Filename: "{sys}\regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\Face
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Register"; \
   StatusMsg: "Registering scheduled tasks..."; Flags: runhidden
 
-; 3. Post-install: offer to bring the tray window up (it is already running).
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; \
-  Flags: nowait postinstall skipifsilent
+; 3. There is deliberately NO "Launch ..." checkbox on the Finish page, and this
+;    comment is what is left of the one that used to be here
+;    (Flags: nowait postinstall skipifsilent).
+;
+;    Step 2 does not merely register the tasks, it STARTS them: register_tasks.ps1
+;    ends in a Start-ScheduledTask pass over every planned task, and one of them --
+;    FaceUnlock-Presence -- IS {#MyAppExeName}. The tray is therefore already
+;    running by the time the Finish page is drawn, and ticking the box started a
+;    SECOND one on top of it. That is not theory: it happened on the 7g acceptance
+;    install.
+;
+;    Nothing in presence_monitor holds a single-instance mutex, so the duplicate
+;    does not exit the way a second face_service.exe would -- it runs, and the two
+;    trays compete for the camera. The mutex is Stage 8 work (KNOWN_ISSUES #4);
+;    until it exists, the tray is started by its scheduled task and by nothing
+;    else. Do not reinstate this entry.
 
 [UninstallRun]
 ; Stop and delete the scheduled tasks first so files aren't held open. This
