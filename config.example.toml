@@ -165,3 +165,14 @@ notify_service_state = false     # toast when the service becomes (un)reachable
 language = "en"                  # UI language code. Default: auto-detected from
                                  # the system locale on first run. Supported:
                                  # ar de en es fr hi ja ko pt ru vi zh
+
+# --- Diagnostics -------------------------------------------------------------
+
+debug_dump_frames = false        # write every frame the unlock burst and the presence
+                                 # probe are about to analyse into
+                                 # ~\.face-unlock\debug_frames (raw .npy + .png, newest
+                                 # 40 files kept). Answers "what did the service
+                                 # actually see" when a verify fails with no face and
+                                 # the log cannot tell a blind camera from an empty
+                                 # room. Turn it off again afterwards: those files are
+                                 # RAW IMAGES OF YOUR FACE sitting on disk.

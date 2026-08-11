@@ -9,7 +9,7 @@ carried the same two defects:
 installer or the updater that ever truncates or archives them. The audit trail has had a size cap
 since Stage 2 (``face_service/audit.py``, ``audit_max_mb``); the four logging-module files never
 did. They rotate here instead, at a fixed 5 MB x 2 backups -- deliberately NOT a config knob,
-because Config is frozen at 53 fields and a log cap is not something a user should have to tune.
+because Config is frozen at 54 fields and a log cap is not something a user should have to tune.
 
 **An unconditional StreamHandler.** All four run under ``pythonw.exe`` (and, once frozen, under a
 ``console=False`` bundle), where ``sys.stderr`` is None. ``StreamHandler`` binds ``sys.stderr`` at

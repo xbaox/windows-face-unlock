@@ -219,6 +219,17 @@ class Config:
     # False = observe-only presence: strikes are counted and visible in Status,
     # but LockWorkStation is never called. Face sign-in works either way.
     auto_lock: bool = True
+    # --- Stage 7h: frame dump (observability; diagnostics only, OFF by default) ---
+    # Write every frame the verify burst and the presence probe are ABOUT TO analyse into
+    # APP_DIR/debug_frames -- a .npy with the raw array plus a .png beside it to look at,
+    # ring-pruned so the directory stays bounded. It exists because a service can fail while
+    # SEEING NOTHING (KNOWN_ISSUES #5): "no face" in the log cannot tell a blind capture apart
+    # from an empty room, and every other signal on that path is derived from the same frame.
+    # The dump is a pure OBSERVER -- it is handed the frame before the engine runs, never reads
+    # a result, and can never change an authentication answer.
+    # Leave it off unless a diagnosis needs it: the files are RAW IMAGES OF A FACE, i.e.
+    # biometric data at rest (tools/uninstall.ps1 classifies the directory as such).
+    debug_dump_frames: bool = False
 
     @classmethod
     def _degraded(cls, reason: str, strict: bool) -> "Config":
@@ -465,6 +476,11 @@ class Config:
             raise ValueError("notify_service_state must be a boolean")
         if not isinstance(self.auto_lock, bool):
             raise ValueError("auto_lock must be a boolean")
+        # Stage 7h: the diagnostics gate is a real boolean for a sharper reason than the rest --
+        # a truthy string or a stray 1 would silently start writing FACE IMAGERY to disk on a
+        # machine whose owner never asked for it. Fail loud instead.
+        if not isinstance(self.debug_dump_frames, bool):
+            raise ValueError("debug_dump_frames must be a boolean")
         # If the hardened descriptor is requested, the current user's SID MUST resolve -- the DACL is
         # built from it (SELF=GA). Fail loud here rather than fall through to a pipe nobody can use.
         # Lazy pywin32 import so importing config on a stripped interpreter stays cheap when off.

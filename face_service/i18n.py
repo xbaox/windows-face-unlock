@@ -220,6 +220,9 @@ _EN: dict[str, str] = {
     "field.warmup_on_start": "Warmup models on service start",
     "field.warmup_on_start.desc": "On = the recognition and liveness models load at service start so the first unlock is fast. Off = faster startup, slower first unlock.",
 
+    "field.debug_dump_frames": "Save camera frames for diagnosis",
+    "field.debug_dump_frames.desc": "Diagnostics only. Writes every frame the unlock burst and the presence check are about to analyse into the debug_frames folder of your data directory (a raw .npy plus a .png to look at, newest 40 files kept). Turn it on when sign-in fails with 'no face' and you need to know whether the camera saw anything at all; turn it off afterwards, because those files are raw images of your face sitting on disk. It only observes: nothing about recognition changes while it is on.",
+
     "field.notify_enroll": "Enrollment result",
     "field.notify_enroll.desc": "Show a tray notification when building the face enrollment succeeds or fails.",
 
@@ -1135,6 +1138,8 @@ _RU: dict[str, str] = {
     "field.low_light_boost.desc": "Если в кадре слишком темно для надёжного распознавания, временно поднять экспозицию камеры и переснять, прежде чем отказывать с причиной «too-dark». Экспозиция затем восстанавливается.",
     "field.warmup_on_start": "Прогрев моделей при запуске",
     "field.warmup_on_start.desc": "Вкл — модели распознавания и живости загружаются при старте сервиса, и первая разблокировка быстрая. Выкл — быстрее старт, медленнее первая разблокировка.",
+    "field.debug_dump_frames": "Сохранять кадры камеры для диагностики",
+    "field.debug_dump_frames.desc": "Только для диагностики. Записывает каждый кадр, который серия разблокировки и проверка присутствия собираются анализировать, в папку debug_frames внутри каталога данных (сырой .npy и .png, который можно открыть; хранятся последние 40 файлов). Включайте, когда вход лицом отказывает с «нет лица» и нужно понять, увидела ли камера хоть что-нибудь; после диагностики выключайте — это сырые изображения вашего лица, лежащие на диске. Режим только наблюдает: на распознавание он не влияет.",
     "field.notify_enroll": "Результат регистрации лица",
     "field.notify_enroll.desc": "Показывать уведомление из трея об успехе или ошибке построения регистрации лица.",
     "field.notify_lockout": "Блокировка входа лицом",

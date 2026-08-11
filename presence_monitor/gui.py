@@ -77,6 +77,7 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, object]]]] = [
         ("camera_reopen_cooldown_s", "float",     (1.0, 600.0)),
         ("low_light_boost",         "bool",       None),
         ("warmup_on_start",         "bool",       None),
+        ("debug_dump_frames",       "bool",       None),
     ]),
     ("section.notifications", [
         ("notify_enroll",           "bool",       None),

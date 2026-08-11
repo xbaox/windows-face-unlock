@@ -161,7 +161,15 @@ $fuTemplateStems = @('embeddings.npz', 'adaptive.npz')
 # enroll_qc_probe.py:66,102). A raw frame is MORE disclosing than a template -- it is
 # the original, not a derived vector -- so a rule that only knew file names would be
 # protecting the lesser artifact while ignoring the greater.
-$fuBiometricDirs = @('enroll')
+#
+# debug_frames is the same kind of thing arriving by a different road (Stage 7h): with
+# config debug_dump_frames = true the service writes every frame it is about to analyse
+# there as a raw .npy plus a .png (face_service/service.py::_maybe_dump_frame). Those are
+# unprocessed camera frames of a face -- the diagnostic intent behind them changes nothing
+# about what they disclose -- and the knob can be left on long after the diagnosis ended,
+# which is precisely when an uninstaller must still see them. Classified by LOCATION for
+# the same reason as enroll\: the file names are timestamps and say nothing.
+$fuBiometricDirs = @('enroll', 'debug_frames')
 
 # Files at the TOP level of the data directory that some part of the project writes.
 # Anything else there is reported by name: an orphaned probe log was found in the

@@ -163,6 +163,13 @@ CASES = [
          content="adaptive_gallery = 1\n",
          expect_lenient="defaults", expect_strict="raise",
          needle="adaptive_gallery must be a boolean", warn=None),
+    # 7h. The diagnostics knob writes RAW FACE IMAGERY to disk when it is on, so a truthy
+    # non-bool must not be able to switch it on by accident -- same shape as the toggles above,
+    # stricter consequence if it were missed.
+    dict(name="debug_dump_frames not a boolean",
+         content="debug_dump_frames = 1\n",
+         expect_lenient="defaults", expect_strict="raise",
+         needle="debug_dump_frames must be a boolean", warn=None),
 ]
 
 

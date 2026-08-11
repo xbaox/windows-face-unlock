@@ -82,7 +82,7 @@ def win32api_get_last_error() -> int:
     return win32api.GetLastError()
 
 from .camera import Camera
-from .config import Config, LOG_PATH, LOCKOUT_PATH, AUDIT_PATH, PIPE_NAME
+from .config import Config, APP_DIR, LOG_PATH, LOCKOUT_PATH, AUDIT_PATH, PIPE_NAME
 from .credentials import load_password
 from .detector import FaceDetector
 from .audit import AuditLog
@@ -112,6 +112,12 @@ GESTURE_TOKEN_TTL_S = 15.0
 
 # Well-known SID for the lockscreen Credential Provider: LogonUI loads the CP DLL as SYSTEM.
 SYSTEM_SID_STRING = "S-1-5-18"
+
+# How many files the debug_frames ring keeps (7h). Files, not frames: each dump writes a .npy and
+# a .png, so this is ~20 frames. Deliberately NOT a config knob -- cfg.debug_dump_frames already
+# decides whether anything is written at all, and the only job left for the bound is to keep a
+# knob somebody forgot to switch off from filling the disk with face imagery.
+DEBUG_DUMP_RING_MAX = 40
 
 # CreateNamedPipe openMode flag (anti-squatting, Stage 4 Step 4): CreateNamedPipe fails if an
 # instance of the name already exists. pywin32 312 does not export it, so define the literal.
@@ -574,6 +580,61 @@ class FaceService:
                     "n/a" if luma_max is None else "%.2f" % luma_max)
         return True
 
+    def _maybe_dump_frame(self, frame, tag: str) -> None:
+        """Write ONE captured frame to disk when ``cfg.debug_dump_frames`` is on. Diagnostics only.
+
+        The gate is the first line, so a machine that never turns the knob on pays one attribute
+        read per frame and nothing else. Everything after it is wrapped, because this is an
+        OBSERVER: it is handed the frame the caller is ABOUT to analyse, it never sees a result,
+        and a debug file that cannot be written must not be able to change an authentication
+        answer. Any failure is logged at WARNING and swallowed for exactly that reason.
+
+        Why it exists (KNOWN_ISSUES #5): every other signal on the verify path is DERIVED from
+        this frame -- distance, det score, scene luma -- so when they all say "nothing", they
+        cannot say whether the camera handed over an empty room or nothing at all. The frame
+        itself is the only artefact that can.
+
+        Both forms are written. The ``.npy`` is the array exactly as the camera produced it and
+        goes first, because it is the one that cannot lie about dtype, range or channel order.
+        The ``.png`` beside it is for a human to open, and PNG encoding is the part that may
+        legitimately refuse (an odd dtype or shape), so the INFO line carrying the frame's
+        statistics is emitted either way: a frame whose PNG failed is still evidence, and the
+        stats alone already separate a black capture from a lit scene with nobody in it.
+
+        The directory is a ring pruned to ``DEBUG_DUMP_RING_MAX`` files after every write, so a
+        knob left on overnight costs a bounded amount of disk. Its contents are BIOMETRIC -- raw
+        imagery of a face -- and tools/uninstall.ps1 classifies the whole directory as such.
+        """
+        if not self.cfg.debug_dump_frames:
+            return
+        try:
+            import cv2
+            import numpy as np
+
+            d = APP_DIR / "debug_frames"
+            d.mkdir(parents=True, exist_ok=True)
+            now = time.time()
+            base = "%s-%03d_%s" % (time.strftime("%Y%m%d-%H%M%S", time.localtime(now)),
+                                   int((now % 1.0) * 1000), tag)
+            npy, png = d / (base + ".npy"), d / (base + ".png")
+            arr = np.asarray(frame)
+            np.save(str(npy), arr)
+            png_note = str(png)
+            try:
+                if not cv2.imwrite(str(png), frame):
+                    png_note = "%s (imwrite returned False)" % png
+            except Exception as e:
+                png_note = "%s (imwrite failed: %r)" % (png, e)
+            log.info("frame dump tag=%s shape=%s dtype=%s min=%s max=%s mean=%.2f npy=%s png=%s",
+                     tag, arr.shape, arr.dtype, arr.min(), arr.max(), float(arr.mean()),
+                     npy, png_note)
+            stale = sorted((p for p in d.iterdir() if p.is_file()),
+                           key=lambda p: p.stat().st_mtime)[:-DEBUG_DUMP_RING_MAX]
+            for old in stale:
+                old.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning("frame dump failed: %r", e)
+
     # ---------- core ops ----------
 
     def _capture_and_verify(self) -> VerifyOutcome:
@@ -654,7 +715,7 @@ class FaceService:
         # drain stale buffered frames
         for _ in range(2):
             cam.read()
-        for _ in range(self.cfg.verify_frames):
+        for i in range(self.cfg.verify_frames):
             frame = cam.read()
             if frame is None:
                 continue
@@ -664,6 +725,10 @@ class FaceService:
             # the face was briefly lost can't trip the low-light gate on its own.
             sl = scene_luma(frame)
             scene_luma_max = sl if scene_luma_max is None else max(scene_luma_max, sl)
+            # Sideways and BEFORE the engine (7h): the dump sees the same bytes analyze_frame is
+            # about to see, and returns nothing this burst reads. Off by default; see
+            # _maybe_dump_frame.
+            self._maybe_dump_frame(frame, f"verify{i}")
             try:
                 a = self.recog.analyze_frame(frame)
             except Exception as e:
@@ -1027,6 +1092,10 @@ class FaceService:
                     frames_ok += 1
                     sl = scene_luma(frame)
                     luma_max = sl if luma_max is None else max(luma_max, sl)
+                    # Same observer as the verify burst, same position: before the engine, with
+                    # no return value anything here reads. This loop carries no frame index, so
+                    # the tag is the bare path name; the timestamp in the file name orders them.
+                    self._maybe_dump_frame(frame, "probe")
                     try:
                         ok, dist, real = self.recog.verify_frame(frame)
                     except Exception:

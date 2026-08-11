@@ -189,6 +189,12 @@ class _StubSvc:
 
     _burst_defect = S.FaceService._burst_defect
     _presence_probe_recognition = S.FaceService._presence_probe_recognition
+    # Taken off the class for the same reason as the two above: the probe body calls it per frame
+    # (7h), so a paraphrase here would let the real one drift. With debug_dump_frames at its
+    # default False it returns on its first line, which is exactly the claim being exercised --
+    # the observer is inert on a machine that never turned it on, and the three probe assertions
+    # below still see the untouched verdicts.
+    _maybe_dump_frame = S.FaceService._maybe_dump_frame
 
     def __init__(self, cfg: Config, frame):
         self.cfg = cfg
@@ -350,9 +356,10 @@ def main(argv=None) -> int:
         I.set_language(saved_lang)
     en, ru = I.TRANSLATIONS["en"], I.TRANSLATIONS["ru"]
     # 208 -> 224 in 7d-E (16 pwd.* keys for the password dialog) -> 226 in 7d-G (two update.*
-    # keys: a mandatory-checksum refusal and the source-checkout notice).
-    t.ok(len(en) == 226, f"_EN has 226 keys (got {len(en)})")
-    t.ok(len(ru) == 226, f"_RU has 226 keys (got {len(ru)})")
+    # keys: a mandatory-checksum refusal and the source-checkout notice) -> 228 in 7h (label
+    # and .desc for the debug_dump_frames diagnostics knob).
+    t.ok(len(en) == 228, f"_EN has 228 keys (got {len(en)})")
+    t.ok(len(ru) == 228, f"_RU has 228 keys (got {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
     # Key parity alone never caught a translation that drops or renames a {placeholder}: t()
     # swallows a failed .format() and returns the raw string, so the damage shows up as an
