@@ -75,6 +75,13 @@ HIDDEN += collect_submodules("skimage.transform")
 # the detector is healthy. KNOWN_ISSUES #5, 7j; evidence C:\dev\d-series\7j-diag.
 HIDDEN += ["scipy._cyutility"]
 
+# Mine 2. scipy vendors array_api_compat under scipy._external and imports its submodules by
+# COMPUTED name at first use -- numpy/__init__.py runs __import__(__package__ + ".fft")
+# -- modulegraph never sees them, so the frozen build died on the first FaceAnalysis.get()
+# with: No module named 'scipy._external.array_api_compat.numpy.fft'. Collect the whole tree;
+# it is pure .py, no binaries. KNOWN_ISSUES #5 mine 2, 7j; evidence C:\dev\d-series\7j-fix.
+HIDDEN += collect_submodules("scipy._external")
+
 HIDDEN += [
     "onnxruntime.capi._pybind_state",
     "nvidia",                    # see the CUDA block below
