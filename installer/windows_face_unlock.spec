@@ -66,6 +66,15 @@ HIDDEN += collect_submodules(
 # lazy_loader, which defeats PyInstaller's static analysis.
 HIDDEN += collect_submodules("skimage.transform")
 
+# Same class as the numpy block above: 51 of the 91 bundled scipy extension
+# modules import scipy._cyutility BY NAME from inside the .pyd (Cython emits the
+# call), no .py in scipy names it, and modulegraph cannot read extension
+# internals -- so it is dropped silently and warn-*.txt shows nothing. Without it
+# scipy's import guard raises "seems to be broken" at the first touch of
+# skimage.transform inside FaceAnalysis.get(), so every probe answers none while
+# the detector is healthy. KNOWN_ISSUES #5, 7j; evidence C:\dev\d-series\7j-diag.
+HIDDEN += ["scipy._cyutility"]
+
 HIDDEN += [
     "onnxruntime.capi._pybind_state",
     "nvidia",                    # see the CUDA block below
