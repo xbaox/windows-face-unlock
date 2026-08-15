@@ -1763,7 +1763,7 @@ class FaceService:
 def _setup_logging() -> None:
     """service.log, rotated, plus stderr only when there is one (see face_service.logging_setup)."""
     from .logging_setup import setup_logging
-    setup_logging(LOG_PATH)
+    setup_logging(LOG_PATH, logging.DEBUG)
 
 
 def main() -> None:
