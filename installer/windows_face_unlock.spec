@@ -143,6 +143,23 @@ DATAS += collect_data_files("onnxruntime")
 DATAS += collect_data_files("skimage")
 DATAS += collect_data_files("cv2")
 
+# Mine 3. insightface.data.get_object carries an EXPLICIT frozen branch
+# (data/pickle_object.py:8-13): under sys.frozen it resolves objects/ against
+# sys._MEIPASS -- the BUNDLE ROOT -- while collect_data_files above reproduces the package
+# layout, insightface/data/objects/. The two never meet. get_object then returns None
+# (it print()s the miss, and a windowed build has no stdout to print it to), so
+# Landmark.mean_lmk is None for 1k3d68, which is the one model with require_pose set, and
+# utils/transform.py estimate_affine_matrix_3d23d does X.shape[0] on it. Result: EVERY
+# app.get() with a face in frame dies on "'NoneType' object has no attribute 'shape'"
+# inside FaceAnalysis.get's per-face loop -- and 1k3d68 sorts FIRST, so recognition never
+# runs at all and every frame reports d=1.000 on both service paths.
+# landmark_3d_68 is load-bearing (recognizer.ALLOWED_MODULES feeds it the gesture pose), so
+# the root copy is mandatory, not defensive. KNOWN_ISSUES #5 mine 3, 7k.
+import insightface as _insightface
+
+_IF_OBJECTS = Path(_insightface.__file__).resolve().parent / "data" / "objects"
+DATAS += [(str(p), "objects") for p in sorted(_IF_OBJECTS.iterdir()) if p.is_file()]
+
 BINARIES = []
 BINARIES += collect_dynamic_libs("onnxruntime")   # onnxruntime.dll + CUDA/TensorRT providers
 BINARIES += collect_dynamic_libs("cv2")
