@@ -443,7 +443,7 @@ class Recognizer:
         try:
             faces = app.get(bgr)
         except Exception as e:
-            log.debug("insightface get failed: %s", e)
+            log.debug("insightface get failed: %s", e, exc_info=True)
             return FrameAnalysis(False, False, 1.0, None, None, None)
         if not faces:
             return FrameAnalysis(False, False, 1.0, None, None, None)
