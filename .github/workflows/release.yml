@@ -72,6 +72,17 @@ jobs:
           choco install innosetup -y --no-progress
           echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Append
 
+      # Both stamps use ${1}/${2}, never a bare $1/$2. In a .NET replacement
+      # string, $ followed by digits is read as the LONGEST run of digits: with
+      # $ver = "0.1.0", "`$1$ver`$2" becomes "$10.1.0$2", and .NET reads the
+      # leading token as capture group $10 -- which this pattern does not have.
+      # The intended group 1 therefore never lands and the line is rewritten to
+      # garbage. That is exactly what broke the v0.1.0 release: installer.iss
+      # lost its `#define MyAppVersion` and Inno Setup failed four minutes later,
+      # in a completely different place, with "Undeclared identifier:
+      # MyAppVersion" on line 21 -- the first line that USES the define. The
+      # braces make the group number explicit, so the digits of the version can
+      # never be absorbed into it.
       - name: Sync installer + app version with tag
         shell: powershell
         run: |
@@ -79,8 +90,28 @@ jobs:
           if ($tag -notmatch '^v\d+\.\d+\.\d+') { $tag = "v0.0.0-${{ github.run_number }}" }
           $ver = $tag.TrimStart('v')
           Write-Host "Stamping app + installer with version $ver"
-          (Get-Content face_service\_version.py) -replace '(__version__\s*=\s*")[^"]+(")', "`$1$ver`$2" | Set-Content face_service\_version.py
-          (Get-Content installer\installer.iss) -replace '(#define MyAppVersion ")[^"]+(")', "`$1$ver`$2" | Set-Content installer\installer.iss
+          (Get-Content face_service\_version.py) -replace '(__version__\s*=\s*")[^"]+(")', "`${1}$ver`${2}" | Set-Content face_service\_version.py
+          (Get-Content installer\installer.iss) -replace '(#define MyAppVersion ")[^"]+(")', "`${1}$ver`${2}" | Set-Content installer\installer.iss
+
+          # Read both stamps back before anything consumes them. A mangled stamp
+          # used to stay invisible until an unrelated tool tripped over it much
+          # later in the run; this fails on the line that is actually wrong.
+          $esc = [regex]::Escape($ver)
+          $checks = @(
+            @{ File = 'face_service\_version.py'; Pattern = "^__version__\s*=\s*""$esc""\s*$" }
+            @{ File = 'installer\installer.iss';  Pattern = "^#define MyAppVersion ""$esc""\s*$" }
+          )
+          foreach ($c in $checks) {
+            $hit = Select-String -Path $c.File -Pattern $c.Pattern | Select-Object -First 1
+            if (-not $hit) {
+              Write-Host "::error file=$($c.File)::version stamp did not land -- no line matches $($c.Pattern)"
+              Write-Host "--- version-bearing lines in $($c.File) ---"
+              Select-String -Path $c.File -Pattern 'version' -CaseSensitive:$false |
+                ForEach-Object { Write-Host ("  {0}: {1}" -f $_.LineNumber, $_.Line) }
+              exit 1
+            }
+            Write-Host ("stamped {0}: {1}" -f $c.File, $hit.Line.Trim())
+          }
 
       # The Credential Provider DLL is built by installer/build.py (step 2), into
       # build-cp/. There is deliberately no separate CMake step here and no
