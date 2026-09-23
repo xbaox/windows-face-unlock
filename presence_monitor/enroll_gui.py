@@ -6,6 +6,10 @@ tray; see ``main()`` at the bottom for why that matters.
 
 Flow
 ----
+0. Wait (off the Tk thread, up to SERVICE_WAIT_S) for the FaceService pipe
+   to answer a ping. Launched from the installer's Finish page, the wizard
+   comes up seconds after the service task was started, and the service
+   opens its pipe only after model warmup.
 1. ``pause_camera`` on the FaceService so we own the webcam, re-armed
    periodically for as long as the window lives.
 2. Open the camera in a background thread and publish BGR frames.
@@ -58,6 +62,13 @@ CAMERA_LEASE_S = 120        # ask the service to hand the camera over for this l
                             # re-arming. The old 300 was five minutes of blindness for that case.
 LEASE_RENEW_S = 45          # re-arm interval. Comfortably under CAMERA_LEASE_S so two renewals
                             # in a row can fail before the lease actually lapses.
+SERVICE_WAIT_S = 90.0       # how long the wizard waits for the service pipe before asking for the
+                            # lease. The installer's Finish page starts the wizard a few seconds
+                            # after register_tasks started FaceUnlock-Service, and the service only
+                            # opens its pipe once model + camera warmup are done -- a single 3 s
+                            # attempt used to lose that race and leave a dead preview.
+SERVICE_PING_S = 3.0        # budget per ping attempt inside that wait (pipe_call retries the
+                            # connect for this long, then logs one "pipe not available" line)
 CAMERA_READ_TIMEOUT_MS = 1000  # open/read timeout hint; only MSMF honors it, and NOT on
                                # this hardware -- kept as cross-HW insurance only
                                # (wizard-local; NOT one of the service camera_* knobs)
@@ -221,13 +232,68 @@ class EnrollWindow:
         self._coach = CoachState("enroll.status.waiting", False, "err")
         self._last_coach_key: str | None = None
         self._guide_pinned = False
-
-        self._lease_ok = self._acquire_camera_lease()
+        # False until the lease is actually taken, which now happens AFTER the window is up (see
+        # _wait_for_service). _on_close keys the resume_camera on this, so closing the window
+        # while it is still connecting sends nothing.
+        self._lease_ok = False
 
         self._build_ui()
         self._refresh_existing_stats()
 
+        # Wait for the service on a worker thread; the result comes back to the Tk thread through
+        # after(). The window is drawn and closable the whole time. Start stays disabled until
+        # then: arming capture with no preview would count nothing and explain nothing.
+        self._set_guide("enroll.status.connecting")
+        self.start_btn.configure(state="disabled")
+        self._wait_t0 = time.monotonic()
+        log.info("waiting for the Face Unlock service (up to %.0fs)", SERVICE_WAIT_S)
+        threading.Thread(
+            target=self._wait_for_service, name="enroll-service-wait", daemon=True
+        ).start()
+
+    def _wait_for_service(self) -> None:
+        """Worker thread: ping the service until it answers, SERVICE_WAIT_S passes, or we close.
+
+        Only ``pipe_call`` runs here -- no Tk object is touched off the window's thread. The
+        verdict is handed to ``_on_service_wait_done`` through ``after()``.
+        """
+        deadline = self._wait_t0 + SERVICE_WAIT_S
+        ready = False
+        while not self._stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            resp = pipe_call({"cmd": "ping"}, timeout_s=min(SERVICE_PING_S, remaining))
+            if resp and resp.get("ok"):
+                ready = True
+                break
+            # A connected-but-failed call returns at once; don't spin on it.
+            self._stop.wait(0.2)
+        if self._stop.is_set():
+            return   # window closed while connecting: no lease was taken, nothing to release
+        waited = time.monotonic() - self._wait_t0
+        try:
+            self.root.after(0, lambda: self._on_service_wait_done(ready, waited))
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _on_service_wait_done(self, ready: bool, waited: float) -> None:
+        """Tk thread: take the lease and start the preview -- or fall back as before."""
+        if self._stop.is_set():
+            return
+        if ready:
+            log.info("Face Unlock service answered after %.1fs", waited)
+        else:
+            # Timed out: fall through to the old single attempt, which fails the same way it
+            # always did (warning box + service_busy line) if the service really is not there.
+            log.warning("Face Unlock service did not answer within %.0fs", SERVICE_WAIT_S)
+        self._lease_ok = self._acquire_camera_lease()
+        try:
+            self.start_btn.configure(state="normal")
+        except (tk.TclError, AttributeError):
+            pass
         if self._lease_ok:
+            log.info("camera lease acquired after %.1fs", time.monotonic() - self._wait_t0)
             self._set_guide("enroll.guide.idle")
             # Start the preview immediately so the user sees themselves.
             self._cam_thread = threading.Thread(

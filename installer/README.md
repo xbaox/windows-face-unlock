@@ -116,6 +116,11 @@ routes to the dialog or the wizard, so neither starts a second tray (the reason
 there is no "Launch" checkbox — KNOWN_ISSUES #4). The tray itself is already
 running from its scheduled task.
 
+The scheduled tasks are started a few seconds before the Finish page appears,
+and the service opens its pipe only after its models have loaded. The wizard
+therefore shows "Connecting to the Face Unlock service…" and waits up to 90 s
+for the pipe before it asks for the camera, instead of failing the lease at once.
+
 Silent installs (`/SILENT`, `/VERYSILENT`, which is also how the updater runs)
 skip all three.
 
