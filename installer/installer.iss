@@ -158,6 +158,44 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile
 ;    trays compete for the camera. The mutex is Stage 8 work (KNOWN_ISSUES #4);
 ;    until it exists, the tray is started by its scheduled task and by nothing
 ;    else. Do not reinstate this entry.
+;
+; 4. Onboarding on the Finish page (Stage 7l): save the Windows password, then
+;    enroll the face. Without both, the face tile registered in step 1 has
+;    nothing to match and nothing to hand LogonUI.
+;
+;    These do NOT break the rule in step 3. They run {#MyAppExeName} with a
+;    FLAG, and presence_monitor\__main__.py is a flag router: --set-password and
+;    --enroll import the dialog or the wizard and return from main() when it
+;    closes. Neither reaches the no-flag branch that starts the tray and the
+;    presence monitor, so no second tray is ever started from here. The wizard
+;    borrows the camera from the service through the pause_camera lease, the same
+;    way the tray menu's "Enroll" item launches it.
+;
+;    Flags, each load-bearing:
+;      postinstall        - a checkbox on the Finish page, run after Finish.
+;      runasoriginaluser  - Setup is elevated, and the password is DPAPI-sealed
+;                           under the account that runs the dialog; the data
+;                           lives in that user's profile, not the admin's.
+;      skipifsilent       - the updater reinstalls with /SILENT; an update must
+;                           never pop a password dialog or a camera window.
+;    Deliberately NO nowait: Setup waits for each to exit before the next, so the
+;    password dialog and the wizard are never on screen at the same time.
+;
+;    The password entry is split in two with mutually exclusive Checks, because
+;    a [Run] entry has one Description and one default state. Without a saved
+;    credential it is offered checked; with one it is offered UNCHECKED as an
+;    update, so a reinstall does not push the user into re-typing a password
+;    that already works. CredentialsSaved only tests that the file exists; it
+;    never opens it.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; \
+  Description: "Save your Windows password for face sign-in"; \
+  Check: not CredentialsSaved; Flags: postinstall runasoriginaluser skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; \
+  Description: "Update your saved Windows password for face sign-in"; \
+  Check: CredentialsSaved; Flags: postinstall runasoriginaluser skipifsilent unchecked
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--enroll"; \
+  Description: "Set up face recognition now"; \
+  Flags: postinstall runasoriginaluser skipifsilent
 
 [UninstallRun]
 ; Stop and delete the scheduled tasks first so files aren't held open. This
@@ -314,6 +352,22 @@ begin
             + '" -Mode Installed -Action Unregister';
     exit;
   end;
+end;
+
+{ Check for the two password entries in [Run] step 4. Same directory as the
+  Dirs section and the uninstall code below: USERPROFILE plus .face-unlock,
+  which is what face_service/config.py resolves as Path.home(). Existence only;
+  the DPAPI blob itself is never opened here.
+
+  USERPROFILE is Setup's own, i.e. the elevated token's. When the user elevated
+  their own account -- the normal UAC prompt -- that is the same profile the
+  runasoriginaluser dialog writes to. When a DIFFERENT administrator's
+  credentials were typed into UAC, it is that administrator's profile, and the
+  only effect is that the entry may show the wrong default state; the user can
+  still tick or untick it. }
+function CredentialsSaved(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{%USERPROFILE}\.face-unlock\credentials.bin'));
 end;
 
 function InitializeUninstall(): Boolean;

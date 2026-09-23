@@ -18,6 +18,7 @@ The installer:
 - Registers `FaceCredentialProvider.dll` with `regsvr32` so the face tile
   appears on the Windows lock screen. This is the `cp` task, checked by default;
   the provider is additive, so the PIN and password tiles stay as they were.
+- Offers the first-run onboarding on the Finish page (see below).
 - On uninstall: walks the same task declaration to stop and remove the tasks,
   unregisters the DLL, removes all files, and asks whether to also wipe
   `%USERPROFILE%\.face-unlock`.
@@ -96,6 +97,28 @@ runs.
 | `SKIP_CP=1`       | Build without the Credential Provider DLL. The installer still shows the (checked) task box, but the `FileExists` check on its `[Run]` entry is false, so `regsvr32` never runs. |
 | `INNO_SETUP_ISCC` | Full path to `ISCC.exe` if it is not at the default `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`. |
 
+## Onboarding on the Finish page
+
+Two things have to exist before the face tile can sign anyone in: the Windows
+password (sealed with DPAPI into `%USERPROFILE%\.face-unlock\credentials.bin`)
+and the enrolled face (`embeddings.npz`). The Finish page offers both, and runs
+the ticked ones one after the other, as the user who started Setup (not the
+elevated token):
+
+| Checkbox | Runs | Default |
+|---|---|---|
+| Save your Windows password for face sign-in | `face_unlock_tray.exe --set-password` | checked, when no `credentials.bin` exists |
+| Update your saved Windows password for face sign-in | same | unchecked, shown instead of the above when `credentials.bin` exists |
+| Set up face recognition now | `face_unlock_tray.exe --enroll` | checked |
+
+Both run the tray executable with a flag, which `presence_monitor\__main__.py`
+routes to the dialog or the wizard, so neither starts a second tray (the reason
+there is no "Launch" checkbox — KNOWN_ISSUES #4). The tray itself is already
+running from its scheduled task.
+
+Silent installs (`/SILENT`, `/VERYSILENT`, which is also how the updater runs)
+skip all three.
+
 ## Scripted install
 
 ```powershell
@@ -109,6 +132,10 @@ previous install's choice on an upgrade: a machine whose last install recorded
 out unchecked) keeps it deselected, silently. `/MERGETASKS` adds the task to that
 remembered selection instead of replacing it. The previous choice is recorded as
 `Inno Setup: Deselected Tasks` under the `{2F7A9B14-...}_is1` Uninstall key.
+
+A silent run skips the Finish-page onboarding, so a scripted install still needs
+the password and the enrollment done afterwards, from the tray menu or with
+`face_unlock_tray.exe --set-password` and `face_unlock_tray.exe --enroll`.
 
 ## Serialization rule (hard)
 
