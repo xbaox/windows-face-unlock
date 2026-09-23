@@ -15,8 +15,9 @@ The installer:
 - Copies everything into `C:\Program Files\WindowsFaceUnlock\`.
 - Registers the scheduled tasks declared in `tools\tasks.psd1` (staged into
   `{app}\postinstall`) and starts them.
-- Optionally registers `FaceCredentialProvider.dll` with `regsvr32` so the face
-  tile appears on the Windows lock screen.
+- Registers `FaceCredentialProvider.dll` with `regsvr32` so the face tile
+  appears on the Windows lock screen. This is the `cp` task, checked by default;
+  the provider is additive, so the PIN and password tiles stay as they were.
 - On uninstall: walks the same task declaration to stop and remove the tasks,
   unregisters the DLL, removes all files, and asks whether to also wipe
   `%USERPROFILE%\.face-unlock`.
@@ -92,8 +93,22 @@ runs.
 
 | Variable          | Effect |
 |-------------------|--------|
-| `SKIP_CP=1`       | Build without the Credential Provider DLL. The installer still offers the task box, but its `FileExists` check will be false so it stays unavailable. |
+| `SKIP_CP=1`       | Build without the Credential Provider DLL. The installer still shows the (checked) task box, but the `FileExists` check on its `[Run]` entry is false, so `regsvr32` never runs. |
 | `INNO_SETUP_ISCC` | Full path to `ISCC.exe` if it is not at the default `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`. |
+
+## Scripted install
+
+```powershell
+.\WindowsFaceUnlock-Setup-0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /MERGETASKS="cp" /LOG="$env:TEMP\wfu-setup.log"
+```
+
+`/MERGETASKS="cp"` is what guarantees the Credential Provider gets registered.
+The `cp` task is checked by default, but `UsePreviousTasks=yes` restores the
+previous install's choice on an upgrade: a machine whose last install recorded
+`cp` as deselected (every install made before Stage 7l, when the box started
+out unchecked) keeps it deselected, silently. `/MERGETASKS` adds the task to that
+remembered selection instead of replacing it. The previous choice is recorded as
+`Inno Setup: Deselected Tasks` under the `{2F7A9B14-...}_is1` Uninstall key.
 
 ## Serialization rule (hard)
 
@@ -208,8 +223,8 @@ Alternatives if SignPath isn't an option:
 - `requirements-build.txt` — build-time-only pins (PyInstaller). Kept out of the
   runtime `requirements.txt` on purpose.
 - `installer.iss` — Inno Setup script. Admin install, `lzma2/ultra64`,
-  `CloseApplications=yes` so the updater can replace files in place, one optional
-  task (register the CP), uninstall asks about user data. It contains no
+  `CloseApplications=yes` so the updater can replace files in place, one task
+  (register the CP, checked by default), uninstall asks about user data. It contains no
   scheduled-task names: install and uninstall both call the registrar.
 - `build.py` — glue script that runs all of the above.
 

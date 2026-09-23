@@ -55,8 +55,26 @@ Name: "english";  MessagesFile: "compiler:Default.isl"
 ; ran. The Credential Provider got registered only when reinstalling over an
 ; install that already had the DLL on disk, which is the opposite of the intent.
 ; The file test moved to the [Run] entry, where it is evaluated at the right time.
+;
+; CHECKED by default (Stage 7l). Signing in with your face from the lock screen IS
+; the definition of done for this product, and an installer that leaves it off
+; unless the user finds and ticks a box ships the tray without the feature. It
+; used to carry Flags: unchecked, which is how a silent install ended with no
+; Credential Provider registered at all.
+;
+; The provider is ADDITIVE. regsvr32 adds one more tile to LogonUI; it filters
+; nothing and replaces nothing, so the PIN / password tiles stay exactly where
+; they were and remain the way in whenever the face tile cannot unlock.
+;
+; UsePreviousTasks=yes (see [Setup]) carries the previous choice into an upgrade:
+; a machine whose last install recorded cp as DESELECTED keeps it deselected, and
+; this default then applies only to a first install. That is Inno's intended
+; behaviour and it is kept -- a user who opted out stays opted out. For a scripted
+; install that must end with the provider registered regardless of history, pass
+;     /MERGETASKS="cp"
+; which adds the task to whatever the previous selection was.
 Name: "cp"; Description: "Register the Credential Provider (enables log-in with your face)"; \
-  GroupDescription: "Optional components"; Flags: unchecked
+  GroupDescription: "Optional components"
 
 [Files]
 ; The whole PyInstaller output, which already includes postinstall\ (the task
