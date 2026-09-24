@@ -3,7 +3,8 @@
 # Copy this file to %USERPROFILE%\.face-unlock\config.toml and edit what you
 # need. Every key below is optional: anything you delete falls back to the
 # default shown here, and unknown keys are ignored. If the file is missing
-# entirely, the service runs on these exact values.
+# entirely, the service runs on these exact values -- except `language`, which
+# is auto-detected from the system locale when the file does not set it.
 #
 # The values here ARE the defaults in face_service/config.py -- that pairing is
 # enforced by tools/config_example_selftest.py, so this file cannot silently
@@ -15,7 +16,9 @@
 
 
 # --- Recognition -------------------------------------------------------------
-# Engine is InsightFace buffalo_l (ONNX ArcFace embeddings); detection is YuNet.
+# Engine is InsightFace buffalo_l (ONNX ArcFace embeddings); detection is its
+# SCRFD model (det_10g). YuNet is used only by presence_mode = "detection" and by
+# the enrollment wizard's live preview.
 # Neither is selectable from config -- there is no model/backend knob.
 
 distance_metric = "cosine"       # embedding distance function

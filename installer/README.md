@@ -33,7 +33,7 @@ Prerequisites:
   Provider DLL. Set `SKIP_CP=1` to deliberately build a
   presence-auto-lock-only installer without it.
 - `cmake` on `PATH`. Build Tools ships one but does not put it there, so a plain
-  shell fails at step 1 with `FileNotFoundError: [WinError 2]` — which reads like
+  shell fails at step 1 (the CP build) with `FileNotFoundError: [WinError 2]` — which reads like
   a broken CP build rather than a missing tool. It lives under
   `<BuildTools>\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`.
 
@@ -43,26 +43,42 @@ Steps from the repo root:
 .\setup.ps1
 .\.venv\Scripts\pip install -r installer\requirements-build.txt
 
-.\.venv\Scripts\python installer\build.py
+$env:SIGN_CP = '<40-hex thumbprint of your code-signing certificate>'
+.\.venv\Scripts\python installer\build.py --half 1     # steps 0-5: build, stage, GATE
+#   operator dist-smoke out of dist\WindowsFaceUnlock (see below)
+.\.venv\Scripts\python installer\build.py --half 2     # steps 6-7: Inno Setup + checksums
 ```
 
-`build.py` runs, in order:
+`build.py` runs, in order (Stage 8b: eight steps, 0-7, in two official halves):
 
-1. CMake → `build-cp\Release\FaceCredentialProvider.dll`. Built at the repo root
-   with `-S credential_provider -B build-cp`, because `build-cp\` is the tree the
-   registered CLSID points at. The tree is **not** wiped first — it holds the DLL
-   LogonUI may be loading right now. Skipped only with `SKIP_CP=1`; any other
-   failure aborts the build.
-2. PyInstaller against `windows_face_unlock.spec` → three exes
+0. Check the `buffalo_l` recognition pack: all five files present, SHA-256 pinned.
+1. CMake → `build-cp\Release\FaceCredentialProvider.dll` (`-S credential_provider
+   -B build-cp`). The tree is **not** wiped first. Skipped only with `SKIP_CP=1`;
+   any other failure aborts the build.
+2. Authenticode-sign the CP DLL with the certificate `SIGN_CP` names, then verify
+   that the signer thumbprint equals `SIGN_CP`. **`SIGN_CP` is required**: a build
+   without it aborts unless `--allow-unsigned-cp` is given (recorded in the gate
+   stamp). `SIGN_CP=self` is refused — create the certificate once with
+   `tools\sign_cp.ps1 -SelfSigned` and pass its thumbprint.
+3. PyInstaller against `windows_face_unlock.spec` → three exes
    (`face_service.exe`, `face_unlock_tray.exe`, `face_unlock_watchdog.exe`)
    sharing one runtime folder in `dist\WindowsFaceUnlock\`.
-3. Stage into that folder: the CP DLL + `register.ps1` under
+4. Stage into that folder: the CP DLL + `register.ps1` under
    `credential_provider\`, the task registrar + `tasks.psd1` under `postinstall\`,
    and the top-level docs.
-4. `ISCC.exe installer\installer.iss` → installer in `installer_output\`.
-5. SHA-256 checksum next to the installer.
+5. **The gate**: `tools\verify_frozen_entrypoints.py --dist dist\WindowsFaceUnlock`,
+   `tools\packaging_selftest.py`, model hashes and the staged DLL's signature. On
+   success it writes `dist\WindowsFaceUnlock.gate.json` — a stamp with the hash of
+   every bundle file.
+6. `ISCC.exe installer\installer.iss` → installer in `installer_output\`. Refused
+   unless the stamp matches the bundle byte for byte.
+7. SHA-256 checksum next to the installer.
 
-### The gate between step 3 and step 4
+`--half 1` = steps 0-5, `--half 2` = steps 6-7, no `--half` = 0-7. `--gate-only`
+re-runs step 5 on the existing `dist\` and re-stamps it (after a change to a staged
+file); `--check-models` runs step 0 only.
+
+### The gate between step 5 and step 6
 
 Do not compile the installer around a bundle nobody has run. Two Stage-7 blocks
 shipped a `dist\` that every check of the day called green and that could not
@@ -72,17 +88,21 @@ module that only numpy's C extension imports. Neither is visible in
 `warn-*.txt`, and neither is visible by reading the PYZ — which is exactly how
 both survived a validation pass that consisted of reading the PYZ.
 
-So the gate has two halves, and step 4 waits for both:
+So the gate has two halves, and step 6 waits for both:
 
 ```powershell
-.\.venv\Scripts\python tools\verify_frozen_entrypoints.py
+.\.venv\Scripts\python tools\verify_frozen_entrypoints.py --dist dist\WindowsFaceUnlock
 ```
 
-is the static half. It walks the entry-point sources for relative imports,
-disassembles the entry bytecode **out of the built EXEs** to ask the artefact the
-same question, checks the PYZ holds every absolute target, and verifies numpy's
-extension has both its native dependencies and every Python module it imports by
-name from C. Exit code 0 means clear to compile.
+is the static half, and since Stage 8b build.py runs it itself (step 5) and
+refuses ISCC without its stamp. It walks the entry-point sources for relative
+imports, disassembles the entry bytecode **out of the built EXEs** to ask the
+artefact the same question, checks the PYZ holds every absolute target, verifies
+numpy's extension has both its native dependencies and every Python module it
+imports by name from C, checks the three KNOWN_ISSUES §5 mines by name
+(`scipy._cyutility`, `scipy._external`, `_internal\objects\meanshape_68.pkl`), and
+runs a class guard over every bundled extension module and every vendor
+`sys.frozen` / `_MEIPASS` / dynamic-import site. Exit code 0 means clear to compile.
 
 The other half is a human running the executables out of `dist\` — at minimum
 `face_unlock_tray.exe --set-password` (a dialog must appear) and

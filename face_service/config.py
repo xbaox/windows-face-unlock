@@ -236,8 +236,8 @@ class Config:
     # SYSTEM (S-1-5-18) -- the lockscreen Credential Provider -- may invoke unlock; any other caller
     # gets {"ok":false,"reason":"not-authorized"} before load_password. Default TRUE since the Stage 5
     # closeout: the lockscreen CP (SYSTEM) is the only legitimate unlock caller, so the gate ships on
-    # -- secure-by-default; dev harnesses connecting as SELF opt out via config. Only unlock is gated
-    # (other commands are scoped by the Batch-1 pipe DACL).
+    # -- secure-by-default; dev harnesses connecting as SELF opt out via config. unlock and
+    # unlock_gesture are gated (other commands are scoped by the Batch-1 pipe DACL).
     pipe_unlock_require_system: bool = True
     # UI language code (see face_service.i18n.LANGUAGES). Auto-detected
     # from the system locale on first run if the config file is missing.

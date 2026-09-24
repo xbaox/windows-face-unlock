@@ -1505,8 +1505,9 @@ class FaceService:
         if cmd == "unlock":
             # Stage 4 Step 5 SID-gate (default ON since Stage 5): when enabled, only a SYSTEM caller -- the
             # lockscreen Credential Provider -- may invoke unlock. Runs BEFORE lockout/verify/
-            # load_password so no password is ever returned to a non-SYSTEM caller. Only unlock is
-            # gated; every other command is scoped by the Batch-1 pipe DACL.
+            # load_password so no password is ever returned to a non-SYSTEM caller. unlock and
+            # unlock_gesture are gated (the only two that can release credentials); every other
+            # command is scoped by the Batch-1 pipe DACL.
             if self.cfg.pipe_unlock_require_system:
                 sid = _pipe_client_sid_string(handle)
                 if sid != SYSTEM_SID_STRING:

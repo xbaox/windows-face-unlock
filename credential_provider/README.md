@@ -22,9 +22,12 @@ cmake --build build-cp --config Release
 
 Output: `build-cp\Release\FaceCredentialProvider.dll`.
 
-That path is not arbitrary: it is the tree the registered CLSID points at, so
-LogonUI loads exactly what you just built. Build here and nowhere else, and do
-not delete `build-cp\` — it holds the live DLL, not disposable output.
+Since Stage 7 the installed layout loads the DLL from
+`C:\Program Files\WindowsFaceUnlock\credential_provider\`, and since Stage 8b
+`register.ps1` **refuses** (exit 4) to register a DLL whose file or any parent
+folder ordinary users can write to — `build-cp\Release` under a repo checkout is
+such a folder. LogonUI loads this DLL as SYSTEM, so for a dev registration copy the
+build into an admin-only folder and pass `-DllPath`.
 
 ## Register (Administrator PowerShell)
 
@@ -49,8 +52,10 @@ tile should appear.
 2. `SetSelected` returns `*pbAutoLogon = FALSE`, so the scan does NOT start
    automatically; the user presses the submit arrow, which triggers
    `GetSerialization`.
-3. `GetSerialization` opens `\\.\pipe\FaceUnlock`, sends
-   `{"cmd":"unlock"}`, and waits up to 12 s.
+3. `GetSerialization` starts a worker thread and returns at once; the worker opens
+   `\\.\pipe\FaceUnlock` (checking that the server runs as the user or SYSTEM,
+   identification-level only), sends `{"cmd":"unlock"}`, and is bounded by 12 s
+   (15 s for the gesture round), the connect wait included.
 4. `FaceService` performs the camera capture, the InsightFace recognition
    check and liveness, decrypts the DPAPI password blob, and returns
    `{"ok":true,"username":"...","password":"...","domain":"..."}`. When
@@ -76,8 +81,11 @@ tile should appear.
   interactive logon" scenario is implemented. The Microsoft
   [SampleCredentialProvider](https://github.com/microsoft/Windows-classic-samples/tree/main/Samples/CredentialProvider)
   is a good reference for polishing.
-- The `CLSID_FaceCredentialProvider` GUID in `guid.h` is shared with the
-  world. **Generate your own** (`uuidgen.exe`) before publishing or
-  distributing builds.
-- If `GetSerialization` returns `S_FALSE` the user can fall back to the
-  standard password tile.
+- The `CLSID_FaceCredentialProvider` GUID in `guid.h` is this fork's own
+  (`{8414D7B6-…}`, generated in Stage 0). A fork of this repository must generate
+  its own (`uuidgen.exe`) before publishing builds.
+- A failed scan never blocks LogonUI: the tile shows one of four fixed messages
+  (not recognised / temporarily locked / service unavailable / stored password
+  rejected) and the PIN and password tiles stay available. After Windows rejects
+  the stored password, the tile stops scanning for the rest of that lock-screen
+  session (Stage 8b, F-04) — re-save the password in Face Unlock.

@@ -35,8 +35,13 @@ What signing *does* buy:
 .\tools\sign_cp.ps1 -DryRun
 
 # 2. Create a dev certificate, sign, and trust it on THIS machine only.
-.\tools\sign_cp.ps1 -SelfSigned -TrustLocally
+.\tools\sign_cp.ps1 -SelfSigned -TrustLocally -IUnderstandTrustLocally
 ```
+
+Since Stage 8b the self-signed key is created **non-exportable**, and
+`-TrustLocally` refuses to run without `-IUnderstandTrustLocally` (a script cannot
+add a root certificate by accident). The removal steps are in the script's help
+(`Get-Help .\tools\sign_cp.ps1 -Full`, `.NOTES`) and are printed after trust is added.
 
 `-TrustLocally` is a separate switch on purpose. Signing a file and *trusting the
 signer machine-wide* are different decisions, and the second one installs your
@@ -76,22 +81,21 @@ Notes that matter in practice:
 
 ## Where this fits in the build
 
-`installer/build.py` has an **optional** sign hook, off by default. It runs only
-when `SIGN_CP` is set, so a normal build is unchanged and no one is silently
-signing with a certificate they did not choose:
+Stage 8b (F-13): signing is a **required** step of `installer/build.py` (step 2).
+The 7l rebuild shipped an unsigned DLL because the old hook silently did nothing
+without `SIGN_CP`; now a build without it aborts unless `--allow-unsigned-cp` is
+given, and that choice is recorded in the gate stamp. After signing, the signer's
+thumbprint must equal `SIGN_CP`, and the gate re-checks the staged copy.
 
 ```powershell
-# self-signed, for a local end-to-end test of the installed layout
-$env:SIGN_CP = "self"
-python installer\build.py
-
-# a real certificate already in the store
+# the certificate already in the store (a dev certificate made once with -SelfSigned,
+# or a real one)
 $env:SIGN_CP = "1A2B3C4D..."      # a 40-char thumbprint
-python installer\build.py
+python installer\build.py --half 1
 ```
 
-The hook runs after the DLL is built and before it is staged into `dist\`, so the
-signed file is the one the installer ships.
+`SIGN_CP=self` is refused: a certificate minted during the build has a thumbprint
+nobody could have pinned.
 
 ## What is still unsigned
 

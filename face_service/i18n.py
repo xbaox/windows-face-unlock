@@ -25,11 +25,16 @@ Keys are namespaced by surface: ``tray.*``, ``status.*``, ``settings.*``,
 #   actually translated; everything else resolves through t()'s fallback
 #   chain (current language -> English -> the raw key), so a missing key
 #   shows English text, never a crash and never an empty label.
-# * NEW keys are added to _EN and _RU only. Filling all twelve locales was
-#   considered and declined: it is ~1160 machine-translated strings for a UI
-#   whose two real audiences read English or Russian, and unreviewed
-#   translations of security wording are worse than an honest English
-#   fallback. Revisit only with a human translator per language.
+# * NEW keys MUST be added to _EN and _RU (Stage 8b, D-13); the other ten
+#   locales MAY carry them and otherwise fall back to English. Filling all
+#   twelve was considered and declined: the gap was 1438 (locale, key) pairs at
+#   the 8a count -- machine-translated strings for a UI whose two real audiences
+#   read English or Russian, and unreviewed translations of security wording are
+#   worse than an honest English fallback. Revisit only with a human translator.
+# * One sanctioned exception: enroll.status.connecting is in all twelve (7l,
+#   architect's call). And the reverse case: a translation whose ENGLISH meaning
+#   changed is dropped from the other locales rather than left wrong (8b dropped
+#   tray.quit.desc from vi/zh/es/fr and update.available/update.launching from vi).
 # * t() falls back on FALSITY, not on absence: an empty-string translation
 #   also lands on English. Deliberate -- a blank label is a worse bug than a
 #   foreign one, and this keeps "translated to nothing" from shipping.

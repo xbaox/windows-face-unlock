@@ -143,7 +143,7 @@ There is no config file after install, and none is needed — the service runs o
 the defaults compiled into `face_service/config.py`.
 
 **[`config.example.toml`](config.example.toml) is the single reference for every
-setting**: it lists all 45 keys with their real defaults and a comment on each.
+setting**: it lists all 54 keys with their real defaults and a comment on each.
 It is not a template you must copy and it is not allowed to drift — a self-test
 (`tools/config_example_selftest.py`) fails the moment a key or a value there
 stops matching the code.
@@ -262,8 +262,36 @@ tile does nothing until you press the submit arrow; and
 `pbAutoLogonWithDefault = TRUE` when a verification result is already waiting.
 An idle lock screen never wakes the camera on its own.
 
-Safety: `GetSerialization` has a hard 12-second timeout and returns `S_FALSE` on
-failure, so a bad verify cannot lock you out of the password tile.
+Safety: `GetSerialization` never blocks. The scan runs on a worker thread whose
+pipe calls are bounded — 12 s for the face check, 15 s for the gesture round,
+connect wait included — and on any failure the tile shows a fixed message while the
+PIN and password tiles stay available. If Windows rejects the stored password
+(for example after a password change), the tile stops scanning until the next
+lock-screen session; save the new password from the tray (Stage 8b).
+
+### What auto-lock does NOT do (accepted, Stage 8)
+
+- **A dark or covered camera counts as "present".** When the camera delivers no
+  frame, or only black frames, the presence probe reports a camera fault, not an
+  absence, so it never spends an absence strike on it. The price: in the dark, or
+  with the lens covered, walk-away auto-lock does not fire. This is deliberate
+  (fail-safe: a device fault must not lock you out of your session or burn the
+  face lockout). Keep the Windows screen-lock timeout (Settings → Accounts →
+  Sign-in options / Power) as the backstop. (8a F-17, KNOWN_ISSUES §6.)
+- **The adaptive gallery does not adapt in paranoid mode.** Adaptation happens
+  only on a passive (no-gesture) PASS, and in `paranoid` every unlock goes through
+  the gesture round, so `adaptive_gallery = true` is a silent no-op there. Re-enroll
+  (Replace) if your appearance changed. (8a F-47, decision after the project is done.)
+
+### Data directory permissions (Stage 8b)
+
+The service re-secures `%USERPROFILE%\.face-unlock` on every start: the folder
+gets a protected ACL for you, SYSTEM and Administrators only, every file below it
+inherits that, and `credentials.bin` / `pipe_entropy.bin` are locked to you and
+SYSTEM. One line in `service.log` reports it (`data dir custody healed: ...`).
+If it cannot (for example a junction inside the folder), face sign-in answers
+`insecure-data-dir` — shown as "service unavailable" on the tile — and PIN still
+works; the ERROR line in `service.log` names the problem.
 
 ### Environment variables
 
