@@ -10,7 +10,8 @@ Covers the busy-camera handling:
       "exception: Cannot open camera..."), LOCKOUT-NEUTRAL (record untouched), audited; and a
       second busy unlock re-detects busy instead of AssertionError-ing on a broken camera.
   [4] presence -- busy returns benign ("present", True) (no absence strikes), verify_frame untouched.
-  [5] lease != busy -- a leased unlock returns "no-match" and never even constructs a camera.
+  [5] lease -- a leased unlock answers "camera-busy" (Stage 8b, F-46 / act A-4; it used to answer
+      "no-match"), lockout untouched, and never even constructs a camera.
   [6] Config.validate -- camera_open_retries / camera_open_timeout_s bounds fail loud.
   [7] BoundedOpener (7b-2) -- one attempt is waited on for at most cap_s; blowing the ceiling
       returns at once and does NOT retry; the abandoned attempt closes its own capture when it
@@ -232,15 +233,15 @@ def main(argv=None) -> int:
             t.ok(s._presence_probe_detection() == ("present", True),
                  "detection presence on busy -> ('present', True)")
 
-            # --- 5) lease != busy -----------------------------------------------------------
-            print("\n[5] enrollment lease is NOT camera-busy")
+            # --- 5) lease -> camera-busy (8b F-46) --------------------------------------------
+            print("\n[5] enrollment lease answers camera-busy, without touching the device")
             FakeCamera.made = 0
             FakeCamera.next_open = False   # would be busy IF an open were attempted
             s = _svc(_cfg())
             s._camera_paused_until = 1e18  # our own enrollment holds the camera
             resp = s._handle({"cmd": "unlock"})
-            t.ok(resp.get("reason") == "no-match" and s._lockout.records == [],
-                 "leased unlock -> 'no-match' (existing path), lockout untouched -- NOT 'camera-busy'")
+            t.ok(resp.get("reason") == "camera-busy" and s._lockout.records == [],
+                 "leased unlock -> 'camera-busy' (8b F-46), lockout untouched")
             t.ok(FakeCamera.made == 0, "leased path never even constructs / opens a camera")
         finally:
             SVC.Camera = orig_camera
@@ -359,7 +360,7 @@ def main(argv=None) -> int:
     print("CAMERA-BUSY SELFTEST OK: the open loop is attempt-bounded AND each attempt is "
           "wait-capped (wedged -> no retry, late capture reclaimed, no second attempt in "
           "flight); busy -> clean 'camera-busy' (no exception, no half-open, lockout-neutral); "
-          "lease stays distinct.")
+          "a leased unlock answers camera-busy without opening the device.")
     return 0
 
 

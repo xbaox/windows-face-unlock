@@ -225,6 +225,7 @@ def main(argv=None) -> int:
             spy = _BoostSpy(bright_match, baud)
             svc = _svc(cfg, dark, spy)
             resp = svc._handle({"cmd": "unlock"})
+            svc._finish_grant(True)   # Stage 8b (F-19): grant bookkeeping runs on delivery
             t.ok(spy.calls == 1, "dark first burst + boost enabled -> _maybe_boost called")
             t.ok(resp.get("ok") is True and resp.get("username") == "admin",
                  "boost lifted + matched -> GRANT via the normal path")

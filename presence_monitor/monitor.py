@@ -224,34 +224,23 @@ def _input_idle_seconds() -> "float | None":
 
 
 def pipe_call(req: dict, timeout_s: float = 30.0) -> dict | None:
-    """Send a JSON request to the FaceService pipe and return the response."""
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        try:
-            handle = win32file.CreateFile(
-                PIPE_NAME,
-                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0, None, win32file.OPEN_EXISTING, 0, None,
-            )
-            break
-        except pywintypes.error:
-            time.sleep(0.2)
-    else:
-        log.warning("FaceService pipe not available")
-        return None
+    """Send a JSON request to the FaceService pipe and return the response, or None.
 
-    try:
-        win32file.WriteFile(handle, (json.dumps(req) + "\n").encode("utf-8"))
-        _hr, data = win32file.ReadFile(handle, 65536)
-        return json.loads(data.decode("utf-8").strip())
-    except Exception as e:
-        log.warning("pipe call failed: %s", e)
-        return None
-    finally:
-        try:
-            win32file.CloseHandle(handle)
-        except Exception:
-            pass
+    Stage 8b (F-20). Defect: this connected to whatever owned the pipe name without checking who
+    that was, and its ReadFile had no deadline (``timeout_s`` bounded only the connect). The tray,
+    the presence loop, the Status window and the enrollment wizard all come through here.
+    Consequence: a squatter on the name received their requests, and a server that accepted and
+    never answered hung the caller for good. Fix: face_service.pipe_io.exchange -- server SID
+    must be SELF or SYSTEM before anything is written, and ``timeout_s`` now bounds the WHOLE
+    exchange, read included."""
+    from face_service.pipe_io import exchange
+    resp, why = exchange(req, timeout_s)
+    if resp is None:
+        if why in ("no-pipe", "busy"):
+            log.warning("FaceService pipe not available (%s)", why)
+        else:
+            log.warning("pipe call failed: %s", why)
+    return resp
 
 
 # Backwards-compat alias

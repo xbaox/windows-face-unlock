@@ -35,8 +35,8 @@ Commands:
       -> {"ok":false,"reason":"gesture-token-invalid"}   # absent / wrong / expired / already used
       -> {"ok":false,"reason":"..."}   # "not-authorized" | "locked-out" (+retry_after_s)
                                        # | "camera-busy" | "no-credentials" | "insecure-data-dir"
-  {"cmd":"reset_lockout"}      # clear the face-auth lockout early (admin / tray / test)
-      -> {"ok":true,"lockout":{...}}
+  (reset_lockout was REMOVED in Stage 8b, F-21: an ungated, unaudited way for any same-user
+   process to clear the face lockout, with no caller anywhere in the repo.)
   {"cmd":"presence"}           # single-frame presence probe
       -> {"ok":true,"present":bool,"real":bool,"mode":"recognition|detection"}
   {"cmd":"challenge","kind":"blink|turn_left|turn_right|nod"}   # active-gesture probe
@@ -71,6 +71,7 @@ Commands:
 from __future__ import annotations
 import json
 import logging
+import math
 import os
 import secrets
 import threading
@@ -122,6 +123,23 @@ CAMERA_OPEN_PAUSE_S = 0.3
 # gesture that starts in time is never cut short by this.
 GESTURE_TOKEN_TTL_S = 15.0
 
+# Stage 8b (F-19, act A-2): server-side deadlines for releasing credentials, counted from the
+# moment the request was READ. PROTOCOL constants, like the TTL above -- not liveness or lockout
+# numbers. Defect: a slow burst (camera heal + retry, low-light boost) or a long gesture round could
+# finish after the Credential Provider had already given up (12 s phase 1, 15 s phase 2), and the
+# password was released -- and the grant audited, and the lockout reset -- into a pipe nobody was
+# reading any more. Fix: past these deadlines the service fails closed WITHOUT releasing anything;
+# each leaves ~1 s for the reply to reach the CP inside its own budget.
+UNLOCK_DEADLINE_S = 11.0
+UNLOCK_GESTURE_DEADLINE_S = 14.0
+
+# Stage 8b (F-16 / act A-5): bounds of a pause_camera lease. Not a Config field.
+PAUSE_CAMERA_MIN_S = 5.0
+PAUSE_CAMERA_MAX_S = 600.0
+
+# Stage 8b (F-42): how much of an untrusted "cmd" value may reach the log.
+LOG_CMD_MAX = 64
+
 # Well-known SID for the lockscreen Credential Provider: LogonUI loads the CP DLL as SYSTEM.
 SYSTEM_SID_STRING = "S-1-5-18"
 
@@ -151,7 +169,11 @@ FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
 #
 # UNCONDITIONAL BY DESIGN -- there is no config flag to disable the ratchet, because such a flag
 # would live in the same file the ratchet exists to distrust.
-POSTURE_KEYS = ("pipe_unlock_require_system", "pipe_hardened_sd")
+#
+# Stage 8b (F-20, act A-2): pipe_first_instance joins them. Defect: it was the one perimeter toggle
+# outside the ratchet, and it also gates the clients' server-SID check. Consequence: a same-user
+# reload could switch the anti-squatting flag off at runtime. Fix: the same one-way rule.
+POSTURE_KEYS = ("pipe_unlock_require_system", "pipe_hardened_sd", "pipe_first_instance")
 
 
 def _current_user_sid_string() -> str:
@@ -691,8 +713,12 @@ class FaceService:
         """
         if self._camera_leased_out():
             log.info("verify skipped: camera leased out to enrollment")
+            # Stage 8b (F-46, act A-4): camera_busy=True, so unlock answers "camera-busy" through
+            # its existing camera gate instead of "no-match" -- the device IS busy, with the
+            # wizard. Lockout-neutral either way; verify still reports verdict SKIPPED.
             return VerifyOutcome(False, 1.0, False,
-                                 {"verdict": "SKIPPED", "reason": "camera-leased"})
+                                 {"verdict": "SKIPPED", "reason": "camera-leased"},
+                                 camera_busy=True)
 
         r = self._locked_burst()
         if r.camera_busy:
@@ -740,6 +766,7 @@ class FaceService:
         screen_checked = 0
         scene_luma_max = None   # brightest scene luma seen this burst (Stage 3.2); None if no frame read
         frames_ok = 0           # frames that actually arrived (camera-health telemetry, 7b)
+        engine_errors = 0       # frames the engine could not judge (Stage 8b, F-18)
         blink = BlinkDetector()
 
         # drain stale buffered frames
@@ -753,8 +780,13 @@ class FaceService:
             # Scene brightness is face-INDEPENDENT: compute it for every captured frame
             # (incl. no-face ones) and keep the MAX, so a transient dip or a frame where
             # the face was briefly lost can't trip the low-light gate on its own.
-            sl = scene_luma(frame)
-            scene_luma_max = sl if scene_luma_max is None else max(scene_luma_max, sl)
+            # Stage 8b (F-44): inside a try -- a frame scene_luma cannot read (odd shape or
+            # dtype) used to raise out of the whole burst; now it only loses its luma sample.
+            try:
+                sl = scene_luma(frame)
+                scene_luma_max = sl if scene_luma_max is None else max(scene_luma_max, sl)
+            except Exception as e:
+                log.warning("scene luma failed on a verify frame: %r", e)
             # Sideways and BEFORE the engine (7h): the dump sees the same bytes analyze_frame is
             # about to see, and returns nothing this burst reads. Off by default; see
             # _maybe_dump_frame.
@@ -763,6 +795,7 @@ class FaceService:
                 a = self.recog.analyze_frame(frame)
             except Exception as e:
                 log.warning("verify error: %s", e)
+                engine_errors += 1
                 continue
             if not a.face:
                 continue
@@ -813,6 +846,8 @@ class FaceService:
             # Additive camera-health telemetry (7b): how many of cfg.verify_frames reads actually
             # returned a frame. 0 with a cached persistent camera is the KNOWN_ISSUES #1 signature.
             "frames_ok": frames_ok,
+            # Stage 8b (F-18), additive: frames the engine could not judge at all.
+            "engine_errors": engine_errors,
             "mode": self.cfg.liveness_mode,
             "latency_ms": round(latency_ms, 1),
         }
@@ -973,7 +1008,11 @@ class FaceService:
                         # does not exist as far as the gesture task is concerned. Skipping the
                         # feed (rather than merely not counting it) is the point -- it stops an
                         # impostor's motion from ever reaching the task.
-                        if not a.is_match:
+                        # Stage 8b (F-11, act A-3). Defect: this round never looked at the
+                        # anti-screen flag. Consequence: a frame the passive check had flagged as a
+                        # screen could still drive the identity-bound gesture. Fix: a screen-flagged
+                        # frame is treated exactly as a non-matching one. No threshold involved.
+                        if not a.is_match or a.screen is True:
                             continue
                         identity_frames += 1
                     ch.feed(a.landmark, a.pose)
@@ -1138,8 +1177,11 @@ class FaceService:
                     if frame is None:
                         continue
                     frames_ok += 1
-                    sl = scene_luma(frame)
-                    luma_max = sl if luma_max is None else max(luma_max, sl)
+                    try:                  # Stage 8b (F-44): see _analyze_burst
+                        sl = scene_luma(frame)
+                        luma_max = sl if luma_max is None else max(luma_max, sl)
+                    except Exception as e:
+                        log.warning("scene luma failed on a probe frame: %r", e)
                     # Same observer as the verify burst, same position: before the engine, with
                     # no return value anything here reads. This loop carries no frame index, so
                     # the tag is the bare path name; the timestamp in the file name orders them.
@@ -1221,8 +1263,11 @@ class FaceService:
                     if frame is None:
                         continue
                     frames_ok += 1
-                    sl = scene_luma(frame)
-                    luma_max = sl if luma_max is None else max(luma_max, sl)
+                    try:                  # Stage 8b (F-44): see _analyze_burst
+                        sl = scene_luma(frame)
+                        luma_max = sl if luma_max is None else max(luma_max, sl)
+                    except Exception as e:
+                        log.warning("scene luma failed on a probe frame: %r", e)
                     try:
                         if self.detector.has_face(frame):
                             result = (True, True)
@@ -1315,12 +1360,27 @@ class FaceService:
         # self.cfg is never once assigned a downgraded posture -- not even for the length of this
         # method -- and so the {"config": ...} reply below reports what actually took effect.
         self._apply_posture_ratchet(new_cfg)
+        old = self.cfg
         old_index = self.cfg.camera_index
         old_persistent = self.cfg.persistent_camera
+        # Stage 8b (F-15). Defect: self.cfg was swapped FIRST and the lockout / audit were
+        # reconfigured after it, so a failure there left a half-applied reload (new cfg, old
+        # lockout numbers) and escaped as a generic "exception" reply. Fix: reconfigure the two
+        # stateful helpers first, roll them back if either raises, and swap cfg only after both
+        # succeeded -- a reload is now all or nothing.
+        try:
+            self._lockout.reconfigure(new_cfg.max_face_attempts, new_cfg.lockout_seconds)
+            self._audit.reconfigure(new_cfg.audit_log, new_cfg.audit_max_mb)
+        except Exception as e:
+            log.exception("reload_config: applying the new settings failed; keeping the old ones")
+            try:
+                self._lockout.reconfigure(old.max_face_attempts, old.lockout_seconds)
+                self._audit.reconfigure(old.audit_log, old.audit_max_mb)
+            except Exception:
+                log.exception("reload_config: rollback failed")
+            return {"ok": False, "reason": f"reload-failed: {e}"}
         self.cfg = new_cfg
         self.recog.cfg = new_cfg
-        self._lockout.reconfigure(new_cfg.max_face_attempts, new_cfg.lockout_seconds)
-        self._audit.reconfigure(new_cfg.audit_log, new_cfg.audit_max_mb)
         # Reset camera if camera-affecting settings changed. The new cfg is already
         # applied above, so a failure here must not abort the reload and strand the
         # OLD camera open under the NEW settings -- log it and carry on.
@@ -1366,8 +1426,16 @@ class FaceService:
         if cmd == "pause_camera":
             # Release the webcam and ignore probe/verify for the requested
             # number of seconds so the enrollment wizard can own it.
-            seconds = float(req.get("seconds", 120))
-            self._camera_paused_until = time.monotonic() + max(5.0, seconds)
+            # Stage 8b (F-16, act A-5). Defect: any float was accepted, inf and 1e308 included.
+            # Consequence: a lease that never ends -- the service blind for good, and presence
+            # reporting "present" for as long. Fix: a finite number, clamped to [5, 600] s;
+            # anything else is a bad-request and changes nothing.
+            raw = req.get("seconds", 120)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                    or not math.isfinite(raw):
+                return {"ok": False, "reason": "bad-request"}
+            seconds = min(PAUSE_CAMERA_MAX_S, max(PAUSE_CAMERA_MIN_S, float(raw)))
+            self._camera_paused_until = time.monotonic() + seconds
             # The deadline above is already live, so probes have stood down and
             # the wizard is being told the device is its. The release must
             # therefore survive any failure: escaping here would leave the webcam
@@ -1468,6 +1536,15 @@ class FaceService:
             if getattr(self, "_data_dir_insecure", False):
                 self._audit.write("unlock", {**r.detail, "outcome": "insecure-data-dir"})
                 return {"ok": False, "reason": "insecure-data-dir"}
+            # Stage 8b (F-18, act A-4). Defect: a burst in which no frame arrived, or in which the
+            # engine could not judge a single frame (no enrollment, models not loaded), was scored
+            # as a failed face and recorded a lockout strike, answering "no-match". Consequence: a
+            # camera or engine fault could lock the face path out for 5 minutes and told the user
+            # their face was wrong. Fix: those bursts return an honest reason, lockout-neutral.
+            fault = self._burst_fault(r)
+            if fault is not None:
+                self._audit.write("unlock", {**r.detail, "outcome": fault})
+                return {"ok": False, "reason": fault}
             # Stage 3.3 gated exposure boost: if the burst came back below the floor, try to raise
             # EXPOSURE and re-capture BEFORE the too-dark fallback. Gated (only below the floor) so a
             # normally-lit face is never blown out; transient (exposure always restored inside
@@ -1507,8 +1584,11 @@ class FaceService:
             # is not an attempt either -- it is a question we just asked, and phase 2 records its
             # own outcome; counting it here would burn the whole strike budget on paranoid, where
             # EVERY recognized face escalates.
-            if not self._camera_leased_out() and not needs_gesture:
-                self._lockout.record(r.match)
+            # Stage 8b (F-19): a MATCH is no longer recorded here. The reset it causes is part of
+            # the grant, so it happens only once the reply has actually been delivered (see
+            # _commit_grant); a failed match is still a strike, recorded right here as before.
+            if not self._camera_leased_out() and not needs_gesture and not r.match:
+                self._lockout.record(False)
             if needs_gesture:
                 kind, prompt, token = self._issue_gesture_token()
                 # Audit records the gesture but NEVER the token.
@@ -1520,12 +1600,24 @@ class FaceService:
             if not r.match:
                 self._audit.write("unlock", {**r.detail, "outcome": "no-match"})
                 return {"ok": False, "reason": "no-match", "distance": r.distance, "real": r.real}
+            if self._past_deadline(UNLOCK_DEADLINE_S):
+                # F-19: too late for the CP to use it -- release nothing, reset nothing.
+                self._audit.write("unlock", {**r.detail, "outcome": "deadline-exceeded"})
+                return {"ok": False, "reason": "deadline-exceeded"}
             granted = self._release_credentials()
             if granted is None:
+                self._lockout.record(True)     # the face matched: same reset as before 8b
                 self._audit.write("unlock", {**r.detail, "outcome": "no-credentials"})
                 return {"ok": False, "reason": "no-credentials"}
-            self._audit.write("unlock", {**r.detail, "outcome": "granted"})
-            self._maybe_adapt_gallery(r)
+
+            def _commit(delivered: bool) -> None:
+                if not delivered:
+                    self._audit.write("unlock", {**r.detail, "outcome": "grant-undelivered"})
+                    return
+                self._lockout.record(True)
+                self._audit.write("unlock", {**r.detail, "outcome": "granted"})
+                self._maybe_adapt_gallery(r)
+            self._pending_grant = _commit
             return granted
 
         if cmd == "unlock_gesture":
@@ -1585,23 +1677,69 @@ class FaceService:
                 return {"ok": False, "reason": "gesture-failed",
                         "challenge": resp.get("challenge"), "state": resp.get("state"),
                         "identity_frames": frames}
-            self._lockout.record(True)
+            if self._past_deadline(UNLOCK_GESTURE_DEADLINE_S):
+                # F-19: the round ran past what phase 2 can still deliver -- release nothing.
+                self._audit_gesture(challenge=resp.get("challenge"), passed=True,
+                                    identity_frames=frames, distance_best=best,
+                                    reason="deadline-exceeded")
+                return {"ok": False, "reason": "deadline-exceeded"}
             granted = self._release_credentials()
             if granted is None:
+                self._lockout.record(True)     # the round passed: same reset as before 8b
                 self._audit_gesture(challenge=resp.get("challenge"), passed=True,
                                     identity_frames=frames, distance_best=best,
                                     reason="no-credentials")
                 return {"ok": False, "reason": "no-credentials"}
-            self._audit_gesture(challenge=resp.get("challenge"), passed=True,
-                                identity_frames=frames, distance_best=best, reason="granted")
+
+            def _commit(delivered: bool) -> None:
+                if delivered:
+                    self._lockout.record(True)
+                self._audit_gesture(challenge=resp.get("challenge"), passed=True,
+                                    identity_frames=frames, distance_best=best,
+                                    reason="granted" if delivered else "grant-undelivered")
+            self._pending_grant = _commit
             return granted
 
-        if cmd == "reset_lockout":
-            # Admin / tray / test: clear the face lockout early.
-            self._lockout.reset()
-            return {"ok": True, "lockout": self._lockout.status()}
-
         return {"ok": False, "reason": "unknown-command"}
+
+    def _past_deadline(self, budget_s: float) -> bool:
+        """F-19: True once more than ``budget_s`` has passed since this request was read.
+        _serve_one stamps the read; a caller that never set the stamp (the selftests drive
+        _handle directly) has no deadline to miss."""
+        t0 = getattr(self, "_req_started", None)
+        if t0 is None:
+            return False
+        late = time.monotonic() - t0 > budget_s
+        if late:
+            log.warning("request past its %.1fs deadline (%.1fs) -> failing closed, nothing "
+                        "released", budget_s, time.monotonic() - t0)
+        return late
+
+    def _finish_grant(self, delivered: bool) -> None:
+        """F-19: settle the grant armed by the request just answered -- lockout reset + audit
+        "granted" only when the reply was written; "grant-undelivered" otherwise, lockout
+        untouched. Idempotent: the slot is taken before the commit runs."""
+        commit, self._pending_grant = getattr(self, "_pending_grant", None), None
+        if commit is not None:
+            try:
+                commit(delivered)
+            except Exception:
+                log.exception("grant bookkeeping failed")
+
+    def _burst_fault(self, r: "VerifyOutcome") -> "str | None":
+        """F-18: the unlock burst's device/engine fault, or None when the burst judged a face.
+        "no-frames" -- the camera delivered nothing; "no-enrollment" / "engine-error" -- frames
+        arrived but the engine could not judge a single one (told apart by whether a gallery is
+        loaded). A burst with any judged frame is None: that is a face verdict, strikes apply."""
+        frames_ok = r.detail.get("frames_ok")
+        if frames_ok is None or r.detail.get("verdict") in (None, "SKIPPED"):
+            return None               # not a measured burst (no telemetry): nothing to judge
+        frames_ok = int(frames_ok)
+        if frames_ok == 0:
+            return "no-frames"
+        if int(r.detail.get("engine_errors", 0) or 0) >= frames_ok:
+            return "no-enrollment" if getattr(self.recog, "_refs", None) is None else "engine-error"
+        return None
 
     def _build_replace(self) -> dict:
         """``build_enrollment`` with ``replace``: build the gallery from the PENDING session only,
@@ -1733,14 +1871,44 @@ class FaceService:
                 raise
             if not data:
                 return
-            req = json.loads(data.decode("utf-8"))
-            log.info("request cmd=%s", req.get("cmd"))
+            self._req_started = time.monotonic()      # F-19: the deadlines count from here
+            self._pending_grant = None
+            # Stage 8b (F-42). Defect: a body that was not JSON, or JSON that was not an object,
+            # raised out of here -- no reply at all, a traceback in the log -- and "cmd" was
+            # logged at whatever length the client sent. Fix: answer bad-request, log a bounded
+            # repr of cmd.
             try:
-                resp = self._handle(req, handle)
-            except Exception as e:
-                log.exception("handler error")
-                resp = {"ok": False, "reason": f"exception: {e}"}
-            win32file.WriteFile(handle, (json.dumps(resp) + "\n").encode("utf-8"))
+                req = json.loads(data.decode("utf-8"))
+            except Exception:
+                req = None
+            if not isinstance(req, dict):
+                log.info("request rejected: not a JSON object (%d bytes)", len(data))
+                resp = {"ok": False, "reason": "bad-request"}
+            else:
+                log.info("request cmd=%s", repr(req.get("cmd"))[:LOG_CMD_MAX])
+                try:
+                    resp = self._handle(req, handle)
+                except Exception as e:
+                    log.exception("handler error")
+                    resp = {"ok": False, "reason": f"exception: {e}"}
+            delivered = False
+            try:
+                win32file.WriteFile(handle, (json.dumps(resp) + "\n").encode("utf-8"))
+                delivered = True
+            except pywintypes.error as e:
+                # Stage 8b (F-43). Defect: a client that gave up before the reply (winerror 232,
+                # the pipe is being closed) surfaced as an ERROR with a traceback -- the only ERROR
+                # in the live log. It is a benign timeout on the client's side: INFO, no traceback.
+                if e.winerror in (winerror.ERROR_NO_DATA, winerror.ERROR_BROKEN_PIPE,
+                                  winerror.ERROR_PIPE_NOT_CONNECTED):
+                    log.info("client left before the reply was written (winerror=%d)", e.winerror)
+                else:
+                    log.warning("reply write failed (winerror=%d)", e.winerror)
+            finally:
+                # F-19: audit "granted" and reset the lockout only for a DELIVERED grant.
+                self._finish_grant(delivered)
+            if not delivered:
+                return
             try:
                 win32file.FlushFileBuffers(handle)   # blocks until the client reads the buffered data
             except pywintypes.error:

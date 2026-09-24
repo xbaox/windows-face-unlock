@@ -144,7 +144,18 @@ def test_phase1_other_verdicts():
     p._capture_and_verify = lambda: _outcome("PASS", match=True, distance=0.05)
     rp = p._handle({"cmd": "unlock"}, None)
     check("PASS -> credentials", rp.get("ok") is True and rp.get("username") == "admin", rp)
-    check("PASS -> record(True)", p._lockout.records == [True], p._lockout.records)
+    # Stage 8b (F-19): the reset is part of the grant and is settled when the reply was WRITTEN
+    # (_serve_one calls _finish_grant); nothing is recorded before that.
+    check("PASS -> nothing recorded before delivery", p._lockout.records == [], p._lockout.records)
+    p._finish_grant(True)
+    check("PASS -> record(True) once delivered", p._lockout.records == [True], p._lockout.records)
+    u = _svc()
+    u._capture_and_verify = lambda: _outcome("PASS", match=True, distance=0.05)
+    u._handle({"cmd": "unlock"}, None)
+    u._finish_grant(False)
+    check("undelivered grant -> no reset, no strike", u._lockout.records == [], u._lockout.records)
+    check("undelivered grant -> audited as grant-undelivered",
+          u._audit.records[-1][1].get("outcome") == "grant-undelivered", u._audit.records[-1])
 
     n = _svc()
     n._capture_and_verify = lambda: _outcome("NOT_LIVE", distance=0.9)
@@ -454,6 +465,7 @@ def test_strikes_and_audit():
     g._run_challenge = _pass_round("blink", identity_frames=3)
     rg = g._handle({"cmd": "unlock_gesture", "token": tok_g}, None)
     check("granted round -> credentials", rg.get("ok") is True and rg.get("username") == "admin", rg)
+    g._finish_grant(True)       # Stage 8b (F-19): settled once the reply is delivered
     check("granted round -> record(True)", g._lockout.records == [True], g._lockout.records)
 
     i = _svc()
@@ -471,6 +483,7 @@ def test_strikes_and_audit():
     ):
         s2._run_challenge = runner
         s2._handle({"cmd": "unlock_gesture", "token": tok2}, None)
+        s2._finish_grant(True)  # Stage 8b (F-19): the "granted" record is written on delivery
         ev2, rec2 = s2._audit.records[-1]
         check(f"audit '{label}': event is unlock_gesture", ev2 == "unlock_gesture", ev2)
         check(f"audit '{label}': stable five-key record", set(rec2) == keys, sorted(rec2))

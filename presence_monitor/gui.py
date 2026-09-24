@@ -19,7 +19,8 @@ from pathlib import Path
 from tkinter import ttk, messagebox
 from typing import Callable
 
-from face_service.config import Config, CONFIG_PATH, LOG_PATH, LIVENESS_MODES, PRESENCE_MODES
+from face_service.config import (Config, CONFIG_PATH, LOG_PATH, LIVENESS_MODES, PRESENCE_MODES,
+                                 THRESHOLD_MAX)
 from face_service.i18n import LANGUAGES, get_language, set_language, t
 
 from .monitor import PresenceMonitor, pipe_call
@@ -47,7 +48,7 @@ SETTINGS_SECTIONS: list[tuple[str, list[tuple[str, str, object]]]] = [
         ("language",                "combo_lang", None),
     ]),
     ("section.recognition", [
-        ("threshold",               "float",      (0.05, 1.5)),
+        ("threshold",               "float",      (0.05, THRESHOLD_MAX)),   # 8b F-32
         ("verify_frames",           "int",        (1, 30)),
         ("verify_required",         "int",        (1, 30)),
     ]),

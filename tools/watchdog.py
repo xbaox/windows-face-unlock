@@ -148,122 +148,27 @@ def ping(timeout_s: float, pipe_name: str = "") -> "tuple[bool, str | None]":
                              IMMEDIATELY, without retrying: a server that answers wrongly will not
                              answer better a tenth of a second later.
     * ``"error: ..."``    -- anything else, carrying the win32 code so the log can be acted on.
+    * ``"untrusted-server"`` -- Stage 8b (F-20): the pipe is owned by a process that is not SELF or
+                             SYSTEM, so nothing was sent. A failure like the others: whoever holds
+                             the name, it is not our service answering.
 
-    SINGLE-THREADED by construction. The previous version ran the exchange in a worker thread and
-    joined with the timeout: the join returned, but the worker stayed BLOCKED inside the native call
-    -- one leaked daemon thread per timed-out ping, accumulating precisely while the service was
-    wedged. Overlapped I/O bounds the wait with no second thread: on expiry we CancelIo (which
-    cancels this thread's pending op on this handle, and there is exactly one) and then DRAIN it
-    with a blocking GetOverlappedResult. That drain is mandatory, not tidiness: the kernel owns the
-    OVERLAPPED and the read buffer until the cancelled op really ends, so freeing them or closing
-    the handle first is a use-after-free.
+    Stage 8b (F-20): the exchange itself -- connect retries, the server-SID check, overlapped
+    write/read bounded by ONE deadline, cancel-then-drain on expiry -- moved into
+    face_service.pipe_io.exchange, which every Python client now shares; it is this function's
+    7c-2 design, generalised. Still single-threaded, still no leaked worker per timed-out ping.
 
-    ``timeout_s`` keeps its meaning -- the budget for the WHOLE exchange, connect included, exactly
-    as the old join() bounded the whole worker. ``pipe_name`` exists for the selftest; production
-    passes nothing and gets face_service.config.PIPE_NAME.
+    ``timeout_s`` keeps its meaning -- the budget for the WHOLE exchange, connect included.
+    ``pipe_name`` exists for the selftest; production passes nothing and gets
+    face_service.config.PIPE_NAME.
     """
-    import pywintypes
-    import win32con
-    import win32event
-    import win32file
-    import win32pipe
-    import winerror
-    from face_service.config import PIPE_NAME
+    from face_service.pipe_io import exchange
 
-    name = pipe_name or PIPE_NAME
-    deadline = time.monotonic() + float(timeout_s)
-
-    def _shut(handle) -> None:
-        try:
-            win32file.CloseHandle(handle)
-        except Exception:
-            pass
-
-    def _sleep_within() -> bool:
-        """Sleep one retry cadence, clamped to what is left. False = the budget is spent."""
-        left = deadline - time.monotonic()
-        if left <= 0:
-            return False
-        time.sleep(min(_PING_RETRY_SLEEP_S, left))
-        return True
-
-    # --- phase 1: connect. Retry the two refusals that mean "the server is mid-turnover"; every
-    # other win32 failure is reported as-is rather than burning the budget on a hopeless retry.
-    h = None
-    stalled = "no-pipe"          # which refusal we were still getting when the budget ran out
-    while True:
-        try:
-            h = win32file.CreateFile(
-                name, win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0, None, win32file.OPEN_EXISTING, win32con.FILE_FLAG_OVERLAPPED, None,
-            )
-        except pywintypes.error as e:
-            if e.winerror == winerror.ERROR_PIPE_BUSY:
-                stalled = "busy"
-            elif e.winerror == winerror.ERROR_FILE_NOT_FOUND:
-                stalled = "no-pipe"
-            else:
-                return False, f"error: connect winerror={e.winerror}"
-            if not _sleep_within():
-                return False, stalled
-            continue
-        try:
-            win32pipe.SetNamedPipeHandleState(h, win32pipe.PIPE_READMODE_MESSAGE, None, None)
-        except pywintypes.error:
-            # Same phase, same race: the server tore its instance down between our CreateFile and
-            # this call. Drop the handle and try to catch the next instance inside the budget.
-            _shut(h)
-            h = None
-            stalled = "busy"
-            if not _sleep_within():
-                return False, stalled
-            continue
-        break
-
-    # --- phase 2: exchange, bounded by what is LEFT of the same budget.
-    ov = pywintypes.OVERLAPPED()
-    ov.hEvent = win32event.CreateEvent(None, True, False, None)   # manual-reset, unsignalled
-
-    def _await(label: str):
-        """Bytes transferred, or None if the budget expired (then: cancel, drain, report)."""
-        ms = max(0, int((deadline - time.monotonic()) * 1000))
-        if win32event.WaitForSingleObject(ov.hEvent, ms) == win32event.WAIT_OBJECT_0:
-            return win32file.GetOverlappedResult(h, ov, False)
-        win32file.CancelIo(h)
-        try:
-            win32file.GetOverlappedResult(h, ov, True)   # MUST finish before anything is freed
-        except Exception:
-            pass
-        log.debug("ping: %s did not finish within the budget; cancelled and drained", label)
-        return None
-
-    try:
-        win32event.ResetEvent(ov.hEvent)
-        win32file.WriteFile(h, json.dumps({"cmd": "ping"}).encode("utf-8"), ov)
-        if _await("write") is None:
-            return False, "reply-timeout"
-
-        buf = win32file.AllocateReadBuffer(65536)
-        win32event.ResetEvent(ov.hEvent)
-        win32file.ReadFile(h, buf, ov)
-        n = _await("read")
-        if n is None:
-            return False, "reply-timeout"
-
-        try:
-            resp = json.loads(bytes(buf[:n]).decode("utf-8"))
-        except Exception:
-            return False, "bad-reply"
-        if isinstance(resp, dict) and resp.get("ok") and resp.get("pong"):
-            return True, None
-        return False, "bad-reply"
-    except pywintypes.error as e:
-        return False, f"error: exchange winerror={e.winerror}"
-    except Exception as e:
-        return False, f"error: {e!r}"
-    finally:
-        _shut(ov.hEvent)
-        _shut(h)
+    resp, why = exchange({"cmd": "ping"}, timeout_s, pipe_name=pipe_name)
+    if resp is None:
+        return False, why
+    if resp.get("ok") and resp.get("pong"):
+        return True, None
+    return False, "bad-reply"
 
 
 # Both helpers below spawn a console-subsystem binary (schtasks.exe / powershell.exe) while the

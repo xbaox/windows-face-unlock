@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -36,11 +37,26 @@ class Lockout:
     # ---------- persistence ----------
 
     def _load(self) -> None:
+        """Stage 8b (F-15). Defect: only FileNotFoundError / ValueError / OSError were caught, so a
+        lockout.json holding a JSON list, a null, or a non-numeric value raised out of __init__;
+        and a non-finite locked_until was accepted. Consequence: the service crashed at start on
+        every restart -- a crash loop the watchdog cannot end -- or stayed locked "forever". Fix:
+        ANY failure to read a sane state starts clean, with a WARNING (a missing file is the normal
+        first start and stays quiet)."""
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            self._fails = int(data.get("fails", 0))
-            self._locked_until = float(data.get("locked_until", 0.0))
-        except (FileNotFoundError, ValueError, OSError):
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
+            fails = int(data.get("fails", 0))
+            locked_until = float(data.get("locked_until", 0.0))
+            if fails < 0 or not math.isfinite(locked_until) or locked_until < 0:
+                raise ValueError(f"out of range (fails={fails}, locked_until={locked_until})")
+            self._fails, self._locked_until = fails, locked_until
+        except FileNotFoundError:
+            self._fails = 0
+            self._locked_until = 0.0
+        except Exception as e:
+            log.warning("lockout state %s unreadable (%r) -- starting clean", self.path, e)
             self._fails = 0
             self._locked_until = 0.0
 

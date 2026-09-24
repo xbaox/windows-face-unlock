@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import sys
 import time
 import warnings
@@ -375,12 +376,19 @@ class Recognizer:
 
         embeds = np.stack(vecs, axis=0)
         EMBED_PATH.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            EMBED_PATH,
-            embeddings=embeds,
-            engine=np.array(ENGINE_TAG),
-            dim=np.array(EMBED_DIM, dtype=np.int64),
-        )
+        # Stage 8b (F-45). Defect: np.savez wrote embeddings.npz in place. Consequence: an
+        # interrupted write left a truncated gallery that load() cannot read -- the user is
+        # silently without face sign-in. Fix: write a sibling through a file object (savez would
+        # otherwise append ".npz" to the temp name), then rename over the old file.
+        tmp = EMBED_PATH.with_name(EMBED_PATH.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            np.savez(
+                fh,
+                embeddings=embeds,
+                engine=np.array(ENGINE_TAG),
+                dim=np.array(EMBED_DIM, dtype=np.int64),
+            )
+        os.replace(tmp, EMBED_PATH)
         self._enroll_refs = embeds
         # A fresh baseline invalidates prior drift adaptation -> reset it (enrollment is the anchor).
         self._adaptive.clear()

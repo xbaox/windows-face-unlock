@@ -33,6 +33,7 @@ Anti-poisoning rests on layered guards, all enforced by ``evaluate``:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import NamedTuple
 
@@ -149,13 +150,17 @@ class AdaptiveStore:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            self.path,
-            embeddings=self.embeddings,
-            ts=self.ts,
-            engine=np.array(ENGINE_TAG),
-            dim=np.array(EMBED_DIM, dtype=np.int64),
-        )
+        # Stage 8b (F-45): write-then-rename, same reason as embeddings.npz in recognizer.py.
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            np.savez(
+                fh,
+                embeddings=self.embeddings,
+                ts=self.ts,
+                engine=np.array(ENGINE_TAG),
+                dim=np.array(EMBED_DIM, dtype=np.int64),
+            )
+        os.replace(tmp, self.path)
 
     def clear(self) -> None:
         """Drop all adaptive embeddings and delete the file (enrollment untouched)."""

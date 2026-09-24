@@ -1,5 +1,7 @@
 from __future__ import annotations
+import functools
 import logging
+import math
 import os
 from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
@@ -39,6 +41,30 @@ LIVENESS_MODES = ("fast", "paranoid")
 DISTANCE_METRICS = ("cosine",)
 
 log = logging.getLogger(__name__)
+
+
+# Stage 8b (F-32, act A-5): upper bound of the match threshold, in validate() and in the Settings
+# window. Defect: validate() allowed (0, 2) and Settings offered up to 1.5 -- cosine distances at
+# which a stranger (~0.97 measured) matches. Fix: a ceiling well above the measured genuine band
+# (self <= ~0.12) and far below any impostor. The 0.32 default is untouched.
+THRESHOLD_MAX = 0.5
+
+
+@functools.lru_cache(maxsize=1)
+def _current_user_sid() -> str:
+    """Stage 8b (D-26): the process token's user SID, read ONCE per process. validate() runs on
+    every load and every reload, and the SID of a running process cannot change. A failure raises
+    and is NOT cached, so the next validate() tries again."""
+    import win32api, win32con, win32security  # noqa: PLC0415
+    th = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
+    finally:
+        win32api.CloseHandle(th)
+    s = win32security.ConvertSidToStringSid(sid)
+    if not s:
+        raise ValueError("current-user SID resolved empty")
+    return s
 
 
 def _default_language() -> str:
@@ -299,13 +325,33 @@ class Config:
         if tomli_w is None:
             raise RuntimeError("tomli-w is required to save config (pip install tomli-w)")
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(
-            tomli_w.dumps(asdict(self)),
-            encoding="utf-8",
-        )
+        # Stage 8b (F-45). Defect: written in place. Consequence: a crash or a full disk mid-write
+        # left a truncated config.toml, which the next start reads as broken and replaces with
+        # DEFAULTS -- silently undoing the user's paranoid mode. Fix: write a sibling, then rename.
+        tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+        tmp.write_text(tomli_w.dumps(asdict(self)), encoding="utf-8")
+        os.replace(tmp, CONFIG_PATH)
+
+    def _validate_types(self) -> None:
+        """Stage 8b (F-15). Defect: the range checks below compare with < and >, and every
+        comparison with NaN is False -- so NaN (and inf, where only one side is bounded) passed
+        validation for several knobs, and an int field accepted 2.5 or "3". Consequence: a knob
+        such as blink_timeout_s = nan broke the gesture round, and inf where a bound was open
+        meant "forever". Fix: one pass by DECLARED type first -- float fields must be real,
+        finite numbers (an int is fine), int fields must be ints; bool is neither. The range
+        checks after it are unchanged."""
+        for f in fields(self):
+            v = getattr(self, f.name)
+            if f.type == "float":
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                    raise ValueError(f"{f.name} must be a finite number, got {v!r}")
+            elif f.type == "int":
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise ValueError(f"{f.name} must be an integer, got {v!r}")
 
     def validate(self) -> None:
         from .i18n import LANG_CODES
+        self._validate_types()
         # Distance metric: declared since Stage 0, read by nothing. The recognizer is hardwired to
         # cosine over L2-normalised ArcFace embeddings, so a config asking for anything else gets
         # cosine regardless -- exactly the silent-wrong-behaviour this pass exists to remove.
@@ -376,8 +422,8 @@ class Config:
         if self.presence_input_idle_s < 0.0:
             raise ValueError(
                 "presence_input_idle_s must be >= 0 (0 = ignore input, camera only)")
-        if not (0.0 < self.threshold < 2.0):
-            raise ValueError("threshold must be in (0, 2)")
+        if not (0.0 < self.threshold <= THRESHOLD_MAX):
+            raise ValueError(f"threshold must be in (0, {THRESHOLD_MAX}]")
         if self.language not in LANG_CODES:
             raise ValueError(
                 f"language must be one of {LANG_CODES}, got {self.language!r}"
@@ -490,12 +536,7 @@ class Config:
         # Lazy pywin32 import so importing config on a stripped interpreter stays cheap when off.
         if self.pipe_hardened_sd:
             try:
-                import win32api, win32con, win32security  # noqa: PLC0415
-                _th = win32security.OpenProcessToken(
-                    win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
-                _sid = win32security.GetTokenInformation(_th, win32security.TokenUser)[0]
-                if not win32security.ConvertSidToStringSid(_sid):
-                    raise ValueError("current-user SID resolved empty")
+                _current_user_sid()
             except Exception as e:
                 raise ValueError(
                     f"pipe_hardened_sd=True but the current-user SID did not resolve: {e}")
