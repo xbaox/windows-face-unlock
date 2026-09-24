@@ -164,14 +164,42 @@ def main(argv=None) -> int:
     t.ok("WindowsFaceUnlock-Setup-" in up,
          "the installer asset is selected by its exact published name pattern")
 
+    # --- Stage 8b: installer invariants (F-41, F-01, F-09, F-34, F-35, F-07, F-36) -------------
+    print("\n[8] installer invariants (Stage 8b)")
+    pub = re.search(r'#define\s+MyAppPublisher\s+"([^"]+)"', iss)
+    url = re.search(r'#define\s+MyAppURL\s+"([^"]+)"', iss)
+    t.ok(bool(pub) and pub.group(1) == "xbaox", f"Publisher is this fork (F-41): {pub and pub.group(1)}")
+    t.ok(bool(url) and url.group(1) == "https://github.com/xbaox/windows-face-unlock",
+         f"AppURL is this fork (F-41): {url and url.group(1)}")
+    readme = _read(REPO_ROOT / "README.md")
+    t.ok("caochitam" not in iss and "caochitam/windows-face-unlock/releases" not in readme,
+         "no upstream URL left in installer.iss or the README install link (F-41)")
+    code_lines = [ln for ln in iss.splitlines() if not ln.lstrip().startswith(";")]
+    t.ok(not any(ln.strip().lower().startswith("[dirs]") for ln in code_lines)
+         and "users-modify" not in "\n".join(code_lines),
+         "no [Dirs] section and no users-modify permission (F-01)")
+    t.ok(re.search(r"^DisableDirPage=yes\s*$", iss, re.M) is not None, "DisableDirPage=yes (F-09)")
+    uninst = re.split(r"^\[UninstallRun\]\s*$", iss, maxsplit=1, flags=re.M)[1].split("[UninstallDelete]", 1)[0]
+    entries = [ln for ln in uninst.splitlines() if ln.startswith("Filename:")]
+    t.ok(len(entries) == 2 and uninst.count("RunOnceId:") == 2,
+         f"both [UninstallRun] entries carry RunOnceId (F-34): {uninst.count('RunOnceId:')}")
+    prep = iss.split("function PrepareToInstall", 1)[1].split("procedure RegisterTasks", 1)[0]
+    t.ok("-Action Stop'" in prep and "ExtractTemporaryFile('register_tasks.ps1')" in prep,
+         "PrepareToInstall runs the NEW registrar with -Action Stop, not Unregister (F-35)")
+    t.ok("ExecAsOriginalUser" in iss and "-UserSid" in iss,
+         "the registrar is given the original user's SID (F-07)")
+    psd1 = _read(REPO_ROOT / "tools" / "tasks.psd1")
+    t.ok(re.search(r"Priority\s*=\s*5", psd1) is not None and psd1.count("RestartOnFailure = $true") == 2,
+         "service priority 5; restart policy on tray and watchdog (F-36)")
+
     print()
     if t.fail:
         print(f"PACKAGING SELFTEST FAILED: {t.fail} check(s) failed.")
         return 1
     print("PACKAGING SELFTEST OK: version literals agree, every declared InstalledExe is an EXE "
           "the spec builds, the watchdog matches the service exe by the same name, the frozen-only "
-          "hidden imports are present, all three entry points are declared, and the shipped model "
-          "set equals recognizer.MODEL_FILES.")
+          "hidden imports are present, all three entry points are declared, the shipped model "
+          "set equals recognizer.MODEL_FILES, and the installer invariants of Stage 8b hold.")
     return 0
 
 

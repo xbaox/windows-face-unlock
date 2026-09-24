@@ -8,11 +8,12 @@
     principal and settings are built once, here, so the dev and installed
     deployments cannot drift apart.
 
-    Task settings (identical for every task):
-        Trigger    -AtLogOn for the current user
-        Principal  current user, Interactive, RunLevel Limited
+    Task settings (shared by every task, plus the per-task keys of tasks.psd1):
+        Trigger    -AtLogOn for the target user (-UserSid, else the current user)
+        Principal  target user, Interactive, RunLevel Limited
         Settings   AllowStartIfOnBatteries, DontStopIfGoingOnBatteries,
-                   StartWhenAvailable, Hidden, ExecutionTimeLimit PT0S
+                   StartWhenAvailable, Hidden, ExecutionTimeLimit PT0S;
+                   Priority / RestartOnFailure where the declaration asks (8b F-36)
 
     ExecutionTimeLimit PT0S ("no limit") is load-bearing: the Windows default
     of PT72H makes the scheduler kill these always-on tasks after three days.
@@ -27,6 +28,17 @@
     Start       start every declared task.
     Restart     stop the tasks, kill leftover processes with the death-wait,
                 start them again. Touches no registration at all.
+    Stop        stop the stack (graceful pipe shutdown, task stop, death-wait)
+                and report survivors. Touches no registration: Setup's
+                PrepareToInstall uses it, and the Register that follows the file
+                copy overwrites the tasks in place (8b F-35).
+
+.PARAMETER UserSid
+    The account the tasks run for (8b F-07). Setup passes the ORIGINAL user's
+    SID -- the one who started Setup, obtained with ExecAsOriginalUser -- because
+    this script runs elevated, and when a different administrator typed their
+    credentials into UAC, "the current user" is that administrator. Omitted:
+    the current user, as before.
 
 .PARAMETER InstallDir
     Required for -Mode Installed: the directory holding the frozen exes.
@@ -52,10 +64,12 @@ param(
     [ValidateSet('Dev', 'Installed')]
     [string]$Mode = 'Dev',
 
-    [ValidateSet('Register', 'Unregister', 'Start', 'Restart')]
+    [ValidateSet('Register', 'Unregister', 'Start', 'Restart', 'Stop')]
     [string]$Action = 'Register',
 
     [string]$InstallDir,
+
+    [string]$UserSid,
 
     [switch]$DryRun
 )
@@ -75,7 +89,7 @@ $ErrorActionPreference = 'Stop'
 # destructive steps had already executed.
 #
 # Therefore: no local variable and no loop variable may be named Mode, Action,
-# InstalledDir/InstallDir or DryRun in any casing. Internal names below are
+# InstalledDir/InstallDir, UserSid or DryRun in any casing. Internal names below are
 # prefixed (fu*/plan*/task*) to keep them clear of the parameter namespace.
 # ---------------------------------------------------------------------------
 
@@ -111,6 +125,9 @@ $fuDeathWaitSec = 10
 $fuTaskPrefix   = 'FaceUnlock-'
 $fuRequiredKeys = @('Name', 'Description', 'DevArgs', 'InstalledExe', 'SkipReason')
 $fuNeedles      = @('face_service', 'presence_monitor', 'tools.watchdog')
+# Stage 8b (F-36): the session this script runs in. Setup runs it elevated but in the user's own
+# interactive session, so this is the session the user's Face Unlock processes live in.
+$fuSession      = (Get-Process -Id $PID).SessionId
 
 
 # --- helpers (pure) ---------------------------------------------------------
@@ -119,6 +136,11 @@ $fuNeedles      = @('face_service', 'presence_monitor', 'tools.watchdog')
 # dry-run count so the three cannot drift. Dev runs modules under python/pythonw
 # so match the commandline; Installed runs frozen exes so match the image name.
 # Read-only: Get-CimInstance never changes anything.
+#
+# Stage 8b (F-36). Defect: the Installed match was the image name alone, machine-wide.
+# Consequence: a stop or an upgrade killed every face_service.exe / tray / watchdog on the machine
+# -- another user's session included, or an unrelated program of the same name. Fix: the full path
+# must be under the install directory AND the process must be in this session.
 function Get-FuProcess {
     param([string]$LayoutMode, [string[]]$ExeNames, [string[]]$CommandLineNeedles)
 
@@ -132,8 +154,14 @@ function Get-FuProcess {
                  })
     }
     if (-not $ExeNames) { return @() }
-    $fuFilter = ($ExeNames | ForEach-Object { "Name='$_'" }) -join ' OR '
-    return @(Get-CimInstance Win32_Process -Filter $fuFilter -ErrorAction SilentlyContinue)
+    $fuFilter  = ($ExeNames | ForEach-Object { "Name='$_'" }) -join ' OR '
+    $fuPrefix  = (Join-Path $fuInstallDir '').TrimEnd('\') + '\'
+    return @(Get-CimInstance Win32_Process -Filter $fuFilter -ErrorAction SilentlyContinue |
+             Where-Object {
+                 $_.ExecutablePath -and
+                 $_.ExecutablePath.StartsWith($fuPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                 $_.SessionId -eq $fuSession
+             })
 }
 
 # Read-only: which FaceUnlock-* tasks exist right now.
@@ -240,23 +268,72 @@ foreach ($fuTask in $fuTasks) {
         $fuTaskAction = New-ScheduledTaskAction -Execute $fuExecute -WorkingDirectory $fuWorkDir
     }
 
+    # Stage 8b (F-36). Defect: every task ran at the scheduler's default priority 7 (below
+    # normal) with no restart policy. Consequence: the service competed for CPU as a background
+    # job, and a tray or watchdog that crashed stayed down until the next logon. Fix: optional
+    # per-task keys in tasks.psd1 -- Priority (the service: 5) and RestartOnFailure (tray and
+    # watchdog: 3 restarts, one minute apart). Everything else stays shared.
+    $fuSetArgs = @{
+        AllowStartIfOnBatteries    = $true
+        DontStopIfGoingOnBatteries = $true
+        StartWhenAvailable         = $true
+        Hidden                     = $true
+        ExecutionTimeLimit         = [TimeSpan]::Zero
+    }
+    $fuPriorityText = 'default (7)'
+    if ($fuTask.ContainsKey('Priority')) {
+        $fuSetArgs['Priority'] = [int]$fuTask.Priority
+        $fuPriorityText = [string]$fuTask.Priority
+    }
+    $fuRestartText = 'none'
+    if ($fuTask.ContainsKey('RestartOnFailure') -and $fuTask.RestartOnFailure) {
+        $fuSetArgs['RestartCount']    = 3
+        $fuSetArgs['RestartInterval'] = New-TimeSpan -Minutes 1
+        $fuRestartText = '3 x 1 min'
+    }
+    $fuTaskSettings = New-ScheduledTaskSettingsSet @fuSetArgs
+
     $fuPlan += [pscustomobject]@{
         Name             = $fuTask.Name
         Execute          = $fuExecute
         Argument         = $fuArgument
         WorkingDirectory = $fuWorkDir
         TaskAction       = $fuTaskAction
+        TaskSettings     = $fuTaskSettings
+        PriorityText     = $fuPriorityText
+        RestartText      = $fuRestartText
     }
 }
 
-# The shared trigger / principal / settings -- built once, for every task.
-$fuTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$fuPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME `
+# Stage 8b (F-07). Defect: the trigger and the principal were built from $env:USERNAME of THIS
+# process, which Setup runs elevated. Consequence: when a different administrator typed their
+# credentials into UAC, the tasks were created for that administrator -- the user who installed
+# got no running service. Fix: Setup passes the ORIGINAL user's SID (obtained with
+# ExecAsOriginalUser and confirmed by a second process of that user); the account is resolved from
+# it here. No -UserSid: the current user, exactly as before.
+if ($UserSid) {
+    if ($UserSid -notmatch '^S-1-5-21-\d+-\d+-\d+-\d+$') {
+        Write-Host "ERROR: -UserSid is not a local or domain user SID: $UserSid" -ForegroundColor Red
+        exit 1
+    }
+    try {
+        $fuTargetUser = ([Security.Principal.SecurityIdentifier]$UserSid).Translate(
+                            [Security.Principal.NTAccount]).Value
+    }
+    catch {
+        Write-Host "ERROR: -UserSid $UserSid does not resolve to an account: $($_.Exception.Message)" `
+                   -ForegroundColor Red
+        exit 1
+    }
+}
+else {
+    $fuTargetUser = $env:USERNAME
+}
+
+# The shared trigger / principal -- built once, for every task.
+$fuTrigger   = New-ScheduledTaskTrigger -AtLogOn -User $fuTargetUser
+$fuPrincipal = New-ScheduledTaskPrincipal -UserId $fuTargetUser `
                                           -LogonType Interactive -RunLevel Limited
-$fuSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-                                            -DontStopIfGoingOnBatteries `
-                                            -StartWhenAvailable -Hidden `
-                                            -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 # Every one of these is wrapped in @() AT THE CALL SITE. A function that returns
 # @(...) still unrolls it into the caller's pipeline, so a single match arrives
@@ -272,6 +349,8 @@ $fuCandidates  = @(Get-FuProcess -LayoutMode $Mode -ExeNames $fuExeNames -Comman
 # --- the plan ---------------------------------------------------------------
 Write-Host ("Mode={0} Action={1}{2}" -f $Mode, $Action, $(if ($DryRun) { '  [DRY RUN]' } else { '' }))
 Write-Host ("Declaration: {0}" -f $fuDeclPath)
+Write-Host ("Tasks run for: {0}{1} (session {2})" -f $fuTargetUser, `
+            $(if ($UserSid) { " [$UserSid, from -UserSid]" } else { ' [current user]' }), $fuSession)
 Write-Host ("Declared {0} task(s); {1} apply to this layout, {2} skipped." -f `
             $fuTasks.Count, $fuPlan.Count, $fuSkipped.Count)
 Write-Host ""
@@ -288,20 +367,23 @@ else {
     foreach ($fuItem in $fuPlan) {
         if ($fuExisting -contains $fuItem.Name) {
             $fuStateText = if ($Action -eq 'Restart') { 'registered (will be stopped, then started)' }
+                           elseif ($Action -eq 'Stop') { 'registered (will be stopped, registration kept)' }
                            else { 'registered (will be overwritten)' }
         }
         else {
-            $fuStateText = if ($Action -eq 'Restart') { 'NOT REGISTERED -- restart cannot create it; run -Action Register' }
+            $fuStateText = if ($Action -in @('Restart', 'Stop')) { 'NOT REGISTERED -- nothing to stop through the scheduler' }
                            else { 'not registered (will be created)' }
         }
         Write-Host ("  - {0}" -f $fuItem.Name)
         Write-Host ("      Execute          : {0}" -f $fuItem.Execute)
         Write-Host ("      Argument         : {0}" -f $(if ($fuItem.Argument) { $fuItem.Argument } else { '(none)' }))
         Write-Host ("      WorkingDirectory : {0}" -f $fuItem.WorkingDirectory)
+        Write-Host ("      Priority         : {0}" -f $fuItem.PriorityText)
+        Write-Host ("      Restart on fail  : {0}" -f $fuItem.RestartText)
         Write-Host ("      Currently        : {0}" -f $fuStateText)
     }
-    if ($Action -eq 'Restart') {
-        Write-Host "  (Restart touches no registration: no task is created, overwritten or removed.)"
+    if ($Action -in @('Restart', 'Stop')) {
+        Write-Host ("  ({0} touches no registration: no task is created, overwritten or removed.)" -f $Action)
     }
 }
 
@@ -333,6 +415,21 @@ if ($DryRun) {
     Write-Host ""
     Write-Host "DRY RUN -- phase A only. Nothing was registered, removed, started or stopped." -ForegroundColor Cyan
     exit 0
+}
+
+# Stage 8b (F-33). Defect: Inno does not capture a [Run] program's output, and the exit code was
+# not looked at either (7g C). Consequence: a registrar failure during Setup left no trace at all.
+# Fix: in the Installed layout every committing run is transcribed to {app}\logs\ -- under
+# Program Files, so only administrators can write it -- and Setup checks the exit code.
+if ($Mode -eq 'Installed') {
+    try {
+        $fuLogDir = Join-Path $fuInstallDir 'logs'
+        New-Item -ItemType Directory -Force -Path $fuLogDir | Out-Null
+        Start-Transcript -LiteralPath (Join-Path $fuLogDir 'register_tasks.log') -Append | Out-Null
+    }
+    catch {
+        Write-Warning ("registrar log not started: {0}" -f $_.Exception.Message)
+    }
 }
 
 
@@ -553,6 +650,27 @@ if ($Action -eq 'Unregister') {
     exit 0
 }
 
+if ($Action -eq 'Stop') {
+    # Stage 8b (F-35). Defect: PrepareToInstall ran -Action Unregister, so an install that was then
+    # aborted -- or a file copy that failed -- left the machine with no tasks at all until Setup was
+    # run again. Fix: Setup only STOPS the stack here; the registrations stay, and the Register that
+    # follows the copy overwrites them in place (-Force, no pre-unregister -- the PHASE ORDER rule).
+    # Same three steps as the others, weakest force first, then the survivor count that Setup's
+    # exit-code check relies on.
+    Invoke-GracefulServiceShutdown
+    foreach ($fuItem in $fuPlan) {
+        Stop-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
+    }
+    Stop-FuAndWait
+    $fuSurvivors = Get-FuSurvivorCount
+    if ($fuSurvivors -gt 0) {
+        Write-Warning ("Stop did NOT bring the stack down: {0} process(es) still running." -f $fuSurvivors)
+        exit 1
+    }
+    Write-Host "Stack stopped; registrations kept."
+    exit 0
+}
+
 if ($Action -eq 'Start') {
     foreach ($fuItem in $fuPlan) {
         Start-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
@@ -590,9 +708,10 @@ if ($Action -eq 'Restart') {
 foreach ($fuItem in $fuPlan) {
     Register-ScheduledTask -TaskName $fuItem.Name -Action $fuItem.TaskAction `
                            -Trigger $fuTrigger -Principal $fuPrincipal `
-                           -Settings $fuSettings -Force | Out-Null
-    Write-Host ("Registered (hidden, no time limit): {0} -> {1} {2}" -f `
-                $fuItem.Name, $fuItem.Execute, $fuItem.Argument)
+                           -Settings $fuItem.TaskSettings -Force | Out-Null
+    Write-Host ("Registered (hidden, no time limit, priority {3}, restart {4}) for {5}: {0} -> {1} {2}" -f `
+                $fuItem.Name, $fuItem.Execute, $fuItem.Argument, $fuItem.PriorityText,
+                $fuItem.RestartText, $fuTargetUser)
 }
 
 # B2: drop tasks the declaration no longer lists. Bounded to our own prefix, and

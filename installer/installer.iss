@@ -6,9 +6,11 @@
 
 #define MyAppName "Windows Face Unlock"
 #define MyAppShortName "WindowsFaceUnlock"
-#define MyAppVersion "0.1.0"
-#define MyAppPublisher "Cao Chi Tam"
-#define MyAppURL "https://github.com/caochitam/windows-face-unlock"
+#define MyAppVersion "0.1.1"
+; Stage 8b (F-41 / D-33): this fork publishes the installer, so Programs and Features names it and
+; links to it -- not the upstream project whose name and URLs were inherited here.
+#define MyAppPublisher "xbaox"
+#define MyAppURL "https://github.com/xbaox/windows-face-unlock"
 #define MyAppExeName "face_unlock_tray.exe"
 ; NOTE: the service/watchdog executables are deliberately NOT defined here.
 ; Scheduled tasks are declared once, in postinstall\tasks.psd1, and this script
@@ -25,6 +27,11 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
 DefaultDirName={autopf}\{#MyAppShortName}
+; Stage 8b (F-09). Defect: the directory page let the installing admin pick ANY folder. Consequence:
+; a folder ordinary users can write to would hold the DLL LogonUI loads as SYSTEM and the scripts
+; Setup runs elevated. Fix: no directory page -- always Program Files (or, on an upgrade, the
+; directory the previous version recorded).
+DisableDirPage=yes
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\installer_output
@@ -80,6 +87,11 @@ Name: "cp"; Description: "Register the Credential Provider (enables log-in with 
 ; The whole PyInstaller output, which already includes postinstall\ (the task
 ; registrar and its declaration, staged there by installer/build.py step 4).
 Source: "{#BuildRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; Stage 8b (F-35): the NEW registrar and its declaration, again, as dontcopy entries. PrepareToInstall
+; runs before [Files], so on an upgrade the registrar under the installed directory is the OLD one,
+; which has no -Action Stop; these two are extracted to a temporary folder for that step instead.
+Source: "{#BuildRoot}\postinstall\register_tasks.ps1"; Flags: dontcopy
+Source: "{#BuildRoot}\postinstall\tasks.psd1"; Flags: dontcopy
 
 ; There is deliberately NO [Dirs] section (Stage 8b, F-01).
 ;
@@ -136,12 +148,12 @@ Filename: "{sys}\regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\Face
   Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); \
   StatusMsg: "Registering Credential Provider..."; Flags: runhidden
 
-; 2. Create AND start the scheduled tasks. Task names, executables and settings
-;    all come from postinstall\tasks.psd1 -- this script does not name them, so
-;    adding or removing a task never needs an installer edit. Register also
-;    starts what it registered, which is why there are no schtasks /Run lines.
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Register"; \
-  StatusMsg: "Registering scheduled tasks..."; Flags: runhidden
+; 2. Creating AND starting the scheduled tasks moved to [Code] (RegisterTasks, from
+;    CurStepChanged ssPostInstall) in Stage 8b. Defects (F-33, F-07): a [Run]
+;    entry cannot look at the exit code and Inno does not capture its output, so
+;    a failed registrar left no trace; and the registrar ran for whoever
+;    elevated rather than for the user who started Setup. Task names,
+;    executables and settings still come only from postinstall\tasks.psd1.
 
 ; 3. There is deliberately NO "Launch ..." checkbox on the Finish page, and this
 ;    comment is what is left of the one that used to be here
@@ -154,11 +166,9 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile
 ;    SECOND one on top of it. That is not theory: it happened on the 7g acceptance
 ;    install.
 ;
-;    Nothing in presence_monitor holds a single-instance mutex, so the duplicate
-;    does not exit the way a second face_service.exe would -- it runs, and the two
-;    trays compete for the camera. The mutex is Stage 8 work (KNOWN_ISSUES #4);
-;    until it exists, the tray is started by its scheduled task and by nothing
-;    else. Do not reinstate this entry.
+;    Since Stage 8b the tray holds Local\FaceUnlockTray and a duplicate exits at
+;    once (KNOWN_ISSUES #4), but the rule stands: the tray is started by its
+;    scheduled task and by nothing else. Do not reinstate this entry.
 ;
 ; 4. Onboarding on the Finish page (Stage 7l): save the Windows password, then
 ;    enroll the face. Without both, the face tile registered in step 1 has
@@ -206,11 +216,17 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--enroll"; \
 ; {sys} for the same reason as [Run] -- see the note there. The uninstaller is the
 ; same 32-bit binary, so an unregister through a bare name would hit the 32-bit
 ; regsvr32 and leave the Credential Provider registered after removal.
+;
+; RunOnceId on both (Stage 8b, F-34). Defect: without it Inno appends one more
+; copy of each entry per upgrade to the uninstall log. Consequence: an uninstall
+; after upgrades ran the registrar and regsvr32 /u once per version ever
+; installed (twice in 7g). Fix: a stable RunOnceId, so each runs exactly once.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Unregister"; \
-  Flags: runhidden
+  Flags: runhidden; RunOnceId: "FaceUnlockUnregisterTasks"
 ; Unregister the Credential Provider if it was installed.
 Filename: "{sys}\regsvr32.exe"; Parameters: "/u /s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
-  Flags: runhidden; Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll'))
+  Flags: runhidden; RunOnceId: "FaceUnlockUnregisterCP"; \
+  Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll'))
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -247,6 +263,130 @@ begin
       Exit;
     end;
   end;
+end;
+
+{ ---- Stage 8b (F-07): the ORIGINAL user -------------------------------------
+
+  Defect: every per-user step used this process's own identity -- the registrar
+  took the current user name, and the data directory was the USERPROFILE of
+  Setup. Setup runs elevated, and when a different administrator typed their
+  credentials into UAC, all of that is the administrator's.
+  Consequence: on a standard-user machine the user who installed got no running
+  service, the data directory landed in the wrong profile, and the uninstaller's
+  "remove my data" cleaned the wrong profile.
+  Fix: ExecAsOriginalUser (a process of the user who started Setup) reports its
+  SID into a file; a SECOND original-user process confirms it through its exit
+  code -- the file sits where other accounts can write, so its content is only a
+  claim until then. The SID goes to the registrar (-UserSid) and is recorded
+  under the app key so the uninstaller can find that user's profile. When it
+  cannot be established, Setup falls back to its own identity (the pre-8b
+  behaviour) and says so in the log. On a same-account elevation -- this
+  machine -- both are the same account. }
+var
+  OrigUserSid: string;
+  OrigUserSidResolved: Boolean;
+
+function IsUserSid(const S: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := (Length(S) > 12) and (Copy(S, 1, 9) = 'S-1-5-21-');
+  if not Result then
+    exit;
+  for I := 1 to Length(S) do
+    if not (((S[I] >= '0') and (S[I] <= '9')) or (S[I] = '-') or ((I = 1) and (S[I] = 'S'))) then
+    begin
+      Result := False;
+      exit;
+    end;
+end;
+
+function PowerShellExe(): string;
+begin
+  Result := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+end;
+
+function ResolveOriginalUserSid(): string;
+var
+  SidFile, Sid: string;
+  Raw: AnsiString;
+  ResultCode: Integer;
+begin
+  Result := '';
+  SidFile := ExpandConstant('{commonappdata}') + '\WindowsFaceUnlock-setup-'
+             + IntToStr(Random(2147483647)) + '.sid';
+  DeleteFile(SidFile);
+  if not ExecAsOriginalUser(PowerShellExe(),
+      '-NoProfile -NonInteractive -Command "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'
+      + ' | Set-Content -Encoding ascii -LiteralPath ''' + SidFile + '''"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+  begin
+    Log('Original user: the SID query did not run (code ' + IntToStr(ResultCode) + ').');
+    DeleteFile(SidFile);
+    exit;
+  end;
+  if not LoadStringFromFile(SidFile, Raw) then
+  begin
+    Log('Original user: no SID file came back.');
+    exit;
+  end;
+  DeleteFile(SidFile);
+  Sid := Trim(String(Raw));
+  if not IsUserSid(Sid) then
+  begin
+    Log('Original user: the reply is not a user SID: ' + Sid);
+    exit;
+  end;
+  if not ExecAsOriginalUser(PowerShellExe(),
+      '-NoProfile -NonInteractive -Command "if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value'
+      + ' -ceq ''' + Sid + ''') { exit 0 } else { exit 3 }"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+  begin
+    Log('Original user: SID ' + Sid + ' was NOT confirmed (code ' + IntToStr(ResultCode) + ').');
+    exit;
+  end;
+  Log('Original user: SID ' + Sid + ' confirmed.');
+  Result := Sid;
+end;
+
+function GetOriginalUserSid(): string;
+begin
+  if not OrigUserSidResolved then
+  begin
+    OrigUserSid := ResolveOriginalUserSid();
+    OrigUserSidResolved := True;
+    if OrigUserSid = '' then
+      Log('Original user could not be established; per-user steps use Setup''s own account.');
+  end;
+  Result := OrigUserSid;
+end;
+
+// The profile directory of a SID, from ProfileList; '' when unknown.
+function ProfileDirOf(const Sid: string): string;
+var
+  P: string;
+begin
+  Result := '';
+  if Sid = '' then
+    exit;
+  if RegQueryStringValue(HKLM, 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + Sid,
+                         'ProfileImagePath', P) then
+  begin
+    StringChangeEx(P, '%SystemDrive%', ExpandConstant('{%SYSTEMDRIVE}'), True);
+    Result := P;
+  end;
+end;
+
+// The data directory face_service uses for that user: <profile>\.face-unlock. Falls back to
+// Setup's own USERPROFILE when the original user is unknown (the pre-8b behaviour).
+function DataDirFor(const Sid: string): string;
+var
+  Profile: string;
+begin
+  Profile := ProfileDirOf(Sid);
+  if Profile = '' then
+    Profile := ExpandConstant('{%USERPROFILE}');
+  Result := Profile + '\.face-unlock';
 end;
 
 { Stop the running stack BEFORE [Files] overwrites it.
@@ -326,13 +466,26 @@ var
   ResultCode: Integer;
 begin
   Result := '';
+  // Resolved here, once, before anything is stopped or copied (Stage 8b, F-07).
+  GetOriginalUserSid();
   AppDir := ExpandConstant('{app}');
-  Registrar := AppDir + '\postinstall\register_tasks.ps1';
-  if not FileExists(Registrar) then
+  // Stage 8b (F-35): an existing installation is recognised by its registrar, but the
+  // registrar that RUNS is the new one, extracted to the temporary folder -- the old one
+  // has no -Action Stop. Stop only: the registrations stay until the Register after the
+  // copy overwrites them, so an aborted install no longer leaves the machine without tasks.
+  if not FileExists(AppDir + '\postinstall\register_tasks.ps1') then
     exit;
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+  try
+    ExtractTemporaryFile('register_tasks.ps1');
+    ExtractTemporaryFile('tasks.psd1');
+  except
+    Result := 'Setup could not unpack its task registrar: ' + GetExceptionMessage;
+    exit;
+  end;
+  Registrar := ExpandConstant('{tmp}\register_tasks.ps1');
+  if not Exec(PowerShellExe(),
               '-NoProfile -ExecutionPolicy Bypass -File "' + Registrar + '"'
-              + ' -Mode Installed -InstallDir "' + AppDir + '" -Action Unregister',
+              + ' -Mode Installed -InstallDir "' + AppDir + '" -Action Stop',
               '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin
     Result := 'Setup could not run the Face Unlock task registrar:' + #13#10
@@ -349,31 +502,73 @@ begin
             + ' after trying twice to stop the stack; it lists the surviving process IDs in its '
             + 'own output.' + #13#10#13#10
             + 'Stop it and run Setup again:' + #13#10
-            + '  powershell -NoProfile -ExecutionPolicy Bypass -File "' + Registrar
-            + '" -Mode Installed -Action Unregister';
+            + '  powershell -NoProfile -ExecutionPolicy Bypass -File "' + AppDir
+            + '\postinstall\register_tasks.ps1" -Mode Installed -Action Unregister';
     exit;
   end;
 end;
 
-{ Check for the two password entries in [Run] step 4. Same directory as the
-  uninstall code below: USERPROFILE plus .face-unlock,
-  which is what face_service/config.py resolves as Path.home(). Existence only;
-  the DPAPI blob itself is never opened here.
+{ Stage 8b (F-33, F-07): register and start the tasks for the original user, and
+  LOOK at the result. The registrar transcribes itself to the logs folder under
+  the install directory; this adds one line to the Setup log either way, and an
+  interactive install also gets a message box on failure. }
+procedure RegisterTasks();
+var
+  Params: string;
+  ResultCode: Integer;
+begin
+  WizardForm.StatusLabel.Caption := 'Registering scheduled tasks...';
+  Params := '-NoProfile -ExecutionPolicy Bypass -File "'
+            + ExpandConstant('{app}\postinstall\register_tasks.ps1') + '"'
+            + ' -Mode Installed -InstallDir "' + ExpandConstant('{app}') + '" -Action Register';
+  if GetOriginalUserSid() <> '' then
+    Params := Params + ' -UserSid ' + GetOriginalUserSid();
+  if not Exec(PowerShellExe(), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    ResultCode := -1;
+  if ResultCode = 0 then
+    Log('Face Unlock task registrar: OK')
+  else
+  begin
+    Log('Face Unlock task registrar FAILED with exit code ' + IntToStr(ResultCode) + '; see '
+        + ExpandConstant('{app}\logs\register_tasks.log'));
+    if not WizardSilent() then
+      MsgBox('Face Unlock could not register its background tasks (exit code '
+             + IntToStr(ResultCode) + ').' + #13#10#13#10
+             + 'Face sign-in will not work until they are registered. Details: '
+             + ExpandConstant('{app}\logs\register_tasks.log'), mbError, MB_OK);
+  end;
+end;
 
-  USERPROFILE is Setup's own, i.e. the elevated token's. When the user elevated
-  their own account -- the normal UAC prompt -- that is the same profile the
-  runasoriginaluser dialog writes to. When a DIFFERENT administrator's
-  credentials were typed into UAC, it is that administrator's profile, and the
-  only effect is that the entry may show the wrong default state; the user can
-  still tick or untick it. }
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    // Recorded for the uninstaller, which has no original-user process to ask (F-07).
+    if GetOriginalUserSid() <> '' then
+      RegWriteStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', GetOriginalUserSid());
+    RegisterTasks();
+  end;
+end;
+
+{ Check for the two password entries in [Run] step 4: the ORIGINAL user's data
+  directory (Stage 8b, F-07) -- the profile the runasoriginaluser dialog writes
+  to -- which is what face_service/config.py resolves as Path.home() for that
+  user. Existence only; the DPAPI blob itself is never opened here. }
 function CredentialsSaved(): Boolean;
 begin
-  Result := FileExists(ExpandConstant('{%USERPROFILE}\.face-unlock\credentials.bin'));
+  Result := FileExists(DataDirFor(GetOriginalUserSid()) + '\credentials.bin');
 end;
+
+var
+  UninstallUserSid: string;
 
 function InitializeUninstall(): Boolean;
 begin
-  // Nothing fancy -- UninstallRun handles task teardown.
+  // Task teardown is [UninstallRun]. The user whose data this is was recorded at install
+  // time (Stage 8b, F-07); read it now, before the app key is deleted with the rest.
+  if not RegQueryStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', UninstallUserSid)
+     or not IsUserSid(UninstallUserSid) then
+    UninstallUserSid := '';
   Result := True;
 end;
 
@@ -436,7 +631,9 @@ var
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    DataDir := ExpandConstant('{%USERPROFILE}\.face-unlock');
+    // The recorded original user's profile (F-07); Setup's own profile for an install
+    // made before 8b, which recorded nothing.
+    DataDir := DataDirFor(UninstallUserSid);
     if DirExists(DataDir) then
     begin
       if WantsDataRemoved(DataDir) then

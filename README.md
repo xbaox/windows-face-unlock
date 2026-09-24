@@ -78,7 +78,7 @@ them. Treat face sign-in as convenience; treat the PIN as the real credential.
 ## Install (end user)
 
 Grab the latest installer from the
-[**Releases page**](https://github.com/caochitam/windows-face-unlock/releases)
+[**Releases page**](https://github.com/xbaox/windows-face-unlock/releases)
 and double-click it. Requires Windows 10/11 x64, admin rights, any webcam.
 
 - The installer bundles Python, the ONNX runtime, the YuNet detector **and** the

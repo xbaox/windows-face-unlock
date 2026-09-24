@@ -13,6 +13,10 @@
 # InstalledExe = '' means "this task has no frozen executable yet" -- the
 # registrar skips it in Installed mode and says so out loud, rather than
 # creating a task that points at a file which does not exist.
+#
+# Optional per-task keys (Stage 8b, F-36):
+#   Priority         -- Task Scheduler priority, 0 (highest) .. 10; default 7 (below normal).
+#   RestartOnFailure -- $true = restart a failed run 3 times, one minute apart.
 
 @{
     Tasks = @(
@@ -22,6 +26,9 @@
             DevArgs      = '-m face_service'
             InstalledExe = 'face_service.exe'
             SkipReason   = ''
+            # Normal priority (5) instead of the scheduler's below-normal 7: this is the process
+            # the lock screen waits on. Only the service -- the tray and watchdog stay at 7 (P-10).
+            Priority     = 5
         },
         @{
             Name         = 'FaceUnlock-Presence'
@@ -29,6 +36,7 @@
             DevArgs      = '-m presence_monitor'
             InstalledExe = 'face_unlock_tray.exe'
             SkipReason   = ''
+            RestartOnFailure = $true
         },
         @{
             Name         = 'FaceUnlock-Watchdog'
@@ -48,6 +56,7 @@
             # installed restart path as untested rather than proven.
             InstalledExe = 'face_unlock_watchdog.exe'
             SkipReason   = ''
+            RestartOnFailure = $true
         }
     )
 }
