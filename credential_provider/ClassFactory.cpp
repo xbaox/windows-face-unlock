@@ -4,12 +4,15 @@
 
 #include "guid.h"
 #include "FaceCredentialProvider.h"
+#include "helpers.h"
 
 namespace FaceUnlock {
 
 class ClassFactory : public IClassFactory {
 public:
-    ClassFactory() : m_cRef(1) {}
+    // 8b F-24: DLL ref for the factory's lifetime (see DllAddRef in dll.cpp).
+    ClassFactory() : m_cRef(1) { DllAddRef(); }
+    ~ClassFactory() { DllRelease(); }
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
@@ -25,13 +28,23 @@ public:
 
     IFACEMETHODIMP CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppv) override {
         if (pUnkOuter) return CLASS_E_NOAGGREGATION;
-        auto* p = new (std::nothrow) FaceCredentialProvider();
-        if (!p) return E_OUTOFMEMORY;
-        HRESULT hr = p->QueryInterface(riid, ppv);
-        p->Release();
-        return hr;
+        // 8b F-48: the provider constructor allocates (make_shared) and could throw through
+        // this COM boundary into LogonUI -> std::terminate -> translate to an HRESULT.
+        try {
+            auto* p = new (std::nothrow) FaceCredentialProvider();
+            if (!p) return E_OUTOFMEMORY;
+            HRESULT hr = p->QueryInterface(riid, ppv);
+            p->Release();
+            return hr;
+        } catch (...) {
+            return HResultFromCurrentException();
+        }
     }
-    IFACEMETHODIMP LockServer(BOOL) override { return S_OK; }
+    // 8b F-24: LockServer was a no-op -> a locked server could still be unloaded -> count it.
+    IFACEMETHODIMP LockServer(BOOL fLock) override {
+        if (fLock) DllAddRef(); else DllRelease();
+        return S_OK;
+    }
 
 private:
     LONG m_cRef;

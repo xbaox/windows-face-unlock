@@ -3,7 +3,8 @@
 #include <string>
 
 // Minimal blocking named-pipe client matching the Python FaceService protocol.
-// Sends a single JSON request and reads a single JSON reply. Timeout is best-effort.
+// Sends a single JSON request and reads a single JSON reply. The timeout bounds the whole call:
+// since 8b (F-03) the connect wait is capped by the remaining budget and is never 0.
 namespace FaceUnlock {
 
 // Outcome of the client-side pipe-server identity check (defense-in-depth
@@ -32,10 +33,48 @@ struct UnlockReply {
     std::string  reason;     // failure reason token, or a parse error; empty on success
     std::string  gesture;    // "blink" | "turn_left" | "turn_right" | "nod", else empty
     std::wstring prompt;     // localized instruction to show on the tile, else empty
+                             // (sanitized: no C0/DEL, at most kMaxPromptChars)
     std::string  token;      // 32 hex chars, replayed in the phase-2 request, else empty
+
+    // 8b F-25: every UnlockReply copy of the password (worker locals, back-compat wrappers)
+    // used to be freed unwiped -> plaintext residue in the LogonUI heap -> wipe on destruction,
+    // on every path including an exception unwinding through the owner.
+    ~UnlockReply() {
+        if (!password.empty()) SecureZeroMemory(&password[0], password.size() * sizeof(wchar_t));
+    }
 };
 
-// Returns true on success; on success, fills `response` with the raw reply JSON.
+// 8b F-48: server-supplied fields had no length bounds -> oversized or NUL-bearing values
+// reached KerbPack (USHORT truncation) and the tile -> fixed caps, in UTF-16 code units.
+// A reply over a cap, or with an embedded NUL in a credential field, is "malformed-response".
+constexpr size_t kMaxUsernameChars = 256;
+constexpr size_t kMaxDomainChars   = 256;
+constexpr size_t kMaxPasswordChars = 1024;
+constexpr size_t kMaxPromptChars   = 120;   // gesture prompt shown on the secure-desktop tile
+
+// 8b F-48/F-04: one failure text for every reason -> a dead service looked like a face
+// mismatch -> a few fixed texts chosen by reason. The server never supplies failure text.
+// Kept here (not in FaceCredential) so the offline parser test can reach the mapping.
+inline constexpr wchar_t kTextNotRecognised[] = L"Face not recognised. Use password tile instead.";
+inline constexpr wchar_t kTextLockedOut[]     = L"Face sign-in temporarily locked. Use PIN or password.";
+inline constexpr wchar_t kTextUnavailable[]   = L"Face Unlock service unavailable. Use PIN or password.";
+inline constexpr wchar_t kTextPasswordRejected[] =
+    L"Stored password was rejected \u2014 sign in with PIN and update it in Face Unlock";
+
+// Map a failure reason token to one of the fixed texts above. Unknown reasons (including any
+// future service reason such as "insecure-data-dir") fall back to kTextUnavailable.
+const wchar_t* FailureTextForReason(const std::string& reason);
+
+// Drop C0 controls (< 0x20) and DEL, then cap at kMaxPromptChars without splitting a
+// surrogate pair. Applied by ParseUnlockReply to the gesture prompt.
+std::wstring SanitizePromptText(const std::wstring& text);
+
+// True iff `s` is 1..64 hex digits: the only shape of phase-1 token that may be pasted back
+// into the phase-2 request. Exposed for the offline test.
+bool IsHexToken(const std::string& s);
+
+// Returns true on success; on success, fills `response` with the raw reply JSON. The reply
+// may carry a password: the caller must wipe `response` after use.
 // When verifyServer is true the server's owner SID is checked BEFORE anything is
 // sent; on an untrusted server PipeCall returns false without writing the request
 // (and, if `trust` is non-null, reports checked=true/trusted=false).

@@ -14,6 +14,42 @@ static std::wstring Utf8ToWide(const std::string& s) {
     return out;
 }
 
+// 8b F-25: reply buffers and parsed strings holding the password were freed unwiped ->
+// plaintext residue in the LogonUI (SYSTEM) heap -> wipe them in place before release.
+template <class S>
+static void WipeContents(S& s) {
+    if (!s.empty()) SecureZeroMemory(&s[0], s.size() * sizeof(s[0]));
+}
+template <class S>
+static void WipeAndClear(S& s) {
+    WipeContents(s);
+    s.clear();
+}
+
+// Wipes a string/vector when the scope ends -- on every path, an exception included.
+template <class S>
+class WipeOnExit {
+public:
+    explicit WipeOnExit(S& s) : m_s(s) {}
+    ~WipeOnExit() { WipeContents(m_s); }
+    WipeOnExit(const WipeOnExit&) = delete;
+    WipeOnExit& operator=(const WipeOnExit&) = delete;
+private:
+    S& m_s;
+};
+
+// 8b F-25: Utf8ToWide returns a temporary whose buffer (or small-string storage) is released
+// unwiped -> a password copy survives -> decode a secret straight into its destination,
+// sized exactly once so no intermediate buffer is ever freed holding it.
+static void Utf8ToWideSecret(const std::string& s, std::wstring& out) {
+    WipeAndClear(out);
+    if (s.empty()) return;
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return;
+    out.resize((size_t)n);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
+}
+
 // ---------------------------------------------------------------------------
 // Minimal, dependency-free JSON reader.
 //
@@ -37,6 +73,14 @@ struct JsonValue {
     enum Type { STRING, BOOL, NUMBER, NUL, OBJECT, ARRAY } type = NUL;
     std::string str;        // decoded UTF-8, valid when type == STRING
     bool boolean = false;   // valid when type == BOOL
+
+    // 8b F-25: the "password" value lived in a temporary JsonValue plus a map copy, both freed
+    // unwiped -> residue -> non-copyable (values are swapped into the map, never copied) and
+    // wiped on destruction.
+    JsonValue() = default;
+    JsonValue(const JsonValue&) = delete;
+    JsonValue& operator=(const JsonValue&) = delete;
+    ~JsonValue() { WipeContents(str); }
 };
 
 inline void SkipWs(const char*& p, const char* end) {
@@ -84,6 +128,17 @@ bool ParseHex4(const char*& p, const char* end, unsigned int& out) {
 bool ParseString(const char*& p, const char* end, std::string& out) {
     if (p >= end || *p != '"') return false;
     ++p;  // opening quote
+    // 8b F-25: growing `out` by push_back reallocated and freed partial password copies
+    // unwiped -> residue -> reserve the raw span up front. Decoding never lengthens a string
+    // (an escape is at least as long as what it decodes to), so no reallocation follows.
+    {
+        const char* q = p;
+        while (q < end && *q != '"') {
+            if (*q == '\\' && ++q >= end) break;
+            ++q;
+        }
+        out.reserve(out.size() + (size_t)(q - p));
+    }
     while (p < end) {
         char c = *p++;
         if (c == '"') return true;                 // closing quote
@@ -199,7 +254,14 @@ bool ParseObject(const std::string& json, std::map<std::string, JsonValue>& out)
                    *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') ++p;
             v.str.assign(s, p);
         }
-        out[key] = v;
+        // 8b F-25: `out[key] = v` left an unwiped copy behind (and, on a duplicate key,
+        // overwrote the previous value without wiping it) -> wipe the slot, then swap the
+        // value in so each decoded byte exists in exactly one place. Last value still wins.
+        JsonValue& slot = out[key];
+        WipeAndClear(slot.str);
+        slot.type = v.type;
+        slot.boolean = v.boolean;
+        slot.str.swap(v.str);
         SkipWs(p, end);
         if (p < end && *p == ',') { ++p; continue; }
         if (p < end && *p == '}') { ++p; return true; }
@@ -240,7 +302,9 @@ bool ParseUnlockReply(const std::string& response, UnlockReply& out) {
     TakeString(obj, "token", out.token);
     std::string promptUtf8;
     TakeString(obj, "prompt", promptUtf8);
-    out.prompt = Utf8ToWide(promptUtf8);
+    // 8b F-48: the prompt went onto the secure-desktop tile unbounded and with control
+    // characters -> arbitrary server text on the lock screen -> strip C0/DEL and cap it.
+    out.prompt = SanitizePromptText(Utf8ToWide(promptUtf8));
 
     auto itOk = obj.find("ok");
     bool ok = (itOk != obj.end() && itOk->second.type == JsonValue::BOOL && itOk->second.boolean);
@@ -266,9 +330,25 @@ bool ParseUnlockReply(const std::string& response, UnlockReply& out) {
     std::string d;
     TakeString(obj, "domain", d);
 
-    out.username = Utf8ToWide(itU->second.str);
-    out.password = Utf8ToWide(itP->second.str);
-    out.domain   = Utf8ToWide(d.empty() ? "." : d);
+    Utf8ToWideSecret(itU->second.str, out.username);
+    Utf8ToWideSecret(itP->second.str, out.password);
+    Utf8ToWideSecret(d.empty() ? std::string(".") : d, out.domain);
+
+    // 8b F-48: no bounds and no NUL check on the credential fields -> USHORT truncation in
+    // KerbPack and a wcslen/size() mismatch on an embedded \u0000 -> enforce the caps and
+    // reject any NUL here, before anything is stored or packed.
+    auto badField = [](const std::wstring& w, size_t cap) {
+        return w.empty() || w.size() > cap || w.find(L'\0') != std::wstring::npos;
+    };
+    if (badField(out.username, kMaxUsernameChars) ||
+        badField(out.password, kMaxPasswordChars) ||
+        badField(out.domain,   kMaxDomainChars)) {
+        WipeAndClear(out.username);
+        WipeAndClear(out.password);
+        WipeAndClear(out.domain);
+        out.reason = "malformed-response";
+        return false;
+    }
     return true;
 }
 
@@ -431,17 +511,28 @@ bool PipeCall(const std::wstring& pipeName,
     // Try to open the pipe within the total timeout.
     HANDLE h = INVALID_HANDLE_VALUE;
     while (true) {
+        // 8b F-26: without SECURITY_SQOS_PRESENT the server was offered impersonation of the
+        // SYSTEM client -> more than the service needs -> offer identification only. The
+        // service SID gate (ImpersonateNamedPipeClient + OpenThreadToken(TOKEN_QUERY)) works
+        // at identification level (proven on a test pipe in 8b, work\f26\f26-proof.txt).
         h = CreateFileW(pipeName.c_str(),
                         GENERIC_READ | GENERIC_WRITE,
-                        0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+                        0, nullptr, OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                        nullptr);
         if (h != INVALID_HANDLE_VALUE) break;
         DWORD err = GetLastError();
-        if (remaining() == 0) return false;
+        // 8b F-03: remaining() was read separately for the check and for the wait argument,
+        // so a tick crossing the deadline passed 0 (= NMPWAIT_USE_DEFAULT_WAIT, a wait of the
+        // server's choosing) -> the join on the LogonUI thread lost its bound -> read the
+        // budget once; every wait and sleep below is capped by it and is never 0.
+        const DWORD rem = remaining();
+        if (rem == 0) return false;
         if (err == ERROR_PIPE_BUSY) {
-            WaitNamedPipeW(pipeName.c_str(), (remaining() < 500) ? remaining() : 500);
+            WaitNamedPipeW(pipeName.c_str(), (rem < 500) ? rem : 500);
         } else if (err == ERROR_FILE_NOT_FOUND) {
             // Service not running; short sleep and retry within budget.
-            Sleep(200);
+            Sleep((rem < 200) ? rem : 200);
         } else {
             return false;
         }
@@ -475,6 +566,7 @@ bool PipeCall(const std::wstring& pipeName,
     ov.hEvent = ev;
     DWORD transferred = 0;
     std::vector<char> buf(65536);
+    WipeOnExit<std::vector<char>> wipeBuf(buf);   // 8b F-25: the raw reply may carry the password
 
     do {
         BOOL w = WriteFile(h, requestJson.data(), (DWORD)requestJson.size(), nullptr, &ov);
@@ -505,6 +597,7 @@ bool RequestUnlock(UnlockReply& out, ServerTrust* trust) {
     const DWORD kUnlockTimeoutMs = 12000;
 
     std::string resp;
+    WipeOnExit<std::string> wipeResp(resp);   // 8b F-25: raw reply JSON may carry the password
     ServerTrust localTrust;
     ServerTrust* t = trust ? trust : &localTrust;
     if (!PipeCall(pipe, "{\"cmd\":\"unlock\"}", resp, kUnlockTimeoutMs, /*verifyServer=*/true, t)) {
@@ -515,11 +608,11 @@ bool RequestUnlock(UnlockReply& out, ServerTrust* trust) {
     return ParseUnlockReply(resp, out);
 }
 
-namespace {
 // The phase-1 token is data we received over the pipe and are about to paste back into a
 // request document. Constrain it to what the service actually issues (hex) instead of
 // escaping: a token carrying a quote or backslash would otherwise build malformed -- or
 // attacker-shaped -- request JSON. 64 is a generous ceiling over the 32 chars in use.
+// (8b F-48: moved out of the anonymous namespace -> reachable from the offline test.)
 bool IsHexToken(const std::string& s) {
     if (s.empty() || s.size() > 64) return false;
     for (char c : s) {
@@ -528,7 +621,32 @@ bool IsHexToken(const std::string& s) {
     }
     return true;
 }
-}  // anonymous namespace
+
+// 8b F-48: see PipeClient.h. Reason tokens are the service's (face_service/service.py unlock
+// and unlock_gesture handlers) plus the client-side ones produced in this file.
+const wchar_t* FailureTextForReason(const std::string& reason) {
+    if (reason == "no-match" || reason == "gesture-failed" || reason == "too-dark")
+        return kTextNotRecognised;
+    if (reason == "locked-out")
+        return kTextLockedOut;
+    // pipe-unavailable, server-untrusted, malformed-response, camera-busy, not-authorized,
+    // no-credentials, gesture-token-invalid, an unusable needs-gesture, insecure-data-dir,
+    // exception: ..., and anything unknown.
+    return kTextUnavailable;
+}
+
+std::wstring SanitizePromptText(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size() < kMaxPromptChars ? text.size() : kMaxPromptChars);
+    for (wchar_t c : text) {
+        if (c < 0x20 || c == 0x7F) continue;          // C0 controls and DEL
+        if (out.size() >= kMaxPromptChars) break;
+        out.push_back(c);
+    }
+    // Never leave half a surrogate pair at the cut.
+    if (!out.empty() && out.back() >= 0xD800 && out.back() <= 0xDBFF) out.pop_back();
+    return out;
+}
 
 bool RequestUnlockGesture(const std::string& token, UnlockReply& out, ServerTrust* trust) {
     const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlock";
@@ -543,6 +661,7 @@ bool RequestUnlockGesture(const std::string& token, UnlockReply& out, ServerTrus
     }
 
     std::string resp;
+    WipeOnExit<std::string> wipeResp(resp);   // 8b F-25: raw reply JSON may carry the password
     ServerTrust localTrust;
     ServerTrust* t = trust ? trust : &localTrust;
     const std::string req = "{\"cmd\":\"unlock_gesture\",\"token\":\"" + token + "\"}";

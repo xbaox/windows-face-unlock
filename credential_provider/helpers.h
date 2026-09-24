@@ -36,4 +36,15 @@ HRESULT KerbPackInteractiveUnlock(const std::wstring& domain,
 
 void KerbUnpackFree(CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* pcpcs);
 
+// 8b F-24: g_DllRefs was never incremented -> DllCanUnloadNow always said S_OK, so the DLL
+// could be unmapped under live objects -> every COM object and LockServer holds a DLL ref.
+// Defined in dll.cpp.
+void DllAddRef();
+void DllRelease();
+
+// 8b F-48: C++ exceptions (std::bad_alloc, std::system_error) could escape a COM method into
+// LogonUI -> std::terminate -> translate at the boundary. Call ONLY from inside a catch block:
+// bad_alloc -> E_OUTOFMEMORY, anything else -> E_UNEXPECTED.
+HRESULT HResultFromCurrentException() noexcept;
+
 }  // namespace FaceUnlock

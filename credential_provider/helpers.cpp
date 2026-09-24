@@ -1,6 +1,8 @@
 #include "helpers.h"
 #include <wincred.h>
 #include <intsafe.h>
+#include <climits>
+#include <new>
 
 #pragma comment(lib, "credui.lib")
 #pragma comment(lib, "secur32.lib")
@@ -25,8 +27,9 @@ const FIELD_STATE_PAIR s_FieldStatePairs[FIELD_COUNT] = {
 // Copy `src` into buffer at cursor, set UNICODE_STRING fields so that
 // Buffer is an OFFSET (in bytes) from the start of the serialization
 // buffer — this is what LSA expects for CPGSR_RETURN_CREDENTIAL_FINISHED.
-static void PackString(UNICODE_STRING& u, PCWSTR src, BYTE* base, USHORT& cursor) {
-    USHORT len = (USHORT)(wcslen(src) * sizeof(WCHAR));
+// 8b F-48: the byte length came from wcslen() while the buffer was sized from size() -> an
+// embedded NUL made them disagree -> the caller passes the one validated length it sized with.
+static void PackString(UNICODE_STRING& u, PCWSTR src, USHORT len, BYTE* base, USHORT& cursor) {
     u.Length = len;
     u.MaximumLength = len;
     if (len > 0) {
@@ -45,13 +48,30 @@ HRESULT KerbPackInteractiveUnlock(const std::wstring& domain,
                                   CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* pcpcs) {
     const bool isUnlock = (cpus == CPUS_UNLOCK_WORKSTATION);
 
-    const USHORT dLen = (USHORT)(domain.size()   * sizeof(WCHAR));
-    const USHORT uLen = (USHORT)(username.size() * sizeof(WCHAR));
-    const USHORT pLen = (USHORT)(password.size() * sizeof(WCHAR));
+    // 8b F-48: byte lengths were narrowed to USHORT unchecked, and the running offset was a
+    // USHORT too -> an oversized field wrapped and produced a malformed serialization -> check
+    // in size_t that every length, and the offset of the last byte, fits a USHORT, and refuse
+    // embedded NULs, BEFORE anything is allocated or narrowed.
+    const size_t headerSize = sizeof(KERB_INTERACTIVE_UNLOCK_LOGON);
+    const size_t dBytes = domain.size()   * sizeof(WCHAR);
+    const size_t uBytes = username.size() * sizeof(WCHAR);
+    const size_t pBytes = password.size() * sizeof(WCHAR);
+    if (dBytes > USHRT_MAX || uBytes > USHRT_MAX || pBytes > USHRT_MAX ||
+        headerSize + dBytes + uBytes + pBytes > USHRT_MAX) {
+        return E_INVALIDARG;
+    }
+    if (domain.find(L'\0') != std::wstring::npos ||
+        username.find(L'\0') != std::wstring::npos ||
+        password.find(L'\0') != std::wstring::npos) {
+        return E_INVALIDARG;
+    }
+
+    const USHORT dLen = (USHORT)dBytes;
+    const USHORT uLen = (USHORT)uBytes;
+    const USHORT pLen = (USHORT)pBytes;
 
     // Always allocate at least KERB_INTERACTIVE_UNLOCK_LOGON (it's a superset
     // of KERB_INTERACTIVE_LOGON) so the LogonId field is zeroed for both scenarios.
-    const size_t headerSize = sizeof(KERB_INTERACTIVE_UNLOCK_LOGON);
     const size_t total = headerSize + dLen + uLen + pLen;
 
     BYTE* buffer = (BYTE*)CoTaskMemAlloc(total);
@@ -64,9 +84,9 @@ HRESULT KerbPackInteractiveUnlock(const std::wstring& domain,
     logon->MessageType = isUnlock ? KerbWorkstationUnlockLogon : KerbInteractiveLogon;
 
     USHORT cursor = (USHORT)headerSize;
-    PackString(logon->LogonDomainName, domain.c_str(),   buffer, cursor);
-    PackString(logon->UserName,        username.c_str(), buffer, cursor);
-    PackString(logon->Password,        password.c_str(), buffer, cursor);
+    PackString(logon->LogonDomainName, domain.c_str(),   dLen, buffer, cursor);
+    PackString(logon->UserName,        username.c_str(), uLen, buffer, cursor);
+    PackString(logon->Password,        password.c_str(), pLen, buffer, cursor);
 
     pcpcs->rgbSerialization = buffer;
     pcpcs->cbSerialization  = (ULONG)total;
@@ -102,6 +122,16 @@ HRESULT KerbPackInteractiveUnlock(const std::wstring& domain,
     pcpcs->ulAuthenticationPackage = pkgId;
     pcpcs->clsidCredentialProvider = GUID_NULL;  // filled by caller
     return S_OK;
+}
+
+HRESULT HResultFromCurrentException() noexcept {
+    try {
+        throw;
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    } catch (...) {
+        return E_UNEXPECTED;
+    }
 }
 
 void KerbUnpackFree(CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* pcpcs) {

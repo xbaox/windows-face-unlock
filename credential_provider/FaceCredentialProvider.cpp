@@ -7,14 +7,21 @@ namespace FaceUnlock {
 
 FaceCredentialProvider::FaceCredentialProvider()
     : m_cRef(1), m_cpus(CPUS_INVALID), m_pCred(nullptr),
-      m_events(std::make_shared<ProviderEvents>()) {}
+      m_events(std::make_shared<ProviderEvents>()) {
+    DllAddRef();   // 8b F-24: the DLL must stay mapped while this object lives
+}
 
 FaceCredentialProvider::~FaceCredentialProvider() {
     // Drop the sink before releasing the credential: LogonUI may still hold its own reference,
     // so the credential can outlive us, and it must not call back into a dead provider. The
     // shared holder makes that safe -- after Clear() the notify is a no-op.
-    m_events->Clear();
+    // 8b F-48: a destructor must not throw (std::terminate in LogonUI) -> contain.
+    try {
+        m_events->Clear();
+    } catch (...) {
+    }
     if (m_pCred) { m_pCred->Release(); m_pCred = nullptr; }
+    DllRelease();  // 8b F-24
 }
 
 IFACEMETHODIMP FaceCredentialProvider::QueryInterface(REFIID riid, void** ppv) {
@@ -48,7 +55,14 @@ IFACEMETHODIMP FaceCredentialProvider::SetUsageScenario(CREDENTIAL_PROVIDER_USAG
         case CPUS_UNLOCK_WORKSTATION:
             m_cpus = cpus;
             if (!m_pCred) {
-                m_pCred = new (std::nothrow) FaceCredential(m_events);
+                // 8b F-48: the credential constructor allocates (std::wstring members) and
+                // could throw through this COM boundary into LogonUI -> translate.
+                try {
+                    m_pCred = new (std::nothrow) FaceCredential(m_events);
+                } catch (...) {
+                    m_pCred = nullptr;
+                    return HResultFromCurrentException();
+                }
                 if (!m_pCred) return E_OUTOFMEMORY;
                 HRESULT hr = m_pCred->Initialize(cpus);
                 if (FAILED(hr)) { m_pCred->Release(); m_pCred = nullptr; return hr; }
@@ -66,13 +80,22 @@ IFACEMETHODIMP FaceCredentialProvider::SetSerialization(const CREDENTIAL_PROVIDE
 // it is the only way a worker thread can tell LogonUI "re-enumerate, I have a credential".
 // The sink is kept in a shared, mutex-guarded holder (see FaceCredential.h) rather than a
 // bare member, because the credential's worker reads it from another thread.
+// 8b F-48: both take a std::mutex, whose lock() can throw -> contained at the COM boundary.
 IFACEMETHODIMP FaceCredentialProvider::Advise(ICredentialProviderEvents* pcpe, UINT_PTR upAdviseContext) {
-    m_events->Set(pcpe, upAdviseContext);
-    return S_OK;
+    try {
+        m_events->Set(pcpe, upAdviseContext);
+        return S_OK;
+    } catch (...) {
+        return HResultFromCurrentException();
+    }
 }
 IFACEMETHODIMP FaceCredentialProvider::UnAdvise() {
-    m_events->Clear();
-    return S_OK;
+    try {
+        m_events->Clear();
+        return S_OK;
+    } catch (...) {
+        return HResultFromCurrentException();
+    }
 }
 
 IFACEMETHODIMP FaceCredentialProvider::GetFieldDescriptorCount(DWORD* pdwCount) {
@@ -109,7 +132,14 @@ IFACEMETHODIMP FaceCredentialProvider::GetCredentialCount(DWORD* pdwCount, DWORD
     // what turns "the face/gesture round succeeded" into an actual sign-in without a second
     // click. HasResult() is false in every other enumeration, including the first one, so the
     // idle lock screen still never fires the camera by itself.
-    *pbAutoLogonWithDefault = (m_pCred && m_pCred->HasResult()) ? TRUE : FALSE;
+    // 8b F-48: HasResult() takes the credential's mutex -> contained at the COM boundary; on
+    // failure the safe answer is "no autologon".
+    try {
+        *pbAutoLogonWithDefault = (m_pCred && m_pCred->HasResult()) ? TRUE : FALSE;
+    } catch (...) {
+        *pbAutoLogonWithDefault = FALSE;
+        return HResultFromCurrentException();
+    }
     return S_OK;
 }
 

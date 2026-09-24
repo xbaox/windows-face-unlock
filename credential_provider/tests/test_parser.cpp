@@ -24,6 +24,7 @@
 using FaceUnlock::ParseUnlockReply;
 using FaceUnlock::ParseUnlockResponse;
 using FaceUnlock::UnlockReply;
+using namespace std::string_literals;   // "..."s keeps embedded NUL bytes (8b hostile vectors)
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -104,6 +105,57 @@ static void CaseGesture(const char* label, const std::string& resp, const char* 
         std::printf("        token   exp=[%s] got=[%s]\n", wantT.c_str(), r.token.c_str());
         std::printf("        creds leaked: user=[%s] pass_len=%d\n",
                     ToUtf8(r.username).c_str(), (int)r.password.size());
+    }
+}
+
+// 8b: a plain boolean assertion, for the helpers that are not parse cases (IsHexToken,
+// FailureTextForReason, SanitizePromptText).
+static void Check(const char* label, bool cond) {
+    if (cond) {
+        ++g_pass;
+        std::printf("  PASS  %s\n", label);
+    } else {
+        ++g_fail;
+        std::printf("  FAIL  %s\n", label);
+    }
+}
+
+// 8b: build {"ok":true,"username":U,"password":P[,"domain":D]} from raw JSON string bodies.
+static std::string Grant(const std::string& u, const std::string& p, const char* d = nullptr) {
+    std::string s = "{\"ok\":true,\"username\":\"" + u + "\",\"password\":\"" + p + "\"";
+    if (d) s += ",\"domain\":\"" + std::string(d) + "\"";
+    return s + "}";
+}
+
+static std::string Repeat(const std::string& unit, size_t n) {
+    std::string s;
+    for (size_t i = 0; i < n; ++i) s += unit;
+    return s;
+}
+
+static std::wstring RepeatW(const std::wstring& unit, size_t n) {
+    std::wstring s;
+    for (size_t i = 0; i < n; ++i) s += unit;
+    return s;
+}
+
+// 8b: parse a needs-gesture reply carrying `promptJson` (a raw JSON string body) and compare
+// the decoded + sanitized prompt.
+static void CasePrompt(const char* label, const std::string& promptJson, const std::wstring& expect) {
+    UnlockReply r;
+    const std::string resp = "{\"ok\":false,\"reason\":\"needs-gesture\",\"gesture\":\"blink\","
+                             "\"token\":\"ab\",\"prompt\":\"" + promptJson + "\"}";
+    const bool ok = ParseUnlockReply(resp, r);
+    const bool good = !ok && r.reason == "needs-gesture" && r.prompt == expect;
+    if (good) {
+        ++g_pass;
+        std::printf("  PASS  %s\n", label);
+    } else {
+        ++g_fail;
+        std::printf("  FAIL  %s\n", label);
+        std::printf("        ok=%d reason=[%s] prompt exp=[%s](%d) got=[%s](%d)\n", (int)ok,
+                    r.reason.c_str(), ToUtf8(expect).c_str(), (int)expect.size(),
+                    ToUtf8(r.prompt).c_str(), (int)r.prompt.size());
     }
 }
 
@@ -269,8 +321,188 @@ int main() {
                R"({"ok":false,"reason":"gesture-failed","challenge":"blink"})",
                "gesture-failed");
 
+    // Gate: the whole pre-8b suite (16 baseline + 12 Stage 7-i) must still be 28/28 green
+    // before any 8b vector runs.
+    const int pre8bTotal = g_pass + g_fail;
+    std::printf("  ---- pre-8b suite: %d/%d green (expected 28/28) ----\n", g_pass, pre8bTotal);
+    if (pre8bTotal != 28 || g_fail != 0) {
+        ++g_fail;
+        std::printf("  FAIL  pre-8b suite is not 28/28 green\n");
+    }
+    const int stage7iTotal = pre8bTotal - baseTotal;
+    const int pre8bCount = g_pass + g_fail;
+
+    std::printf("\n8b: hostile vectors, length caps, IsHexToken, failure texts\n");
     std::printf("-----------------------------\n");
-    std::printf("PASS=%d  FAIL=%d  (baseline 16 + Stage 7-i %d)\n",
-                g_pass, g_fail, g_pass + g_fail - baseTotal);
+
+    // --- Length caps (UTF-16 code units): username/domain <= 256, password <= 1024 ---
+    CaseOk("cap: username of exactly 256 chars accepted",
+           Grant(std::string(256, 'u'), "pw"),
+           std::wstring(256, L'u'), L"pw", L".");
+    CaseReject("cap: username of 257 chars rejected",
+               Grant(std::string(257, 'u'), "pw"), "malformed-response");
+    CaseOk("cap: domain of exactly 256 chars accepted",
+           Grant("u", "pw", std::string(256, 'd').c_str()),
+           L"u", L"pw", std::wstring(256, L'd'));
+    CaseReject("cap: domain of 257 chars rejected",
+               Grant("u", "pw", std::string(257, 'd').c_str()), "malformed-response");
+    CaseOk("cap: password of exactly 1024 chars accepted",
+           Grant("u", std::string(1024, 'p')),
+           L"u", std::wstring(1024, L'p'), L".");
+    CaseReject("cap: password of 1025 chars rejected",
+               Grant("u", std::string(1025, 'p')), "malformed-response");
+    CaseReject("cap: 70000-char password (beyond 64 KiB) rejected",
+               Grant("u", std::string(70000, 'p')), "malformed-response");
+    CaseOk("cap: counted in UTF-16 units -- 256 x \\u00e9 username accepted",
+           Grant(Repeat("\\u00e9", 256), "pw"),
+           std::wstring(256, L'\u00e9'), L"pw", L".");
+    CaseOk("cap: 512 astral chars (1024 units) password accepted",
+           Grant("u", Repeat("\\uD83D\\uDE00", 512)),
+           L"u", RepeatW(L"\U0001F600", 512), L".");
+    CaseReject("cap: 513 astral chars (1026 units) password rejected",
+               Grant("u", Repeat("\\uD83D\\uDE00", 513)), "malformed-response");
+
+    // --- Embedded NUL: never allowed in a credential field ---
+    CaseReject("NUL: escaped \\u0000 inside password rejected",
+               Grant("u", "ab\\u0000cd"), "malformed-response");
+    CaseReject("NUL: escaped \\u0000 inside username rejected",
+               Grant("al\\u0000ice", "pw"), "malformed-response");
+    CaseReject("NUL: escaped \\u0000 inside domain rejected",
+               Grant("u", "pw", "CO\\u0000RP"), "malformed-response");
+    CaseReject("NUL: raw 0x00 byte inside password rejected",
+               "{\"ok\":true,\"username\":\"u\",\"password\":\"ab\0cd\"}"s, "malformed-response");
+    CaseReject("NUL: password that is only \\u0000 rejected",
+               Grant("u", "\\u0000"), "malformed-response");
+
+    // --- Bad / truncated escapes ---
+    CaseReject("escape: invalid \\x rejected",
+               Grant("u", "a\\xb"), "malformed-response");
+    CaseReject("escape: truncated \\u12 rejected",
+               R"({"ok":true,"username":"u","password":"a\u12"})", "malformed-response");
+    CaseReject("escape: non-hex \\uZZZZ rejected",
+               Grant("u", "a\\uZZZZ"), "malformed-response");
+    CaseReject("escape: backslash at end of input rejected",
+               R"({"ok":true,"username":"u","password":"a\)", "malformed-response");
+    CaseReject("escape: high surrogate + truncated low \\uDC0 rejected",
+               Grant("u", "\\uD83D\\uDC0"), "malformed-response");
+    CaseOk("escape: lone low surrogate decodes to U+FFFD",
+           Grant("u", "a\\uDC00b"), L"u", L"a\uFFFDb", L".");
+    CaseOk("escape: high surrogate + non-low decodes to U+FFFD + char",
+           Grant("u", "\\uD83D\\u0041"), L"u", L"\uFFFDA", L".");
+
+    // --- Truncated JSON ---
+    CaseReject("truncated: empty input", "", "malformed-response");
+    CaseReject("truncated: lone '{'", "{", "malformed-response");
+    CaseReject("truncated: inside a literal", R"({"ok":tr)", "malformed-response");
+    CaseReject("truncated: unterminated password string",
+               R"({"ok":true,"username":"u","password":"x)", "malformed-response");
+    CaseReject("truncated: after a trailing comma",
+               R"({"ok":true,"username":"u","password":"x",)", "malformed-response");
+    CaseReject("truncated: inside a nested container",
+               R"({"ok":true,"username":"u","password":"x","meta":{"a":[1,2)", "malformed-response");
+    CaseReject("truncated: key without value",
+               R"({"ok":true,"username":"u","password")", "malformed-response");
+    CaseReject("not an object: top-level array",
+               R"([{"ok":true,"username":"u","password":"x"}])", "malformed-response");
+
+    // --- Nested and duplicated keys ---
+    CaseOk("nested: a nested \"password\" does not override the top-level one",
+           R"({"ok":true,"username":"u","password":"x","n":{"password":"evil","a":[{"b":[1,{"c":"}"}]}]}})",
+           L"u", L"x", L".");
+    CaseOk("nested: 5000-deep balanced nesting is skipped (iterative, no recursion)",
+           "{\"ok\":true,\"username\":\"u\",\"password\":\"x\",\"deep\":" +
+               std::string(5000, '[') + std::string(5000, ']') + "}",
+           L"u", L"x", L".");
+    CaseReject("nested: 5000-deep unbalanced nesting rejected",
+               "{\"ok\":true,\"username\":\"u\",\"password\":\"x\",\"deep\":" +
+                   std::string(5000, '[') + std::string(4999, ']') + "}",
+               "malformed-response");
+    CaseOk("duplicate: last \"password\" wins",
+           R"({"ok":true,"username":"u","password":"first","password":"second"})",
+           L"u", L"second", L".");
+    CaseReject("duplicate: a later \"ok\":false wins over an earlier true",
+               R"({"ok":true,"username":"u","password":"x","ok":false})", "no-match");
+    CaseReject("duplicate: a later non-string password wins and is rejected",
+               R"({"ok":true,"username":"u","password":"x","password":7})", "malformed-response");
+
+    // --- Huge numbers and non-string types (never coerced) ---
+    CaseOk("number: huge exponent and 400-digit number are skipped",
+           "{\"ok\":true,\"retry_after_s\":1e999999,\"n\":" + std::string(400, '9') +
+               ",\"username\":\"u\",\"password\":\"x\"}",
+           L"u", L"x", L".");
+    CaseReject("type: ok as number 1 is not truthy",
+               R"({"ok":1,"username":"u","password":"x"})", "no-match");
+    CaseReject("type: username as number rejected",
+               R"({"ok":true,"username":12345,"password":"x"})", "malformed-response");
+    CaseReject("type: password as array rejected",
+               R"({"ok":true,"username":"u","password":["x"]})", "malformed-response");
+    CaseReject("type: password as object rejected",
+               R"({"ok":true,"username":"u","password":{"v":"x"}})", "malformed-response");
+    CaseReject("type: password null rejected",
+               R"({"ok":true,"username":"u","password":null})", "malformed-response");
+    CaseReject("type: password true rejected",
+               R"({"ok":true,"username":"u","password":true})", "malformed-response");
+    CaseReject("type: non-string reason -> no-match",
+               R"({"ok":false,"reason":42})", "no-match");
+    CaseOk("type: non-string domain is ignored -> \".\"",
+           R"({"ok":true,"username":"u","password":"x","domain":7})", L"u", L"x", L".");
+
+    // --- Gesture prompt: C0/DEL stripped, capped at 120 UTF-16 units ---
+    CasePrompt("prompt: escaped C0 controls and DEL stripped",
+               "Bl\\n\\tink\\u0007 \\u001bnow\\u007f!", L"Blink now!");
+    CasePrompt("prompt: raw control bytes stripped",
+               "Bl\x01ink\x1f now", L"Blink now");
+    CasePrompt("prompt: 300 chars capped to 120", std::string(300, 'a'), std::wstring(120, L'a'));
+    CasePrompt("prompt: cap never splits a surrogate pair",
+               std::string(119, 'a') + "\\uD83D\\uDE00", std::wstring(119, L'a'));
+    CasePrompt("prompt: C1/non-ASCII text is kept",
+               "Turn \\u00e9 \\u0085", L"Turn \u00e9 \u0085");
+    CasePrompt("prompt: only controls -> empty", "\\n\\r\\t", L"");
+
+    // --- IsHexToken (the only token shape pasted back into the phase-2 request) ---
+    using FaceUnlock::IsHexToken;
+    Check("IsHexToken: empty -> false", !IsHexToken(""));
+    Check("IsHexToken: 32 lowercase hex -> true", IsHexToken("0123456789abcdef0123456789abcdef"));
+    Check("IsHexToken: uppercase hex -> true", IsHexToken("ABCDEF0123"));
+    Check("IsHexToken: single digit -> true", IsHexToken("a"));
+    Check("IsHexToken: 64 chars -> true", IsHexToken(std::string(64, 'f')));
+    Check("IsHexToken: 65 chars -> false", !IsHexToken(std::string(65, 'f')));
+    Check("IsHexToken: quote -> false", !IsHexToken("abc\""));
+    Check("IsHexToken: backslash -> false", !IsHexToken("abc\\"));
+    Check("IsHexToken: 0x prefix -> false", !IsHexToken("0x12"));
+    Check("IsHexToken: non-hex letter -> false", !IsHexToken("abcg"));
+    Check("IsHexToken: space -> false", !IsHexToken("ab cd"));
+    Check("IsHexToken: embedded NUL -> false", !IsHexToken("ab\0cd"s));
+    Check("IsHexToken: JSON-breaking payload -> false", !IsHexToken("ab\",\"cmd\":\"x"));
+
+    // --- Fixed failure texts by reason ---
+    using FaceUnlock::FailureTextForReason;
+    Check("text: no-match -> not recognised",
+          std::wstring(FailureTextForReason("no-match")) == FaceUnlock::kTextNotRecognised);
+    Check("text: gesture-failed -> not recognised",
+          std::wstring(FailureTextForReason("gesture-failed")) == FaceUnlock::kTextNotRecognised);
+    Check("text: too-dark -> not recognised",
+          std::wstring(FailureTextForReason("too-dark")) == FaceUnlock::kTextNotRecognised);
+    Check("text: locked-out -> temporarily locked",
+          std::wstring(FailureTextForReason("locked-out")) == FaceUnlock::kTextLockedOut);
+    Check("text: pipe-unavailable -> unavailable",
+          std::wstring(FailureTextForReason("pipe-unavailable")) == FaceUnlock::kTextUnavailable);
+    Check("text: server-untrusted -> unavailable",
+          std::wstring(FailureTextForReason("server-untrusted")) == FaceUnlock::kTextUnavailable);
+    Check("text: insecure-data-dir -> unavailable (ordinary failure)",
+          std::wstring(FailureTextForReason("insecure-data-dir")) == FaceUnlock::kTextUnavailable);
+    Check("text: unknown / empty / exception reasons -> generic unavailable",
+          std::wstring(FailureTextForReason("")) == FaceUnlock::kTextUnavailable &&
+          std::wstring(FailureTextForReason("exception: boom")) == FaceUnlock::kTextUnavailable &&
+          std::wstring(FailureTextForReason("needs-gesture")) == FaceUnlock::kTextUnavailable);
+    Check("text: stored-password-rejected text is exact, with U+2014",
+          std::wstring(FaceUnlock::kTextPasswordRejected) ==
+              L"Stored password was rejected \u2014 sign in with PIN and update it in Face Unlock");
+
+    const int total8b = g_pass + g_fail - pre8bCount;
+
+    std::printf("-----------------------------\n");
+    std::printf("PASS=%d  FAIL=%d  (baseline 16 + Stage 7-i %d + 8b %d)\n",
+                g_pass, g_fail, stage7iTotal, total8b);
     return g_fail == 0 ? 0 : 1;
 }

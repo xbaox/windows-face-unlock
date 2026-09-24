@@ -76,7 +76,7 @@ public:
     bool HasResult();
 
 private:
-    void StartWorker();          // LogonUI thread only
+    HRESULT StartWorker();       // LogonUI thread only; fails only if the thread cannot start
     void StopWorker();           // LogonUI thread only: abort flag + join (UnAdvise / dtor)
     void WorkerMain();           // worker thread: runs the scan, then clears m_scanning
     void RunScan();              // worker thread: the scan itself
@@ -107,6 +107,11 @@ private:
     bool m_haveResult;
     bool m_scanning;
     bool m_selected;             // is our tile the one the user is looking at
+    // 8b F-04: LogonUI rejected the credential we submitted (stale stored password, say) and
+    // every further face success would submit it again -> account-lockout risk -> latched on
+    // a failed ReportResult; no new scan (no pipe call) for the life of this object, i.e. of
+    // the provider instance / this LogonUI session. Never cleared.
+    bool m_scansDisabled;
     std::thread m_worker;
 };
 
