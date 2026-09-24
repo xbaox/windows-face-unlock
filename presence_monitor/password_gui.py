@@ -13,12 +13,29 @@ it is the dev/scriptable path (``--clear`` included) and nothing here replaces i
 Deliberately small: no camera, no pipe, no service. The only side effect is the one the dialog
 exists to perform -- writing (or clearing) ``credentials.bin`` through the existing helpers, which
 own the DPAPI entropy and the file DACL.
+
+Stage 8b (F-04). Defect: the password was saved after pw == pw2 and a DPAPI read-back only; nothing
+ever asked Windows whether it is the account's password. Consequence: a typo at onboarding, or a
+later Windows password change, turned every successful face scan into a failed logon at the lock
+screen, and repeated failures can trip the account-lockout policy -- which blocks PIN sign-in too.
+Fix: before saving, ONE network-logon check through LogonUserW. A plain local or domain account
+whose password Windows rejects is not saved. Where that check cannot be trusted either way (a
+Microsoft-account-linked or Entra ID account, logon type denied by policy, an expired password,
+...) the password is saved and the user is WARNED instead of blocked. The check runs once per Save
+click, never in a loop, so it costs the account at most the one bad attempt a typo at the lock
+screen would.
+
+How the account is stored: ``username`` is %USERNAME% (the SAM name) and ``domain`` is %USERDOMAIN%
+-- the computer name for a local account, including one linked to a Microsoft account, "AzureAD"
+for Entra ID. That is exactly what the Credential Provider packs into the logon.
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import tkinter as tk
+from ctypes import wintypes
 from tkinter import ttk
 
 from face_service.config import Config
@@ -28,6 +45,93 @@ from face_service.i18n import set_language, t
 log = logging.getLogger(__name__)
 
 _MASK = "•"
+
+# LogonUserW network logon: validates the password without a profile load or an interactive
+# session. Win32 error codes that mean "Windows looked at this password and said no".
+_LOGON32_LOGON_NETWORK = 3
+_LOGON32_PROVIDER_DEFAULT = 0
+_ERROR_LOGON_FAILURE = 1326
+
+
+class _UserInfo24(ctypes.Structure):
+    _fields_ = [("internet_identity", wintypes.BOOL), ("flags", wintypes.DWORD),
+                ("provider_name", wintypes.LPWSTR), ("principal_name", wintypes.LPWSTR),
+                ("user_sid", ctypes.c_void_p)]
+
+
+def _is_internet_linked(user: str) -> "bool | None":
+    """True when the LOCAL account ``user`` is linked to a Microsoft account (USER_INFO_24
+    internet_identity), False when it is a plain local account, None when Windows would not say.
+    Read-only account metadata, no logon attempt."""
+    try:
+        netapi = ctypes.WinDLL("netapi32")
+        buf = ctypes.c_void_p()
+        rc = netapi.NetUserGetInfo(None, ctypes.c_wchar_p(user), 24, ctypes.byref(buf))
+        if rc != 0 or not buf:
+            return None
+        try:
+            return bool(ctypes.cast(buf, ctypes.POINTER(_UserInfo24)).contents.internet_identity)
+        finally:
+            netapi.NetApiBufferFree(buf)
+    except Exception:
+        return None
+
+
+def _logon_user(user: str, domain: str, password: str) -> int:
+    """One LogonUserW network logon. Returns 0 on success, else the Win32 error code."""
+    import pywintypes      # type: ignore
+    import win32security   # type: ignore
+    try:
+        h = win32security.LogonUser(user, domain or None, password,
+                                    _LOGON32_LOGON_NETWORK, _LOGON32_PROVIDER_DEFAULT)
+    except pywintypes.error as e:
+        return int(e.winerror or -1)
+    h.Close()
+    return 0
+
+
+def check_windows_password(user: str, domain: str, password: str, *, logon=_logon_user,
+                           internet_linked=_is_internet_linked) -> "tuple[str, int]":
+    """``("ok", 0)`` | ``("rejected", err)`` | ``("unverifiable", err)``. Calls ``logon`` ONCE.
+
+    "rejected" only when the answer is conclusive: ERROR_LOGON_FAILURE for an account whose
+    password this machine validates itself (a plain local account, or a domain account whose
+    domain controller answered). A Microsoft-account-linked local account (or one whose link state
+    is unknown) and an Entra ID account ("AzureAD") are validated against a cloud password the
+    local check may not have yet, so a refusal there is "unverifiable", as is every other error."""
+    err = logon(user, domain, password)
+    if err == 0:
+        return "ok", 0
+    if err == _ERROR_LOGON_FAILURE:
+        local = domain in (".", "") or domain.upper() == os.environ.get("COMPUTERNAME", "").upper()
+        if domain.upper() == "AZUREAD":
+            return "unverifiable", err
+        if not local:
+            return "rejected", err
+        if internet_linked(user) is False:
+            return "rejected", err
+    return "unverifiable", err
+
+
+def store_password_checked(user: str, password: str, domain: str, *, check=check_windows_password,
+                           save=None, load=None) -> "tuple[bool, str]":
+    """The Save button without Tk: check once, then save and read back. Returns ``(ok, status)``
+    where status is the localized line to show. Nothing is written when the check is conclusive
+    and negative."""
+    save = save or save_password
+    load = load or load_password
+    verdict, err = check(user, domain, password)
+    if verdict == "rejected":
+        return False, t("pwd.err.rejected").format(user=user)
+    save(user, password, domain)
+    # Same read-back the console tool does: proves DPAPI round-tripped under this user,
+    # rather than reporting success on a write nobody has verified.
+    rec = load()
+    if not rec or rec.get("u") != user:
+        raise RuntimeError("stored credential did not read back")
+    if verdict == "unverifiable":
+        return True, t("pwd.status.saved_unverified").format(err=err)
+    return True, t("pwd.status.saved")
 
 
 class PasswordWindow:
@@ -103,19 +207,18 @@ class PasswordWindow:
         user = self.user.get().strip()
         domain = self.domain.get().strip() or "."
         try:
-            save_password(user, pw, domain)
-            # Same read-back the console tool does: proves DPAPI round-tripped under this user,
-            # rather than reporting success on a write nobody has verified.
-            check = load_password()
-            if not check or check.get("u") != user:
-                raise RuntimeError("stored credential did not read back")
+            ok, status = store_password_checked(user, pw, domain)
         except Exception as e:
             log.exception("saving the password failed")
             self._set_status(t("pwd.err.save").format(err=e), ok=False)
             return
+        if not ok:
+            # Keep what was typed: the user corrects it rather than retyping both fields.
+            self._set_status(status, ok=False)
+            return
         self.pw1.set("")
         self.pw2.set("")
-        self._set_status(t("pwd.status.saved"))
+        self._set_status(status)
 
     def _clear(self) -> None:
         try:

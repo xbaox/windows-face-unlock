@@ -336,12 +336,18 @@ _EN: dict[str, str] = {
     "pwd.btn.close": "Close",
     "pwd.status.existing": "A password is already stored for {user}. Saving replaces it.",
     "pwd.status.none": "No password stored yet.",
-    "pwd.status.saved": "Saved, and read back successfully (DPAPI).",
+    "pwd.status.saved": "Saved: Windows accepted the password, and it read back "
+                        "successfully (DPAPI).",
     "pwd.status.cleared": "Stored password cleared. Face sign-in cannot log you in until you set "
                           "one again; PIN and password still work.",
     "pwd.err.empty": "Enter your Windows password.",
     "pwd.err.mismatch": "The two entries do not match.",
     "pwd.err.save": "Could not save: {err}",
+    "pwd.err.rejected": "Windows rejected this password for {user}. Nothing was saved — "
+                        "check it and try again.",
+    "pwd.status.saved_unverified": "Saved, but Windows could not confirm the password here "
+                                   "(error {err}). If face sign-in fails at the lock screen, "
+                                   "sign in with your PIN and save the password again.",
 
     # ---- Language names (native) ----
     "lang.vi": "Tiếng Việt",
@@ -1245,12 +1251,18 @@ _RU: dict[str, str] = {
     "pwd.btn.close": "Закрыть",
     "pwd.status.existing": "Пароль для {user} уже сохранён. Сохранение заменит его.",
     "pwd.status.none": "Пароль пока не сохранён.",
-    "pwd.status.saved": "Сохранено и успешно прочитано обратно (DPAPI).",
+    "pwd.status.saved": "Сохранено: Windows приняла пароль, и он успешно прочитан обратно "
+                        "(DPAPI).",
     "pwd.status.cleared": "Сохранённый пароль удалён. Вход по лицу не сможет войти за вас, пока "
                           "вы не зададите пароль снова; PIN и пароль работают по-прежнему.",
     "pwd.err.empty": "Введите пароль Windows.",
     "pwd.err.mismatch": "Значения не совпадают.",
     "pwd.err.save": "Не удалось сохранить: {err}",
+    "pwd.err.rejected": "Windows отклонила этот пароль для {user}. Ничего не сохранено — "
+                        "проверьте пароль и попробуйте снова.",
+    "pwd.status.saved_unverified": "Сохранено, но Windows не смогла подтвердить пароль здесь "
+                                   "(ошибка {err}). Если вход по лицу на экране блокировки не "
+                                   "сработает, войдите по PIN и сохраните пароль снова.",
 
     "lang.vi": "Вьетнамский",
     "lang.en": "Английский",
