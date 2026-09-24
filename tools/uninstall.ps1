@@ -65,8 +65,16 @@
     .\tools\uninstall.ps1 -Force
 .EXAMPLE
     .\tools\uninstall.ps1 -Mode Installed -Force -RemoveData -IncludeModels
+
+.NOTES
+    Stage 8b (F-39). Phase A no longer needs elevation: it only reads, and a
+    "what would this remove?" run that demands an administrator prompt is one
+    nobody makes. Phase B (-Force) still refuses to start unelevated. For the
+    Installed layout the Inno uninstaller owns the program directory, the
+    HKLM\SOFTWARE\WindowsFaceUnlock key and the Programs and Features entry;
+    this script does not remove them, and now REPORTS them as left over instead
+    of printing CLEAN while they exist.
 #>
-#Requires -RunAsAdministrator
 [CmdletBinding()]
 param(
     [ValidateSet('Dev', 'Installed')]
@@ -95,6 +103,9 @@ $ErrorActionPreference = 'Stop'
 
 $fuRepoRoot   = Split-Path -Parent $PSScriptRoot
 $fuTaskPrefix = 'FaceUnlock-'
+# The Programs and Features entry Inno writes: AppId from installer.iss + "_is1" (F-39).
+$fuArpKey     = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{2F7A9B14-3C31-4B1E-9AB9-5E0D1B02B6A7}_is1'
+$fuAppKey     = 'HKLM:\SOFTWARE\WindowsFaceUnlock'
 $fuRegistrar  = Join-Path $PSScriptRoot 'register_tasks.ps1'
 $fuCpScript   = Join-Path $fuRepoRoot 'credential_provider\register.ps1'
 
@@ -312,6 +323,9 @@ function Invoke-Inventory {
         tasks  = @()
         cpKeys = @()
         appDir = $null
+        appDirPresent = $false
+        appKey = $false
+        arp    = $false
         venv   = $false
         data   = $false
         models = $false
@@ -359,13 +373,20 @@ function Invoke-Inventory {
         $fuFound['appDir'] = $fuAppDir
         if ($fuAppDir) {
             $fuSz = Get-DirSize $fuAppDir
+            $fuFound['appDirPresent'] = [bool]$fuSz
             Write-Trace $fuAppDir ([bool]$fuSz) $(if ($fuSz) { "{0} files, {1}" -f $fuSz.Files, (Format-Size $fuSz.Bytes) } else { '' })
         }
         else { Write-Trace 'installed layout: not present (no InstallLocation recorded in HKLM)' $false }
-        $fuVer = Get-RegValueOrNull -Path 'HKLM:\SOFTWARE\WindowsFaceUnlock' -Name 'Version'
-        Write-Trace 'HKLM:\SOFTWARE\WindowsFaceUnlock' (Test-Path -LiteralPath 'HKLM:\SOFTWARE\WindowsFaceUnlock') `
+        $fuVer = Get-RegValueOrNull -Path $fuAppKey -Name 'Version'
+        $fuFound['appKey'] = (Test-Path -LiteralPath $fuAppKey)
+        Write-Trace $fuAppKey $fuFound['appKey'] `
                     $(if ($fuVer) { "Version=$fuVer; written by installer.iss, removed by its own uninstaller" }
                       else { 'written by installer.iss; removed by its own uninstaller' })
+        # Stage 8b (F-39): the Programs and Features entry is a trace too.
+        $fuFound['arp'] = (Test-Path -LiteralPath $fuArpKey)
+        $fuArpName = Get-RegValueOrNull -Path $fuArpKey -Name 'DisplayName'
+        Write-Trace 'Programs and Features entry' $fuFound['arp'] `
+                    $(if ($fuArpName) { "$fuArpName; removed by the Inno uninstaller (unins000.exe)" } else { '' })
     }
 
     Invoke-Section 'Repository (dev layout)' {
@@ -513,6 +534,15 @@ if (-not $Force) {
 # ===========================================================================
 # PHASE B -- REMOVAL. Every mutating call in this file is below this banner.
 # ===========================================================================
+# Stage 8b (F-39): elevation is checked HERE, at the start of phase B, instead of by
+# #Requires for the whole script -- phase A only reads and needs no administrator.
+$fuIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+             ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $fuIsAdmin) {
+    Write-Host 'Removal (-Force) needs an elevated PowerShell: tasks, the Credential Provider keys and' -ForegroundColor Red
+    Write-Host 'the install tree belong to an administrator. Nothing was changed.' -ForegroundColor Red
+    exit 2
+}
 Write-Host 'PHASE B -- removing' -ForegroundColor Yellow
 Write-Host ('=' * 60)
 
@@ -615,6 +645,14 @@ if ($fuAfter['temp'])         { $fuLeft += 'downloaded installers' }
 if ($Mode -eq 'Dev' -and $fuAfter['venv']) { $fuLeft += '.venv' }
 if ($RemoveData -and $fuAfter['data'])      { $fuLeft += 'the data directory' }
 if ($IncludeModels -and $fuAfter['models']) { $fuLeft += 'the model cache' }
+# Stage 8b (F-39). Defect: -Mode Installed printed CLEAN while the program directory, the HKLM key
+# and the Programs and Features entry were all still there. Consequence: the report claimed a
+# clean machine that was not. Fix: they are reported as left over, with the tool that owns them.
+if ($Mode -eq 'Installed') {
+    if ($fuAfter['appDirPresent']) { $fuLeft += ("the program directory {0} (run its unins000.exe)" -f $fuAfter['appDir']) }
+    if ($fuAfter['appKey'])        { $fuLeft += "$fuAppKey (removed by unins000.exe)" }
+    if ($fuAfter['arp'])           { $fuLeft += 'the Programs and Features entry (removed by unins000.exe)' }
+}
 
 Write-Host ''
 if ($fuLeft.Count) {

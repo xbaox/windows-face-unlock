@@ -10,6 +10,14 @@ name: release
 #     git tag v0.1.0
 #     git push origin v0.1.0
 # ...triggers this workflow.
+#
+# Supply chain (8a F-38). Everything this job runs or ships is pinned: every action by
+# full commit SHA (the tag it was taken from is in the trailing comment), Inno Setup by
+# version AND installer SHA-256, pyinstaller-hooks-contrib and pip by version, the
+# buffalo_l models by SHA-256 (installer/build.py MODEL_SHA256 is the one list). To bump
+# an action: resolve the new tag with
+#     git ls-remote https://github.com/<owner>/<repo> refs/tags/<tag>
+# and replace SHA and comment together.
 
 on:
   push:
@@ -28,12 +36,19 @@ jobs:
       SIGNPATH_API_TOKEN:    ${{ secrets.SIGNPATH_API_TOKEN }}
       SIGNPATH_ORG_ID:       ${{ secrets.SIGNPATH_ORG_ID }}
       SIGNPATH_PROJECT_SLUG: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+      # Same versions as the local build venv (8a: .venv == requirements.lock + these).
+      PIP_VERSION: "26.1.2"
+      HOOKS_CONTRIB_VERSION: "2026.6"
+      INNO_VERSION: "6.7.3"
+      # SHA-256 of innosetup-6.7.3.exe as published on the jrsoftware/issrc GitHub release
+      # (asset digest, 10,592,232 bytes).
+      INNO_SHA256: "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0 (v4)
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0 (v5)
         with:
           python-version: "3.12"
           cache: pip
@@ -43,34 +58,70 @@ jobs:
       # file that exists to prevent exactly that was read by nothing in the build or release path.
       # PyInstaller stays in its own build-only file: it is not a runtime dependency and has no
       # business in a venv that only wants to run the service.
+      #
+      # pip and pyinstaller-hooks-contrib are pinned here: pip is bundled into the app (insightface
+      # references it), and hooks-contrib supplies hook-cv2, hook-skimage.* and the
+      # pyi_rth_pywintypes rthook -- an unpinned bump silently changes what ships (8a F-38).
       - name: Install Python dependencies
         shell: powershell
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install "pip==$env:PIP_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pip install -r requirements.lock
-          pip install -r installer/requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install -r installer/requirements-build.txt "pyinstaller-hooks-contrib==$env:HOOKS_CONTRIB_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip show pyinstaller pyinstaller-hooks-contrib pip | Select-String '^(Name|Version):'
 
       # The spec bundles the buffalo_l pack from the BUILD MACHINE's %USERPROFILE%\.insightface,
       # so CI has to populate it before PyInstaller runs. Uses insightface's own resolver rather
       # than a hardcoded URL, so the pack always matches the pinned library version.
       #
-      # The leftover archive is removed on purpose: insightface extracts buffalo_l.zip and then
-      # does NOT delete it (the os.remove in utils/storage.py is commented out), so leaving it
-      # would put ~275 MB of dead weight next to the 325 MiB that is actually needed.
-      - name: Fetch the buffalo_l recognition models
+      # The download is then checked against the SHA-256 pins in installer/build.py
+      # (--check-models: the five .onnx files AND buffalo_l.zip while it still exists). Defect:
+      # the models were fetched and shipped unverified -> a substituted model could recognise the
+      # wrong face -> the release now fails instead.
+      #
+      # The leftover archive is removed afterwards on purpose: insightface extracts buffalo_l.zip
+      # and then does NOT delete it (the os.remove in utils/storage.py is commented out), so leaving
+      # it would put ~275 MB of dead weight next to the 325 MiB that is actually needed.
+      - name: Fetch and verify the buffalo_l recognition models
         shell: powershell
         run: |
           python -c "from insightface.utils.storage import ensure_available; print(ensure_available('models', 'buffalo_l'))"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python installer\build.py --check-models
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $zip = Join-Path $env:USERPROFILE '.insightface\models\buffalo_l.zip'
           if (Test-Path $zip) { Remove-Item -Force $zip; Write-Host "removed the extracted buffalo_l.zip" }
           Get-ChildItem (Join-Path $env:USERPROFILE '.insightface\models\buffalo_l') |
             Select-Object Name, Length | Format-Table -AutoSize
 
-      - name: Install Inno Setup
+      # Pinned Inno Setup. The runner image ships its own (unpinned) Inno Setup, and choco
+      # installed "latest": a compiler bump could change [Code]/RunOnceId semantics under us.
+      # Download the exact release, check its SHA-256, install into a private folder, and hand
+      # build.py that ISCC.exe explicitly via INNO_SETUP_ISCC (which build.py prefers over
+      # every default location).
+      - name: Install Inno Setup (pinned)
         shell: powershell
         run: |
-          choco install innosetup -y --no-progress
-          echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Append
+          $ErrorActionPreference = 'Stop'
+          $tag = 'is-' + $env:INNO_VERSION.Replace('.', '_')
+          $url = "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$env:INNO_VERSION.exe"
+          $exe = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_VERSION.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          $got = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:INNO_SHA256) {
+            throw "innosetup-$env:INNO_VERSION.exe sha256 $got != pinned $env:INNO_SHA256 -- refusing to run it"
+          }
+          $dir = Join-Path $env:RUNNER_TEMP "InnoSetup-$env:INNO_VERSION"
+          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$dir`"")
+          if ($p.ExitCode -ne 0) { throw "Inno Setup installer exited $($p.ExitCode)" }
+          $iscc = Join-Path $dir 'ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe not found at $iscc" }
+          "INNO_SETUP_ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Inno Setup $env:INNO_VERSION -> $iscc"
 
       - name: Sync installer + app version with tag
         shell: powershell
@@ -82,14 +133,30 @@ jobs:
           (Get-Content face_service\_version.py) -replace '(__version__\s*=\s*")[^"]+(")', "`$1$ver`$2" | Set-Content face_service\_version.py
           (Get-Content installer\installer.iss) -replace '(#define MyAppVersion ")[^"]+(")', "`$1$ver`$2" | Set-Content installer\installer.iss
 
-      # The Credential Provider DLL is built by installer/build.py (step 2), into
+      # The Credential Provider DLL is built by installer/build.py (step 1), into
       # build-cp/. There is deliberately no separate CMake step here and no
       # SKIP_CP: if the DLL cannot be built, the release must fail rather than
       # ship an installer whose face tile can never appear.
-
-      - name: Build installer (PyInstaller + Inno Setup)
+      #
+      # Half 1 = steps 0-5: models, CP DLL, signing policy, PyInstaller, staging and THE GATE
+      # (tools/verify_frozen_entrypoints.py against the staged bundle -- entry points, PYZ,
+      # numpy native imports, KNOWN_ISSUES #5 mines 1-3, the class guard over every extension
+      # and vendor frozen/computed import -- plus tools/packaging_selftest.py, model hashes and
+      # the staged CP signature). Any failure fails the job before ISCC exists in the picture.
+      #
+      # --allow-unsigned-cp: CI holds no code-signing certificate for the DLL, so without the flag
+      # build.py refuses (8a F-13: an unsigned DLL must be a decision, not an accident). The
+      # choice is recorded in dist\WindowsFaceUnlock.gate.json. SignPath below signs the
+      # installer only; credential_provider/SIGNING.md explains why the DLL signature does not
+      # decide whether the lock-screen tile loads.
+      - name: Build half 1 - stage + gate
         shell: powershell
-        run: python installer\build.py
+        run: python installer\build.py --half 1 --allow-unsigned-cp
+
+      # Half 2 = steps 6-7: refuses unless the gate stamp matches dist\ byte for byte.
+      - name: Build half 2 - Inno Setup + checksums
+        shell: powershell
+        run: python installer\build.py --half 2
 
       - name: Detect SignPath config
         id: signcheck
@@ -106,7 +173,7 @@ jobs:
       - name: Upload unsigned installer for SignPath
         if: steps.signcheck.outputs.have_signpath == 'true'
         id: upload_unsigned
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2 (v4)
         with:
           name: installer-unsigned
           path: installer_output\WindowsFaceUnlock-Setup-*.exe
@@ -114,7 +181,7 @@ jobs:
 
       - name: Submit to SignPath
         if: steps.signcheck.outputs.have_signpath == 'true'
-        uses: signpath/github-action-submit-signing-request@v1
+        uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e  # v1.3 (v1)
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
@@ -134,7 +201,7 @@ jobs:
           }
 
       - name: Collect artefacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2 (v4)
         with:
           name: installer
           path: |
@@ -143,7 +210,7 @@ jobs:
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2 (v2)
         with:
           files: |
             installer_output/WindowsFaceUnlock-Setup-*.exe

@@ -18,7 +18,9 @@
     Three ways to get a key, exactly one of which must be given:
 
       -SelfSigned            create a fresh code-signing certificate in
-                             CurrentUser\My and use it. Development only.
+                             CurrentUser\My and use it. Development only. The
+                             private key is created NON-EXPORTABLE: it signs from
+                             this user store and cannot be copied out of it.
       -Thumbprint <hex>      use a certificate already installed in
                              CurrentUser\My or LocalMachine\My. This is the
                              option for a real purchased certificate that lives
@@ -29,8 +31,14 @@
 
     A self-signed certificate is NOT trusted by anything until it is installed
     into a trust store, and that is a machine-wide security decision, so it never
-    happens implicitly. -TrustLocally is a separate, explicit switch, and it is
-    the only thing in this script that writes to a certificate store.
+    happens implicitly. -TrustLocally is a separate, explicit switch, it is the
+    only thing in this script that writes to a MACHINE certificate store, and it
+    is refused unless -IUnderstandTrustLocally is given as well. How to remove
+    everything this script creates: see NOTES.
+
+    installer\build.py calls this script with -Thumbprint <SIGN_CP> and then
+    verifies the signer thumbprint itself; it never passes -SelfSigned or
+    -TrustLocally.
 
 .PARAMETER DllPath
     The DLL to sign. Defaults to the dev build tree, build-cp\Release.
@@ -43,6 +51,14 @@
     Install the signing certificate into LocalMachine\Root and
     LocalMachine\TrustedPublisher. Development convenience for a self-signed
     certificate; do not do this with anything you did not create yourself.
+    Needs elevation AND -IUnderstandTrustLocally; refused otherwise.
+
+.PARAMETER IUnderstandTrustLocally
+    Required together with -TrustLocally. Defect (8a F-40): one switch used to
+    add a developer certificate to the machine Root store -> every process on the
+    machine then trusts code signed with that key -> the decision now has to be
+    spelled out twice. There is deliberately no interactive prompt: a build or a
+    script must fail closed, never sit waiting for a keypress.
 
 .PARAMETER DryRun
     Print the plan and the DLL's CURRENT signature status, then exit. Changes
@@ -51,11 +67,34 @@
 .EXAMPLE
     .\tools\sign_cp.ps1 -DryRun
 .EXAMPLE
-    .\tools\sign_cp.ps1 -SelfSigned -TrustLocally
+    .\tools\sign_cp.ps1 -SelfSigned
+.EXAMPLE
+    .\tools\sign_cp.ps1 -SelfSigned -TrustLocally -IUnderstandTrustLocally
 .EXAMPLE
     .\tools\sign_cp.ps1 -Thumbprint 1A2B3C...
 .EXAMPLE
     .\tools\sign_cp.ps1 -PfxPath C:\keys\codesign.pfx
+
+.NOTES
+    REMOVING WHAT THIS SCRIPT CREATED. Replace <THUMBPRINT> with the value the
+    script printed ("created:" / "Thumb").
+
+    Machine trust -- only if -TrustLocally was used. Elevated PowerShell:
+        Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\TrustedPublisher |
+            Where-Object Thumbprint -eq '<THUMBPRINT>' | Remove-Item
+    or, from an elevated prompt:
+        certutil -delstore Root <THUMBPRINT>
+        certutil -delstore TrustedPublisher <THUMBPRINT>
+
+    The self-signed certificate and its private key (-SelfSigned). As the user:
+        Remove-Item -LiteralPath 'Cert:\CurrentUser\My\<THUMBPRINT>' -DeleteKey
+
+    Check that nothing is left:
+        Get-ChildItem Cert:\CurrentUser\My, Cert:\LocalMachine\Root, Cert:\LocalMachine\TrustedPublisher |
+            Where-Object Thumbprint -eq '<THUMBPRINT>'
+
+    Removing the certificate does not unsign DLLs already signed with it; their
+    signature simply stops chaining to a trusted root on this machine.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Inspect')]
 param(
@@ -79,6 +118,8 @@ param(
 
     [switch]$TrustLocally,
 
+    [switch]$IUnderstandTrustLocally,
+
     [switch]$DryRun
 )
 
@@ -99,6 +140,18 @@ Write-Host "DLL            : $DllPath"
 Write-Host "Mode           : $($PSCmdlet.ParameterSetName)"
 Write-Host "Timestamp      : $TimestampServer"
 Write-Host "Trust locally  : $TrustLocally"
+
+# Refused before anything else -- -DryRun included, so a dry run never presents a plan
+# the real run would reject. See .PARAMETER IUnderstandTrustLocally.
+if ($TrustLocally -and -not $IUnderstandTrustLocally) {
+    Write-Host ''
+    Write-Host 'REFUSED: -TrustLocally adds this certificate to LocalMachine\Root and' -ForegroundColor Red
+    Write-Host '         LocalMachine\TrustedPublisher -> every process on this machine then' -ForegroundColor Red
+    Write-Host '         trusts code signed with its key. Signing does not need it (SIGNING.md).' -ForegroundColor Red
+    Write-Host '         To do it anyway for a certificate you created, repeat the command with' -ForegroundColor Red
+    Write-Host '         -IUnderstandTrustLocally. Removal: Get-Help .\tools\sign_cp.ps1 -Full (NOTES).' -ForegroundColor Red
+    exit 1
+}
 
 if (-not (Test-Path -LiteralPath $DllPath -PathType Leaf)) {
     Write-Host ''
@@ -144,7 +197,7 @@ if ($DryRun) {
         'SelfSigned' {
             Write-Host "  1. create a code-signing certificate in Cert:\CurrentUser\My"
             Write-Host "     Subject   : $Subject"
-            Write-Host "     Type      : CodeSigningCert, 3 years"
+            Write-Host "     Type      : CodeSigningCert, 3 years, private key NonExportable"
         }
         'Thumbprint' { Write-Host "  1. look up certificate $Thumbprint in CurrentUser\My then LocalMachine\My" }
         'Pfx'        { Write-Host "  1. load the certificate from $PfxPath" }
@@ -153,7 +206,7 @@ if ($DryRun) {
     Write-Host "     with -TimestampServer $TimestampServer"
     if ($TrustLocally) {
         Write-Host '  3. install the certificate into LocalMachine\Root and LocalMachine\TrustedPublisher'
-        Write-Host '     (machine-wide trust decision; needs elevation)' -ForegroundColor Yellow
+        Write-Host '     (machine-wide trust decision; needs elevation; confirmed by -IUnderstandTrustLocally)' -ForegroundColor Yellow
     }
     else {
         Write-Host '  3. (skipped) no certificate store is touched without -TrustLocally'
@@ -176,9 +229,10 @@ switch ($PSCmdlet.ParameterSetName) {
             -Type CodeSigningCert `
             -CertStoreLocation 'Cert:\CurrentUser\My' `
             -KeyUsage DigitalSignature `
-            -KeyExportPolicy Exportable `
+            -KeyExportPolicy NonExportable `
             -NotAfter (Get-Date).AddYears(3)
         Write-Host "  created: $($fuCert.Thumbprint)"
+        Write-Host '  (private key NonExportable; removal: Get-Help .\tools\sign_cp.ps1 -Full, NOTES)' -ForegroundColor DarkGray
     }
     'Thumbprint' {
         $fuCert = Get-ChildItem -Path 'Cert:\CurrentUser\My', 'Cert:\LocalMachine\My' `
@@ -240,6 +294,9 @@ if ($TrustLocally) {
         }
         finally { $fuStore.Close() }
     }
+    Write-Host '  To undo (elevated):' -ForegroundColor DarkGray
+    Write-Host ("    certutil -delstore Root {0}" -f $fuCert.Thumbprint) -ForegroundColor DarkGray
+    Write-Host ("    certutil -delstore TrustedPublisher {0}" -f $fuCert.Thumbprint) -ForegroundColor DarkGray
 }
 
 Write-Host ''

@@ -8,11 +8,25 @@
     the registry, because regsvr32 /s reports nothing and its exit code is not
     trustworthy on its own. Success is printed only after the registry agrees.
 
+    Before anything runs, the DLL path must be ADMIN-ONLY: LogonUI loads the
+    registered DLL as SYSTEM, and regsvr32 (register or unregister) loads it in
+    this elevated process. Defect (8a F-10): the dev fallback build-cp\Release
+    sits under C:\dev, which grants Authenticated Users Modify -> any local
+    account could replace the file SYSTEM loads -> the script now refuses any
+    DLL that a principal other than SYSTEM, Administrators or TrustedInstaller
+    can modify, delete, re-permission or take ownership of -- on the file, its
+    folder, or any folder above it. For a dev build, copy the DLL into an
+    admin-only folder (e.g. under %ProgramFiles%) and pass -DllPath. There is no
+    override switch. The check is Find-NonAdminWriteAccess below; it only reads
+    ACLs and can be exercised on its own (see NOTES).
+
     Exit codes:
         0  requested state reached and verified
         1  DLL not found, or the host cannot register an x64 DLL
         2  regsvr32 returned a non-zero exit code
         3  regsvr32 claimed success but the registry says otherwise
+        4  refused: the DLL path is writable by a non-admin principal
+           (also under -DryRun, which predicts the real run)
 
 .PARAMETER Action
     register (default) or unregister.
@@ -39,6 +53,26 @@
     .\register.ps1 -DryRun
 .EXAMPLE
     .\register.ps1 -Action unregister -DryRun
+
+.NOTES
+    Exercising the path check without elevation and without registering
+    anything (the function only reads ACLs):
+
+        $t = $null; $e = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\credential_provider\register.ps1), [ref]$t, [ref]$e)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                                    $n.Name -eq 'Find-NonAdminWriteAccess' }, $true)
+        . ([scriptblock]::Create($fn.Extent.Text))
+        Find-NonAdminWriteAccess -LiteralPath 'C:\Program Files\WindowsFaceUnlock\credential_provider\FaceCredentialProvider.dll'
+
+    No output means admin-only. Each finding names the path, the principal and
+    the right that disqualifies it.
+
+    If an older dev registration still points at an unsafe path, unregister is
+    refused too (regsvr32 /u loads the DLL elevated). Remove the two registry
+    keys directly instead -- tools\uninstall.ps1 does exactly that after this
+    script declines.
 #>
 [CmdletBinding()]
 param(
@@ -58,6 +92,78 @@ $ErrorActionPreference = 'Stop'
 $Clsid    = '{8414D7B6-D536-461B-B31B-ADF77B3A8974}'
 $CpKey    = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\$Clsid"
 $ClsidKey = "HKLM:\SOFTWARE\Classes\CLSID\$Clsid"
+
+# --- admin-only path check (8a F-10) ------------------------------------------
+# Returns one finding per (path, principal, right) that lets a principal other than
+# SYSTEM, BUILTIN\Administrators or TrustedInstaller change what this path resolves
+# to. Returns nothing when the path is admin-only. Reads ACLs only.
+#
+# Rights that count, per level of the path:
+#   the file          write/append data, delete, change permissions, take ownership
+#   its folder        the same minus append, plus add-file and delete-child
+#                     (replacing the file needs one of those)
+#   every folder up   delete, delete-child, change permissions, take ownership
+#                     (replacing a folder on the way down needs one of those)
+# Plain "create folders" on an ancestor -- which the volume root grants to
+# Authenticated Users by default -- cannot replace an existing path component and
+# is not counted. Inherit-only ACEs (e.g. CREATOR OWNER) do not apply to the object
+# they sit on and are skipped; their effect shows up on the child they apply to,
+# which is checked in its own right. A non-admin OWNER counts too: an owner can
+# always rewrite the DACL. A reparse point anywhere on the path is refused
+# outright, because the ACLs read here would not be the ones of the real target.
+function Find-NonAdminWriteAccess {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $trusted = @(
+        'S-1-5-18',                                                        # SYSTEM
+        'S-1-5-32-544',                                                    # BUILTIN\Administrators
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'   # NT SERVICE\TrustedInstaller
+    )
+    $R = [System.Security.AccessControl.FileSystemRights]
+    $generic = 0x10000000 -bor 0x40000000                                  # GENERIC_ALL | GENERIC_WRITE
+    $common  = [int]$R::Delete -bor [int]$R::ChangePermissions -bor [int]$R::TakeOwnership -bor $generic
+    $masks = @{
+        file     = $common -bor [int]$R::WriteData -bor [int]$R::AppendData
+        parent   = $common -bor [int]$R::WriteData -bor [int]$R::DeleteSubdirectoriesAndFiles
+        ancestor = $common -bor [int]$R::DeleteSubdirectoriesAndFiles
+    }
+    $sidType = [System.Security.Principal.SecurityIdentifier]
+
+    $findings = @()
+    $item = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
+    $level = if ($item -is [System.IO.DirectoryInfo]) { 'parent' } else { 'file' }
+    while ($null -ne $item) {
+        $path = $item.FullName
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            $findings += [pscustomobject]@{ Path = $path; Principal = '-'; Right = 'reparse point';
+                                            Level = $level }
+        }
+        $acl = Get-Acl -LiteralPath $path
+        $owner = $acl.GetOwner($sidType).Value
+        if ($trusted -notcontains $owner) {
+            $name = $owner
+            try { $name = ([System.Security.Principal.SecurityIdentifier]$owner).Translate(
+                              [System.Security.Principal.NTAccount]).Value } catch { }
+            $findings += [pscustomobject]@{ Path = $path; Principal = $name; Right = 'owner (can rewrite the ACL)';
+                                            Level = $level }
+        }
+        foreach ($ace in $acl.GetAccessRules($true, $true, $sidType)) {
+            if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+            if ($ace.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            $sid = $ace.IdentityReference.Value
+            if ($trusted -contains $sid) { continue }
+            $hit = [int]$ace.FileSystemRights -band $masks[$level]
+            if ($hit -eq 0) { continue }
+            $name = $sid
+            try { $name = $ace.IdentityReference.Translate([System.Security.Principal.NTAccount]).Value } catch { }
+            $findings += [pscustomobject]@{ Path = $path; Principal = $name;
+                                            Right = [string]$ace.FileSystemRights; Level = $level }
+        }
+        if ($item -is [System.IO.DirectoryInfo]) { $item = $item.Parent } else { $item = $item.Directory }
+        $level = if ($level -eq 'file') { 'parent' } else { 'ancestor' }
+    }
+    return $findings
+}
 
 # A 32-bit host would use the 32-bit regsvr32 (which cannot load an x64 DLL)
 # AND would read HKLM:\SOFTWARE redirected into WOW6432Node -- so the
@@ -107,6 +213,35 @@ else {
 
 Write-Host "DLL:    $resolved"
 Write-Host "Action: $Action"
+
+# --- refuse a DLL a non-admin can replace (8a F-10) -------------------------------
+# Read-only, so it sits above the dry-run gate and -DryRun reports the same verdict
+# the real run would act on. Applies to unregister as well: regsvr32 /u loads the DLL
+# into this elevated process just like register does.
+$aclFindings = @(Find-NonAdminWriteAccess -LiteralPath $resolved)
+if ($aclFindings.Count -gt 0) {
+    Write-Host ""
+    Write-Host "REFUSED: the DLL path is writable by a non-admin principal." -ForegroundColor Red
+    Write-Host "  LogonUI loads this DLL as SYSTEM and regsvr32 loads it elevated, so anyone"
+    Write-Host "  who can change the file or a folder above it controls code that runs as"
+    Write-Host "  SYSTEM. Findings:"
+    foreach ($f in $aclFindings) {
+        Write-Host ("    [{0}] {1}" -f $f.Level, $f.Path)
+        Write-Host ("        {0}: {1}" -f $f.Principal, $f.Right)
+    }
+    Write-Host ""
+    Write-Host "Fix: install through the installer (Program Files is admin-only), or copy the"
+    Write-Host "     DLL into an admin-only folder, e.g. `"$env:ProgramFiles\WindowsFaceUnlock-dev`","
+    Write-Host "     and pass -DllPath. Nothing was registered or unregistered."
+    if ($Action -eq 'unregister') {
+        Write-Host "To drop a stale registration without loading the DLL, delete these keys"
+        Write-Host "(tools\uninstall.ps1 does this after this script declines):"
+        Write-Host "  $CpKey"
+        Write-Host "  $ClsidKey"
+    }
+    exit 4
+}
+Write-Host "Path:   admin-only (file, folder and every folder above it)"
 
 # --- build the command -------------------------------------------------------
 # The path is quoted inside the argument so directories with spaces
