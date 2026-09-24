@@ -25,6 +25,8 @@ Commands:
                                # gesture -> answer with `unlock_gesture` carrying the token.
       -> {"ok":false,"reason":"..."}   # "no-match" | "no-credentials" | "locked-out" (+retry_after_s)
                                        # | "not-authorized" | "camera-busy" | "too-dark"
+                                       # | "insecure-data-dir" (Stage 8b: the data directory could
+                                       #   not be secured at start-up; see face_service/datadir.py)
   {"cmd":"unlock_gesture","token":"<32 hex>"}   # Stage 7-i phase 2: run the gesture phase 1
                                # asked for; credentials only if it is performed BY THE FACE
                                # THAT MATCHED (non-matching frames are dropped, not fed).
@@ -32,7 +34,7 @@ Commands:
       -> {"ok":false,"reason":"gesture-failed","challenge":str,"state":str,"identity_frames":int}
       -> {"ok":false,"reason":"gesture-token-invalid"}   # absent / wrong / expired / already used
       -> {"ok":false,"reason":"..."}   # "not-authorized" | "locked-out" (+retry_after_s)
-                                       # | "camera-busy" | "no-credentials"
+                                       # | "camera-busy" | "no-credentials" | "insecure-data-dir"
   {"cmd":"reset_lockout"}      # clear the face-auth lockout early (admin / tray / test)
       -> {"ok":true,"lockout":{...}}
   {"cmd":"presence"}           # single-frame presence probe
@@ -84,6 +86,7 @@ def win32api_get_last_error() -> int:
 from .camera import Camera
 from .config import Config, APP_DIR, LOG_PATH, LOCKOUT_PATH, AUDIT_PATH, PIPE_NAME
 from .credentials import load_password
+from .datadir import DUMP_NAME_RE, heal_data_dir, is_reparse, purge_debug_frames
 from .detector import FaceDetector
 from .audit import AuditLog
 from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
@@ -419,8 +422,16 @@ class VerifyOutcome(NamedTuple):
 
 
 class FaceService:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, custody=None):
         self.cfg = cfg
+        # Stage 8b (F-01 / P-03, act A-2): the data-directory custody verdict. main() heals the
+        # directory BEFORE the config is read and hands the report in; any other constructor gets
+        # a heal of its own here, so no FaceService ever serves without one. Fixed for the process
+        # lifetime: a failed heal refuses unlock / unlock_gesture with "insecure-data-dir" after
+        # the existing gates, and nothing at runtime can flip it back.
+        if custody is None:
+            custody = heal_data_dir(APP_DIR)
+        self._data_dir_insecure = not custody.ok
         self.recog = Recognizer(cfg)
         self.detector = FaceDetector()
         # Persistent consecutive-failure lockout for the face path (PIN stays available).
@@ -612,6 +623,11 @@ class FaceService:
             import numpy as np
 
             d = APP_DIR / "debug_frames"
+            # Stage 8b (F-02): never write or prune THROUGH a reparse point -- a linked directory
+            # points outside the tree the heal secured, and the prune below deletes files.
+            if is_reparse(d):
+                log.warning("frame dump skipped: %s is a reparse point", d)
+                return
             d.mkdir(parents=True, exist_ok=True)
             now = time.time()
             base = "%s-%03d_%s" % (time.strftime("%Y%m%d-%H%M%S", time.localtime(now)),
@@ -628,8 +644,13 @@ class FaceService:
             log.info("frame dump tag=%s shape=%s dtype=%s min=%s max=%s mean=%.2f npy=%s png=%s",
                      tag, arr.shape, arr.dtype, arr.min(), arr.max(), float(arr.mean()),
                      npy, png_note)
-            stale = sorted((p for p in d.iterdir() if p.is_file()),
-                           key=lambda p: p.stat().st_mtime)[:-DEBUG_DUMP_RING_MAX]
+            # Stage 8b (F-02 / F-12). Defect: the ring pruned EVERY file in the directory, by
+            # mtime, following links. Consequence: anything placed there -- or reached through a
+            # link -- could be deleted by it. Fix: only names of the dump pattern, never a reparse
+            # point; the ring bound itself is unchanged.
+            dumps = [p for p in d.iterdir()
+                     if DUMP_NAME_RE.match(p.name) and not is_reparse(p) and p.is_file()]
+            stale = sorted(dumps, key=lambda p: p.stat().st_mtime)[:-DEBUG_DUMP_RING_MAX]
             for old in stale:
                 old.unlink(missing_ok=True)
         except Exception as e:
@@ -1203,6 +1224,8 @@ class FaceService:
             "enrollment": EMBED_PATH.exists(),
             "lockout": self._lockout.status(),
             "audit": self._audit.status(),
+            # Stage 8b, additive: False while unlock answers "insecure-data-dir".
+            "data_dir_secure": not getattr(self, "_data_dir_insecure", False),
         }
 
     def _apply_posture_ratchet(self, new_cfg: Config) -> None:
@@ -1387,6 +1410,15 @@ class FaceService:
             if r.camera_busy:
                 self._audit.write("unlock", {**r.detail, "outcome": "camera-busy"})
                 return {"ok": False, "reason": "camera-busy"}
+            # Stage 8b (F-01 / P-03, act A-2): additive fail-closed gate AFTER the existing ones
+            # (SYSTEM -> lockout -> camera above are unchanged). Defect: the service released the
+            # password from a data directory other accounts could write to. Consequence: a gallery
+            # or config it trusts could have been planted. Fix: when the start-up heal could not
+            # secure the directory, refuse -- lockout-neutral (returns before the counter), which
+            # the Credential Provider shows as an ordinary failure, so PIN stays the way in.
+            if getattr(self, "_data_dir_insecure", False):
+                self._audit.write("unlock", {**r.detail, "outcome": "insecure-data-dir"})
+                return {"ok": False, "reason": "insecure-data-dir"}
             # Stage 3.3 gated exposure boost: if the burst came back below the floor, try to raise
             # EXPOSURE and re-capture BEFORE the too-dark fallback. Gated (only below the floor) so a
             # normally-lit face is never blown out; transient (exposure always restored inside
@@ -1485,6 +1517,12 @@ class FaceService:
                 self._audit_gesture(challenge=slot["kind"], reason=raw)
                 return {"ok": False, "reason": "gesture-failed", "challenge": slot["kind"],
                         "state": "failed", "identity_frames": 0}
+            # Stage 8b (act A-2): the same additive custody gate as unlock, after SYSTEM ->
+            # lockout -> token -> camera. Phase 1 already refuses before issuing a token, so this
+            # is defence in depth; lockout-neutral like there.
+            if getattr(self, "_data_dir_insecure", False):
+                self._audit_gesture(challenge=resp.get("challenge"), reason="insecure-data-dir")
+                return {"ok": False, "reason": "insecure-data-dir"}
             frames = int(resp.get("identity_frames") or 0)
             best = resp.get("distance_best")
             # Two conditions, no new numbers: the task itself passed AND enough MATCHING frames
@@ -1768,8 +1806,16 @@ def _setup_logging() -> None:
 
 def main() -> None:
     _setup_logging()
+    # Stage 8b (F-01 / F-23): secure the data directory BEFORE anything in it is read -- the
+    # config below included -- and before the pipe exists. Never raises; a failure is logged at
+    # ERROR and turns into the insecure-data-dir refusal inside FaceService.
+    custody = heal_data_dir(APP_DIR)
     cfg = Config.load()
-    svc = FaceService(cfg)
+    # Stage 8b (F-12): with the dump knob off, frames left over from an earlier diagnosis are
+    # biometric data with no purpose -- remove them (dump-named files only, no reparse points).
+    if not cfg.debug_dump_frames:
+        purge_debug_frames(APP_DIR)
+    svc = FaceService(cfg, custody=custody)
     try:
         svc.serve_forever()
     except KeyboardInterrupt:

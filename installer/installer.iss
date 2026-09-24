@@ -81,18 +81,19 @@ Name: "cp"; Description: "Register the Credential Provider (enables log-in with 
 ; registrar and its declaration, staged there by installer/build.py step 4).
 Source: "{#BuildRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
-[Dirs]
-; Writable log/config dir in the per-user profile -- created on first run anyway,
-; but pre-created so permissions are right the first time.
+; There is deliberately NO [Dirs] section (Stage 8b, F-01).
 ;
-; This used to say {userappdata}\..\.face-unlock, which expands to
-; %APPDATA%\..\.face-unlock = C:\Users\<u>\AppData\.face-unlock -- NOT the
-; directory the application uses, and not the one CurUninstallStepChanged below
-; offers to delete. The installer therefore created a stray empty directory that
-; nothing read and no uninstall path removed, while the real data directory got
-; no pre-created permissions at all. {%USERPROFILE} matches face_service/config.py
-; (Path.home()/".face-unlock") and matches the uninstall code below.
-Name: "{%USERPROFILE}\.face-unlock"; Permissions: users-modify
+; Defect: up to 0.1.0 this section pre-created the data directory
+; (USERPROFILE\.face-unlock) with "Permissions: users-modify" -- an explicit,
+; inheritable BUILTIN\Users:Modify ACE that every file below it inherited,
+; including the encrypted password blob, the per-install entropy and the face
+; images. Consequence: other local accounts could read and alter data the service
+; trusts. Fix: the installer no longer creates or touches that directory at all.
+; face_service creates it on first start and, on EVERY start, re-secures it to
+; SELF / SYSTEM / Administrators (face_service/datadir.py) -- which also heals a
+; machine that was installed with the old ACE, since a reinstall never removes an
+; ACE Inno added. Do not reinstate an entry here: an installer-side ACL is exactly
+; what broke custody.
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -355,7 +356,7 @@ begin
 end;
 
 { Check for the two password entries in [Run] step 4. Same directory as the
-  Dirs section and the uninstall code below: USERPROFILE plus .face-unlock,
+  uninstall code below: USERPROFILE plus .face-unlock,
   which is what face_service/config.py resolves as Path.home(). Existence only;
   the DPAPI blob itself is never opened here.
 
@@ -404,6 +405,30 @@ begin
                    mbConfirmation, MB_YESNO) = IDYES;
 end;
 
+{ Stage 8b (F-02). Defect: the data directory is removed ELEVATED with
+  rmdir /S /Q, and up to 0.1.0 other accounts could write inside it.
+  Consequence: whether the delete stays inside the directory depended only on how
+  rmdir treats a link. Fix, defence in depth: the directory itself must not be a
+  reparse point (then nothing is deleted and the uninstall log says why), and below
+  it rmdir /S removes a junction as a link without entering it -- measured on this
+  Windows build in 8b (ps51-junction-test.txt: target survived). $400 is
+  FILE_ATTRIBUTE_REPARSE_POINT; FindFirst on a path without a wildcard describes
+  that entry itself, not its target. }
+function IsReparsePoint(const Path: string): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if FindFirst(Path, FindRec) then
+  begin
+    try
+      Result := (FindRec.Attributes and $400) <> 0;
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: string;
@@ -416,8 +441,11 @@ begin
     begin
       if WantsDataRemoved(DataDir) then
       begin
-        Exec(ExpandConstant('{cmd}'), '/C rmdir /S /Q "' + DataDir + '"',
-             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+        if IsReparsePoint(DataDir) then
+          Log('Data directory is a reparse point, not removed: ' + DataDir)
+        else
+          Exec(ExpandConstant('{cmd}'), '/C rmdir /S /Q "' + DataDir + '"',
+               '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
       end;
     end;
   end;

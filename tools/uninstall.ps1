@@ -553,11 +553,39 @@ foreach ($fuKey in $fuCpKeys) {
 # 3. Files.
 Write-Host ''
 Write-Host '[3/4] files' -ForegroundColor Cyan
+# Stage 8b (F-02). Defect: Remove-Item -Recurse ran ELEVATED over directories another account
+# could write to (the data directory carried BUILTIN\Users:Modify up to 0.1.0), with nothing that
+# said "do not walk through a link". Consequence: correctness rested on how PowerShell happens to
+# treat a junction. Fix: an explicit walk that unlinks every reparse point AS A LINK and never
+# enters it. Defence in depth: on PS 5.1 both Remove-Item -Recurse and rd /s /q were measured to
+# delete a junction itself and leave its target untouched (8b, ps51-junction-test.txt); this makes
+# that property ours instead of an observation about the host.
+function Remove-TreeNoFollow {
+    param([string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if ($item.PSIsContainer) { [IO.Directory]::Delete($item.FullName, $false) }
+        else { [IO.File]::Delete($item.FullName) }
+        return
+    }
+    if ($item.PSIsContainer) {
+        foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) {
+            Remove-TreeNoFollow $child.FullName
+        }
+        [IO.Directory]::Delete($item.FullName, $false)
+        return
+    }
+    if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) {
+        $item.Attributes = $item.Attributes -bxor [IO.FileAttributes]::ReadOnly
+    }
+    [IO.File]::Delete($item.FullName)
+}
+
 function Remove-Trace {
     param([string]$Path, [string]$Label)
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Write-Host "  removing $Label : $Path"
-    try { Remove-Item -LiteralPath $Path -Recurse -Force }
+    try { Remove-TreeNoFollow $Path }
     catch { Write-Warning ("could not remove {0}: {1}" -f $Path, $_.Exception.Message) }
 }
 

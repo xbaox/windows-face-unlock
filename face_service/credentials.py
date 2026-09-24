@@ -65,13 +65,22 @@ def _build_secret_file_sa() -> win32security.SECURITY_ATTRIBUTES:
 
 
 def _write_locked_file(path: Path, data: bytes) -> None:
-    """Create ``path`` with the restrictive SELF+SYSTEM descriptor and write ``data`` -- born locked,
-    with no default-perms window (the SA is applied at creation)."""
+    """Write ``data`` to ``path`` under the restrictive SELF+SYSTEM descriptor.
+
+    A NEW file is born locked (the SA is applied at creation). Stage 8b (F-23): defect -- with
+    CREATE_ALWAYS on a file that already EXISTS, Windows ignores the SA and keeps the old
+    descriptor; consequence -- a secret that predated this code (or sat in a directory with a
+    broad inheritable ACE) stayed readable by whoever that descriptor admitted, while the
+    docstring said "born locked"; fix -- the same descriptor is also applied explicitly through
+    the open handle, protected, every time."""
     path.parent.mkdir(parents=True, exist_ok=True)
     sa = _build_secret_file_sa()
-    h = win32file.CreateFile(str(path), win32con.GENERIC_WRITE, 0, sa,
+    h = win32file.CreateFile(str(path), win32con.GENERIC_WRITE | win32con.WRITE_DAC, 0, sa,
                              win32con.CREATE_ALWAYS, 0, None)
     try:
+        win32security.SetKernelObjectSecurity(
+            h, win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION, sa.SECURITY_DESCRIPTOR)
         win32file.WriteFile(h, data)
     finally:
         win32file.CloseHandle(h)
@@ -98,8 +107,11 @@ def _ensure_entropy_secret() -> bytes:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write-then-rename. Stage 8b (F-23): the temp file is written LOCKED, and a same-volume
+    rename keeps the descriptor of the file it moves, so credentials.bin never exists -- not even
+    as the .tmp -- under the directory's inheritable ACL."""
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
+    _write_locked_file(tmp, data)
     os.replace(tmp, path)
 
 
