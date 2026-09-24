@@ -361,8 +361,8 @@ def main(argv=None) -> int:
     # keys: a mandatory-checksum refusal and the source-checkout notice) -> 228 in 7h (label
     # and .desc for the debug_dump_frames diagnostics knob) -> 229 in 7l (enroll.status.connecting,
     # the wizard's wait-for-service line; added to all twelve locales).
-    t.ok(len(en) == 236, f"_EN has 236 keys (got {len(en)})")
-    t.ok(len(ru) == 236, f"_RU has 236 keys (got {len(ru)})")
+    t.ok(len(en) == 237, f"_EN has 237 keys (got {len(en)})")
+    t.ok(len(ru) == 237, f"_RU has 237 keys (got {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
     # Key parity alone never caught a translation that drops or renames a {placeholder}: t()
     # swallows a failed .format() and returns the raw string, so the damage shows up as an

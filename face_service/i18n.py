@@ -285,6 +285,10 @@ _EN: dict[str, str] = {
     "enroll.error.service_busy": "Could not pause the Face Unlock service — enrollment may conflict with probes.",
     "enroll.error.wipe_failed": "The Face Unlock service did not confirm the deletion. Try again; "
                                 "if it keeps failing, restart the service from the tray.",
+    "enroll.guide.pose_warn": "Enrollment built from {n} photos, but your head was at an angle in "
+                              "most of them (pitch {pitch}°, yaw {yaw}°). Face sign-in works best "
+                              "when you enroll the way you sit at the lock screen: camera at eye "
+                              "level, face straight on. Consider enrolling again (Replace).",
     "enroll.confirm.mode.title": "Replace or add?",
     "enroll.confirm.mode.body": "An enrollment already exists.\n\nYes — Replace it with this session "
                                 "(recommended). The old photos and gallery are removed only after "
@@ -1188,6 +1192,11 @@ _RU: dict[str, str] = {
     "enroll.error.service_busy": "Не удалось приостановить сервис Face Unlock — регистрация может конфликтовать с проверками присутствия.",
     "enroll.error.wipe_failed": "Сервис Face Unlock не подтвердил удаление. Попробуйте ещё раз; "
                                 "если не помогает, перезапустите сервис из трея.",
+    "enroll.guide.pose_warn": "Регистрация построена из {n} снимков, но на большинстве голова была "
+                              "под углом (наклон {pitch}°, поворот {yaw}°). Вход по лицу работает "
+                              "лучше, если регистрироваться так же, как вы сидите перед экраном "
+                              "блокировки: камера на уровне глаз, лицо прямо. Лучше пройти "
+                              "регистрацию ещё раз (Заменить).",
     "enroll.confirm.mode.title": "Заменить или добавить?",
     "enroll.confirm.mode.body": "Регистрация уже есть.\n\nДа — заменить её этой сессией "
                                 "(рекомендуется). Старые снимки и галерея удаляются только после "

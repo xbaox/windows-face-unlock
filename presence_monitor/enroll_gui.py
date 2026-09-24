@@ -84,6 +84,25 @@ COACH_AREA_MAX_FRAC = 0.38     # larger -> "move back"
 COACH_OFFSET_MAX_FRAC = 0.18   # box centre may sit this far off the frame centre
 COACH_FACE_ASPECT = 0.8        # nominal face w/h, used only to draw the guide oval
 
+# ---- Pose coach (Stage 8b, D-17 / act A-5): UX thresholds, WARNING ONLY ----
+# Defect: the coach judged framing and image quality only, and said "Good -- hold still" to a
+# face tilted down by 19 degrees (7l). Consequence: a whole enrollment session was captured at an
+# angle the lock screen never sees, and the gallery drifted away from the daily pose (d_july ~0.2).
+# Fix: the service reports the median pitch / yaw of the accepted frames of a build (the
+# landmark_3d_68 pose, the same measure as 7l gallery-diag.txt), and the wizard warns when the
+# session is pitched below POSE_PITCH_WARN_DEG or turned beyond POSE_YAW_WARN_DEG. Calibrated on
+# gallery-diag: every July frame has pitch -8.8..-13.8 (no warning), every September frame
+# -16.5..-24.1 (warning); |yaw| <= 9.4 throughout. Frame acceptance (QC) is unchanged: this is
+# advice, never a gate. Not a recognition, liveness or QC number.
+POSE_PITCH_WARN_DEG = -15.0
+POSE_YAW_WARN_DEG = 15.0
+
+
+def pose_warning(pitch: float, yaw: float) -> bool:
+    """True when this pose should be warned about (see the thresholds above)."""
+    return pitch < POSE_PITCH_WARN_DEG or abs(yaw) > POSE_YAW_WARN_DEG
+
+
 # On-screen guide oval, in PREVIEW pixels. Sized to the midpoint of the accepted
 # area band so "fill the oval" and the area gate agree by construction.
 _GUIDE_AREA_PX = (COACH_AREA_MIN_FRAC + COACH_AREA_MAX_FRAC) / 2 * PREVIEW_W * PREVIEW_H
@@ -960,7 +979,18 @@ class EnrollWindow:
                 # the coach from overwriting it on the next frame.
                 if resp and resp.get("ok"):
                     n = int(resp.get("count", 0))
-                    if n > 0:
+                    pose = resp.get("pose") or {}
+                    if n > 0 and pose and pose_warning(float(pose.get("pitch", 0.0)),
+                                                       float(pose.get("yaw", 0.0))):
+                        # D-17: warn, never refuse -- the enrollment IS built and in use.
+                        msg = t("enroll.guide.pose_warn", n=n, pitch=round(pose["pitch"]),
+                                yaw=round(pose["yaw"]))
+                        log.info("enroll pose warning: pitch=%s yaw=%s n=%s",
+                                 pose.get("pitch"), pose.get("yaw"), pose.get("n"))
+                        self._set_guide("enroll.guide.pose_warn", n=n, pitch=round(pose["pitch"]),
+                                        yaw=round(pose["yaw"]))
+                        messagebox.showwarning(t("enroll.title"), msg, parent=self.root)
+                    elif n > 0:
                         self._set_guide("enroll.guide.done", n=n)
                     else:
                         self._set_guide("enroll.guide.build_empty")

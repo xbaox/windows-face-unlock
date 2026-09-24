@@ -1460,9 +1460,9 @@ class FaceService:
             try:
                 from .config import ENROLL_DIR
                 if req.get("replace") is True:
-                    return self._build_replace()
+                    return self._with_pose(self._build_replace())
                 n = self.recog.enroll_from_dir(ENROLL_DIR)
-                return {"ok": True, "count": n}
+                return self._with_pose({"ok": True, "count": n})
             except Exception as e:
                 log.exception("build_enrollment failed")
                 return {"ok": False, "reason": str(e)}
@@ -1740,6 +1740,15 @@ class FaceService:
         if int(r.detail.get("engine_errors", 0) or 0) >= frames_ok:
             return "no-enrollment" if getattr(self.recog, "_refs", None) is None else "engine-error"
         return None
+
+    def _with_pose(self, resp: dict) -> dict:
+        """Stage 8b (D-17): add the built session's median pose to a successful build reply.
+        Additive key; the wizard turns it into a warning. Numbers only, no image data."""
+        pose = getattr(self.recog, "last_enroll_pose", None)
+        if resp.get("ok") and pose:
+            resp["pose"] = {k: (round(v, 1) if isinstance(v, float) else v)
+                            for k, v in pose.items()}
+        return resp
 
     def _build_replace(self) -> dict:
         """``build_enrollment`` with ``replace``: build the gallery from the PENDING session only,

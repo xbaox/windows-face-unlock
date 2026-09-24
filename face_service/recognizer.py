@@ -206,6 +206,7 @@ class Recognizer:
         self._app_failed_at = 0.0                       # monotonic; 0.0 = never failed to build
         self._app_error = ""                            # last build failure, replayed in cooldown
         self._screen = ScreenDetector()                 # anti-screen (hf-only, conservative)
+        self.last_enroll_pose = None                    # 8b D-17: median pose of the last build
 
     def _refresh_refs(self) -> None:
         """Rebuild the matching set from the enrollment baseline + the adaptive ring."""
@@ -336,6 +337,7 @@ class Recognizer:
         vecs: list[np.ndarray] = []
         accepted: list[tuple[str, FrameQuality]] = []
         rejected: list[tuple[str, str]] = []
+        poses: list[tuple[float, float]] = []   # (pitch, yaw) of accepted frames (8b D-17)
         for p in sorted(images):
             img = cv2.imread(str(p))
             if img is None:
@@ -362,6 +364,15 @@ class Recognizer:
                 continue
             vecs.append(np.asarray(face.normed_embedding, dtype=np.float32))
             accepted.append((p.name, q))
+            # Stage 8b (D-17): telemetry only -- the pose of each ACCEPTED frame, from the same
+            # landmark_3d_68 pose the gesture round uses. Nothing here changes what is accepted.
+            try:
+                pose = face.get("pose") if hasattr(face, "get") else None
+                if pose is not None:
+                    from .liveness import POSE_PITCH, POSE_YAW
+                    poses.append((float(pose[POSE_PITCH]), float(pose[POSE_YAW])))
+            except Exception:
+                pass
             log.info("enroll OK %s: det=%.3f sharp=%.1f luma=%.1f facepx=%d",
                      p.name, q.det, q.sharpness, q.luma, q.face_px)
 
@@ -390,6 +401,11 @@ class Recognizer:
             )
         os.replace(tmp, EMBED_PATH)
         self._enroll_refs = embeds
+        # Stage 8b (D-17): the session's pose, for the wizard's warning (medians of the accepted
+        # frames; None when the engine reported no pose).
+        self.last_enroll_pose = ({"pitch": float(np.median([a for a, _b in poses])),
+                                  "yaw": float(np.median([b for _a, b in poses])),
+                                  "n": len(poses)} if poses else None)
         # A fresh baseline invalidates prior drift adaptation -> reset it (enrollment is the anchor).
         self._adaptive.clear()
         self._refresh_refs()
