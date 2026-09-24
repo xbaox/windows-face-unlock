@@ -33,8 +33,40 @@ Stage 8b (D-10) from rules learned the hard way in 7k and 7l (`audit-notes.md`,
   the report quotes the JSON reply next to it. `status` opens no camera and proves
   nothing about recognition (7k А).
 - **READY pattern v2** before the first probe (7k Г): the process being up is not
-  enough — wait for the log lines `InsightFace ready` and `camera warmup ok`, then
-  poll `ping` until it answers, pause ~2 s, and only then send the first probe.
+  enough — wait for `camera warmup ok` in the log, then poll `ping` until it answers,
+  pause ~2 s, and only then send the first probe.
+- **Engine readiness (8b-2).** `InsightFace ready` is logged when the engine is first
+  BUILT, and it is built lazily: at warmup only if `enroll\` holds an image, otherwise
+  by the first probe that needs a gallery. A scratch home with no gallery therefore
+  never shows it — every probe answers `ok:false engine-error` ("No enrollment found"),
+  which is correct behaviour, not a failed smoke. So a dist smoke seeds a **synthetic
+  gallery** and the marker becomes: the first `presence` answers `ok:true` and
+  `InsightFace ready` is in the log after it.
+
+### Synthetic gallery (scratch homes only)
+
+`embeddings.npz` written by the production save path — `Recognizer.enroll_from_dir`,
+which writes a sibling and renames it (F-45) — with synthetic INPUTS only: noise images
+(no face), a stub engine returning random L2-normalised 512-D vectors, QC told every
+frame passes. The file is the exact on-disk format (`embeddings`, `engine`, `dim`) and
+holds no biometric data: nothing derived from a face, nothing copied from a real
+gallery. Reference implementation: `C:\dev\d-series\8b2\smoke\gen_synthetic_gallery.py`.
+With it, `presence` on a real person answers `ok:true state=absent` (no vector matches)
+— the point is that the engine ran, not the verdict. Never put a synthetic gallery into
+a real `.face-unlock`.
+
+### The fixed dist-smoke checklist (8b-2)
+
+Seed: `Users:(OI)(CI)(M)`, three dump-named fakes in `debug_frames\`, fake
+`credentials.bin` / `pipe_entropy.bin` (random bytes), the synthetic gallery.
+- smoke-1: custody INFO line (`aces_removed ≥ 1`, `relocked = 2`); ACL of the home clean
+  afterwards; `status.data_dir_secure = true`; the three fakes purged; `camera warmup ok`;
+  `ping` / `status` ok; `presence` `ok:true` + `InsightFace ready`; `unlock` from the user
+  → `not-authorized` (SYSTEM gate first) with `lockout.fails` 0 before and after; graceful
+  shutdown through the frozen `face_unlock_tray.exe --pipe-shutdown` → exit 0.
+- smoke-2: the same home with a junction inside: custody ERROR,
+  `data_dir_secure = false`, `unlock` → `not-authorized` (gate order unchanged), the
+  junction target untouched, shutdown.
 
 ## 4. The criterion includes the scene and the frame class
 
