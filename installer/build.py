@@ -425,6 +425,81 @@ def _gate_run(label: str, cmd: list[str]) -> None:
         )
 
 
+def gate_frozen_custody(dist_root: Path) -> dict:
+    """Live half of the gate for the data-directory custody (Stage 8b-2).
+
+    Defect: the 8b bundle passed every static check, yet the FROZEN service could not heal the
+    data directory at all (pywin32 lazily imported win32timezone, which the bundle lacked).
+    Consequence: it surfaced only in a manual dist smoke, one step before the installer. Fix: run
+    the real code path out of the BUILT exe -- face_service.exe --selfcheck-custody -- on two seeded
+    scratch directories, before the stamp:
+      clean    -- BUILTIN\\Users:(OI)(CI)(M) + fake credentials.bin / pipe_entropy.bin (random
+                  bytes): exit 0, ok, 0 foreign ACEs, both secrets protected SELF + SYSTEM;
+      junction -- the same plus a junction inside the tree: exit 1, ok false.
+    FACE_UNLOCK_HOME points at a directory that must still not exist afterwards: the mode may act
+    on its argument only. Any deviation aborts the build.
+    """
+    import tempfile
+
+    exe = dist_root / "face_service.exe"
+    if not exe.is_file():
+        raise BuildAbort(f"GATE FAILED: {exe} missing -> cannot run the custody self-check.")
+    summary: dict = {}
+    with tempfile.TemporaryDirectory(prefix="fu_gate_custody_") as tmp:
+        td = Path(tmp)
+        never = td / "app-dir-must-not-appear"
+        victim = td / "victim"
+        victim.mkdir()
+        (victim / "keep.txt").write_bytes(b"k")
+        for case in ("clean", "junction"):
+            home = td / case
+            (home / "enroll").mkdir(parents=True)
+            (home / "credentials.bin").write_bytes(os.urandom(96))
+            (home / "pipe_entropy.bin").write_bytes(os.urandom(32))
+            subprocess.run(["icacls", str(home), "/grant", "*S-1-5-32-545:(OI)(CI)(M)"],
+                           capture_output=True, check=True)
+            if case == "junction":
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(home / "enroll" / "link"),
+                                str(victim)], capture_output=True, check=True)
+            out = td / f"{case}.json"
+            env = dict(os.environ, FACE_UNLOCK_HOME=str(never))
+            proc = subprocess.run([str(exe), "--selfcheck-custody", str(home), "--out", str(out)],
+                                  env=env, capture_output=True, timeout=180)
+            data = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else {}
+            summary[case] = {"rc": proc.returncode, "ok": data.get("ok"),
+                             "heal": data.get("heal"), "foreign": data.get("foreign_ace_problems"),
+                             "secrets": {k: v.get("self_system_only")
+                                         for k, v in (data.get("secrets") or {}).items()},
+                             "frozen": data.get("frozen"), "exception": data.get("exception")}
+            log(f"gate: frozen custody [{case}] rc={proc.returncode} ok={data.get('ok')} "
+                f"heal={(data.get('heal') or {}).get('ok')} "
+                f"aces_removed={(data.get('heal') or {}).get('aces_removed')} "
+                f"relocked={(data.get('heal') or {}).get('relocked')} "
+                f"foreign={data.get('foreign_ace_problems')} "
+                f"exception={data.get('exception')}")
+        clean, junc = summary["clean"], summary["junction"]
+        bad = []
+        if clean["rc"] != 0 or clean["ok"] is not True:
+            bad.append(f"clean case rc={clean['rc']} ok={clean['ok']} ({clean['exception'] or clean['heal']})")
+        if clean["foreign"] != 0:
+            bad.append(f"clean case left {clean['foreign']} foreign-ACE problem(s)")
+        if sorted(clean["secrets"]) != ["credentials.bin", "pipe_entropy.bin"] or \
+                not all(clean["secrets"].values()):
+            bad.append(f"clean case secrets not SELF+SYSTEM protected: {clean['secrets']}")
+        if clean["frozen"] is not True:
+            bad.append("the self-check did not run frozen")
+        if junc["rc"] != 1 or junc["ok"] is not False:
+            bad.append(f"junction case rc={junc['rc']} ok={junc['ok']} (expected 1 / false)")
+        if never.exists():
+            bad.append(f"the self-check created {never} -- it must act on its argument only")
+        if not (victim / "keep.txt").exists():
+            bad.append("the junction target was modified")
+        if bad:
+            raise BuildAbort("GATE FAILED: frozen custody self-check -> " + "; ".join(bad))
+    log("gate: frozen custody self-check passed (clean -> healed and locked; junction -> refused)")
+    return summary
+
+
 def step_gate(dist_root: Path, cp_dll: Path | None, policy: dict) -> dict:
     """The automated half of the gate, then the stamp that step 6 insists on.
 
@@ -441,6 +516,7 @@ def step_gate(dist_root: Path, cp_dll: Path | None, policy: dict) -> dict:
     _gate_run("tools/verify_frozen_entrypoints.py",
               [python_exe(), str(TOOLS_DIR / "verify_frozen_entrypoints.py"), "--dist", str(dist_root)])
     _gate_run("tools/packaging_selftest.py", [python_exe(), "-m", "tools.packaging_selftest"])
+    custody = gate_frozen_custody(dist_root)
 
     log("gate: bundled recognition models against the pinned SHA-256")
     verify_model_pack(dist_root / BUNDLED_PACK_REL, "bundle")
@@ -480,7 +556,9 @@ def step_gate(dist_root: Path, cp_dll: Path | None, policy: dict) -> dict:
         "git_dirty_paths": len((_git("status", "--porcelain") or "").splitlines()),
         "python": sys.version.split()[0],
         "checks": ["verify_frozen_entrypoints rc=0", "packaging_selftest rc=0",
+                   "frozen custody self-check clean=0 junction=1",
                    "buffalo_l sha256 pinned", f"cp {policy['mode']}"],
+        "frozen_custody": custody,
     }
     GATE_STAMP.write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
     log(f"GATE PASSED: {manifest['files']} files, {manifest['bytes'] / 2**30:.2f} GiB, "

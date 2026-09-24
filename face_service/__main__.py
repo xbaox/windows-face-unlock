@@ -7,6 +7,14 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 # falls back to CPU silently. Removing it is what made GPU inference work.
 
 import multiprocessing
+import sys
+
+# Stage 8b-2: the hidden custody self-check the build gate runs out of the FROZEN exe (see
+# face_service/selfcheck.py). Routed here, BEFORE face_service.service is imported, so the mode
+# never loads the engine, the camera or the pipe code, and never reads the config.
+if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck-custody":
+    from face_service.selfcheck import selfcheck_custody_main
+    raise SystemExit(selfcheck_custody_main(sys.argv[1:]))
 
 # ABSOLUTE, and it must stay absolute. This file is an entry point in both
 # layouts, and the two layouts disagree about what package it belongs to.

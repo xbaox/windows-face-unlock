@@ -38,10 +38,12 @@ already matches).
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import re
 import stat
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -75,6 +77,53 @@ _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _SHARE_ALL = (win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE)
+
+# Stage 8b-2 (frozen custody). Defect: the attributes and the link count came from
+# win32file.GetFileInformationByHandle, whose reply carries three file TIMES that pywin32 turns into
+# datetimes through a lazy, native-side import of win32timezone. Consequence: the venv had that
+# module and every selftest passed, the PyInstaller bundle did not, and the frozen service failed
+# every heal with ModuleNotFoundError -- fail-closed "insecure-data-dir" on every install (8b smoke,
+# RED). Fix: ask the kernel for exactly the two facts the check needs, through ctypes on the SAME
+# handle, with nothing time-typed in the reply: FileAttributeTagInfo (attributes, reparse) and
+# FileStandardInfo (link count, directory). The check itself is unchanged: a reparse point or a
+# hard-linked file is unsafe.
+_FILE_STANDARD_INFO_CLASS = 1        # FILE_INFO_BY_HANDLE_CLASS.FileStandardInfo
+_FILE_ATTRIBUTE_TAG_INFO_CLASS = 9   # FILE_INFO_BY_HANDLE_CLASS.FileAttributeTagInfo
+
+
+class _FileStandardInfo(ctypes.Structure):
+    _fields_ = [("AllocationSize", ctypes.c_longlong), ("EndOfFile", ctypes.c_longlong),
+                ("NumberOfLinks", wintypes.DWORD), ("DeletePending", wintypes.BOOLEAN),
+                ("Directory", wintypes.BOOLEAN)]
+
+
+class _FileAttributeTagInfo(ctypes.Structure):
+    _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_GetFileInformationByHandleEx = _kernel32.GetFileInformationByHandleEx
+_GetFileInformationByHandleEx.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+                                          wintypes.DWORD)
+_GetFileInformationByHandleEx.restype = wintypes.BOOL
+
+
+def _file_facts(handle) -> "tuple[int, int, bool]":
+    """(attributes, number of links, is directory) of an open handle. Raises pywintypes.error on
+    failure, like the pywin32 call it replaces, so every caller's error path is unchanged."""
+    raw = int(handle)
+    tag = _FileAttributeTagInfo()
+    if not _GetFileInformationByHandleEx(raw, _FILE_ATTRIBUTE_TAG_INFO_CLASS, ctypes.byref(tag),
+                                         ctypes.sizeof(tag)):
+        raise pywintypes.error(ctypes.get_last_error(), "GetFileInformationByHandleEx",
+                               "FileAttributeTagInfo")
+    std = _FileStandardInfo()
+    if not _GetFileInformationByHandleEx(raw, _FILE_STANDARD_INFO_CLASS, ctypes.byref(std),
+                                         ctypes.sizeof(std)):
+        raise pywintypes.error(ctypes.get_last_error(), "GetFileInformationByHandleEx",
+                               "FileStandardInfo")
+    return int(tag.FileAttributes), int(std.NumberOfLinks), bool(std.Directory)
+
 
 _DACL = win32security.DACL_SECURITY_INFORMATION
 _OWNER = win32security.OWNER_SECURITY_INFORMATION
@@ -187,12 +236,10 @@ def _heal_one(path: str, kind: str, t: _Targets, rep: CustodyReport) -> "bool | 
         rep.problems.append("cannot open %s (winerror=%d)" % (path, e.winerror))
         return None
     try:
-        info = win32file.GetFileInformationByHandle(h)
-        attrs, nlinks = info[0], info[7]
+        attrs, nlinks, is_dir = _file_facts(h)
         if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
             rep.problems.append("reparse point %s (not followed, not modified)" % path)
             return None
-        is_dir = bool(attrs & _FILE_ATTRIBUTE_DIRECTORY)
         if not is_dir and nlinks > 1:
             rep.problems.append("hard-linked file %s (links=%d; not modified)" % (path, nlinks))
             return None
@@ -250,12 +297,10 @@ def verify_data_dir(app_dir, self_sid: "str | None" = None) -> list:
             problems.append("cannot open %s (winerror=%d)" % (path, e.winerror))
             return None
         try:
-            info = win32file.GetFileInformationByHandle(h)
-            attrs, nlinks = info[0], info[7]
+            attrs, nlinks, is_dir = _file_facts(h)
             if attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
                 problems.append("reparse point %s" % path)
                 return None
-            is_dir = bool(attrs & _FILE_ATTRIBUTE_DIRECTORY)
             if not is_dir and nlinks > 1:
                 problems.append("hard-linked file %s" % path)
                 return None

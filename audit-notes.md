@@ -1509,3 +1509,24 @@ SHA-256 **`0BE85822E0558963F45F9E789C9D79745F58D318B7669FBDC8D0A370DB9EA385`**,
 сборки, а не покадрово в превью: в мастере нет движка с 3D-позой (YuNet даёт 5
 точек), а тащить InsightFace в exe трея — риск новой мины класса §5. Поза
 считается сервисом на тех же моделях, что и `gallery-diag.txt` 7l.
+
+#### 8b-2 — RED 8b и его фикс (2026-09-24)
+
+- **RED 8b (смоук dist).** Frozen-сервис не мог лечить каталог данных: `datadir` звал
+  `win32file.GetFileInformationByHandle`, pywin32 превращает времена файла в `datetime` через ЛЕНИВЫЙ
+  импорт `win32timezone` из нативного `pywintypes*.dll`; в венве модуль есть, в бандле — нет →
+  `ModuleNotFoundError` → `insecure-data-dir` на каждой установке. Класс мин KNOWN_ISSUES §5.
+- **Решения архитектора по §7 отчёта 8b:** Q1 — фикс в два слоя + живой frozen-гейт; Q2 — граница
+  F-37 остаётся **10 с** (первый запуск после установки идёт под AV-сканом), замеры 8b —
+  **1.13 с / 1.01 с** (frozen `face_unlock_tray.exe --pipe-shutdown`, холодный старт + обмен),
+  записаны и у константы в `tools/register_tasks.ps1`; Q3 — маркер готовности движка в смоуке —
+  синтетическая галерея; Q4 / Q5 — живьём в 8c; Q6 — read-only в 8b-2; отклонения 8b 1–7 приняты.
+- **Фикс (коммит 8b-2).** (а) `datadir` берёт атрибуты / reparse (`FileAttributeTagInfo`) и число
+  ссылок / каталог (`FileStandardInfo`) через ctypes `GetFileInformationByHandleEx` по тому же
+  хэндлу — ни одного time-значения; семантика проверки та же. Других time-возвращающих вызовов
+  pywin32 в коде проекта нет (аудит всех 50 вызовов — отчёт 8b-2). (б) `win32timezone` + три новых
+  модуля 8b — в hiddenimports всех трёх EXE. (в) `verify_frozen_entrypoints` пасс 7 «lazy»: явный
+  список ленивых импортов нативной стороны pywin32 (минимум `pywintypes → win32timezone`), каждый
+  обязан лежать в PYZ каждого EXE; на бандле 8b пасс даёт rc=1. (г) скрытый режим
+  `face_service.exe --selfcheck-custody <dir> --out <file>` и живой frozen-самотест custody в гейте
+  половины 1 (чистый случай exit 0, с junction — exit 1, иначе abort до штампа).

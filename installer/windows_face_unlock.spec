@@ -135,6 +135,18 @@ HIDDEN += [
     # tools/ tree and no interpreter under {app}). Self-contained: stdlib + pywin32 +
     # face_service.config, all of which are already here.
     "tools.pipe_client",
+    # Stage 8b-2. Defect: pywin32 imports win32timezone LAZILY from its native side (pywintypes
+    # turns a FILETIME into a datetime through it), so modulegraph never sees the import.
+    # Consequence: the 8b bundle lacked it and the frozen service failed the data-directory heal on
+    # every start. Fix: named here for all three EXEs (insurance for the whole class;
+    # tools/verify_frozen_entrypoints.py pass 7 checks it is in every PYZ). The service no longer
+    # calls a time-returning pywin32 function (face_service/datadir.py uses ctypes).
+    "win32timezone",
+    # New 8b modules, named so the graph does not depend on bytecode scanning (datadir and pipe_io
+    # are also imported directly; selfcheck only from face_service/__main__.py).
+    "face_service.datadir",
+    "face_service.pipe_io",
+    "face_service.selfcheck",
 ]
 
 DATAS = []

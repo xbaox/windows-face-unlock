@@ -75,7 +75,7 @@ The lesson passes 4-6 encode: verifying a bundle by reading its PYZ proves what
 was collected, never that the result runs. Native extensions and frozen-aware
 vendor code fail on their own terms.
 
---passes selects a subset (comma-separated: source,frozen,pyz,native,mines,class);
+--passes selects a subset (comma-separated: source,frozen,pyz,native,mines,class,lazy);
 the default is all six. A subset run is a diagnostic, never a gate result.
 """
 from __future__ import annotations
@@ -122,7 +122,7 @@ MODULE_NAME_RE = re.compile(rb"numpy(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 # the filesystem, so the regex itself may be generous.
 DOTTED_RE = re.compile(rb"(?<![A-Za-z0-9_.])[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 
-ALL_PASSES = ("source", "frozen", "pyz", "native", "mines", "class")
+ALL_PASSES = ("source", "frozen", "pyz", "native", "mines", "class", "lazy")
 
 # Roots whose code is ours (reviewed in-repo) or PyInstaller's own runtime, which
 # is frozen-aware by definition. Everything else in the bundle is vendor code.
@@ -620,6 +620,45 @@ def pass_native(rep: Report, bundle: Bundle) -> None:
             rep.fail(f"{mod} is imported by the C extension but is NOT in the PYZ")
 
 
+# --------------------------------------------------------------------------- 7
+# Stage 8b-2. Defect: pywin32's NATIVE side imports some Python modules by name, lazily -- the
+# first time a call needs them -- so neither modulegraph nor passes 1-6 can see the import (pass 6
+# reads *.pyd; pywintypes lives in a *.dll). Consequence: the 8b bundle lacked win32timezone,
+# which pywintypes needs to turn a FILETIME into a datetime, and the frozen service failed its
+# data-directory heal on every start while the venv passed everything. Fix: an explicit list of
+# such imports; each must be in EVERY EXE's PYZ, and the claim that the native module carries the
+# name is re-checked against the bundled DLL itself.
+PYWIN32_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    # module: (native file glob under _internal, why)
+    "win32timezone": (
+        "pywintypes*.dll",
+        "pywintypes converts FILETIME / SYSTEMTIME to datetime through it; every time-returning "
+        "pywin32 call (GetFileInformationByHandle, FindFiles, GetFileTime, ...) imports it on first "
+        "use -- the 8b RED"),
+}
+
+
+def pass_lazy(rep: Report, bundle) -> None:
+    header("PASS 7 -- PYWIN32 LAZY IMPORTS (modules pywin32's native side imports by name)")
+    for mod, (glob, why) in PYWIN32_LAZY_IMPORTS.items():
+        natives = sorted(bundle.internal.rglob(glob)) if bundle.internal.is_dir() else []
+        if not natives:
+            rep.fail(f"{glob} not found under _internal -- pywin32 is not bundled as expected")
+        for native in natives:
+            if mod.encode() in native.read_bytes():
+                rep.ok(f"{native.relative_to(bundle.internal).as_posix()} names {mod} (lazy import)")
+            else:
+                rep.info(f"{native.name} does not embed {mod!r} -- list entry kept as insurance")
+        for _rel, exe_name in ENTRIES:
+            names = bundle.pyz_by_exe.get(exe_name)
+            if names is None:
+                rep.fail(f"{exe_name}: no PYZ to check {mod} against")
+            elif mod in names:
+                rep.ok(f"{exe_name}: {mod} in the PYZ")
+            else:
+                rep.fail(f"{exe_name}: {mod} is NOT in the PYZ -- {why}")
+
+
 # --------------------------------------------------------------------------- 5
 def pass_mines(rep: Report, bundle: Bundle, dirs: list[Path]) -> None:
     header("PASS 5 -- MINES (KNOWN_ISSUES #5, the three defects behind the blind frozen service)")
@@ -923,6 +962,8 @@ def main(argv: list[str] | None = None) -> int:
         pass_mines(rep, bundle, dirs)
     if "class" in passes:
         pass_class(rep, bundle, dirs)
+    if "lazy" in passes:
+        pass_lazy(rep, bundle)
 
     print()
     subset = set(passes) != set(ALL_PASSES)
@@ -935,8 +976,9 @@ def main(argv: list[str] | None = None) -> int:
     print("RESULT: entry points import cleanly in source and in the built EXEs, every")
     print("absolute target is in the PYZ, numpy's C extension has its native dependencies")
     print("and every module it imports by name, mines 1-3 of KNOWN_ISSUES #5 are covered,")
-    print("every extension's by-name imports resolve inside the bundle, and every vendor")
-    print("frozen branch / computed import is reviewed.")
+    print("every extension's by-name imports resolve inside the bundle, every vendor")
+    print("frozen branch / computed import is reviewed, and every module pywin32's native side")
+    print("imports lazily is in each EXE's PYZ.")
     print()
     print("This is the static half of the gate. The operator dist-smoke is the other half.")
     return 0

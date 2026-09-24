@@ -15,6 +15,10 @@ Everything runs on a FACE_UNLOCK_HOME this test creates itself under %TEMP%; the
   [4] purge-on-start removes only dump-named files, never enters a junction, and removes the
       directory once it is empty; the ring prune of _maybe_dump_frame deletes dump names only.
   [5] remove_tree_no_follow unlinks a junction as a link and leaves its target intact.
+  [6] Stage 8b-2: the ctypes path (GetFileInformationByHandleEx FileStandardInfo +
+      FileAttributeTagInfo) reports directory / link count / reparse exactly as the check needs --
+      a hard-linked file and a junction deep in the tree still fail the heal -- and a heal in a
+      fresh interpreter never loads win32timezone (the module the frozen bundle lacked in 8b).
 
 Run:  python -m tools.datadir_acl_selftest
 Exit 0 = all pass; 1 = a failure.
@@ -314,6 +318,60 @@ def test_remove_tree():
     check("junction target intact", (victim / "keep.txt").exists())
 
 
+# --- [6] ctypes facts (8b-2) ----------------------------------------------------------------
+
+def _facts(path: Path):
+    import win32con  # type: ignore
+    h = D._open_no_follow(str(path), win32con.READ_CONTROL)
+    try:
+        return D._file_facts(h)
+    finally:
+        D.win32file.CloseHandle(h)
+
+
+def test_ctypes_facts():
+    print("[6] ctypes file facts (8b-2)")
+    home = _ROOT / "facts"
+    (home / "misc").mkdir(parents=True)
+    f = home / "config.toml"
+    f.write_bytes(b"x")
+    attrs, links, is_dir = _facts(home)
+    check("directory: is_dir, not reparse", is_dir and not attrs & D._FILE_ATTRIBUTE_REPARSE_POINT,
+          (hex(attrs), links, is_dir))
+    attrs, links, is_dir = _facts(f)
+    check("plain file: 1 link, not a directory", links == 1 and not is_dir, (hex(attrs), links))
+    check("heal of a plain tree is ok", D.heal_data_dir(home).ok)
+
+    os.link(f, home / "misc" / "second-name.toml")
+    _a, links, _d = _facts(f)
+    check("hard link: link count 2", links == 2, links)
+    rep = D.heal_data_dir(home)
+    check("hard-linked file fails the heal", rep.ok is False
+          and any("hard-linked" in p for p in rep.problems), rep.problems[:3])
+    (home / "misc" / "second-name.toml").unlink()
+    check("heal ok again once the link is gone", D.heal_data_dir(home).ok)
+
+    victim = _ROOT / "facts_victim"
+    victim.mkdir()
+    _junction(home / "misc" / "deep-link", victim)
+    attrs, _l, _d = _facts(home / "misc" / "deep-link")
+    check("junction: reparse attribute seen through the no-follow handle",
+          bool(attrs & D._FILE_ATTRIBUTE_REPARSE_POINT), hex(attrs))
+    rep = D.heal_data_dir(home)
+    check("junction deep in the tree fails the heal", rep.ok is False
+          and any("reparse point" in p and "deep-link" in p for p in rep.problems), rep.problems[:3])
+
+    fresh = _ROOT / "fresh"
+    fresh.mkdir()
+    code = ("import sys; sys.path.insert(0, %r); from face_service import datadir as D; "
+            "r = D.heal_data_dir(%r); print(r.ok, 'win32timezone' in sys.modules)"
+            % (str(Path(__file__).resolve().parents[1]), str(fresh)))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env=dict(os.environ, FACE_UNLOCK_HOME=str(_ROOT / "fresh-app")))
+    check("fresh interpreter: heal ok and win32timezone NOT loaded",
+          out.stdout.strip() == "True False", (out.stdout.strip(), out.stderr[-300:]))
+
+
 def main() -> int:
     try:
         test_heal()
@@ -321,6 +379,7 @@ def main() -> int:
         test_reparse()
         test_purge()
         test_remove_tree()
+        test_ctypes_facts()
     finally:
         subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", str(_ROOT)], capture_output=True)
     if FAILS:
