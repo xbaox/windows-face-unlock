@@ -15,7 +15,7 @@ from face_service.i18n import LANGUAGES, get_language, set_language, t
 
 from .gui import open_help, open_settings, open_status
 from .monitor import PresenceMonitor, pipe_call
-from .updater import check_latest, current_version, download_and_launch
+from .updater import RELEASES_PAGE_URL, check_latest_status, current_version
 
 log = logging.getLogger(__name__)
 
@@ -277,20 +277,28 @@ def run_with_tray(cfg: Config) -> None:
             log.exception("tray.notify failed")
 
     def _run_update_flow(interactive: bool = True) -> None:
-        """Background worker that checks GitHub and (optionally) installs.
+        """Background worker that checks GitHub and tells the user (Stage 8b: NOTIFY-ONLY).
 
-        interactive=True comes from a menu click → always show a dialog.
-        interactive=False is the startup auto-check → only notify on new version.
+        interactive=True comes from a menu click → always report the outcome.
+        interactive=False is the startup auto-check → only speak up for a newer version.
+
+        Stage 8b (F-28). Defect: a 404 (nothing published yet) was shown as a network error, the
+        dialogs had no parent, and after "install" the tray quit even if Setup was then declined.
+        Fix: the updater installs nothing (updater.APPLY_ENABLED); a newer version opens the
+        releases page on request, the tray keeps running, 404 has its own text, dialogs have a
+        parent.
         """
         from tkinter import Tk, messagebox
+        import webbrowser
 
-        release = check_latest(timeout=8.0)
+        release, status = check_latest_status(timeout=8.0)
         current = current_version()
 
         if release is None:
             if interactive and icon_ref:
-                _update_notify(icon_ref[0], t("update.title"),
-                               t("update.check_failed", err="network"))
+                msg = (t("update.no_releases") if status == "no-release"
+                       else t("update.check_failed", err=status))
+                _update_notify(icon_ref[0], t("update.title"), msg)
             return
 
         if not release.is_newer_than(current):
@@ -307,30 +315,14 @@ def run_with_tray(cfg: Config) -> None:
         root = Tk()
         root.withdraw()
         try:
-            # A source checkout cannot be updated by running an installer -- that would install a
-            # separate frozen copy and re-point the tasks at it. Say so instead of offering a
-            # download we would refuse a moment later.
-            if not FROZEN:
-                ok, msg = download_and_launch(release)
-                messagebox.showinfo(t("update.title"), msg)
-                return
             notes = (release.body or "")[:600]
             if messagebox.askyesno(
                 t("update.title"),
                 t("update.available", latest=release.tag,
                   current=current, notes=notes),
+                parent=root,
             ):
-                ok, msg = download_and_launch(release)
-                if ok:
-                    messagebox.showinfo(t("update.title"), msg)
-                    # Give the installer a moment, then leave — installer
-                    # will kill us anyway if needed.
-                    threading.Thread(target=lambda: (time.sleep(2),
-                                                     icon_ref[0].stop()
-                                                     if icon_ref else None),
-                                     daemon=True).start()
-                else:
-                    messagebox.showerror(t("update.title"), msg)
+                webbrowser.open(RELEASES_PAGE_URL)
         finally:
             try:
                 root.destroy()

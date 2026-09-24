@@ -31,6 +31,16 @@ Three properties this deliberately has (Stage 7d-G), because it did not before:
 No external dependencies — urllib only. Safe to call from the tray thread
 but the network + download run in a background worker so the UI doesn't
 freeze.
+
+Stage 8b: NOTIFY-ONLY (F-27, F-28 / P-01). Defect: the only thing vouching for a downloaded
+installer was a checksum published in the same release as the installer -- integrity, not
+authenticity -- and that installer was then run elevated with /SILENT. The flow also treated a
+404 (no release yet) as a network error and took pre-release tags as final. Consequence: whoever
+could publish a release to the repository could have every installed client run their executable.
+Fix: APPLY_ENABLED below is False, so download_and_launch refuses before any download; the tray
+only tells the user a newer version exists and offers the releases page. A 404 gets its own text,
+pre-releases (flagged, or a tag with a suffix) are ignored, and dialogs have a parent. The apply
+code stays for the day releases are signed and the signature is verified here.
 """
 from __future__ import annotations
 import hashlib
@@ -69,6 +79,14 @@ INSTALLER_RE = re.compile(r"^WindowsFaceUnlock-Setup-.+\.exe$", re.IGNORECASE)
 # Applying an update means running an installer, which only makes sense for an installed layout.
 FROZEN = bool(getattr(sys, "frozen", False))
 
+# Stage 8b (P-01): the apply path is OFF. Enable ONLY together with signed releases and a signature
+# check of the downloaded installer against a pinned signer (WinVerifyTrust) -- never on its own.
+APPLY_ENABLED = False
+
+# A FINAL release tag: vX.Y.Z and nothing after it. "v0.2.0-rc1" parses to the same (0, 2, 0) as
+# the final, so without this a pre-release would be offered as the release itself.
+_FINAL_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+$")
+
 
 @dataclass
 class ReleaseInfo:
@@ -104,16 +122,31 @@ def _http_get(url: str, timeout: float = 15.0) -> bytes:
 
 def check_latest(timeout: float = 10.0) -> ReleaseInfo | None:
     """Fetch the latest release. Returns None on any error (callers warn)."""
+    return check_latest_status(timeout)[0]
+
+
+def check_latest_status(timeout: float = 10.0) -> "tuple[ReleaseInfo | None, str]":
+    """``(release, "ok")`` or ``(None, status)`` with status one of ``"no-release"`` (404: nothing
+    published, or only a pre-release / draft), ``"no-asset"``, ``"network"``, ``"http <code>"``,
+    ``"bad-response"``. Never raises."""
     try:
         payload = json.loads(_http_get(RELEASES_LATEST_URL, timeout=timeout))
     except urllib.error.HTTPError as e:
+        if e.code == 404:
+            log.info("releases/latest: 404 -- no release has been published")
+            return None, "no-release"
         log.warning("releases/latest HTTP %s: %s", e.code, e)
-        return None
+        return None, f"http {e.code}"
     except Exception:
         log.exception("releases/latest fetch failed")
-        return None
+        return None, "network"
+    if not isinstance(payload, dict):
+        return None, "bad-response"
 
     tag = payload.get("tag_name") or ""
+    if payload.get("prerelease") or payload.get("draft") or not _FINAL_TAG_RE.match(tag):
+        log.info("releases/latest: %r is a pre-release or not a final tag -- ignored", tag)
+        return None, "no-release"
     version = tag.lstrip("v")
     body = payload.get("body") or ""
     assets = payload.get("assets") or []
@@ -126,7 +159,7 @@ def check_latest(timeout: float = 10.0) -> ReleaseInfo | None:
 
     if not (tag and installer):
         log.info("latest release %s has no WindowsFaceUnlock-Setup-*.exe asset", tag)
-        return None
+        return None, "no-asset"
 
     # Prefer the checksum that belongs to THIS asset; fall back to a lone .sha256 in the release.
     installer_name = installer.get("name") or ""
@@ -142,6 +175,7 @@ def check_latest(timeout: float = 10.0) -> ReleaseInfo | None:
                 checksum_url = a.get("browser_download_url")
                 break
 
+    log.info("releases/latest: %s (current %s)", tag, __version__)
     return ReleaseInfo(
         tag=tag,
         version=version,
@@ -149,7 +183,7 @@ def check_latest(timeout: float = 10.0) -> ReleaseInfo | None:
         asset_name=installer.get("name") or "installer.exe",
         asset_url=installer.get("browser_download_url") or "",
         checksum_url=checksum_url,
-    )
+    ), "ok"
 
 
 def _download(url: str, dest: Path,
@@ -227,7 +261,11 @@ def download_and_launch(
 
     Fail-closed: every path that cannot PROVE the download matches the published hash deletes it
     and returns False. A source checkout never gets here at all.
+
+    Stage 8b: with APPLY_ENABLED False (notify-only) this refuses before downloading anything.
     """
+    if not APPLY_ENABLED:
+        return False, t("update.notify_only", url=RELEASES_PAGE_URL)
     if not FROZEN:
         # Running an installer would not update this checkout; it would install a second, frozen
         # copy beside it and re-point the scheduled tasks at that. Point at the release instead.
