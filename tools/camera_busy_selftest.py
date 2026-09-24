@@ -320,22 +320,34 @@ def main(argv=None) -> int:
     t.ok(f.closes == 0, "no cap breach -> close_fn never called")
 
     # An attempt that outlives the ceiling: return at once, do NOT retry, reclaim it later.
-    wedged = FakeOpen([True], sleep_s=0.4)
+    #
+    # Stage 8b (D-12, test-only). Defect: the wedged attempt slept 0.4 s and the bound was 0.25 s
+    # -- a margin of 4x over the measured base (max 0.06 s in 20 runs, 8a) but only 0.15 s from the
+    # attempt itself, and one run under build load measured 0.33 s. Consequence: a timing flake
+    # that says nothing about the code. Fix: widen BOTH sides of what is being told apart -- the
+    # wedged attempt now takes 1.5 s and the bound is 0.75 s: 12x the measured base, 2x the loaded
+    # outlier, and still half of the attempt, so "returned at the cap" and "waited for the
+    # attempt" cannot be confused. The code under test is unchanged.
+    wedged = FakeOpen([True], sleep_s=1.5)
     t0 = time.monotonic()
     got = op.open(open_fn=wedged.open_fn, close_fn=wedged.close_fn, retries=3, pause_s=0.0,
                   timeout_s=9e9, cap_s=0.05)
     waited = time.monotonic() - t0
     t.ok(got is False and wedged.calls == 1,
          f"attempt outliving the cap -> False and NO retry ({wedged.calls} call, retries=3)")
-    t.ok(waited < 0.25,
-         f"returns at the ceiling, not when the wedged attempt finishes ({waited:.2f}s of 0.4s)")
+    t.ok(waited < 0.75,
+         f"returns at the ceiling, not when the wedged attempt finishes ({waited:.2f}s of 1.5s)")
 
     blocked = FakeOpen([True])
     t.ok(op.open(open_fn=blocked.open_fn, close_fn=blocked.close_fn, retries=0, pause_s=0.0,
                  timeout_s=9e9, cap_s=1.0) is False and blocked.calls == 0,
          "a second open while that worker is still in flight -> False, its open_fn NOT called")
 
-    time.sleep(0.5)   # let the abandoned attempt finish and run its own cleanup
+    # Let the abandoned attempt finish and run its own cleanup (polled, bounded: it takes 1.5 s).
+    t_end = time.monotonic() + 5.0
+    while wedged.closes == 0 and time.monotonic() < t_end:
+        time.sleep(0.05)
+    time.sleep(0.1)   # and let its worker thread leave the opener's in-flight slot
     t.ok(wedged.closes == 1,
          "the abandoned attempt closed its capture exactly once, from its own thread")
 
