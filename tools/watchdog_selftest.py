@@ -18,6 +18,8 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Stage 8b: a private home, so nothing below can reach a real ~/.face-unlock (see [5]).
+os.environ["FACE_UNLOCK_HOME"] = tempfile.mkdtemp(prefix="faceunlock_wdself_")
 
 from face_service import watchdog as W
 
@@ -97,12 +99,85 @@ def main(argv=None) -> int:
         t.ok(W.should_restart(3, 3, paused_expired) is True and not p.exists(),
              "same fault later: pause EXPIRED -> restart allowed and stale marker deleted")
 
+    # --- 4) Stage 8b (F-29): a hostile or broken marker can never silence supervision ------------
+    print("\n[4] F-29 pause markers: non-finite / far-future / unusable")
+    import json
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "watchdog.pause"
+        for label, raw in (("NaN until", '{"until": NaN, "created": 0}'),
+                           ("Infinity until", '{"until": Infinity, "created": 0}'),
+                           ("list body", "[1, 2]"), ("string until", '{"until": "soon"}')):
+            p.write_text(raw, encoding="utf-8")
+            t.ok(W.is_paused(p, now=100.0) is False and not p.exists(),
+                 f"{label} -> not paused, marker removed")
+        p.write_text(json.dumps({"until": 1e12, "created": 1.0}), encoding="utf-8")
+        t.ok(W.is_paused(p, now=100.0, ttl_s=300.0) is True, "far-future until -> paused, but...")
+        t.ok(abs(json.loads(p.read_text(encoding="utf-8"))["until"] - 400.0) < 1e-6,
+             "...clamped to now + ttl and written back")
+        t.ok(W.is_paused(p, now=401.0, ttl_s=300.0) is False and not p.exists(),
+             "the clamped pause expires on schedule")
+        for bad in (float("nan"), float("inf")):
+            try:
+                W.write_pause(p, now=0.0, ttl_s=bad)
+                t.ok(False, f"write_pause refuses ttl={bad}")
+            except ValueError:
+                t.ok(True, f"write_pause refuses ttl={bad}")
+        W.write_pause(p, now=0.0, ttl_s=1e9)
+        t.ok(json.loads(p.read_text(encoding="utf-8"))["until"] == W.MAX_PAUSE_TTL_S,
+             "write_pause caps the TTL at MAX_PAUSE_TTL_S")
+        # a marker that cannot be read or deleted must not raise out of either helper
+        d = Path(td) / "is_a_dir.pause"
+        d.mkdir()
+        try:
+            got = W.is_paused(d, now=1.0)
+            W.clear_pause(d)
+            t.ok(got is False, "unreadable + undeletable marker -> not paused, no exception")
+        except Exception as e:
+            t.ok(False, f"unreadable + undeletable marker raised {e!r}")
+
+    # --- 5) Stage 8b (F-29): one failing iteration does not end the loop ----------------------
+    print("\n[5] F-29 per-iteration guard in tools.watchdog.main")
+    import tools.watchdog as TW
+    calls = {"n": 0}
+    saved = (TW.ping, TW.time.sleep, TW._setup_logging)
+
+    def boom(_timeout):
+        calls["n"] += 1
+        raise RuntimeError("simulated iteration failure")
+
+    def fake_sleep(_s):
+        if calls["n"] >= 3:
+            raise KeyboardInterrupt
+
+    from face_service.config import Config
+    saved_cfg = TW._load_config
+    # Plain dataclass defaults: this test never reads a config.toml (nor any file of a real home).
+    TW.ping, TW.time.sleep, TW._setup_logging = boom, fake_sleep, (lambda: None)
+    TW._load_config = lambda: Config(language="en")
+    try:
+        rc = TW.main()
+    finally:
+        TW.ping, TW.time.sleep, TW._setup_logging = saved
+        TW._load_config = saved_cfg
+    t.ok(rc == 0 and calls["n"] == 3, f"three failing iterations, loop survived (n={calls['n']})")
+
+    # --- 6) Stage 8b (F-36): the installed kill filter is path + session scoped ---------------
+    print("\n[6] F-36 installed kill filter")
+    ps = TW._match_ps(True)
+    t.ok("ExecutablePath -eq '" in ps and "face_service.exe'" in ps,
+         "installed filter pins the full exe path")
+    t.ok("SessionId -eq " in ps, "installed filter pins the session")
+    t.ok("CommandLine" in TW._match_ps(False), "dev filter unchanged (command-line needle)")
+
     print()
     if t.fail:
         print(f"WATCHDOG SELFTEST FAILED: {t.fail} check(s) failed.")
         return 1
     print("WATCHDOG SELFTEST OK: restart fires at threshold, pause suppresses a deliberate stop, "
-          "and a stale/expired pause self-heals (never silences the watchdog forever).")
+          "and a stale/expired pause self-heals (never silences the watchdog forever); a "
+          "non-finite or far-future pause is refused or clamped, a broken marker never raises, "
+          "a failing iteration does not end the loop, and the installed kill is path+session "
+          "scoped.")
     return 0
 
 

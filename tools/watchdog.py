@@ -82,18 +82,39 @@ def _match_ps(installed: bool) -> str:
     either. NB a healthy venv service is TWO matches, not one: the .venv pythonw.exe launcher stub
     and the base-interpreter worker it spawns both carry "face_service" on their command line.
 
-    INSTALLED filters the image name alone. The task runs <InstallDir>\\face_service.exe with NO
-    arguments (tools/register_tasks.ps1), so there is no command-line needle to test -- and the
-    dev-instance exemption is meaningless there, because a repo checkout is not what is running.
-    Matching by image name is also what the registrar's own Get-FuProcess does in Installed mode.
+    INSTALLED matches the FULL PATH of the service exe beside this watchdog, in THIS session. The
+    task runs <InstallDir>\\face_service.exe with NO arguments (tools/register_tasks.ps1), so there
+    is no command-line needle to test. Stage 8b (F-36). Defect: this used to match the image name
+    alone, machine-wide. Consequence: a restart killed every face_service.exe on the machine --
+    another user's session, or any unrelated program with that file name. Fix: ExecutablePath must
+    equal <our install dir>\\face_service.exe and SessionId must equal ours.
     """
     if installed:
+        exe_path, session = _installed_target()
         return ("Get-CimInstance Win32_Process -Filter \"Name='" + _INSTALLED_SERVICE_EXE + "'\" "
-                "-ErrorAction SilentlyContinue")
+                "-ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq '"
+                + exe_path.replace("'", "''") + "'"
+                + (" -and $_.SessionId -eq " + str(session) if session >= 0 else "") + " }")
     return (
         "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" -ErrorAction SilentlyContinue | "
         "Where-Object { $_.CommandLine -like '*face_service*' }"
     )
+
+
+def _installed_target() -> "tuple[str, int]":
+    """(full path of the installed service exe, this process's session id). The watchdog exe and
+    face_service.exe are laid down side by side in {app}; the session is ours because the three
+    tasks run for the same user in the same logon session."""
+    import ctypes
+    exe = str(Path(sys.executable).resolve().with_name(_INSTALLED_SERVICE_EXE))
+    sid = ctypes.c_ulong(0)
+    import os
+    try:
+        if not ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid)):
+            return exe, -1           # unknown session: the path alone still scopes the kill
+    except Exception:
+        return exe, -1
+    return exe, int(sid.value)
 
 
 _MATCH_PS = _match_ps(INSTALLED)
@@ -286,45 +307,62 @@ def main(argv=None) -> int:
     interval = cfg.watchdog_interval_s
     timeout = cfg.watchdog_ping_timeout_s
     threshold = cfg.watchdog_fail_threshold
+    pause_ttl = cfg.watchdog_pause_ttl_s
     log.info("self-loop: interval=%ss ping_timeout=%ss fail_threshold=%s pause=%s",
              interval, timeout, threshold, WATCHDOG_PAUSE_PATH)
 
     fails = 0
     try:
         while True:
-            ok, reason = ping(timeout)
-            if ok:
-                fails = 0
-            else:
-                fails += 1
-                paused = is_paused(WATCHDOG_PAUSE_PATH, time.time())
-                if should_restart(fails, threshold, paused):
-                    log.warning("%d consecutive ping failures -> restart (kill-then-start)", fails)
-                    killed, alive = restart_service()
-                    clear_pause(WATCHDOG_PAUSE_PATH)   # a restart clears the deliberate-stop pause
-                    fails = 0
-                    if restart_outcome(alive) == "unrecoverable":
-                        # Killed whatever matched (if anything) and started the task, yet NO
-                        # service instance survived. Log clearly and back off so we don't
-                        # tight-loop a no-op kill-start. The likely cause differs by layout, so
-                        # the hint does too -- a diagnosis that names the wrong layout's failure
-                        # is worse than none, and this line is the one someone reads afterwards.
-                        log.error("no service instance survived the task start (killed %d %s, "
-                                  "%d running after) -- %s; backing off %gs",
-                                  killed, _PROC_LABEL, alive, _UNRECOVERABLE_HINT,
-                                  _UNRECOVERABLE_BACKOFF_S)
-                        time.sleep(_UNRECOVERABLE_BACKOFF_S)
-                    else:
-                        log.info("a service instance is up after restart")
-                elif paused:
-                    log.info("ping failed (%d/%d): %s -- but a deliberate pause is active -> "
-                             "not restarting", fails, threshold, reason)
-                else:
-                    log.info("ping failed (%d/%d): %s", fails, threshold, reason)
+            # Stage 8b (F-29). Defect: nothing guarded one iteration, so a single unexpected
+            # exception (a pause file it could not read or delete, a failed subprocess launch)
+            # ended main() -- and the watchdog task has no restart policy of its own. Consequence:
+            # supervision silently stopped. Fix: an iteration that fails is logged with its
+            # traceback and the loop carries on at the normal interval.
+            try:
+                fails = _iteration(fails, timeout, threshold, pause_ttl)
+            except Exception:
+                log.exception("watchdog iteration failed; continuing")
             time.sleep(interval)
     except KeyboardInterrupt:
         log.info("stopped")
         return 0
+
+
+def _iteration(fails: int, timeout: float, threshold: int, pause_ttl: float) -> int:
+    """One ping / decide / (restart) step. Returns the new consecutive-failure count."""
+    from face_service.config import WATCHDOG_PAUSE_PATH
+    from face_service.watchdog import should_restart, restart_outcome, is_paused, clear_pause
+
+    ok, reason = ping(timeout)
+    if ok:
+        return 0
+    fails += 1
+    paused = is_paused(WATCHDOG_PAUSE_PATH, time.time(), pause_ttl)
+    if should_restart(fails, threshold, paused):
+        log.warning("%d consecutive ping failures -> restart (kill-then-start)", fails)
+        killed, alive = restart_service()
+        clear_pause(WATCHDOG_PAUSE_PATH)   # a restart clears the deliberate-stop pause
+        if restart_outcome(alive) == "unrecoverable":
+            # Killed whatever matched (if anything) and started the task, yet NO
+            # service instance survived. Log clearly and back off so we don't
+            # tight-loop a no-op kill-start. The likely cause differs by layout, so
+            # the hint does too -- a diagnosis that names the wrong layout's failure
+            # is worse than none, and this line is the one someone reads afterwards.
+            log.error("no service instance survived the task start (killed %d %s, "
+                      "%d running after) -- %s; backing off %gs",
+                      killed, _PROC_LABEL, alive, _UNRECOVERABLE_HINT,
+                      _UNRECOVERABLE_BACKOFF_S)
+            time.sleep(_UNRECOVERABLE_BACKOFF_S)
+        else:
+            log.info("a service instance is up after restart")
+        return 0
+    if paused:
+        log.info("ping failed (%d/%d): %s -- but a deliberate pause is active -> "
+                 "not restarting", fails, threshold, reason)
+    else:
+        log.info("ping failed (%d/%d): %s", fails, threshold, reason)
+    return fails
 
 
 if __name__ == "__main__":

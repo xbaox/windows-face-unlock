@@ -426,11 +426,19 @@ function Invoke-GracefulServiceShutdown {
         return
     }
 
-    # pipe_client blocks in ReadFile with NO timeout, so a server that accepts the connection and
-    # then wedges would hang this client forever. Bound it, and kill the CLIENT on timeout --
-    # never the service, which is Stop-FuAndWait's job after the tasks are stopped.
-    if (-not $fuClient.WaitForExit(3000)) {
-        Write-Warning "pipe client did not return within 3s; killing the client and falling back to hard kill"
+    # Bound the client, and kill the CLIENT on timeout -- never the service, which is
+    # Stop-FuAndWait's job after the tasks are stopped. (Since 8b the client bounds its own read
+    # too -- face_service/pipe_io.py -- but a client that never gets that far must not hang Setup.)
+    #
+    # Stage 8b (F-37). Defect: the bound was 3 s, and in the Installed layout that includes the
+    # COLD START of the ~30 MB frozen tray exe before it can even connect. Consequence: a slow
+    # start degraded the graceful stop into the hard kill it exists to avoid -- the KNOWN_ISSUES #2
+    # risk. Fix: $fuGraceClientMs, set from a measurement of the frozen client (8b step 3:
+    # measured cold start x2, rounded up); see audit-notes "Stage 8".
+    $fuGraceClientMs = 10000
+    if (-not $fuClient.WaitForExit($fuGraceClientMs)) {
+        Write-Warning ("pipe client did not return within {0}s; killing the client and falling back to hard kill" -f `
+                       ($fuGraceClientMs / 1000))
         try { $fuClient.Kill() } catch { }
         return
     }

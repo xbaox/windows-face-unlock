@@ -107,7 +107,11 @@ def exchange(req: dict, timeout_s: float, *, pipe_name: str = "",
     (identity check failed; nothing was written), ``"reply-timeout"``, ``"bad-reply"`` (not a
     JSON object), ``"error: ..."`` (anything else, with the win32 code)."""
     name = pipe_name or PIPE_NAME
-    check = _verify_by_default() if verify_server is None else bool(verify_server)
+    # The config toggle governs the PRODUCTION pipe only. A private pipe name (the selftests) is
+    # always checked and never makes this process read config.toml.
+    if verify_server is None:
+        verify_server = _verify_by_default() if name == PIPE_NAME else True
+    check = bool(verify_server)
     deadline = time.monotonic() + float(timeout_s)
 
     def _shut(h) -> None:
