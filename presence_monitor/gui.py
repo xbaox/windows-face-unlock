@@ -114,6 +114,8 @@ class StatusWindow:
 
     def __init__(self, monitor: PresenceMonitor):
         self.monitor = monitor
+        self._closed = False     # set by _close; worker results arriving later are dropped
+        self._polling = False    # one status poll in flight at most
         self.root = tk.Tk()
         self.root.title(t("status.title"))
         self.root.geometry("560x480")
@@ -159,15 +161,39 @@ class StatusWindow:
         close_btn.pack(side="right", padx=4)
         attach_tooltip(close_btn, close_label + ".desc")
 
+    # Stage 8b (F-49 / P-21). Defect: _refresh called pipe_call on the Tk thread every 2 s, and the
+    # Ping / Probe buttons did the same (Probe for up to 10 s). Consequence: the window froze for
+    # as long as the sequential service was busy -- up to a whole gesture round. Fix: every pipe
+    # call runs on a worker thread and hands its result back through after(); at most one status
+    # poll is in flight, and a result arriving after Close is dropped.
     def _refresh_loop(self) -> None:
+        if self._closed:
+            return
+        if not self._polling:
+            self._polling = True
+            threading.Thread(target=self._poll_status, name="status-poll", daemon=True).start()
         try:
-            self._refresh()
-        finally:
             self.root.after(2000, self._refresh_loop)
+        except (tk.TclError, RuntimeError):
+            pass
 
-    def _refresh(self) -> None:
-        snap = self.monitor.snapshot()
+    def _poll_status(self) -> None:
         status = pipe_call({"cmd": "status"}, timeout_s=2.0)
+        self._on_tk(lambda: self._refresh(status))
+
+    def _on_tk(self, fn) -> None:
+        """Run ``fn`` on this window's Tk thread; silently dropped once the window is closed."""
+        def run():
+            if not self._closed:
+                fn()
+        try:
+            self.root.after(0, run)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _refresh(self, status) -> None:
+        self._polling = False
+        snap = self.monitor.snapshot()
 
         if status and status.get("ok"):
             self.vars["svc"].set(t("status.val.running"))
@@ -193,14 +219,24 @@ class StatusWindow:
         )
 
     def _ping(self) -> None:
-        resp = pipe_call({"cmd": "ping"}, timeout_s=3.0)
+        def work():
+            resp = pipe_call({"cmd": "ping"}, timeout_s=3.0)
+            self._on_tk(lambda: self._show_ping(resp))
+        threading.Thread(target=work, name="status-ping", daemon=True).start()
+
+    def _show_ping(self, resp) -> None:
         if resp and resp.get("ok"):
             messagebox.showinfo(t("status.btn.ping"), "pong", parent=self.root)
         else:
             messagebox.showwarning(t("status.btn.ping"), t("status.val.not_reachable"), parent=self.root)
 
     def _probe(self) -> None:
-        resp = pipe_call({"cmd": "presence"}, timeout_s=10.0)
+        def work():
+            resp = pipe_call({"cmd": "presence"}, timeout_s=10.0)
+            self._on_tk(lambda: self._show_probe(resp))
+        threading.Thread(target=work, name="status-probe", daemon=True).start()
+
+    def _show_probe(self, resp) -> None:
         if resp and resp.get("ok"):
             messagebox.showinfo(
                 t("status.btn.probe"),
@@ -220,6 +256,7 @@ class StatusWindow:
         # from another thread finding Variables of a dead root raises
         # "main thread is not in main loop" and can abort the process
         # (Tcl_AsyncDelete). Every close path must end here.
+        self._closed = True
         self.vars.clear()
         self.root.destroy()
 

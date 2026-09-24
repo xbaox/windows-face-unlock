@@ -34,7 +34,8 @@ from typing import Callable, NamedTuple
 import cv2
 from PIL import Image, ImageTk
 
-from face_service.config import ENROLL_DIR, EMBED_PATH, Config
+from face_service.config import (ENROLL_DIR, ENROLL_PENDING_DIR, EMBED_PATH,
+                                 WATCHDOG_PAUSE_PATH, Config)
 from face_service.detector import FaceDetector
 from face_service.enroll_qc import frame_quality, qc_reasons
 from face_service.i18n import set_language, t
@@ -116,14 +117,47 @@ _COACH_KEY_BY_TOKEN = {
 }
 
 
-def _count_enroll_images() -> int:
+def _count_enroll_images(directory=None) -> int:
     try:
         return sum(
-            1 for p in ENROLL_DIR.iterdir()
+            1 for p in (directory or ENROLL_DIR).iterdir()
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
         )
     except FileNotFoundError:
         return 0
+
+
+def _pause_watchdog(ttl_s: float) -> "float | None":
+    """Stage 8b (F-30). Defect: the watchdog counts a busy pipe as a failed ping, and the build
+    holds the sequential server for up to the 120 s build call. Consequence: a long build could be cut
+    short by a watchdog restart mid-build. Fix: the wizard drops the STANDARD self-expiring pause
+    (the one the service writes on a deliberate shutdown, TTL watchdog_pause_ttl_s) for the length
+    of the build. Returns the marker's creation time, so only this marker is cleared afterwards."""
+    try:
+        from face_service.watchdog import write_pause
+        now = time.time()
+        write_pause(WATCHDOG_PAUSE_PATH, now, ttl_s)
+        return now
+    except Exception:
+        log.exception("could not pause the watchdog for the build")
+        return None
+
+
+def _resume_watchdog(created: "float | None") -> None:
+    """Clear the pause written by _pause_watchdog -- and only that one: a marker with another
+    creation time belongs to someone else (a deliberate shutdown meanwhile) and is left alone."""
+    if created is None:
+        return
+    try:
+        import json
+        data = json.loads(WATCHDOG_PAUSE_PATH.read_text(encoding="utf-8"))
+        if float(data.get("created", -1)) == created:
+            from face_service.watchdog import clear_pause
+            clear_pause(WATCHDOG_PAUSE_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        log.exception("could not clear the build's watchdog pause (it self-expires)")
 
 
 def _has_embeddings() -> bool:
@@ -236,6 +270,12 @@ class EnrollWindow:
         # _wait_for_service). _on_close keys the resume_camera on this, so closing the window
         # while it is still connecting sends nothing.
         self._lease_ok = False
+        # Stage 8b (F-12): "replace" | "add", chosen at the first Start when an enrollment already
+        # exists (None until then; a first-ever enrollment is simply "add"). Replace captures into
+        # ENROLL_PENDING_DIR and builds from there, so the old gallery survives until the new one
+        # has built.
+        self._mode: "str | None" = None
+        self._capture_dir = ENROLL_DIR
 
         self._build_ui()
         self._refresh_existing_stats()
@@ -288,10 +328,14 @@ class EnrollWindow:
             # always did (warning box + service_busy line) if the service really is not there.
             log.warning("Face Unlock service did not answer within %.0fs", SERVICE_WAIT_S)
         self._lease_ok = self._acquire_camera_lease()
-        try:
-            self.start_btn.configure(state="normal")
-        except (tk.TclError, AttributeError):
-            pass
+        # Stage 8b (F-49). Defect: Start was enabled unconditionally here, lease or not.
+        # Consequence: after a refused lease the user could "start" a session with no preview,
+        # which counted nothing and explained nothing. Fix: Start only with the lease.
+        if self._lease_ok:
+            try:
+                self.start_btn.configure(state="normal")
+            except (tk.TclError, AttributeError):
+                pass
         if self._lease_ok:
             log.info("camera lease acquired after %.1fs", time.monotonic() - self._wait_t0)
             self._set_guide("enroll.guide.idle")
@@ -761,8 +805,8 @@ class EnrollWindow:
             return
 
         try:
-            ENROLL_DIR.mkdir(parents=True, exist_ok=True)
-            path = ENROLL_DIR / f"enroll_{int(now * 1000)}.jpg"
+            self._capture_dir.mkdir(parents=True, exist_ok=True)
+            path = self._capture_dir / f"enroll_{int(now * 1000)}.jpg"
             cv2.imwrite(str(path), frame)
             self._captured += 1
             self._last_capture_ts = now
@@ -820,6 +864,8 @@ class EnrollWindow:
             self._set_guide("enroll.guide.idle")
             return
 
+        if self._mode is None and not self._choose_mode():
+            return
         # (re)start a session: reset counters
         self._captured = 0
         self._last_capture_ts = 0.0
@@ -834,10 +880,32 @@ class EnrollWindow:
         self.start_btn.configure(text=t("enroll.btn.stop"))
         self._set_guide("enroll.guide.capturing", i=0, n=self._target)
 
+    def _choose_mode(self) -> bool:
+        """First Start of this wizard: with an enrollment already present, ask Replace (default)
+        or Add. Returns False when the user cancels. Replace starts from an empty pending session:
+        whatever an interrupted earlier Replace left there is discarded first."""
+        if _count_enroll_images() == 0 and not _has_embeddings():
+            self._mode = "add"
+            self._capture_dir = ENROLL_DIR
+            return True
+        answer = messagebox.askyesnocancel(
+            t("enroll.confirm.mode.title"), t("enroll.confirm.mode.body"),
+            default=messagebox.YES, parent=self.root)
+        if answer is None:
+            return False
+        if answer:
+            from face_service.datadir import remove_tree_no_follow
+            remove_tree_no_follow(ENROLL_PENDING_DIR)
+            self._mode, self._capture_dir = "replace", ENROLL_PENDING_DIR
+        else:
+            self._mode, self._capture_dir = "add", ENROLL_DIR
+        log.info("enroll session mode: %s", self._mode)
+        return True
+
     def _on_build(self) -> None:
         if self._building:
             return
-        if _count_enroll_images() == 0:
+        if _count_enroll_images(self._capture_dir) == 0:
             messagebox.showwarning(
                 t("enroll.title"),
                 t("enroll.guide.build_empty"),
@@ -852,9 +920,17 @@ class EnrollWindow:
         self.wipe_btn.configure(state="disabled")
         self._set_guide("enroll.guide.building")
 
+        req = {"cmd": "build_enrollment"}
+        if self._mode == "replace":
+            req["replace"] = True
+
         def worker():
             # Call the service — it already has the ONNX engine loaded and warm.
-            resp = pipe_call({"cmd": "build_enrollment"}, timeout_s=120.0)
+            paused = _pause_watchdog(self._cfg.watchdog_pause_ttl_s)
+            try:
+                resp = pipe_call(req, timeout_s=120.0)
+            finally:
+                _resume_watchdog(paused)
             ok = bool(resp and resp.get("ok"))
             n = int(resp.get("count", 0)) if ok else 0
             try:
@@ -913,31 +989,44 @@ class EnrollWindow:
         threading.Thread(target=worker, name="enroll-build", daemon=True).start()
 
     def _on_wipe(self) -> None:
+        """Stage 8b (F-06). Defect: this unlinked the top-level images and embeddings.npz itself,
+        while the running service kept matching the gallery it had cached in memory (and the adaptive
+        ring and sub-directories stayed). Consequence: a face the user had just "deleted" went on
+        unlocking until the next service restart. Fix: the service does the deleting through
+        clear_enrollment -- it forgets the gallery first, then removes the files, reparse-safe, and
+        audits it. Nothing is deleted from here, so a failed call leaves one consistent state."""
         if not messagebox.askyesno(
             t("enroll.confirm.wipe.title"),
             t("enroll.confirm.wipe.body"),
             parent=self.root,
         ):
             return
+        self.wipe_btn.configure(state="disabled")
 
-        try:
-            if ENROLL_DIR.exists():
-                for p in ENROLL_DIR.iterdir():
-                    if p.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-                        try:
-                            p.unlink()
-                        except Exception:
-                            log.exception("delete %s", p)
-            if EMBED_PATH.exists():
-                EMBED_PATH.unlink()
-        except Exception:
-            log.exception("wipe failed")
+        def worker():
+            resp = pipe_call({"cmd": "clear_enrollment"}, timeout_s=20.0)
 
-        self._captured = 0
-        self._guide_pinned = False
-        self._update_progress()
-        self._refresh_existing_stats()
-        self._set_guide("enroll.guide.idle")
+            def done():
+                try:
+                    self.wipe_btn.configure(state="normal")
+                except (tk.TclError, AttributeError):
+                    return
+                if not (resp and resp.get("ok")):
+                    log.warning("clear_enrollment failed: %s", resp)
+                    messagebox.showerror(t("enroll.title"), t("enroll.error.wipe_failed"),
+                                         parent=self.root)
+                self._mode, self._capture_dir = None, ENROLL_DIR
+                self._captured = 0
+                self._guide_pinned = False
+                self._update_progress()
+                self._refresh_existing_stats()
+                self._set_guide("enroll.guide.idle")
+            try:
+                self.root.after(0, done)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, name="enroll-clear", daemon=True).start()
 
     def _on_close(self) -> None:
         # Signal the camera thread first and WAIT for it to release the
@@ -977,6 +1066,14 @@ class EnrollWindow:
         # clear a lease we never set.
         if self._lease_ok:
             self._release_camera_lease()
+        # Stage 8b (F-12): an unbuilt Replace session is discarded -- the old gallery was never
+        # touched, and captured face images must not linger. Not while a build is still reading it.
+        if self._mode == "replace" and not self._building:
+            try:
+                from face_service.datadir import remove_tree_no_follow
+                remove_tree_no_follow(ENROLL_PENDING_DIR)
+            except Exception:
+                log.exception("discarding the pending session failed")
 
     def _teardown_tk_objects(self) -> None:
         """Drop every Tk reference we hold, BEFORE root.destroy().

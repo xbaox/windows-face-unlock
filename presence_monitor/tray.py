@@ -349,30 +349,20 @@ def run_with_tray(cfg: Config) -> None:
                      name="update-startup", daemon=True).start()
 
     def _stop_service_process() -> None:
-        """Best-effort shutdown of face_service, then kill survivors."""
+        """Ask face_service to shut down, synchronously and bounded (Stage 8b, F-49).
+
+        Defect: the shutdown ran on a DAEMON thread started just before icon.stop(), and the process
+        exits as soon as icon.run() returns. Consequence: whether the request was sent at all was a
+        race, and the psutil sweep after it (python.exe / pythonw.exe with "face_service" in the
+        command line) never ran -- it is inert in the installed layout anyway, and in a dev layout
+        it would kill a debugging `python -m face_service` the watchdog deliberately spares. Fix:
+        send the shutdown on the Quit handler itself, before the icon stops; no sweep."""
         try:
-            pipe_call({"cmd": "shutdown"}, timeout_s=3.0)
+            resp = pipe_call({"cmd": "shutdown"}, timeout_s=3.0)
+            log.info("service shutdown on Quit: %s", "sent" if resp and resp.get("ok")
+                     else "no answer (service not running?)")
         except Exception:
-            pass
-        time.sleep(1.0)
-        try:
-            import psutil  # type: ignore
-            for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
-                try:
-                    cmdline = " ".join(p.info.get("cmdline") or [])
-                except Exception:
-                    continue
-                name = (p.info.get("name") or "").lower()
-                if name not in {"python.exe", "pythonw.exe"}:
-                    continue
-                if "face_service" in cmdline:
-                    try:
-                        log.info("terminating lingering face_service pid=%s", p.info["pid"])
-                        p.terminate()
-                    except Exception:
-                        pass
-        except Exception:
-            log.exception("force-kill sweep failed")
+            log.exception("service shutdown on Quit failed")
 
     def on_quit(icon, item):
         log.info("Quit requested from tray")
@@ -380,7 +370,7 @@ def run_with_tray(cfg: Config) -> None:
         # Before the service teardown: the wizard holds the webcam under a lease, so taking it
         # down first is what lets the device come back at all.
         _terminate_enroll()
-        threading.Thread(target=_stop_service_process, daemon=True).start()
+        _stop_service_process()
         icon.stop()
 
     def make_language_handler(code: str):

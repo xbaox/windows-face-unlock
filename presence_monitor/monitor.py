@@ -475,10 +475,16 @@ class PresenceMonitor:
             self._set_last("error", "service-unavailable")
             return
         resp = pipe_call({"cmd": "presence"}, timeout_s=20.0)
-        if resp is None:
-            # Service down — don't lock blindly
-            log.warning("presence probe: service unavailable; skipping")
-            self._set_last("error", "service-unavailable")
+        if resp is None or not resp.get("ok"):
+            # Service down — don't lock blindly. Stage 8b (F-05). Defect: only a MISSING reply was
+            # skipped; {"ok": false, "reason": ...} (a handler exception, an engine error) went on
+            # to _state_of, which read no "state" and no "present" as ABSENT. Consequence: a
+            # failing service earned an absence strike per tick and, with auto_lock on, locked a
+            # user who was sitting right there. Fix: a refusal is not evidence either -- skip, no
+            # strike, exactly like an unreachable service.
+            why = "service-unavailable" if resp is None else f"service-error {resp.get('reason')}"
+            log.warning("presence probe: %s; skipping", why)
+            self._set_last("error", why)
             return
 
         state = _state_of(resp)
@@ -508,10 +514,13 @@ class PresenceMonitor:
             log.debug("absence confirmation abandoned: monitor stopping")
             return
         resp2 = pipe_call({"cmd": "presence"}, timeout_s=20.0)
-        if resp2 is None:
-            # Same rule as the first probe: an unreachable service is not evidence of absence.
-            log.warning("absence confirmation: service unavailable; skipping")
-            self._set_last("error", f"service-unavailable {self._fmt_counters()} d4=unreachable")
+        if resp2 is None or not resp2.get("ok"):
+            # Same rule as the first probe: an unreachable -- or refusing (Stage 8b, F-05) --
+            # service is not evidence of absence.
+            why = ("service-unavailable" if resp2 is None
+                   else f"service-error {resp2.get('reason')}")
+            log.warning("absence confirmation: %s; skipping", why)
+            self._set_last("error", f"{why} {self._fmt_counters()} d4=unreachable")
             return
         state2 = _state_of(resp2)
         if state2 == "present":

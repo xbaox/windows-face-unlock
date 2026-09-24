@@ -58,12 +58,20 @@ Commands:
       -> {"ok":true}
   {"cmd":"build_enrollment"}              # (re)compute embeddings from ENROLL_DIR
       -> {"ok":true,"count":int} | {"ok":false,"reason":str}
+  {"cmd":"build_enrollment","replace":true}   # Stage 8b: build from ENROLL_PENDING_DIR; only on
+      -> {"ok":true,"count":int,"replaced":true}  # success are the old images removed and the new
+                                              # session promoted (an interrupted re-enroll keeps
+                                              # the old gallery)
+  {"cmd":"clear_enrollment"}              # Stage 8b: forget the gallery now (refs + adaptive ring),
+      -> {"ok":true,"removed":int} | {"ok":false,"reason":str}   # delete embeddings.npz and the
+                                              # enroll tree (reparse-safe), audit it
   {"cmd":"shutdown"}           # stop the service cleanly (tray Quit uses this)
       -> {"ok":true,"shutting_down":true}
 """
 from __future__ import annotations
 import json
 import logging
+import os
 import secrets
 import threading
 import time
@@ -86,7 +94,8 @@ def win32api_get_last_error() -> int:
 from .camera import Camera
 from .config import Config, APP_DIR, LOG_PATH, LOCKOUT_PATH, AUDIT_PATH, PIPE_NAME
 from .credentials import load_password
-from .datadir import DUMP_NAME_RE, heal_data_dir, is_reparse, purge_debug_frames
+from .datadir import (DUMP_NAME_RE, heal_data_dir, is_reparse, purge_debug_frames,
+                      remove_tree_no_follow)
 from .detector import FaceDetector
 from .audit import AuditLog
 from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
@@ -1087,6 +1096,23 @@ class FaceService:
             return self._presence_probe_detection()
         return self._presence_probe_recognition()
 
+    def _note_probe_errors(self, errors: list) -> None:
+        """Stage 8b (F-22): log the FIRST engine exception of an error episode with its traceback,
+        then stay quiet (DEBUG) until a probe runs clean again -- once per episode, not once per
+        60-second tick."""
+        if not errors:
+            self._probe_error_logged = False
+            return
+        if not getattr(self, "_probe_error_logged", False):
+            self._probe_error_logged = True
+            e = errors[0]
+            log.warning("presence probe: engine error on %d frame(s); first: %r "
+                        "(logged once per episode)", len(errors), e,
+                        exc_info=(type(e), e, e.__traceback__))
+        else:
+            log.debug("presence probe: engine error persists (%d frame(s)): %r",
+                      len(errors), errors[0])
+
     def _presence_probe_recognition(self) -> tuple[str, bool]:
         # Camera-health telemetry (7b): count the frames that actually arrived and keep the
         # brightest scene luma among them, then judge AFTER the lock is dropped --
@@ -1098,6 +1124,7 @@ class FaceService:
         luma_max: "float | None" = None
         result = (False, False)
         seen: list = []          # (ok, distance, real) per analysed frame -- diagnostics only
+        errors: list = []        # engine exceptions this burst (Stage 8b, F-22)
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
@@ -1119,8 +1146,9 @@ class FaceService:
                     self._maybe_dump_frame(frame, "probe")
                     try:
                         ok, dist, real = self.recog.verify_frame(frame)
-                    except Exception:
+                    except Exception as e:
                         seen.append((None, None, None))
+                        errors.append(e)
                         continue
                     seen.append((ok, dist, real))
                     if ok:
@@ -1132,6 +1160,7 @@ class FaceService:
         # No retry on this path: the probe runs on a timer, so the next tick already gets the
         # fresh camera, and absence-strike policy stays entirely the caller's business.
         self._note_camera_health(frames_ok, luma_max, "probe-recog")
+        self._note_probe_errors(errors)
         defect = self._burst_defect(frames_ok, luma_max)
         if not result[0] and defect is not None:
             # Either no frame arrived at all, or every one that did was black. The DEVICE is blind;
@@ -1148,6 +1177,17 @@ class FaceService:
         # derived from the frame classes, which also see the weak and suspect frames that
         # ``result`` cannot represent.
         threshold, soft = self.cfg.threshold, self.cfg.presence_soft_margin
+        if seen and all(ok is None for ok, _d, _r in seen):
+            # Stage 8b (F-22). Defect: an all-error burst fell through _probe_verdict to "absent".
+            # Consequence: no enrollment, a model or a CUDA failure earned an absence strike every
+            # idle tick and ended in LockWorkStation. Fix: an engine that could not judge a single
+            # frame is an ERROR, reported as ok:false, which the monitor skips without a strike.
+            # _probe_verdict and every number it uses are untouched; a burst with at least one
+            # frame the engine DID judge is classified exactly as before.
+            log.info("presence probe error (recognition): frames=%s frames_ok=%d luma_max=%s "
+                     "state=error", _fmt_probe_frames(seen, threshold, soft), frames_ok,
+                     _fmt_luma(luma_max))
+            return "error", False
         state = _probe_verdict(seen, threshold, soft)
         # DEBUG on present (every interval on a healthy machine), INFO on the two states worth
         # reading -- an absence about to cost a strike, and the uncertainty that used to be one.
@@ -1351,11 +1391,16 @@ class FaceService:
         if cmd == "build_enrollment":
             try:
                 from .config import ENROLL_DIR
+                if req.get("replace") is True:
+                    return self._build_replace()
                 n = self.recog.enroll_from_dir(ENROLL_DIR)
                 return {"ok": True, "count": n}
             except Exception as e:
                 log.exception("build_enrollment failed")
                 return {"ok": False, "reason": str(e)}
+
+        if cmd == "clear_enrollment":
+            return self._clear_enrollment()
 
         if cmd == "verify":
             r = self._capture_and_verify()
@@ -1371,6 +1416,10 @@ class FaceService:
 
         if cmd == "presence":
             state, real = self._presence_probe()
+            if state == "error":
+                # Stage 8b (F-22): engine error, not absence -> ok:false, never a strike.
+                return {"ok": False, "reason": "engine-error", "present": False, "real": False,
+                        "mode": self.cfg.presence_mode, "state": "error"}
             # ``present`` is kept for compatibility and keeps its old meaning exactly: the manual
             # probes in the tray and the Status window read it, and an older monitor that knows
             # nothing about ``state`` still sees uncertain as not-present (i.e. the pre-7c-6
@@ -1554,6 +1603,69 @@ class FaceService:
 
         return {"ok": False, "reason": "unknown-command"}
 
+    def _build_replace(self) -> dict:
+        """``build_enrollment`` with ``replace``: build the gallery from the PENDING session only,
+        and only after that succeeded delete the old images and promote the new ones.
+
+        Stage 8b (F-12). Defect: every session appended to ENROLL_DIR and the build used them all
+        (45 images from 3 sessions on the live machine), with no way to replace an enrollment
+        short of deleting it first. Consequence: a re-enroll either mixed old and new faces or
+        left the user with no gallery at all while the new one was being captured. Fix: the
+        wizard's Replace mode captures into ENROLL_PENDING_DIR; a failed build here leaves the old
+        gallery and images exactly as they were."""
+        from .config import ENROLL_DIR, ENROLL_PENDING_DIR
+        for d in (ENROLL_DIR, ENROLL_PENDING_DIR):
+            if is_reparse(d):
+                return {"ok": False, "reason": f"{d.name} is a reparse point (not followed)"}
+        n = self.recog.enroll_from_dir(ENROLL_PENDING_DIR)   # raises on a bad session: old kept
+        images = {".jpg", ".jpeg", ".png"}
+        removed = moved = 0
+        for p in list(ENROLL_DIR.iterdir()):
+            if p.suffix.lower() in images and p.is_file() and not is_reparse(p):
+                p.unlink()
+                removed += 1
+        for p in list(ENROLL_PENDING_DIR.iterdir()):
+            if p.suffix.lower() in images and p.is_file() and not is_reparse(p):
+                os.replace(p, ENROLL_DIR / p.name)
+                moved += 1
+        _n, problems = remove_tree_no_follow(ENROLL_PENDING_DIR)
+        if problems:
+            log.warning("build_enrollment(replace): pending cleanup left %s", problems[:3])
+        log.info("build_enrollment(replace): %d accepted; %d old image(s) removed, %d promoted",
+                 n, removed, moved)
+        self._audit.write("enroll_replace", {"accepted": n, "old_removed": removed,
+                                             "promoted": moved})
+        return {"ok": True, "count": n, "replaced": True}
+
+    def _clear_enrollment(self) -> dict:
+        """Stage 8b (F-06). Defect: the wizard's "Delete enrollment" unlinked files on disk while
+        the running service kept its gallery in memory. Consequence: the deleted face went on
+        matching until the next service restart, although the confirmation promised deletion.
+        Fix: the service itself forgets the gallery (refs + adaptive ring), deletes
+        embeddings.npz and the whole enroll tree without following reparse points, drops any
+        pending gesture token, and writes an audit record."""
+        from .config import EMBED_PATH, ENROLL_DIR
+        self.recog.clear_enrollment()
+        self._gesture_slot = None
+        removed = 0
+        problems: list = []
+        try:
+            if EMBED_PATH.exists():
+                EMBED_PATH.unlink()
+                removed += 1
+        except OSError as e:
+            problems.append(f"{EMBED_PATH.name}: {e}")
+        n, more = remove_tree_no_follow(ENROLL_DIR)
+        removed += n
+        problems.extend(more)
+        self._audit.write("clear_enrollment", {"removed": removed, "problems": len(problems)})
+        if problems:
+            log.error("clear_enrollment: %d item(s) could not be removed: %s",
+                      len(problems), "; ".join(problems[:3]))
+            return {"ok": False, "reason": "partial", "removed": removed}
+        log.info("clear_enrollment: gallery forgotten, %d item(s) removed", removed)
+        return {"ok": True, "removed": removed}
+
     def _serve_one(self) -> None:
         sa = _build_pipe_sa(self.cfg)
         open_mode = win32pipe.PIPE_ACCESS_DUPLEX
@@ -1666,7 +1778,9 @@ class FaceService:
                     self.recog.verify_frame(img)
                     log.info("model warmup ok in %.2fs", time.time() - t0)
         except Exception as e:
-            log.warning("model warmup failed: %s", e)
+            # Stage 8b (D-07): with the traceback -- "failed: <text>" alone never told a missing
+            # enrollment from a broken model.
+            log.warning("model warmup failed: %s", e, exc_info=True)
 
         # Also warm up the camera (open + close if not persistent). If the device is busy at
         # startup, skip gracefully -- the first real request will retry the bounded open.
@@ -1679,8 +1793,14 @@ class FaceService:
                     # close in a finally: a raising read() must not skip it, or the
                     # non-persistent path leaks the handle for the process lifetime.
                     try:
-                        cam.read()
-                        log.info("camera warmup ok (persistent=%s)", self.cfg.persistent_camera)
+                        # Stage 8b (D-07): "ok" only when a frame actually arrived. It used to be
+                        # logged whatever read() returned, so a blind camera looked healthy here.
+                        if cam.read() is None:
+                            log.warning("camera warmup: opened, but no frame arrived "
+                                        "(persistent=%s)", self.cfg.persistent_camera)
+                        else:
+                            log.info("camera warmup ok (persistent=%s)",
+                                     self.cfg.persistent_camera)
                     finally:
                         if not self.cfg.persistent_camera:
                             cam.close()

@@ -25,6 +25,34 @@ from __future__ import annotations
 import multiprocessing
 import sys
 
+# Stage 8b (F-31 / KNOWN_ISSUES #4 / D-14 / D-18). Defect: nothing in presence_monitor held a
+# single-instance mutex. Consequence: a second tray (task start + a manual start, or the old Finish
+# checkbox) ran beside the first and competed for the camera; two wizards could release each
+# other's camera lease; both processes appended to one rotating log. Fix: one named mutex per
+# role, taken ONLY in its own branch -- the tray's in the no-flag branch, the wizard's under
+# --enroll -- so the wizard, the password dialog and --pipe-shutdown never collide with a running
+# tray. A second instance exits silently with 0. Deliberately not an Inno AppMutex: that would make
+# Setup refuse to run while the tray is up, which is exactly when an update runs.
+TRAY_MUTEX = "Local\\FaceUnlockTray"
+ENROLL_MUTEX = "Local\\FaceUnlockEnroll"
+_held_mutexes: list = []   # kept for the process lifetime; the OS releases them at exit
+
+
+def _first_instance(name: str) -> bool:
+    """True if this process now owns the named mutex; False if another instance holds it. A mutex
+    that cannot be created at all fails OPEN (True): the guard must never stop the tray itself."""
+    try:
+        import win32api    # type: ignore
+        import win32event  # type: ignore
+        import winerror    # type: ignore
+        handle = win32event.CreateMutex(None, False, name)
+        if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+            return False
+        _held_mutexes.append(handle)
+    except Exception:
+        return True
+    return True
+
 
 def main(argv: "list[str] | None" = None) -> int:
     # Every import below is ABSOLUTE, and that is load-bearing rather than a style
@@ -47,6 +75,8 @@ def main(argv: "list[str] | None" = None) -> int:
     flag = args[0] if args else ""
 
     if flag == "--enroll":
+        if not _first_instance(ENROLL_MUTEX):
+            return 0
         from presence_monitor.enroll_gui import main as enroll_main
         return int(enroll_main() or 0)
 
@@ -60,7 +90,9 @@ def main(argv: "list[str] | None" = None) -> int:
         from tools.pipe_client import main as pipe_main
         return int(pipe_main(["shutdown"]))
 
-    # No flag (or an unrecognised one): the tray, exactly as before.
+    # No flag (or an unrecognised one): the tray, exactly as before -- one of it.
+    if not _first_instance(TRAY_MUTEX):
+        return 0
     from presence_monitor.monitor import main as monitor_main
     monitor_main()
     return 0

@@ -159,6 +159,13 @@ def _select_providers(ort):
     return ["CPUExecutionProvider"], -1
 
 
+class EngineError(Exception):
+    """Stage 8b (F-22): the engine could not judge a frame (empty input, or InsightFace/ONNX
+    raised). Deliberately NOT a RuntimeError: RuntimeError is what analyze_frame raises for "no
+    enrollment", which the gesture round treats as an engine refusal of the whole round, whereas
+    this is a per-frame fault that every caller skips."""
+
+
 class FrameAnalysis(NamedTuple):
     """Everything one detect yields, for the service loop to build a liveness verdict."""
     face: bool                     # a face was detected
@@ -440,11 +447,20 @@ class Recognizer:
             raise RuntimeError("No enrollment found. Run enroll first.")
 
         app = self._lazy_app()
+        # Stage 8b (F-22 / D-07). Defect: an engine failure here was logged at DEBUG and returned
+        # as "no face". Consequence: a broken model / CUDA / input looked exactly like an empty
+        # room -- the presence probe spent absence strikes on it, and the log never said why.
+        # Fix: an empty frame and an engine exception both raise EngineError (chained to the
+        # cause). Every caller already catches per frame: the unlock burst and the gesture round
+        # skip the frame exactly as they skipped a "no face" before (EngineError is deliberately
+        # NOT a RuntimeError, so the gesture round's engine-refusal branch is not reached), and the
+        # presence probe now classifies it as an error rather than an absence.
+        if bgr is None or getattr(bgr, "size", 0) == 0:
+            raise EngineError("empty frame")
         try:
             faces = app.get(bgr)
         except Exception as e:
-            log.debug("insightface get failed: %s", e)
-            return FrameAnalysis(False, False, 1.0, None, None, None)
+            raise EngineError(f"insightface get failed: {e!r}") from e
         if not faces:
             return FrameAnalysis(False, False, 1.0, None, None, None)
 
@@ -530,6 +546,15 @@ class Recognizer:
             log.debug("adaptive: skip (%s) enroll-dist=%.3f ceil=%.3f",
                       dec.reason, dist_to_enroll, dec.ceiling)
         return dec
+
+    def clear_enrollment(self) -> None:
+        """Stage 8b (F-06): forget the gallery IN MEMORY -- enrollment refs and the adaptive ring
+        (whose file is deleted too). The caller deletes embeddings.npz and the images; this makes
+        the running service stop matching immediately instead of at its next restart."""
+        self._enroll_refs = None
+        self._adaptive.clear()
+        self._refs = None
+        log.info("enrollment cleared in memory (refs + adaptive ring)")
 
     def clear_adaptive(self) -> None:
         """Roll back all drift adaptation (delete the adaptive file); enrollment stays."""

@@ -17,6 +17,10 @@ except ImportError:  # pragma: no cover - optional for read-only usage
 APP_DIR = Path(os.environ.get("FACE_UNLOCK_HOME", Path.home() / ".face-unlock"))
 CONFIG_PATH = APP_DIR / "config.toml"
 ENROLL_DIR = APP_DIR / "enroll"
+# Stage 8b (F-12): a "Replace" enrollment session is captured here and only promoted into
+# ENROLL_DIR after it built successfully, so an interrupted re-enroll never leaves the user without
+# a gallery. A module path, not a Config field.
+ENROLL_PENDING_DIR = ENROLL_DIR / ".pending"
 EMBED_PATH = APP_DIR / "embeddings.npz"
 CREDS_PATH = APP_DIR / "credentials.bin"
 LOG_PATH = APP_DIR / "service.log"

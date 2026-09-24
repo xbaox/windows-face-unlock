@@ -90,7 +90,7 @@ _EN: dict[str, str] = {
     "tray.open_log.desc": "Open the folder containing service.log and presence.log.",
     "tray.language.desc": "Change the display language of the tray menu and the management windows.",
     "tray.help.desc": "Show this help dialog listing every menu entry and what it does.",
-    "tray.quit.desc": "Stop the background FaceService process and close the tray icon. Auto-lock will NOT run again until next login or a manual task start.",
+    "tray.quit.desc": "Stop the background FaceService and close the tray icon. The watchdog starts the service again after a 5-minute pause, so face sign-in comes back on its own; walk-away auto-lock stays off until the tray runs again (next sign-in, or start the FaceUnlock-Presence task).",
 
     # ---- Status window ----
     "status.title": "Face Unlock — Status",
@@ -281,6 +281,13 @@ _EN: dict[str, str] = {
     "enroll.confirm.wipe.body": "This will delete all saved enrollment photos and embeddings. Continue?",
     "enroll.error.camera": "Cannot open the camera. Close any other app using it and retry.",
     "enroll.error.service_busy": "Could not pause the Face Unlock service — enrollment may conflict with probes.",
+    "enroll.error.wipe_failed": "The Face Unlock service did not confirm the deletion. Try again; "
+                                "if it keeps failing, restart the service from the tray.",
+    "enroll.confirm.mode.title": "Replace or add?",
+    "enroll.confirm.mode.body": "An enrollment already exists.\n\nYes — Replace it with this session "
+                                "(recommended). The old photos and gallery are removed only after "
+                                "the new session has built successfully.\n\nNo — Add this session "
+                                "to the existing enrollment.",
     "enroll.status.waiting": "No face detected — look at the camera.",
     "enroll.status.connecting": "Connecting to the Face Unlock service…",
     "enroll.status.ready": "Good — hold still.",
@@ -387,7 +394,6 @@ _VI: dict[str, str] = {
     "tray.open_log.desc": "Mở Explorer vào thư mục chứa service.log và presence.log.",
     "tray.language.desc": "Đổi ngôn ngữ hiển thị của menu tray và các cửa sổ quản lý.",
     "tray.help.desc": "Hiện cửa sổ trợ giúp liệt kê từng mục menu và ý nghĩa.",
-    "tray.quit.desc": "Dừng tiến trình FaceService nền và đóng tray icon. Tự-động khoá sẽ KHÔNG chạy lại cho tới lần đăng nhập sau hoặc khi bạn khởi động thủ công.",
 
     "status.title": "Face Unlock — Trạng thái",
     "status.service": "Service",
@@ -525,7 +531,6 @@ _ZH: dict[str, str] = {
     "tray.open_log.desc": "用资源管理器打开包含 service.log 与 presence.log 的文件夹。",
     "tray.language.desc": "更改托盘菜单和管理窗口的显示语言。",
     "tray.help.desc": "显示此帮助对话框,列出每个菜单项及其功能。",
-    "tray.quit.desc": "停止后台 FaceService 进程并关闭托盘图标。自动锁屏在下次登录或手动启动任务前不会再运行。",
 
     "status.title": "Face Unlock — 状态",
     "status.service": "服务",
@@ -634,7 +639,6 @@ _ES: dict[str, str] = {
     "tray.open_log.desc": "Abrir la carpeta con service.log y presence.log.",
     "tray.language.desc": "Cambiar el idioma de la bandeja y las ventanas.",
     "tray.help.desc": "Mostrar este diálogo con todas las entradas y su descripción.",
-    "tray.quit.desc": "Detiene el proceso FaceService y cierra el icono. El auto-bloqueo no volverá hasta el siguiente inicio de sesión.",
     "status.title": "Face Unlock — Estado",
     "status.service": "Servicio",
     "status.uptime": "Tiempo en ejecución",
@@ -724,7 +728,6 @@ _FR: dict[str, str] = {
     "tray.open_log.desc": "Ouvrir le dossier contenant service.log et presence.log.",
     "tray.language.desc": "Changer la langue du tray et des fenêtres.",
     "tray.help.desc": "Afficher cette aide listant chaque entrée.",
-    "tray.quit.desc": "Arrête le processus FaceService et ferme l'icône. L'auto-verrouillage ne reviendra qu'à la prochaine session.",
     "status.title": "Face Unlock — État",
     "status.service": "Service",
     "status.uptime": "Durée",
@@ -1051,7 +1054,7 @@ _RU: dict[str, str] = {
     "tray.open_log.desc": "Открыть папку с service.log и presence.log.",
     "tray.language.desc": "Сменить язык меню в трее и окон управления.",
     "tray.help.desc": "Показать эту справку со списком всех пунктов меню и их назначением.",
-    "tray.quit.desc": "Остановить фоновый процесс FaceService и закрыть значок в трее. Автоблокировка НЕ заработает снова до следующего входа в систему или ручного запуска задачи.",
+    "tray.quit.desc": "Остановить фоновый FaceService и закрыть значок в трее. Вотчдог снова запустит сервис после 5-минутной паузы, так что вход по лицу вернётся сам; автоблокировка при уходе останется выключенной, пока трей не запустится снова (при следующем входе или запуском задачи FaceUnlock-Presence).",
     "status.title": "Face Unlock — Состояние",
     "status.service": "Сервис",
     "status.uptime": "Время работы",
@@ -1183,6 +1186,13 @@ _RU: dict[str, str] = {
     "enroll.confirm.wipe.body": "Будут удалены все сохранённые снимки регистрации и эмбеддинги. Продолжить?",
     "enroll.error.camera": "Не удалось открыть камеру. Закройте другие приложения, использующие её, и повторите.",
     "enroll.error.service_busy": "Не удалось приостановить сервис Face Unlock — регистрация может конфликтовать с проверками присутствия.",
+    "enroll.error.wipe_failed": "Сервис Face Unlock не подтвердил удаление. Попробуйте ещё раз; "
+                                "если не помогает, перезапустите сервис из трея.",
+    "enroll.confirm.mode.title": "Заменить или добавить?",
+    "enroll.confirm.mode.body": "Регистрация уже есть.\n\nДа — заменить её этой сессией "
+                                "(рекомендуется). Старые снимки и галерея удаляются только после "
+                                "того, как новая сессия успешно построится.\n\nНет — добавить эту "
+                                "сессию к существующей регистрации.",
     "enroll.status.waiting": "Лицо не обнаружено — смотрите в камеру.",
     "enroll.status.connecting": "Подключение к службе Face Unlock…",
     "enroll.status.ready": "Хорошо — не двигайтесь.",
