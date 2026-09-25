@@ -101,3 +101,30 @@ camera; `engine-error` is the engine. Name the class in the verdict.
   `[N ms]` may come before or after it (7l Е).
 - Read logs with `-Encoding utf8`.
 - Zip evidence with the `ZipFile` API and `/` in entry names.
+
+## 7. Reboot runs (8c-8 / 8c-8b)
+
+- On this machine a Start-menu **Restart** triggers Automatic Restart Sign-On (ARSO): Windows signs the user in
+  by itself (8c-8: 15 s after the OS started) and locks the session ~3 s later. The first screen is then the
+  lock screen of a live session with the stack already starting — there is **no pre-logon screen**.
+- To exercise the pre-logon path (service not running yet), use **Shut down + power on**. Expected: the Face
+  Unlock tile answers "Face Unlock service unavailable. Use PIN or password." once the CP pipe budget (12 s)
+  runs out, and the PIN signs in.
+- With Fast Startup on (`HiberbootEnabled = 1`) Shut down hibernates the kernel, so `LastBootUpTime` does not
+  change. Prove the cycle instead with User32 1074 (power off vs restart), Kernel-Boot 27 (boot type 0x1 hybrid,
+  0x0 full), the new session id, and Winlogon/Operational: authentication timing, and no lock notification (4)
+  right after logon — ARSO locks within seconds, a manual sign-in does not.
+- After logon: one process each from PF, created within seconds of logon; the service's custody line reads
+  `aces_removed=0 relocked=0 problems=0`; one warm-up `no-pipe` from the watchdog is normal.
+
+## 8. Thin-margin fast-mode test (7c, 8c-7)
+
+- Measure d with `verify` under the reference config right before the test: `verify` grants nothing, adapts
+  nothing and does not touch the lockout.
+- While `adaptive_gallery = true`, `validate()` rejects a threshold at or below `adaptive_margin`, and
+  `reload_config` keeps the old config. Set `adaptive_gallery = false` for the run.
+- `reload_config` does not reload the gallery: adaptive samples stay in matching until the next start.
+- The gesture round only feeds frames with d ≤ `threshold` (identity binding). Measure d in the gesture poses
+  too, or a head turn may never register at a thin threshold (KNOWN_ISSUES §9).
+- Keep a byte backup of `config.toml` outside the data directory and restore it at any outcome; the SHA must
+  match the reference afterwards.
