@@ -49,10 +49,11 @@ UsePreviousAppDir=yes
 UsePreviousTasks=yes
 
 [Languages]
-; Inno Setup 6 ships only Default.isl (English) out of the box. The app
-; itself is fully translated into 12 languages at runtime -- the installer
-; wizard stays English for simplicity.
-Name: "english";  MessagesFile: "compiler:Default.isl"
+; Stage 9 (act 9b R16, F-215): English and Russian, like the app. Inno's own texts come from its
+; message files, ours from lang\*.isl ([CustomMessages]); Setup picks the one that matches the
+; Windows display language.
+Name: "english"; MessagesFile: "compiler:Default.isl,lang\en.isl"
+Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl,lang\ru.isl"
 
 [Tasks]
 ; Deliberately NO Check: on this entry. A task's Check runs while the Select Tasks
@@ -80,8 +81,7 @@ Name: "english";  MessagesFile: "compiler:Default.isl"
 ; install that must end with the provider registered regardless of history, pass
 ;     /MERGETASKS="cp"
 ; which adds the task to whatever the previous selection was.
-Name: "cp"; Description: "Register the Credential Provider (enables log-in with your face)"; \
-  GroupDescription: "Optional components"
+Name: "cp"; Description: "{cm:TaskCP}"; GroupDescription: "{cm:TaskGroup}"
 
 [Files]
 ; The whole PyInstaller output, which already includes postinstall\ (the task
@@ -108,8 +108,11 @@ Source: "{#BuildRoot}\postinstall\tasks.psd1"; Flags: dontcopy
 ; what broke custody.
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\{#MyAppName} - Uninstall"; Filename: "{uninstallexe}"
+; Stage 9 (act 9b R14): the Start-menu shortcut carries the tray's AppUserModelID -- Windows shows
+; the tray's toast notifications only for an app ID it knows from such a shortcut. The same ID is
+; set by the tray process itself (presence_monitor\toast.py, APP_ID).
+Name: "{group}\{cm:IconTray}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "WindowsFaceUnlock.Tray"
+Name: "{group}\{cm:IconUninstall}"; Filename: "{uninstallexe}"
 
 [Registry]
 ; InstallLocation is read by tools\register_tasks.ps1 when -Mode Installed is used without an
@@ -146,7 +149,7 @@ Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: 
 Filename: "{sys}\regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
   Tasks: cp; \
   Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); \
-  StatusMsg: "Registering Credential Provider..."; Flags: runhidden
+  StatusMsg: "{cm:StatusRegCP}"; Flags: runhidden
 
 ; 2. Creating AND starting the scheduled tasks moved to [Code] (RegisterTasks, from
 ;    CurStepChanged ssPostInstall) in Stage 8b. Defects (F-33, F-07): a [Run]
@@ -199,13 +202,13 @@ Filename: "{sys}\regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\Face
 ;    that already works. CredentialsSaved only tests that the file exists; it
 ;    never opens it.
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; \
-  Description: "Save your Windows password for face sign-in"; \
+  Description: "{cm:RunSavePassword}"; \
   Check: not CredentialsSaved; Flags: postinstall runasoriginaluser skipifsilent
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; \
-  Description: "Update your saved Windows password for face sign-in"; \
+  Description: "{cm:RunUpdatePassword}"; \
   Check: CredentialsSaved; Flags: postinstall runasoriginaluser skipifsilent unchecked
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--enroll"; \
-  Description: "Set up face recognition now"; \
+  Description: "{cm:RunEnroll}"; \
   Flags: postinstall runasoriginaluser skipifsilent
 
 [UninstallRun]
@@ -447,8 +450,7 @@ begin
       Result := SidOfAccount(Arg);
     if not IsUserSid(Result) then
     begin
-      Why := '/OWNER=' + Arg + ' is not a person''s account on this PC (SYSTEM and service '
-             + 'accounts cannot own Face Unlock).';
+      Why := FmtMessage(CustomMessage('WhyOwnerArg'), [Arg]);
       Result := '';
     end;
     exit;
@@ -456,16 +458,14 @@ begin
   Session := WTSGetActiveConsoleSessionId();
   if Session = NO_CONSOLE_SESSION then
   begin
-    Why := 'Nobody is signed in at this PC''s console, so Setup cannot tell whose Face Unlock '
-           + 'this is. Sign in at the PC itself and run Setup there, or pass /OWNER=DOMAIN\user.';
+    Why := CustomMessage('WhyNoConsole');
     exit;
   end;
   User := ConsoleSessionString(Session, WTS_USER_NAME);
   Dom := ConsoleSessionString(Session, WTS_DOMAIN_NAME);
   if User = '' then
   begin
-    Why := 'The console session has no signed-in user. Sign in at the PC and run Setup there, '
-           + 'or pass /OWNER=DOMAIN\user.';
+    Why := CustomMessage('WhyNoConsoleUser');
     exit;
   end;
   if Dom <> '' then
@@ -474,8 +474,7 @@ begin
     Result := SidOfAccount(User);
   if not IsUserSid(Result) then
   begin
-    Why := 'The console user ' + Dom + '\' + User + ' could not be resolved to a person''s '
-           + 'account (' + Result + '). Pass /OWNER=DOMAIN\user or /OWNER=<SID>.';
+    Why := FmtMessage(CustomMessage('WhyUnresolved'), [Dom + '\' + User, Result]);
     Result := '';
   end;
 end;
@@ -510,7 +509,7 @@ begin
   begin
     Log('Setup stops: ' + Why);
     if not WizardSilent() then
-      MsgBox('Face Unlock cannot be installed yet.' + #13#10#13#10 + Why, mbCriticalError, MB_OK);
+      MsgBox(FmtMessage(CustomMessage('CannotInstall'), [Why]), mbCriticalError, MB_OK);
     exit;
   end;
   OwnerName := AccountOfSid(OwnerSid);
@@ -527,10 +526,8 @@ begin
         exit;
       end;
       Log('Owner changes from ' + Recorded + ' to ' + OwnerSid + ' (/FORCEOWNER).');
-    end else if MsgBox('Face Unlock on this PC belongs to ' + AccountOfSid(Recorded) + '.'
-                       + #13#10#13#10 + 'Make ' + OwnerName + ' the owner instead? Face sign-in '
-                       + 'then works for ' + OwnerName + ' only; the previous owner signs in '
-                       + 'with PIN or password as usual.', mbConfirmation, MB_YESNO) <> IDYES then
+    end else if MsgBox(FmtMessage(CustomMessage('BelongsToOther'), [AccountOfSid(Recorded), OwnerName]),
+                       mbConfirmation, MB_YESNO) <> IDYES then
     begin
       Log('Setup stops: the user kept the recorded owner ' + Recorded + '.');
       exit;
@@ -543,7 +540,7 @@ end;
 function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
   MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
 begin
-  Result := 'Face Unlock owner (the only account that can sign in with its face):' + NewLine
+  Result := CustomMessage('ReadyOwner') + NewLine
             + Space + OwnerName + NewLine + Space + OwnerSid + NewLine;
   if MemoDirInfo <> '' then
     Result := Result + NewLine + MemoDirInfo + NewLine;
@@ -673,7 +670,7 @@ begin
     ExtractTemporaryFile('register_tasks.ps1');
     ExtractTemporaryFile('tasks.psd1');
   except
-    Result := 'Setup could not unpack its task registrar: ' + GetExceptionMessage;
+    Result := FmtMessage(CustomMessage('UnpackFailed'), [GetExceptionMessage]);
     exit;
   end;
   Registrar := ExpandConstant('{tmp}\register_tasks.ps1');
@@ -682,22 +679,14 @@ begin
               + ' -Mode Installed -InstallDir "' + AppDir + '" -Action Stop',
               '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
   begin
-    Result := 'Setup could not run the Face Unlock task registrar:' + #13#10
-            + Registrar + #13#10#13#10
-            + 'The existing installation has to be stopped before it can be replaced. '
-            + 'Stop it manually, then run Setup again.';
+    Result := FmtMessage(CustomMessage('RegistrarRunFailed'), [Registrar]);
     exit;
   end;
   if ResultCode <> 0 then
   begin
-    Result := 'The installed Face Unlock is still running, so Setup will not overwrite it.'
-            + #13#10#13#10
-            + 'The task registrar exited with code ' + IntToStr(ResultCode)
-            + ' after trying twice to stop the stack; it lists the surviving process IDs in its '
-            + 'own output.' + #13#10#13#10
-            + 'Stop it and run Setup again:' + #13#10
-            + '  powershell -NoProfile -ExecutionPolicy Bypass -File "' + AppDir
-            + '\postinstall\register_tasks.ps1" -Mode Installed -Action Unregister';
+    Result := FmtMessage(CustomMessage('StillRunning'), [IntToStr(ResultCode),
+                          'powershell -NoProfile -ExecutionPolicy Bypass -File "' + AppDir
+                          + '\postinstall\register_tasks.ps1" -Mode Installed -Action Unregister']);
     exit;
   end;
 end;
@@ -711,7 +700,7 @@ var
   Params: string;
   ResultCode: Integer;
 begin
-  WizardForm.StatusLabel.Caption := 'Registering scheduled tasks...';
+  WizardForm.StatusLabel.Caption := CustomMessage('StatusRegTasks');
   Params := '-NoProfile -ExecutionPolicy Bypass -File "'
             + ExpandConstant('{app}\postinstall\register_tasks.ps1') + '"'
             + ' -Mode Installed -InstallDir "' + ExpandConstant('{app}') + '" -Action Register';
@@ -725,10 +714,8 @@ begin
     Log('Face Unlock task registrar FAILED with exit code ' + IntToStr(ResultCode) + '; see '
         + ExpandConstant('{app}\logs\register_tasks.log'));
     if not WizardSilent() then
-      MsgBox('Face Unlock could not register its background tasks (exit code '
-             + IntToStr(ResultCode) + ').' + #13#10#13#10
-             + 'Face sign-in will not work until they are registered. Details: '
-             + ExpandConstant('{app}\logs\register_tasks.log'), mbError, MB_OK);
+      MsgBox(FmtMessage(CustomMessage('TasksFailed'), [IntToStr(ResultCode), ExpandConstant('{app}\logs\register_tasks.log')]),
+             mbError, MB_OK);
   end;
 end;
 
@@ -787,9 +774,7 @@ begin
   { UninstallSilent() covers both /SILENT and /VERYSILENT. }
   if UninstallSilent() then
     exit;
-  Result := MsgBox('Also remove your saved enrollment data at ' + DataDir + '?'#13#10#13#10
-                   + 'This includes your face embeddings and the encrypted Windows password. '
-                   + 'Choose No to keep them for a future reinstall.',
+  Result := MsgBox(FmtMessage(CustomMessage('RemoveData'), [DataDir]),
                    mbConfirmation, MB_YESNO) = IDYES;
 end;
 

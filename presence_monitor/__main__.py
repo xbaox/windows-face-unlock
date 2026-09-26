@@ -34,24 +34,12 @@ import sys
 # tray. A second instance exits silently with 0. Deliberately not an Inno AppMutex: that would make
 # Setup refuse to run while the tray is up, which is exactly when an update runs.
 TRAY_MUTEX = "Local\\FaceUnlockTray"
-ENROLL_MUTEX = "Local\\FaceUnlockEnroll"
-_held_mutexes: list = []   # kept for the process lifetime; the OS releases them at exit
+ENROLL_MUTEX = "Local\\FaceUnlockEnroll"      # taken by enroll_gui.main() itself (F-189)
 
 
 def _first_instance(name: str) -> bool:
-    """True if this process now owns the named mutex; False if another instance holds it. A mutex
-    that cannot be created at all fails OPEN (True): the guard must never stop the tray itself."""
-    try:
-        import win32api    # type: ignore
-        import win32event  # type: ignore
-        import winerror    # type: ignore
-        handle = win32event.CreateMutex(None, False, name)
-        if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-            return False
-        _held_mutexes.append(handle)
-    except Exception:
-        return True
-    return True
+    from presence_monitor.instance import first_instance
+    return first_instance(name)
 
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -75,8 +63,8 @@ def main(argv: "list[str] | None" = None) -> int:
     flag = args[0] if args else ""
 
     if flag == "--enroll":
-        if not _first_instance(ENROLL_MUTEX):
-            return 0
+        # The wizard takes its own mutex (Stage 9, F-189: the dev path -m presence_monitor.enroll_gui
+        # skipped this router and ran unguarded) and raises the running window on a duplicate.
         from presence_monitor.enroll_gui import main as enroll_main
         return int(enroll_main() or 0)
 
@@ -90,7 +78,13 @@ def main(argv: "list[str] | None" = None) -> int:
         from tools.pipe_client import main as pipe_main
         return int(pipe_main(["shutdown"]))
 
-    # No flag (or an unrecognised one): the tray, exactly as before -- one of it.
+    if flag:
+        # Stage 9 (D-95): an unknown flag (--help, a typo) no longer starts a second tray.
+        import logging
+        logging.getLogger("presence_monitor").warning("unknown option %r -- nothing started", flag)
+        return 2
+
+    # No flag: the tray -- one of it.
     if not _first_instance(TRAY_MUTEX):
         return 0
     from presence_monitor.monitor import main as monitor_main

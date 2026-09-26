@@ -56,6 +56,7 @@ class Tooltip:
             self._after_id = None
 
     def _show(self):
+        self._hide()             # Stage 9 (F-174): never a second tip on top of the first
         try:
             text = self.text_provider()
         except Exception:
@@ -70,7 +71,6 @@ class Tooltip:
             return
         tip = tk.Toplevel(self.widget)
         tip.wm_overrideredirect(True)
-        tip.wm_geometry(f"+{x}+{y}")
         tip.attributes("-topmost", True)
         lbl = tk.Label(
             tip,
@@ -85,6 +85,18 @@ class Tooltip:
             pady=3,
         )
         lbl.pack()
+        # F-174: clamp to the screen -- the tips of the bottom rows used to open off-screen.
+        try:
+            tip.update_idletasks()
+            sw, sh = tip.winfo_screenwidth(), tip.winfo_screenheight()
+            w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
+            if x + w > sw:
+                x = max(0, sw - w - 4)
+            if y + h > sh:
+                y = max(0, self.widget.winfo_rooty() - h - 4)
+        except tk.TclError:
+            pass
+        tip.wm_geometry(f"+{x}+{y}")
         self._tip = tip
 
     def _hide(self):
@@ -97,16 +109,19 @@ class Tooltip:
 
 
 class InfoButton(ttk.Label):
-    """Small clickable (ⓘ) label. Hover shows tooltip; click shows messagebox."""
+    """Small (ⓘ) label. Hover shows the tooltip; a click -- or Space / Enter when it has the
+    keyboard focus (Stage 9, F-171: it is in the Tab order now) -- shows the text in a box."""
 
     def __init__(self, master: tk.Widget, i18n_key: str, **kwargs):
-        super().__init__(master, text=INFO_GLYPH, cursor="question_arrow", **kwargs)
+        super().__init__(master, text=INFO_GLYPH, cursor="question_arrow", takefocus=True, **kwargs)
         self.i18n_key = i18n_key
         self.configure(foreground="#2a6dbf")
         self.bind("<Button-1>", self._on_click)
+        self.bind("<space>", self._on_click)
+        self.bind("<Return>", lambda e: (self._on_click(e), "break")[1])
         Tooltip(self, lambda: t(self.i18n_key))
 
-    def _on_click(self, _e):
+    def _on_click(self, _e=None):
         from tkinter import messagebox
         messagebox.showinfo(t("settings.info.title"), t(self.i18n_key), parent=self.winfo_toplevel())
 

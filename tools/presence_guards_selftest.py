@@ -369,9 +369,8 @@ def main(argv=None) -> int:
     # keys: a mandatory-checksum refusal and the source-checkout notice) -> 228 in 7h (label
     # and .desc for the debug_dump_frames diagnostics knob) -> 229 in 7l (enroll.status.connecting,
     # the wizard's wait-for-service line; added to all twelve locales).
-    # Stage 9: +gesture.then, +detector_unavailable (9c-2); +field.camera_name(.desc), +tray.camera_unknown (9c-3)
-    t.ok(len(en) == 242, f"_EN has 242 keys (got {len(en)})")
-    t.ok(len(ru) == 242, f"_RU has 242 keys (got {len(ru)})")
+    # Stage 9 (R16): EN and RU are the product languages, rebuilt key-for-key in 9c-4.
+    t.ok(len(en) == len(ru) >= 300, f"_EN / _RU have the same, full key count (got {len(en)} / {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
     # Key parity alone never caught a translation that drops or renames a {placeholder}: t()
     # swallows a failed .format() and returns the raw string, so the damage shows up as an
@@ -415,8 +414,10 @@ def main(argv=None) -> int:
     with _Harness(_cfg(auto_lock=True), present=False, idle=5.0) as h:
         h.mon._strikes, h.mon._uncertain = 1, 2
         h.tick(3)
-        t.ok(h.probe_calls == 0 and h.status_calls == 0,
-             f"fresh input opens NO pipe at all (probe={h.probe_calls} status={h.status_calls})")
+        # Stage 9 (F-154): the cheap status poll runs on every tick (it feeds the toasts and the
+        # tray state); the camera probe still never runs on a tick answered by input.
+        t.ok(h.probe_calls == 0 and h.status_calls == 3,
+             f"fresh input never probes the camera (probe={h.probe_calls} status={h.status_calls})")
         t.ok(h.mon._strikes == 0 and h.mon._uncertain == 0,
              f"and clears both counters like any present tick (s={h.mon._strikes} u={h.mon._uncertain})")
         t.ok(h.locks == 0, "never locks while the user is typing")

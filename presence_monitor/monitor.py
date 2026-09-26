@@ -1,4 +1,5 @@
 from __future__ import annotations
+import collections
 import json
 import logging
 import os
@@ -232,6 +233,13 @@ class PresenceMonitor:
         # per reachability transition (baseline set silently on first tick).
         self._svc_reachable: bool | None = None
         self._lockout_notified = False
+        # Stage 9 (act 9b R14): every event also lands here -- the Status window's "Recent events"
+        # list is the channel that works when a toast is not shown. And the last status reply, so
+        # the tray can show the service's state (refusing + why, a rejected password) without a
+        # second poll of its own.
+        self.events: "collections.deque" = collections.deque(maxlen=20)
+        self.on_event = None        # set by the tray: (gate, message) -> shows the toast
+        self._last_status: "dict | None" = None
 
     def _reset_strikes(self) -> None:
         """End the current absence episode. The strike count, the uncertain run and the
@@ -293,6 +301,8 @@ class PresenceMonitor:
                 "interval_s": self.cfg.presence_interval_s,
                 "absent_strikes": self.cfg.presence_absent_strikes,
                 "mode": self.cfg.presence_mode,
+                "auto_lock": bool(self.cfg.auto_lock),
+                "events": list(self.events),
             }
 
     def _set_last(self, result: str, reason: str = "", mode: str = "", why: str = "") -> None:
@@ -314,11 +324,25 @@ class PresenceMonitor:
                 log.debug("on_update callback failed", exc_info=True)
 
     def _notify(self, gate: str, message: str) -> None:
+        """Record the event (always) and hand it to the tray for a toast (gated by config there)."""
+        with self._state_lock:
+            self.events.appendleft((time.time(), message))
+        cb = self.on_event
+        if cb is None:
+            return
         try:
-            from .tray import notify_event  # lazy: tray imports this module
-            notify_event(gate, message)
+            cb(gate, message)
         except Exception:
             log.exception("event notification failed")
+
+    def record_event(self, message: str) -> None:
+        """An event for the Status list only (no toast) -- e.g. the result of a manual check."""
+        with self._state_lock:
+            self.events.appendleft((time.time(), message))
+
+    def last_status(self) -> "dict | None":
+        with self._state_lock:
+            return self._last_status
 
     def _check_service_events(self) -> bool:
         """Event toasts from the EXISTING ``status`` command (cheap, no
@@ -328,6 +352,17 @@ class PresenceMonitor:
         on a dead pipe."""
         resp = pipe_call({"cmd": "status"}, timeout_s=5.0)
         reachable = bool(resp and resp.get("ok"))
+        def _sig(st):
+            return None if not st else (st.get("state"), st.get("why"), st.get("password_rejected"),
+                                        st.get("enrollment"))
+        with self._state_lock:
+            changed = _sig(self._last_status) != _sig(resp if reachable else None)
+            self._last_status = resp if reachable else None
+        if changed and self.on_update is not None:
+            try:
+                self.on_update()          # the tray's state line follows the service (R12, R13)
+            except Exception:
+                log.debug("on_update callback failed", exc_info=True)
         prev, self._svc_reachable = self._svc_reachable, reachable
         if prev is not None and prev != reachable:
             self._notify(
@@ -381,18 +416,21 @@ class PresenceMonitor:
             log.info("session unlocked: presence counters reset (%s)", self._fmt_counters())
             self._reset_strikes()
 
+        # Stage 9 (F-154): the status poll -- the one source of the lockout / service toasts and of
+        # the tray's state line -- runs on EVERY unlocked tick, before the input gate. It used to
+        # run only on idle ticks, so a user who kept typing after a PIN sign-in never saw the
+        # lockout notice. It is a cheap pipe round trip and never touches the camera.
+        reachable = self._check_service_events()
+
         # Stage 9 (F-147): Pause is checked BEFORE the input gate, so Status says "paused" -- not
-        # "present src=input" -- while it is on. The status poll still runs for the toasts.
+        # "present src=input" -- while it is on.
         if self._paused.is_set():
-            self._check_service_events()
             self._reset_strikes()
             self._set_last("skipped", "paused")
             return
 
         # Stage 9 (act 9b R10): auto_lock off means presence is off -- not a single camera probe.
-        # Only the status poll runs, for the notifications.
         if not self.cfg.auto_lock:
-            self._check_service_events()
             self._reset_strikes()
             self._set_last("skipped", "auto-lock-off")
             return
@@ -400,10 +438,9 @@ class PresenceMonitor:
         # 1. Live input IS presence (7c-8). Typing or moving the mouse proves the user is at the
         #    machine far better than a frame does, and it proves it while they are looking at a
         #    phone, reading something on the desk, or simply turned away -- all of which take the
-        #    face out of frame and used to be counted as absence. Deliberately BEFORE the status
-        #    poll: a tick answered by input opens no pipe at all, so an active user costs neither a
-        #    camera wake nor a round trip. Beyond the idle threshold nothing changes and the camera
-        #    decides exactly as before.
+        #    face out of frame and used to be counted as absence. A tick answered by input never
+        #    wakes the camera (the status poll above is the only pipe call it makes). Beyond the idle
+        #    threshold nothing changes and the camera decides exactly as before.
         idle_limit = self.cfg.presence_input_idle_s
         if idle_limit > 0:
             idle = _input_idle_seconds()
@@ -414,11 +451,7 @@ class PresenceMonitor:
                 self._set_last("present", f"src=input idle={idle:.0f}s/{idle_limit:.0f}s")
                 return
 
-        # 2. Event toasts ride on the existing `status` poll — before the
-        #    pause/remote skips, so notifications work while paused too.
-        reachable = self._check_service_events()
-
-        # (Pause is handled at the top of the tick since Stage 9 -- F-147.)
+        # (The status poll and Pause are handled at the top of the tick since Stage 9.)
 
         # 2. Skip if this is a remote session — face check doesn't make sense
         #    when nobody is physically at the machine.
@@ -613,6 +646,5 @@ def main() -> None:
     from .tray import run_with_tray
     run_with_tray(cfg)
 
-
-if __name__ == "__main__":
-    main()
+# (Stage 9, D-95: no __main__ block -- `python -m presence_monitor` is the one entry point, and it
+# holds the tray's single-instance mutex.)

@@ -78,27 +78,65 @@ def _write_locked_file(path: Path, data: bytes) -> None:
             h, win32security.DACL_SECURITY_INFORMATION
             | win32security.PROTECTED_DACL_SECURITY_INFORMATION, sa.SECURITY_DESCRIPTOR)
         win32file.WriteFile(h, data)
+        # Stage 9 (F-109): on disk before the rename that publishes it -- a power loss must not
+        # leave an empty secret or blob under the final name.
+        win32file.FlushFileBuffers(h)
     finally:
         win32file.CloseHandle(h)
 
 
 def _load_entropy_secret() -> "bytes | None":
+    """The entropy secret, or None when there is none. Stage 9 (F-108): an entropy file that exists
+    but cannot be read is logged with its real error instead of passing for "missing"."""
     try:
-        if ENTROPY_PATH.exists():
-            data = ENTROPY_PATH.read_bytes()
-            return data or None
-    except Exception:
-        pass
-    return None
+        data = ENTROPY_PATH.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log.warning("entropy secret %s unreadable: %r", ENTROPY_PATH.name, e)
+        return None
+    return data or None
+
+
+# Stage 9 (F-109): creating the secret and sealing the blob with it is one critical section across
+# processes (two first-time writers could otherwise each generate an entropy, and the survivor would
+# not open the blob sealed by the other).
+_CREDS_MUTEX = "Local\\FaceUnlockCredentials"
+
+
+class _NamedMutex:
+    def __init__(self, name: str):
+        self.name, self.h = name, None
+
+    def __enter__(self):
+        try:
+            import win32event  # type: ignore
+            self.h = win32event.CreateMutex(None, False, self.name)
+            win32event.WaitForSingleObject(self.h, 10000)
+        except Exception:
+            log.debug("credentials mutex unavailable", exc_info=True)
+            self.h = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.h is not None:
+            try:
+                import win32event  # type: ignore
+                win32event.ReleaseMutex(self.h)
+            except Exception:
+                pass
+            self.h = None
+        return False
 
 
 def _ensure_entropy_secret() -> bytes:
-    """Return the per-install entropy secret, generating + persisting it (locked DACL) if absent."""
+    """Return the per-install entropy secret, generating + persisting it (locked DACL) if absent.
+    Stage 9 (F-109): written like the blob -- locked temp file, flushed, renamed into place."""
     existing = _load_entropy_secret()
     if existing is not None:
         return existing
     secret = os.urandom(32)
-    _write_locked_file(ENTROPY_PATH, secret)
+    _atomic_write_bytes(ENTROPY_PATH, secret)
     return secret
 
 
@@ -137,11 +175,38 @@ def clear_password_rejected() -> None:
 
 def save_password(username: str, password: str, domain: str = ".") -> None:
     blob = json.dumps({"u": username, "p": password, "d": domain}).encode("utf-8")
-    secret = _ensure_entropy_secret()
-    enc = _V2_PREFIX + win32crypt.CryptProtectData(blob, "face-unlock", secret, None, None, 0)
-    CREDS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_bytes(CREDS_PATH, enc)
+    with _NamedMutex(_CREDS_MUTEX):
+        secret = _ensure_entropy_secret()
+        enc = _V2_PREFIX + win32crypt.CryptProtectData(blob, "face-unlock", secret, None, None, 0)
+        CREDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_bytes(CREDS_PATH, enc)
     clear_password_rejected()        # a new password answers the lock screen's rejection
+
+
+def password_state() -> "tuple[str, str]":
+    """Stage 9 (F-108): ``("none", "")`` -- nothing stored; ``("unreadable", why)`` -- a blob exists
+    but this account cannot open it (DPAPI key lost after a password reset, a profile restored on
+    another PC, a damaged file, an entropy mismatch, an old v1 blob); ``("ok", user)``. The dialog
+    and the wizard's readiness check use this; the unlock path keeps load_password's None."""
+    if not CREDS_PATH.exists():
+        return "none", ""
+    try:
+        enc = CREDS_PATH.read_bytes()
+    except OSError as e:
+        return "unreadable", f"read failed ({e.__class__.__name__})"
+    if not enc.startswith(_V2_PREFIX):
+        return "unreadable", "old format"
+    secret = _load_entropy_secret()
+    if secret is None:
+        return "unreadable", "entropy missing"
+    try:
+        _, data = win32crypt.CryptUnprotectData(enc[len(_V2_PREFIX):], secret, None, None, 0)
+        rec = json.loads(data.decode("utf-8"))
+    except Exception as e:
+        return "unreadable", f"cannot decrypt ({getattr(e, 'winerror', '') or e.__class__.__name__})"
+    if not isinstance(rec, dict) or not rec.get("u"):
+        return "unreadable", "damaged"
+    return "ok", str(rec["u"])
 
 
 def load_password() -> "dict | None":

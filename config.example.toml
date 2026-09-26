@@ -156,15 +156,16 @@ presence_input_idle_s = 45.0     # keyboard/mouse activity newer than this ends 
 
 # --- Notifications -----------------------------------------------------------
 
-notify_enroll = true             # toast on enrollment success / failure
 notify_lockout = true            # toast when a face lockout starts
 notify_service_state = false     # toast when the service becomes (un)reachable
+update_check = true              # look for a newer release in the background, at
+                                 # most once a day (the menu item always works)
 
 # --- Interface ---------------------------------------------------------------
 
-language = "en"                  # UI language code. Default: auto-detected from
-                                 # the system locale on first run. Supported:
-                                 # ar de en es fr hi ja ko pt ru vi zh
+language = "en"                  # "en" or "ru". Default: the Windows display
+                                 # language on first run. The codes ar de es fr
+                                 # hi ja ko pt vi zh are accepted and show English.
 
 # --- Diagnostics -------------------------------------------------------------
 

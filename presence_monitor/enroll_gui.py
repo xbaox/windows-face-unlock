@@ -1,158 +1,134 @@
-"""Enrollment wizard — live camera preview, auto-capture, build embeddings.
+"""The face setup wizard -- camera preview, capture, build, turn calibration, readiness check.
 
-Replaces the old ``python -m tools.enroll capture`` console flow. Runs as
-its OWN process (``python -m presence_monitor.enroll_gui``), spawned by the
-tray; see ``main()`` at the bottom for why that matters.
+Runs as its OWN process (``python -m presence_monitor.enroll_gui`` in a checkout, the tray exe with
+``--enroll`` when installed; started by the tray and by the installer's Finish page). Owning a
+process is what makes a wedged camera read harmless: closing the window ends the process, and the
+OS takes the device back whatever state the native call is in (KNOWN_ISSUES #1).
 
-Flow
-----
-0. Wait (off the Tk thread, up to SERVICE_WAIT_S) for the FaceService pipe
-   to answer a ping. Launched from the installer's Finish page, the wizard
-   comes up seconds after the service task was started, and the service
-   opens its pipe only after model warmup.
-1. ``pause_camera`` on the FaceService so we own the webcam, re-armed
-   periodically for as long as the window lives.
-2. Open the camera in a background thread and publish BGR frames.
-3. Render each frame with a green box around detected faces (YuNet).
-4. When capture is armed and a face has been visible long enough, save
-   the frame as JPG into ``ENROLL_DIR`` and increment the counter.
-5. When the user hits "Build", call ``build_enrollment`` on the service
-   which runs the ONNX/InsightFace engine (buffalo_l, ArcFace embeddings)
-   and writes ``embeddings.npz``.
-6. On close, always ``resume_camera`` so probes come back on.
+Stage 9 (act 9b R12) rebuilt it around four rules:
+
+* **Threads never touch Tk.** The camera, the service calls and the readiness check run as plain
+  functions on worker threads that hold only a queue and plain data (``Session``). They post
+  messages; the Tk thread drains the queue with ``after`` and is the only one that touches a
+  widget. Only the newest preview frame is drawn.
+* **Honest flow.** The first text says what to do ("press Start"); Start is enabled only when the
+  service answers AND the camera has delivered a usable frame; a service that does not answer or a
+  camera that does not open says so, with a Retry button, and the wait goes on in the background
+  (F-177, F-178, F-179). The shot counter and the pose instruction have their own row (F-181).
+* **The camera lease only while it is needed** (R10): the wizard asks the service for the camera
+  when capture starts, keeps it through the build and the calibration, and gives it back right
+  after -- not for as long as the window is open (F-180).
+* **A real end state.** After the build the wizard offers the head-turn calibration (R6, F-117),
+  then checks what face sign-in needs -- a readable stored password the lock screen has not
+  rejected, a secure data folder, the service seeing the new face profile, the camera given back
+  -- and shows each with a button to fix it (F-180).
+
+Also: pick the camera by device name (R10, F-141); Replace / Add is a dialog with those words on
+its buttons (F-202); an unbuilt Replace session asks before it is thrown away, and a stale one is
+removed at start (F-182); Close waits for a running build (F-185); Delete is off while capturing
+(F-186); after a build the next Start asks the mode again (F-187); the build timeout follows the
+number of shots (F-190); one wizard at a time -- a second start brings this window to the front
+(F-189).
 """
 from __future__ import annotations
+
 import logging
 import os
+import queue
 import threading
 import time
 import tkinter as tk
-from pathlib import Path
-from tkinter import ttk, messagebox
-from typing import Callable, NamedTuple
+from tkinter import messagebox, ttk
+from typing import NamedTuple
 
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 
-from face_service.config import (ENROLL_DIR, ENROLL_PENDING_DIR, EMBED_PATH,
+from face_service import imio
+from face_service.config import (CALIBRATION_DIR, EMBED_PATH, ENROLL_DIR, ENROLL_PENDING_DIR,
                                  WATCHDOG_PAUSE_PATH, Config)
 from face_service.detector import FaceDetector
-from face_service import imio
 from face_service.enroll_qc import frame_quality, qc_reasons
 from face_service.i18n import set_language, t
 
 from .monitor import pipe_call
-from .widgets import InfoButton, Tooltip, attach_tooltip
+from .widgets import attach_tooltip
 
-# Explicit name, NOT __name__: this module is also the process entry point, and under
-# `python -m presence_monitor.enroll_gui` __name__ is "__main__" -- which would label every line
-# in enroll.log as "__main__" and make it ungreppable against the tray's own logs. Pinning the
-# canonical dotted name keeps records identical whether the module is imported or run.
+# Explicit name, NOT __name__: under `python -m presence_monitor.enroll_gui` __name__ is "__main__".
 log = logging.getLogger("presence_monitor.enroll_gui")
 
+ENROLL_MUTEX = "Local\\FaceUnlockEnroll"
 PREVIEW_W = 480
 PREVIEW_H = 360
-CAPTURE_COOLDOWN_S = 1.0    # min gap between auto captures
-FACE_STABLE_FRAMES = 3      # face must be seen this many frames before arming capture
-DETECT_EVERY_N_FRAMES = 2   # YuNet is fast but skipping halves CPU
-CAMERA_LEASE_S = 120        # ask the service to hand the camera over for this long. SHORT on
-                            # purpose, and only workable because of the renewal below: the lease
-                            # is the sole thing keeping the service off the webcam, and nothing
-                            # cancels it if this wizard dies without sending resume_camera. So it
-                            # doubles as the worst-case hostage window -- a dead wizard gives the
-                            # camera back within CAMERA_LEASE_S, while a live one just keeps
-                            # re-arming. The old 300 was five minutes of blindness for that case.
-LEASE_RENEW_S = 45          # re-arm interval. Comfortably under CAMERA_LEASE_S so two renewals
-                            # in a row can fail before the lease actually lapses.
-SERVICE_WAIT_S = 90.0       # how long the wizard waits for the service pipe before asking for the
-                            # lease. The installer's Finish page starts the wizard a few seconds
-                            # after register_tasks started FaceUnlock-Service, and the service only
-                            # opens its pipe once model + camera warmup are done -- a single 3 s
-                            # attempt used to lose that race and leave a dead preview.
-SERVICE_PING_S = 3.0        # budget per ping attempt inside that wait (pipe_call retries the
-                            # connect for this long, then logs one "pipe not available" line)
-CAMERA_READ_TIMEOUT_MS = 1000  # open/read timeout hint; only MSMF honors it, and NOT on
-                               # this hardware -- kept as cross-HW insurance only
-                               # (wizard-local; NOT one of the service camera_* knobs)
+CAPTURE_COOLDOWN_S = 1.0    # min gap between captures
+FACE_STABLE_FRAMES = 3      # a face must be seen this many frames in a row before a capture
+DETECT_EVERY_N_FRAMES = 2   # YuNet is fast, but every other frame is enough to feel live
+CAMERA_LEASE_S = 120        # the lease asked of the service; renewed while it is needed
+LEASE_RENEW_S = 45
+SERVICE_WAIT_S = 60.0       # after this the wizard SAYS the service is not answering (it keeps trying)
+SERVICE_PING_S = 3.0
+CAMERA_READ_TIMEOUT_MS = 1000
+COUNT_MIN, COUNT_MAX, COUNT_DEFAULT = 5, 40, 15
+BLACK_LUMA = 8.0            # a first frame at or below this is not "usable" yet
+CALIB_SHOTS = 3
+CALIB_TURN_WAIT_S = 2.5
 
-# ---- Framing coach (wizard UX only -- NOT recognition or QC numbers) ----
-# These shape the on-screen advice and the FRAMING half of the capture gate.
-# The QUALITY half (sharpness / exposure) is delegated to face_service.enroll_qc
-# so the wizard and the build step judge a frame with ONE set of thresholds;
-# nothing below is a matching, liveness or QC constant.
-COACH_AREA_MIN_FRAC = 0.06     # face box smaller than this share of the frame -> "closer"
-COACH_AREA_MAX_FRAC = 0.38     # larger -> "move back"
-COACH_OFFSET_MAX_FRAC = 0.18   # box centre may sit this far off the frame centre
-COACH_FACE_ASPECT = 0.8        # nominal face w/h, used only to draw the guide oval
+# ---- framing coach (wizard UX only -- not recognition, liveness or QC numbers) ----
+COACH_AREA_MIN_FRAC = 0.06
+COACH_AREA_MAX_FRAC = 0.38
+COACH_OFFSET_MAX_FRAC = 0.18
+COACH_FACE_ASPECT = 0.8
 
-# ---- Pose coach (Stage 8b, D-17 / act A-5): UX thresholds, WARNING ONLY ----
-# Defect: the coach judged framing and image quality only, and said "Good -- hold still" to a
-# face tilted down by 19 degrees (7l). Consequence: a whole enrollment session was captured at an
-# angle the lock screen never sees, and the gallery drifted away from the daily pose (d_july ~0.2).
-# Fix: the service reports the median pitch / yaw of the accepted frames of a build (the
-# landmark_3d_68 pose, the same measure as 7l gallery-diag.txt), and the wizard warns when the
-# session is pitched below POSE_PITCH_WARN_DEG or turned beyond POSE_YAW_WARN_DEG. Calibrated on
-# gallery-diag: every July frame has pitch -8.8..-13.8 (no warning), every September frame
-# -16.5..-24.1 (warning); |yaw| <= 9.4 throughout. Frame acceptance (QC) is unchanged: this is
-# advice, never a gate. Not a recognition, liveness or QC number.
+# ---- pose advice after a build (Stage 8b D-17): a WARNING, never a gate ----
 POSE_PITCH_WARN_DEG = -15.0
 POSE_YAW_WARN_DEG = 15.0
 
 
 def pose_warning(pitch: float, yaw: float) -> bool:
-    """True when this pose should be warned about (see the thresholds above)."""
     return pitch < POSE_PITCH_WARN_DEG or abs(yaw) > POSE_YAW_WARN_DEG
 
 
-# On-screen guide oval, in PREVIEW pixels. Sized to the midpoint of the accepted
-# area band so "fill the oval" and the area gate agree by construction.
 _GUIDE_AREA_PX = (COACH_AREA_MIN_FRAC + COACH_AREA_MAX_FRAC) / 2 * PREVIEW_W * PREVIEW_H
 _GUIDE_AXIS_Y = int((_GUIDE_AREA_PX / COACH_FACE_ASPECT) ** 0.5) // 2
 _GUIDE_AXIS_X = int(_GUIDE_AXIS_Y * COACH_FACE_ASPECT)
-
-# Coach level -> named ttk style (see _init_styles) and preview box colour (BGR).
-_COACH_STYLE = {
-    "ok": "Coach.Ok.TLabel",
-    "warn": "Coach.Warn.TLabel",
-    "err": "Coach.Err.TLabel",
-}
 _COACH_BGR = {"ok": (60, 190, 90), "warn": (40, 170, 235), "err": (60, 60, 210)}
+_COACH_FG = {"ok": "#1e7a3c", "warn": "#8a5a00", "err": "#b3261e", "info": "#222222"}
 
-# enroll_qc token -> i18n key. Tokens embed the live threshold (``blur<80``), so
-# only the head before the comparison operator is matched.
 _REASON_KEY_BY_TOKEN = {
-    "det": "enroll.reason.det",
-    "blur": "enroll.reason.blur",
-    "dark": "enroll.reason.dark",
-    "bright": "enroll.reason.bright",
-    "no-face": "enroll.reason.no_face",
-    "unreadable": "enroll.reason.unreadable",
-    "crop-failed": "enroll.reason.crop_failed",
+    "det": "enroll.reason.det", "blur": "enroll.reason.blur", "dark": "enroll.reason.dark",
+    "bright": "enroll.reason.bright", "no-face": "enroll.reason.no_face",
+    "unreadable": "enroll.reason.unreadable", "crop-failed": "enroll.reason.crop_failed",
 }
-# Quality advice, in the order the coach reports it (exposure before focus).
-_COACH_KEY_BY_TOKEN = {
-    "dark": "enroll.coach.dark",
-    "bright": "enroll.coach.bright",
-    "blur": "enroll.coach.blur",
-}
+_COACH_KEY_BY_TOKEN = {"dark": "enroll.coach.dark", "bright": "enroll.coach.bright",
+                       "blur": "enroll.coach.blur"}
 
 
-def _count_enroll_images(directory=None) -> int:
+def count_images(directory=None) -> int:
     try:
-        return sum(
-            1 for p in (directory or ENROLL_DIR).iterdir()
-            if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        )
+        return sum(1 for p in (directory or ENROLL_DIR).iterdir()
+                   if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})
     except FileNotFoundError:
         return 0
 
 
+def clamp_count(raw) -> int:
+    """F-184: the shot count is 5..40 however it was typed."""
+    try:
+        v = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return COUNT_DEFAULT
+    return max(COUNT_MIN, min(COUNT_MAX, v))
+
+
+def build_timeout_s(n_images: int) -> float:
+    """F-190: the first build may load the engine on a CPU; allow for it and for every shot."""
+    return float(min(600, 90 + 6 * max(0, n_images)))
+
+
 def _pause_watchdog(ttl_s: float) -> "float | None":
-    """Stage 8b (F-30). Defect: the watchdog counts a busy pipe as a failed ping, and the build
-    holds the sequential server for up to the 120 s build call. Consequence: a long build could be cut
-    short by a watchdog restart mid-build. Fix: the wizard drops the STANDARD self-expiring pause
-    (the one the service writes on a deliberate shutdown, TTL watchdog_pause_ttl_s) for the length
-    of the build. Returns the marker's creation time, so only this marker is cleared afterwards."""
+    """Stage 8b (F-30): the build holds the sequential server; the watchdog would read that as a
+    hang. A standard self-expiring pause marker covers the build; its creation time identifies it."""
     try:
         from face_service.watchdog import write_pause
         now = time.time()
@@ -164,8 +140,6 @@ def _pause_watchdog(ttl_s: float) -> "float | None":
 
 
 def _resume_watchdog(created: "float | None") -> None:
-    """Clear the pause written by _pause_watchdog -- and only that one: a marker with another
-    creation time belongs to someone else (a deliberate shutdown meanwhile) and is left alone."""
     if created is None:
         return
     try:
@@ -180,46 +154,7 @@ def _resume_watchdog(created: "float | None") -> None:
         log.exception("could not clear the build's watchdog pause (it self-expires)")
 
 
-def _has_embeddings() -> bool:
-    return EMBED_PATH.exists()
-
-
-class CoachState(NamedTuple):
-    """One frame's verdict: what to tell the user, and whether it may be saved."""
-    key: str      # i18n key for the guidance line
-    ok: bool      # True == this frame passes the live capture gate
-    level: str    # "ok" | "warn" | "err" -> style + preview box colour
-
-
-class _YuNetFace:
-    """Adapt a YuNet row to the InsightFace shape ``enroll_qc`` expects.
-
-    ``enroll_qc.frame_quality`` reads ``.bbox``, ``.kps`` and ``.det_score`` off
-    an InsightFace face. YuNet hands back a flat 15-float row whose box is
-    (x, y, w, h) where InsightFace uses (x1, y1, x2, y2), so the conversion
-    lives here -- enroll_qc itself is used strictly read-only.
-    """
-    __slots__ = ("bbox", "kps", "det_score")
-
-    def __init__(self, row):
-        import numpy as np
-        x, y, w, h = (float(v) for v in row[0:4])
-        self.bbox = np.array([x, y, x + w, y + h], dtype=np.float32)
-        pts = np.asarray(row[4:14], dtype=np.float32).reshape(5, 2)
-        # norm_crop's reference landmarks put the IMAGE-left eye first, then the
-        # image-right one (same for the mouth corners). YuNet names its pair from
-        # the SUBJECT's point of view, which is the mirror of that, so sort each
-        # pair by x rather than trusting the column order -- a swapped pair
-        # silently mirrors the aligned crop and skews the numbers we compare
-        # against the build step.
-        eyes = pts[0:2][np.argsort(pts[0:2, 0])]
-        mouth = pts[3:5][np.argsort(pts[3:5, 0])]
-        self.kps = np.stack([eyes[0], eyes[1], pts[2], mouth[0], mouth[1]])
-        self.det_score = float(row[14])
-
-
 def _token_head(tok: str) -> str:
-    """``blur<80`` -> ``blur``; ``no-face`` -> ``no-face``."""
     for sep in ("<", ">"):
         i = tok.find(sep)
         if i > 0:
@@ -227,25 +162,15 @@ def _token_head(tok: str) -> str:
     return tok
 
 
-def _humanize_reason(reason: str) -> str | None:
-    """Localise the service's QC rejection summary, or None if unrecognised.
-
-    The service's ``reason`` format is frozen, so it is parsed here rather than
-    changed there. It reads:
-
-        "enrollment rejected: only 1 of 15 image(s) passed quality control
-         (need >= 3). Dropped: blur<80 x2, no-face x1. Re-capture with ..."
-
-    Returning None (rather than a partial translation) on ANY unknown token lets
-    the caller fall back to the raw string, so a reason we cannot parse is still
-    shown to the user instead of being swallowed.
-    """
+def humanize_reason(reason: str) -> "str | None":
+    """Localise the service's QC rejection summary ("... Dropped: blur<80 x2, no-face x1. ..."),
+    or None when a token is unknown (the caller then shows the raw text)."""
     marker = "Dropped:"
     i = reason.find(marker)
     if i < 0:
         return None
     tail = reason[i + len(marker):].strip()
-    end = tail.find(". ")          # summarize_rejections output ends here
+    end = tail.find(". ")
     if end >= 0:
         tail = tail[:end]
     parts: list[str] = []
@@ -256,948 +181,925 @@ def _humanize_reason(reason: str) -> str | None:
         tok, _, count = item.partition(" x")
         key = _REASON_KEY_BY_TOKEN.get(_token_head(tok.strip()))
         if key is None:
-            return None            # unknown token -> caller shows the raw text
+            return None
         count = count.strip()
         parts.append(f"{t(key)} ×{count}" if count else t(key))
     return ", ".join(parts) or None
 
 
+class CoachState(NamedTuple):
+    key: str      # i18n key for the guidance line
+    ok: bool      # the frame passes the live capture gate
+    level: str    # "ok" | "warn" | "err"
+
+
+class _YuNetFace:
+    """A YuNet row in the InsightFace shape ``enroll_qc`` reads (.bbox x1y1x2y2, .kps, .det_score)."""
+    __slots__ = ("bbox", "kps", "det_score")
+
+    def __init__(self, row):
+        x, y, w, h = (float(v) for v in row[0:4])
+        self.bbox = np.array([x, y, x + w, y + h], dtype=np.float32)
+        pts = np.asarray(row[4:14], dtype=np.float32).reshape(5, 2)
+        eyes = pts[0:2][np.argsort(pts[0:2, 0])]
+        mouth = pts[3:5][np.argsort(pts[3:5, 0])]
+        self.kps = np.stack([eyes[0], eyes[1], pts[2], mouth[0], mouth[1]])
+        self.det_score = float(row[14])
+
+
+def evaluate_coach(frame, rows, cfg, detector_unavailable: bool = False) -> CoachState:
+    """Grade one frame: no face -> framing -> quality -> ready. Pure except for enroll_qc."""
+    if not rows:
+        if detector_unavailable:
+            return CoachState("enroll.coach.detector_unavailable", False, "err")
+        return CoachState("enroll.status.waiting", False, "err")
+    row = max(rows, key=lambda r: float(r[2]) * float(r[3]))
+    fh, fw = frame.shape[:2]
+    x, y, w, h = (float(v) for v in row[0:4])
+    area = (w * h) / float(fw * fh)
+    if area < COACH_AREA_MIN_FRAC:
+        return CoachState("enroll.coach.closer", False, "warn")
+    if area > COACH_AREA_MAX_FRAC:
+        return CoachState("enroll.coach.farther", False, "warn")
+    if (abs((x + w / 2) - fw / 2) / fw > COACH_OFFSET_MAX_FRAC
+            or abs((y + h / 2) - fh / 2) / fh > COACH_OFFSET_MAX_FRAC):
+        return CoachState("enroll.coach.center", False, "warn")
+    try:
+        q = frame_quality(frame, _YuNetFace(row))
+    except Exception as e:
+        log.debug("live quality failed: %s", e)
+        q = None
+    if q is None:
+        return CoachState("enroll.status.waiting", False, "err")
+    heads = {_token_head(r) for r in qc_reasons(q, cfg)} - {"det"}
+    for tok in ("dark", "bright", "blur"):
+        if tok in heads:
+            return CoachState(_COACH_KEY_BY_TOKEN[tok], False, "warn")
+    return CoachState("enroll.status.ready", True, "ok")
+
+
+def annotate(bgr, faces, level: str):
+    colour = _COACH_BGR.get(level, _COACH_BGR["warn"])
+    img = bgr.copy()
+    for row in faces:
+        x, y, w, h = (int(v) for v in row[0:4])
+        cv2.rectangle(img, (x, y), (x + w, y + h), colour, 3)
+    img = cv2.flip(img, 1)
+    h0, w0 = img.shape[:2]
+    scale = min(PREVIEW_W / w0, PREVIEW_H / h0)
+    nw, nh = int(w0 * scale), int(h0 * scale)
+    img = cv2.resize(img, (nw, nh))
+    canvas = np.zeros((PREVIEW_H, PREVIEW_W, 3), dtype=img.dtype)
+    ox, oy = (PREVIEW_W - nw) // 2, (PREVIEW_H - nh) // 2
+    canvas[oy:oy + nh, ox:ox + nw] = img
+    cv2.ellipse(canvas, (PREVIEW_W // 2, PREVIEW_H // 2), (_GUIDE_AXIS_X, _GUIDE_AXIS_Y),
+                0, 0, 360, colour, 2)
+    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+
+# ---------------------------------------------------------------------------------------------
+# Worker side: plain data + a queue. Nothing below touches Tk.
+# ---------------------------------------------------------------------------------------------
+
+class Session:
+    """State shared between the Tk thread and the camera worker. Plain Python, one lock."""
+
+    def __init__(self, cfg: Config, camera_name: str):
+        self.cfg = cfg
+        self.camera_name = camera_name
+        self.stop = threading.Event()
+        self.armed = threading.Event()
+        self.lock = threading.Lock()
+        self.capture_dir = ENROLL_DIR
+        self.target = COUNT_DEFAULT
+        self.captured = 0
+        self.calib: "tuple[str, int] | None" = None     # ("frontal"|"left", shots still wanted)
+        self.calib_names: dict = {"frontal": [], "left": []}
+
+
+def _open_capture(cfg: Config, camera_name: str):
+    """Open the configured camera: by NAME on DSHOW only (R10); an empty name is the legacy index
+    path. Returns (cap, None) or (None, reason) with reason "not-found" | "open-failed"."""
+    index, backends = cfg.camera_index, (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY)
+    name = (camera_name or "").strip()
+    if name:
+        from face_service.camera_devices import resolve_index
+        index = resolve_index(name)
+        if index is None:
+            log.warning("enroll camera %r is not connected", name)
+            return None, "not-found"
+        backends = (cv2.CAP_DSHOW,)
+    for backend in backends:
+        cap = cv2.VideoCapture(index, backend)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        try:
+            fcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+            log.info("enroll camera open: device=%s index=%s backend=%s %dx%d fps=%.1f fourcc=%s",
+                     repr(name) if name else "(by index)", index, backend,
+                     int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                     float(cap.get(cv2.CAP_PROP_FPS)),
+                     "".join(chr((fcc >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00") or "?")
+        except Exception:
+            log.debug("enroll camera format query failed", exc_info=True)
+        for prop_name in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
+            prop = getattr(cv2, prop_name, None)
+            if prop is not None:
+                cap.set(prop, CAMERA_READ_TIMEOUT_MS)
+        return cap, None
+    return None, "open-failed"
+
+
+def camera_worker(s: Session, q: "queue.Queue") -> None:
+    """Preview + capture + calibration shots. Posts: ("camera", "failed", reason),
+    ("frame", rgb), ("first_frame",), ("coach", CoachState), ("captured", n),
+    ("done_capture", n), ("calib_shots", phase, names)."""
+    cap, why = _open_capture(s.cfg, s.camera_name)
+    if cap is None:
+        q.put(("camera_failed", why))
+        return
+    detector = FaceDetector()
+    try:
+        import importlib
+        importlib.import_module("insightface.utils.face_align")   # warm the one-off import
+    except Exception:
+        pass
+    frame_idx = 0
+    faces: list = []
+    coach = CoachState("enroll.status.waiting", False, "err")
+    last_coach = None
+    streak = 0
+    last_capture = 0.0
+    first = False
+    try:
+        while not s.stop.is_set():
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                time.sleep(0.05)
+                continue
+            frame_idx += 1
+            if not first and float(frame.mean()) > BLACK_LUMA:
+                first = True
+                q.put(("first_frame",))
+            measured = frame_idx % DETECT_EVERY_N_FRAMES == 0
+            if measured:
+                try:
+                    h, w = frame.shape[:2]
+                    det = detector._ensure(w, h)  # type: ignore[attr-defined]
+                    _, res = det.detect(frame) if det is not None else (None, None)
+                    faces = list(res) if res is not None else []
+                except Exception as e:
+                    log.debug("detect failed: %s", e)
+                    faces = []
+                coach = evaluate_coach(frame, faces, s.cfg, bool(getattr(detector, "unavailable", False)))
+                streak = streak + 1 if faces else 0
+            if coach.key != last_coach:
+                last_coach = coach.key
+                q.put(("coach", coach))
+            now = time.time()
+            if measured and coach.ok and streak >= FACE_STABLE_FRAMES and now - last_capture >= CAPTURE_COOLDOWN_S:
+                with s.lock:
+                    calib = s.calib
+                if calib is not None:
+                    phase, left = calib
+                    name = f"{phase}_{int(now * 1000)}.png"
+                    CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
+                    if imio.imwrite(CALIBRATION_DIR / name, frame):
+                        last_capture = now
+                        with s.lock:
+                            s.calib_names[phase].append(name)
+                            s.calib = (phase, left - 1) if left > 1 else None
+                        if left <= 1:
+                            q.put(("calib_shots", phase, list(s.calib_names[phase])))
+                elif s.armed.is_set():
+                    with s.lock:
+                        target, d = s.target, s.capture_dir
+                    try:
+                        d.mkdir(parents=True, exist_ok=True)
+                        path = d / f"enroll_{int(now * 1000)}.jpg"
+                        if imio.imwrite(path, frame):      # R8: checked, Unicode-safe
+                            last_capture = now
+                            with s.lock:
+                                s.captured += 1
+                                n = s.captured
+                                done = n >= target
+                            log.info("enroll: saved %s (%d/%d)", path.name, n, target)
+                            q.put(("captured", n))
+                            if done:
+                                s.armed.clear()
+                                q.put(("done_capture", n))
+                        else:
+                            log.error("enroll: could not save %s -- not counted", path.name)
+                    except Exception:
+                        log.exception("failed to save an enrollment shot")
+            q.put(("frame", annotate(frame, faces, coach.level)))
+            time.sleep(0.03)
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            log.exception("enroll camera release failed")
+
+
+def service_wait_worker(stop: threading.Event, q: "queue.Queue") -> None:
+    """Ping until the service answers; says "late" once after SERVICE_WAIT_S and keeps trying."""
+    t0 = time.monotonic()
+    late = False
+    while not stop.is_set():
+        resp = pipe_call({"cmd": "ping"}, timeout_s=SERVICE_PING_S)
+        if resp and resp.get("ok"):
+            q.put(("service", "ready", resp.get("state"), resp.get("why")))
+            return
+        if not late and time.monotonic() - t0 >= SERVICE_WAIT_S:
+            late = True
+            q.put(("service", "late", None, None))
+        stop.wait(2.0)
+
+
+class LeaseKeeper:
+    """The camera lease, held only while capture / build / calibration need it (R10)."""
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self.held = False
+
+    def acquire(self) -> bool:
+        resp = pipe_call({"cmd": "pause_camera", "seconds": CAMERA_LEASE_S}, timeout_s=5.0)
+        if not (resp and resp.get("ok")):
+            log.warning("camera lease refused: %s", resp)
+            return False
+        self.held = True
+        self._stop.clear()
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._renew, name="enroll-lease", daemon=True)
+            self._thread.start()
+        return True
+
+    def _renew(self) -> None:
+        while not self._stop.wait(LEASE_RENEW_S):
+            resp = pipe_call({"cmd": "pause_camera", "seconds": CAMERA_LEASE_S}, timeout_s=5.0)
+            if not (resp and resp.get("ok")):
+                log.warning("camera lease renewal failed: %s", resp)
+
+    def release(self) -> None:
+        self._stop.set()
+        if self.held:
+            self.held = False
+            for _ in range(3):              # F-185: a busy server may need a second try
+                resp = pipe_call({"cmd": "resume_camera"}, timeout_s=5.0)
+                if resp and resp.get("ok"):
+                    return
+                time.sleep(1.0)
+            log.warning("resume_camera was not confirmed; the lease lapses by itself")
+
+
+def build_worker(q: "queue.Queue", req: dict, timeout_s: float, pause_ttl: float) -> None:
+    paused = _pause_watchdog(pause_ttl)
+    try:
+        resp = pipe_call(req, timeout_s=timeout_s)
+    finally:
+        _resume_watchdog(paused)
+    q.put(("built", resp))
+
+
+def calibrate_worker(q: "queue.Queue", frontal: list, left: list) -> None:
+    q.put(("calibrated", pipe_call({"cmd": "calibrate_turn", "frontal": frontal, "left": left},
+                                   timeout_s=30.0)))
+
+
+def readiness_worker(q: "queue.Queue", lease_released: bool) -> None:
+    """F-180: what face sign-in needs, checked for real."""
+    from face_service.credentials import password_state
+    status = pipe_call({"cmd": "status"}, timeout_s=5.0) or {}
+    try:
+        pwd, _info = password_state()
+    except Exception:
+        pwd = "unreadable"
+    ok = bool(status.get("ok"))
+    checks = {
+        "service": ok and status.get("state") == "serving",
+        "custody": ok and bool(status.get("data_dir_secure")),
+        "enrollment": ok and bool(status.get("enrollment")),
+        "password": pwd == "ok" and not status.get("password_rejected"),
+        "camera": lease_released,
+    }
+    q.put(("readiness", checks, pwd, bool(status.get("password_rejected"))))
+
+
+def release_and_check_worker(q: "queue.Queue", lease: LeaseKeeper) -> None:
+    """Give the camera back, then run the readiness check (worker: the lease and the queue only)."""
+    lease.release()
+    readiness_worker(q, not lease.held)
+
+
+def camera_worker_after(prev: "threading.Thread | None", s: Session, q: "queue.Queue") -> None:
+    """Start the preview only once the previous camera thread has let the device go."""
+    if prev is not None and prev.is_alive():
+        prev.join(timeout=5.0)
+    camera_worker(s, q)
+
+
+def wipe_worker(q: "queue.Queue") -> None:
+    q.put(("wiped", pipe_call({"cmd": "clear_enrollment"}, timeout_s=30.0)))
+
+
+def save_camera_worker(q: "queue.Queue", name: str) -> None:
+    try:
+        cfg = Config.load()
+        cfg.camera_name = name
+        cfg.validate()
+        cfg.save(keys=["camera_name"])
+        pipe_call({"cmd": "reload_config"}, timeout_s=5.0)
+    except Exception:
+        log.exception("saving the camera choice failed")
+
+
+# ---------------------------------------------------------------------------------------------
+# Tk side
+# ---------------------------------------------------------------------------------------------
+
+def ask_mode(parent) -> "str | None":
+    """F-202: Replace / Add / Cancel with those words on the buttons (never Yes/No/Cancel)."""
+    result: dict = {"v": None}
+    top = tk.Toplevel(parent)
+    top.title(t("enroll.confirm.mode.title"))
+    top.transient(parent)
+    top.resizable(False, False)
+    frm = ttk.Frame(top, padding=14)
+    frm.pack(fill="both", expand=True)
+    ttk.Label(frm, text=t("enroll.confirm.mode.body"), wraplength=420, justify="left").pack(
+        anchor="w", pady=(0, 12))
+    btns = ttk.Frame(frm)
+    btns.pack(anchor="e")
+
+    def choose(v):
+        result["v"] = v
+        top.destroy()
+    b = ttk.Button(btns, text=t("enroll.mode.replace"), command=lambda: choose("replace"))
+    b.pack(side="left", padx=4)
+    ttk.Button(btns, text=t("enroll.mode.add"), command=lambda: choose("add")).pack(side="left", padx=4)
+    ttk.Button(btns, text=t("enroll.btn.cancel"), command=lambda: choose(None)).pack(side="left", padx=4)
+    top.bind("<Escape>", lambda _e: choose(None))
+    top.bind("<Return>", lambda _e: choose("replace"))
+    b.focus_set()
+    top.grab_set()
+    parent.wait_window(top)
+    return result["v"]
+
+
+def ask_unbuilt(parent, n: int) -> "str | None":
+    """F-182: an unbuilt Replace session on Close -- Build / Discard / Cancel."""
+    result: dict = {"v": None}
+    top = tk.Toplevel(parent)
+    top.title(t("enroll.unbuilt.title"))
+    top.transient(parent)
+    frm = ttk.Frame(top, padding=14)
+    frm.pack(fill="both", expand=True)
+    ttk.Label(frm, text=t("enroll.unbuilt.body", n=n), wraplength=420, justify="left").pack(
+        anchor="w", pady=(0, 12))
+    btns = ttk.Frame(frm)
+    btns.pack(anchor="e")
+
+    def choose(v):
+        result["v"] = v
+        top.destroy()
+    b = ttk.Button(btns, text=t("enroll.btn.build"), command=lambda: choose("build"))
+    b.pack(side="left", padx=4)
+    ttk.Button(btns, text=t("enroll.unbuilt.discard"), command=lambda: choose("discard")).pack(side="left", padx=4)
+    ttk.Button(btns, text=t("enroll.btn.cancel"), command=lambda: choose(None)).pack(side="left", padx=4)
+    top.bind("<Escape>", lambda _e: choose(None))
+    b.focus_set()
+    top.grab_set()
+    parent.wait_window(top)
+    return result["v"]
+
+
 class EnrollWindow:
     def __init__(self):
+        from .ui import apply_scaling
         self.root = tk.Tk()
         self.root.title(t("enroll.title"))
-        self.root.geometry(f"{PREVIEW_W + 60}x{PREVIEW_H + 320}")
+        apply_scaling(self.root)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.q: "queue.Queue" = queue.Queue()
+        self.cfg = Config.load()
+        self.session: "Session | None" = None
+        self.cam_thread: "threading.Thread | None" = None
+        self.lease = LeaseKeeper()
+        self.stop_all = threading.Event()
+        self.service_ready = False
+        self.refusing: "str | None" = None
+        self.camera_ok = False
+        self.building = False
+        self.calibrating = False
+        self.mode: "str | None" = None
+        self.devices: list = []
+        self._tk_image = None
 
-        self.detector = FaceDetector()
-        # Live QC thresholds, read once. The wizard only READS these; the gate
-        # numbers themselves stay owned by Config/enroll_qc.
-        self._cfg = Config.load()
-        self._stop = threading.Event()
-        self._capture_armed = threading.Event()
-        self._cam_thread: threading.Thread | None = None
-        self._cap: cv2.VideoCapture | None = None
-        self._latest_tk_image: ImageTk.PhotoImage | None = None
-        self._face_streak = 0
-        self._last_capture_ts = 0.0
-        self._captured = 0
-        self._target = 15
-        self._building = False
-        self._coach = CoachState("enroll.status.waiting", False, "err")
-        self._last_coach_key: str | None = None
-        self._guide_pinned = False
-        # False until the lease is actually taken, which now happens AFTER the window is up (see
-        # _wait_for_service). _on_close keys the resume_camera on this, so closing the window
-        # while it is still connecting sends nothing.
-        self._lease_ok = False
-        # Stage 8b (F-12): "replace" | "add", chosen at the first Start when an enrollment already
-        # exists (None until then; a first-ever enrollment is simply "add"). Replace captures into
-        # ENROLL_PENDING_DIR and builds from there, so the old gallery survives until the new one
-        # has built.
-        self._mode: "str | None" = None
-        self._capture_dir = ENROLL_DIR
+        # A stale pending session (a tray Quit killed an earlier wizard mid-Replace) holds face
+        # images with no purpose -- removed before anything else (F-182).
+        try:
+            from face_service.datadir import remove_tree_no_follow
+            if ENROLL_PENDING_DIR.exists():
+                remove_tree_no_follow(ENROLL_PENDING_DIR)
+                log.info("removed a stale pending enrollment session")
+        except Exception:
+            log.exception("could not remove the stale pending session")
 
         self._build_ui()
-        self._refresh_existing_stats()
+        self._set_line(t("enroll.status.connecting"), "info")
+        self._refresh_buttons()
+        threading.Thread(target=service_wait_worker, args=(self.stop_all, self.q),
+                         name="enroll-service-wait", daemon=True).start()
+        self._load_devices()
+        self._start_camera()
+        self.root.after(33, self._drain)
 
-        # Wait for the service on a worker thread; the result comes back to the Tk thread through
-        # after(). The window is drawn and closable the whole time. Start stays disabled until
-        # then: arming capture with no preview would count nothing and explain nothing.
-        self._set_guide("enroll.status.connecting")
-        self.start_btn.configure(state="disabled")
-        self._wait_t0 = time.monotonic()
-        log.info("waiting for the Face Unlock service (up to %.0fs)", SERVICE_WAIT_S)
-        threading.Thread(
-            target=self._wait_for_service, name="enroll-service-wait", daemon=True
-        ).start()
-
-    def _wait_for_service(self) -> None:
-        """Worker thread: ping the service until it answers, SERVICE_WAIT_S passes, or we close.
-
-        Only ``pipe_call`` runs here -- no Tk object is touched off the window's thread. The
-        verdict is handed to ``_on_service_wait_done`` through ``after()``.
-        """
-        deadline = self._wait_t0 + SERVICE_WAIT_S
-        ready = False
-        while not self._stop.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            resp = pipe_call({"cmd": "ping"}, timeout_s=min(SERVICE_PING_S, remaining))
-            if resp and resp.get("ok"):
-                ready = True
-                break
-            # A connected-but-failed call returns at once; don't spin on it.
-            self._stop.wait(0.2)
-        if self._stop.is_set():
-            return   # window closed while connecting: no lease was taken, nothing to release
-        waited = time.monotonic() - self._wait_t0
-        try:
-            self.root.after(0, lambda: self._on_service_wait_done(ready, waited))
-        except (RuntimeError, tk.TclError):
-            pass
-
-    def _on_service_wait_done(self, ready: bool, waited: float) -> None:
-        """Tk thread: take the lease and start the preview -- or fall back as before."""
-        if self._stop.is_set():
-            return
-        if ready:
-            log.info("Face Unlock service answered after %.1fs", waited)
-        else:
-            # Timed out: fall through to the old single attempt, which fails the same way it
-            # always did (warning box + service_busy line) if the service really is not there.
-            log.warning("Face Unlock service did not answer within %.0fs", SERVICE_WAIT_S)
-        self._lease_ok = self._acquire_camera_lease()
-        # Stage 8b (F-49). Defect: Start was enabled unconditionally here, lease or not.
-        # Consequence: after a refused lease the user could "start" a session with no preview,
-        # which counted nothing and explained nothing. Fix: Start only with the lease.
-        if self._lease_ok:
-            try:
-                self.start_btn.configure(state="normal")
-            except (tk.TclError, AttributeError):
-                pass
-        if self._lease_ok:
-            log.info("camera lease acquired after %.1fs", time.monotonic() - self._wait_t0)
-            self._set_guide("enroll.guide.idle")
-            # Start the preview immediately so the user sees themselves.
-            self._cam_thread = threading.Thread(
-                target=self._camera_loop, name="enroll-camera", daemon=True
-            )
-            self._cam_thread.start()
-        else:
-            # Lease refused (camera owned by the service / another process): do
-            # NOT open a competing capture. Keep the blank preview frame and
-            # tell the user; the window still closes cleanly (no cam thread).
-            self._set_guide("enroll.error.service_busy")
-
-    # ---------------- UI ----------------
-
-    def _init_styles(self) -> None:
-        """Define NAMED ttk styles for this window only.
-
-        ``ttk.Style(self.root)`` is bound to OUR interpreter for the same reason
-        every Variable above carries ``master=``: several Tk roots live in this
-        process (tray Status/Settings/Help), and an unmastered Style would attach
-        to whichever root came up first. Every name is derived
-        ("Enroll.*"/"Coach.*") -- configuring a BARE class such as "TButton", or
-        calling ``theme_use``, would restyle the settings window too.
-        """
-        style = ttk.Style(self.root)
-        style.configure("Enroll.TButton", padding=(10, 5))
-        style.configure("Enroll.Guide.TLabel", font=("", 11, "bold"))
-        style.configure("Enroll.Hint.TLabel", foreground="#555555")
-        style.configure("Enroll.Count.TLabel", font=("", 10, "bold"))
-        # Coach line: one size up from the body text, colour carries the state.
-        for name, colour in (("Coach.Ok.TLabel", "#1e7a3c"),
-                             ("Coach.Warn.TLabel", "#8a5a00"),
-                             ("Coach.Err.TLabel", "#b3261e")):
-            style.configure(name, foreground=colour, font=("", 11, "bold"))
-
+    # ---- UI ----
     def _build_ui(self) -> None:
-        self._init_styles()
         frm = ttk.Frame(self.root, padding=10)
         frm.pack(fill="both", expand=True)
+        cam_row = ttk.Frame(frm)
+        cam_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(cam_row, text=t("enroll.camera") + ":").pack(side="left")
+        self.cam_var = tk.StringVar(master=self.root)
+        self.cam_combo = ttk.Combobox(cam_row, textvariable=self.cam_var, state="readonly", width=40)
+        self.cam_combo.pack(side="left", padx=6)
+        self.cam_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_camera_chosen())
 
-        # Camera preview canvas
-        self.preview = tk.Label(frm, background="#222",
-                                width=PREVIEW_W, height=PREVIEW_H)
+        self.preview = tk.Label(frm, background="#222", width=PREVIEW_W, height=PREVIEW_H)
         self.preview.pack(pady=(0, 8))
+        blank = Image.new("RGB", (PREVIEW_W, PREVIEW_H), (24, 24, 24))
+        self._tk_image = ImageTk.PhotoImage(blank, master=self.root)
+        self.preview.configure(image=self._tk_image)
 
-        # Big guidance line.
-        # master= on every Variable below: several Tk roots live in this
-        # process (tray Status/Settings/Help each open their own), and a
-        # master-less Variable binds to the FIRST live root instead of ours --
-        # the empty-widget bug fixed for the tray windows in block1 (c27a79f).
-        self.guide_var = tk.StringVar(master=self.root, value="")
-        self.guide = ttk.Label(frm, textvariable=self.guide_var,
-                               wraplength=PREVIEW_W, justify="center",
-                               style="Coach.Warn.TLabel")
-        self.guide.pack(fill="x", pady=(0, 6))
-
-        # Progress row -- counts frames that PASSED the live quality gate.
-        prog_row = ttk.Frame(frm)
-        prog_row.pack(fill="x", pady=(0, 6))
-        self.progress = ttk.Progressbar(prog_row, mode="determinate",
-                                        maximum=self._target)
+        self.line = ttk.Label(frm, text="", wraplength=PREVIEW_W, justify="center",
+                              font=("", 11, "bold"))
+        self.line.pack(fill="x", pady=(0, 4))
+        # F-181: the shot counter and the pose instruction live in their own rows.
+        prog = ttk.Frame(frm)
+        prog.pack(fill="x", pady=(0, 2))
+        self.progress = ttk.Progressbar(prog, mode="determinate", maximum=COUNT_DEFAULT)
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.progress_var = tk.StringVar(master=self.root, value="0/15")
-        ttk.Label(prog_row, textvariable=self.progress_var, width=8,
-                  anchor="e", style="Enroll.Count.TLabel").pack(side="right")
+        self.count_lbl = ttk.Label(prog, text="", font=("", 10, "bold"))
+        self.count_lbl.pack(side="right")
         attach_tooltip(self.progress, "enroll.progress.tip")
+        ttk.Label(frm, text=t("enroll.pose_hint"), foreground="#555", wraplength=PREVIEW_W,
+                  justify="left").pack(anchor="w", pady=(0, 6))
 
-        # Count spinbox
-        count_row = ttk.Frame(frm)
-        count_row.pack(fill="x", pady=4)
-        ttk.Label(count_row, text=t("enroll.count") + ":",
-                  width=22, anchor="w").pack(side="left")
-        self.count_var = tk.IntVar(master=self.root, value=self._target)
-        self.count_spin = ttk.Spinbox(
-            count_row, from_=5, to=40, textvariable=self.count_var,
-            width=6, command=self._on_count_changed,
-        )
-        self.count_spin.pack(side="left")
-        attach_tooltip(self.count_spin, "enroll.count")
+        row = ttk.Frame(frm)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text=t("enroll.count") + ":").pack(side="left")
+        self.count_var = tk.StringVar(master=self.root, value=str(COUNT_DEFAULT))
+        self.count_spin = ttk.Spinbox(row, from_=COUNT_MIN, to=COUNT_MAX, textvariable=self.count_var,
+                                      width=6)
+        self.count_spin.pack(side="left", padx=6)
+        self.existing = ttk.Label(frm, text="", foreground="#555")
+        self.existing.pack(anchor="w", pady=(2, 6))
 
-        # Existing data label
-        self.existing_var = tk.StringVar(master=self.root)
-        ttk.Label(frm, textvariable=self.existing_var,
-                  style="Enroll.Hint.TLabel").pack(anchor="w", pady=(2, 6))
-
-        # Buttons row
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(4, 0))
-        self.start_btn = ttk.Button(btns, text=t("enroll.btn.start"),
-                                    style="Enroll.TButton",
-                                    command=self._on_start_stop)
+        self.start_btn = ttk.Button(btns, text=t("enroll.btn.start"), command=self._on_start_stop)
         self.start_btn.pack(side="left", padx=3)
-        self.build_btn = ttk.Button(btns, text=t("enroll.btn.build"),
-                                    style="Enroll.TButton",
-                                    command=self._on_build)
+        self.build_btn = ttk.Button(btns, text=t("enroll.btn.build"), command=self._on_build)
         self.build_btn.pack(side="left", padx=3)
-        self.wipe_btn = ttk.Button(btns, text=t("enroll.btn.wipe"),
-                                   style="Enroll.TButton",
-                                   command=self._on_wipe)
+        self.wipe_btn = ttk.Button(btns, text=t("enroll.btn.wipe"), command=self._on_wipe)
         self.wipe_btn.pack(side="left", padx=3)
-        ttk.Button(btns, text=t("enroll.btn.close"), style="Enroll.TButton",
-                   command=self._on_close).pack(side="right", padx=3)
+        self.retry_btn = ttk.Button(btns, text=t("enroll.btn.retry"), command=self._on_retry)
+        ttk.Button(btns, text=t("enroll.btn.close"), command=self._on_close).pack(side="right", padx=3)
 
-        # Render a first black frame so the layout doesn't collapse.
-        blank = Image.new("RGB", (PREVIEW_W, PREVIEW_H), (24, 24, 24))
-        self._latest_tk_image = ImageTk.PhotoImage(blank)
-        self.preview.configure(image=self._latest_tk_image)
+        # The end-state panel (F-180), shown after a build.
+        self.ready_frm = ttk.LabelFrame(frm, text=t("enroll.ready.title"), padding=8)
+        self.ready_lines: dict = {}
+        for i, key in enumerate(("service", "custody", "enrollment", "password", "camera")):
+            lbl = ttk.Label(self.ready_frm, text="", wraplength=PREVIEW_W - 40, justify="left")
+            lbl.grid(row=i, column=0, sticky="w")
+            self.ready_lines[key] = lbl
+        rb = ttk.Frame(self.ready_frm)
+        rb.grid(row=10, column=0, sticky="w", pady=(6, 0))
+        self.calib_btn = ttk.Button(rb, text=t("enroll.btn.calibrate"), command=self._on_calibrate)
+        self.calib_btn.pack(side="left", padx=3)
+        self.pwd_btn = ttk.Button(rb, text=t("enroll.btn.set_password"), command=self._on_set_password)
+        self.pwd_btn.pack(side="left", padx=3)
+        ttk.Button(rb, text=t("enroll.btn.check_again"), command=self._check_ready).pack(side="left", padx=3)
 
-    # ---------------- helpers ----------------
+        self.root.bind("<Escape>", lambda _e: self._on_close())
+        self._refresh_existing()
 
-    def _set_guide(self, key: str, **kwargs) -> None:
-        """Set a NON-coach message (build progress, run finished, errors).
+    def _set_line(self, text: str, level: str = "info") -> None:
+        self.line.configure(text=text, foreground=_COACH_FG.get(level, "#222"))
 
-        Drops the state colour back to neutral and clears the coach's
-        last-key memo, so the next genuine change of advice re-posts even if it
-        happens to repeat whatever was on screen before this message.
-        """
-        self._last_coach_key = None
+    def _refresh_existing(self) -> None:
+        n = count_images()
+        key = "enroll.existing.yes" if EMBED_PATH.exists() else "enroll.existing.no"
+        self.existing.configure(text=t(key, n=n))
+
+    def _refresh_buttons(self) -> None:
+        armed = bool(self.session and self.session.armed.is_set())
+        can_start = (self.service_ready and not self.refusing and self.camera_ok
+                     and not self.building and not self.calibrating)
+        self.start_btn.configure(text=t("enroll.btn.stop") if armed else t("enroll.btn.start"),
+                                 state="normal" if (can_start or armed) else "disabled")
+        n = count_images(self._capture_dir())
+        self.build_btn.configure(state="normal" if (self.service_ready and not self.refusing and n
+                                                    and not self.building and not armed
+                                                    and not self.calibrating) else "disabled")
+        self.wipe_btn.configure(state="normal" if (self.service_ready and not armed and not self.building
+                                                   and not self.calibrating) else "disabled")
+        self.count_spin.configure(state="disabled" if armed else "normal")
+        self.cam_combo.configure(state="disabled" if (armed or self.building or self.calibrating)
+                                 else "readonly")
+
+    def _capture_dir(self):
+        return ENROLL_PENDING_DIR if self.mode == "replace" else ENROLL_DIR
+
+    # ---- camera ----
+    def _load_devices(self) -> None:
+        from face_service.camera_devices import list_video_devices
         try:
-            self.guide_var.set(t(key, **kwargs))
-            self.guide.configure(style="Enroll.Guide.TLabel")
-        except (tk.TclError, AttributeError, RuntimeError):
-            pass
-
-    def _refresh_existing_stats(self) -> None:
-        n = _count_enroll_images()
-        has = t("enroll.has.yes") if _has_embeddings() else t("enroll.has.no")
-        self.existing_var.set(t("enroll.existing", n=n, has=has))
-
-    def _on_count_changed(self) -> None:
-        try:
-            v = int(self.count_var.get())
-        except (ValueError, tk.TclError):
-            return
-        self._target = max(1, v)
-        self.progress.configure(maximum=self._target)
-        self.progress_var.set(f"{self._captured}/{self._target}")
-
-    def _update_progress(self) -> None:
-        self.progress["value"] = self._captured
-        self.progress_var.set(f"{self._captured}/{self._target}")
-
-    def _acquire_camera_lease(self) -> bool:
-        resp = pipe_call(
-            {"cmd": "pause_camera", "seconds": CAMERA_LEASE_S},
-            timeout_s=3.0,
-        )
-        if not (resp and resp.get("ok")):
-            log.warning("could not pause face_service camera: %s", resp)
-            messagebox.showwarning(
-                t("enroll.title"),
-                t("enroll.error.service_busy"),
-                parent=self.root,
-            )
-            return False
-        return True
-
-    def _renew_camera_lease(self) -> None:
-        """Re-arm the lease, so it never outlives this wizard by more than CAMERA_LEASE_S.
-
-        Driven from the camera loop rather than a timer thread, and that is the design: the loop
-        is already what has to keep running for the preview to be alive, so a wedged loop simply
-        stops renewing -- which is exactly when we WANT the lease to lapse and the device to go
-        back to the service.
-
-        A failed renewal is logged and otherwise ignored; ``_lease_ok`` is deliberately NOT
-        cleared. The expected cause is the service restarting mid-enrollment, and the next renewal
-        then takes the lease again from scratch. That also repairs the restart case, which used to
-        have no cure: a restarted service grabs the webcam in its warmup with no memory of our
-        lease (the lease lives only in its RAM), and the next re-arm takes it back through the
-        normal pause_camera handler. Worst-case contention is one renewal interval.
-
-        Honest cost: pipe_call blocks THIS loop for up to its timeout when the service is down, so
-        the preview can hitch for up to 3s once every LEASE_RENEW_S. Accepted deliberately -- the
-        alternative is a second thread racing the same pipe for the same lease.
-        """
-        resp = pipe_call({"cmd": "pause_camera", "seconds": CAMERA_LEASE_S}, timeout_s=3.0)
-        if not (resp and resp.get("ok")):
-            # Once per LEASE_RENEW_S at worst, so this cannot spam the log.
-            log.warning("camera lease renewal failed (service down or busy?): %s", resp)
-
-    def _release_camera_lease(self) -> None:
-        pipe_call({"cmd": "resume_camera"}, timeout_s=3.0)
-
-    # ---------------- camera thread ----------------
-
-    def _open_capture(self) -> bool:
-        """Open the webcam with a bounded read-timeout, storing it on
-        ``self._cap``. Returns True on success.
-
-        DSHOW is tried FIRST: it is the backend this hardware has always used.
-        MSMF was promoted to first in block5-A because it is the only backend
-        that honors ``CAP_PROP_*_TIMEOUT_MSEC``, but on the target webcam the
-        timeout is NOT applied -- read() still blocks forever (measured: 2
-        hangs on MSMF vs 2 on DSHOW, i.e. no improvement). The timeout props
-        below are kept as harmless cross-hardware insurance; the wedged-read
-        leak itself is contained by running this wizard in its own process
-        (see ``main()``), so a stuck thread dies with it.
-
-        The device is the one the service opens (Stage 9, act 9b R10 / F-141): ``cfg.camera_name``
-        resolved to its DirectShow index and opened on DSHOW only -- the index a name maps to means
-        nothing to another backend. A name that is not connected opens nothing. Only an empty name
-        (an old config) falls back to ``cfg.camera_index`` on DSHOW -> MSMF -> ANY.
-        """
-        index, backends = self._cfg.camera_index, (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY)
-        name = str(getattr(self._cfg, "camera_name", "") or "").strip()
-        if name:
-            from face_service.camera_devices import resolve_index
-            index = resolve_index(name)
-            if index is None:
-                log.warning("enroll camera %r is not connected", name)
-                return False
-            backends = (cv2.CAP_DSHOW,)
-        for backend in backends:
-            cap = cv2.VideoCapture(index, backend)
-            if not cap.isOpened():
-                cap.release()   # never keep a candidate we didn't accept
-                continue
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            # F-151: what the driver actually negotiated, once per open.
-            try:
-                fcc = int(cap.get(cv2.CAP_PROP_FOURCC))
-                log.info("enroll camera open: device=%s index=%s backend=%s %dx%d fps=%.1f fourcc=%s",
-                         repr(name) if name else "(by index)", index, backend,
-                         int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                         int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), float(cap.get(cv2.CAP_PROP_FPS)),
-                         "".join(chr((fcc >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00") or "?")
-            except Exception:
-                log.debug("enroll camera format query failed", exc_info=True)
-            # Open/read timeout hint. getattr(): these props only exist on newer
-            # OpenCV; set() may be rejected by a backend -- both are non-fatal.
-            # DSHOW ignores them outright; kept for hardware where MSMF wins.
-            for prop_name in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
-                prop = getattr(cv2, prop_name, None)
-                if prop is not None and not cap.set(prop, CAMERA_READ_TIMEOUT_MS):
-                    log.debug("%s not accepted by backend %s", prop_name, backend)
-            self._cap = cap
-            return True
-        return False
-
-    def _release_capture(self) -> None:
-        """Release the capture on every exit path (idempotent)."""
-        cap, self._cap = self._cap, None
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                log.exception("enroll camera release failed")
-
-    def _camera_loop(self) -> None:
-        if not self._open_capture():
-            self.root.after(0, lambda: messagebox.showerror(
-                t("enroll.title"), t("enroll.error.camera"),
-                parent=self.root,
-            ))
-            return
-
-        cap = self._cap
-        try:
-            self._warm_quality()
-            frame_idx = 0
-            faces: list = []
-            # Monotonic, not wall-clock: a clock adjustment mid-enrollment must not skip or stall
-            # the renewal. _lease_ok is checked even though the thread only starts when the lease
-            # was taken -- an unpaired pause_camera would hand us a device we never asked for.
-            next_renew = time.monotonic() + LEASE_RENEW_S
-            while not self._stop.is_set():
-                if self._lease_ok and time.monotonic() >= next_renew:
-                    self._renew_camera_lease()
-                    # Re-read the clock: the call above can burn up to its timeout, and scheduling
-                    # from BEFORE it would make a slow/failing renewal fire again immediately.
-                    next_renew = time.monotonic() + LEASE_RENEW_S
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    # Timed-out / dropped read: NOT fatal. Sleep a beat (in case
-                    # a backend ignored the timeout and returns instantly) and
-                    # loop -- the point is to re-check _stop, not to die.
-                    time.sleep(0.05)
-                    continue
-                frame_idx += 1
-
-                # Detect every few frames to save CPU but still feel live. The
-                # coach verdict is recomputed with the detection, since it needs
-                # that frame's landmarks; in between, the last verdict stands.
-                # ``measured`` says whether the verdict describes THIS frame --
-                # only such a frame may be written to disk.
-                measured = frame_idx % DETECT_EVERY_N_FRAMES == 0
-                if measured:
-                    faces = self._detect_faces(frame)
-                    self._coach = self._evaluate_coach(frame, faces)
-
-                self._process_capture(frame, faces, self._coach, measured)
-
-                annotated = self._annotate(frame, faces, self._coach)
-                self._post_preview(annotated)
-                time.sleep(0.03)  # ~30 fps cap
-        finally:
-            self._release_capture()
-
-    def _warm_quality(self) -> None:
-        """Pay the one-off insightface import before the preview starts.
-
-        ``enroll_qc.aligned_crop`` imports ``insightface.utils.face_align`` on
-        first use (~0.5 s). Left lazy that would land on the camera thread a
-        frame or two into the preview and read as a freeze while we hold the
-        webcam -- exactly the symptom of the wedged-read debt. Failure here is
-        harmless: aligned_crop falls back to a resized bbox crop on its own.
-        """
-        try:
-            from insightface.utils import face_align  # noqa: F401
-        except Exception as e:
-            log.debug("face_align warmup skipped: %s", e)
-
-    def _detect_faces(self, bgr) -> list:
-        """Return the FULL YuNet rows for this frame.
-
-        YuNet yields (N, 15) float32: cols 0-3 the bbox (x, y, w, h), cols 4-13
-        the five landmarks as x,y pairs, col 14 the confidence. The wizard used
-        to keep only the bbox; the landmarks are what enroll_qc needs to build
-        the same 112x112 aligned crop the build step measures, so the whole row
-        is carried up now.
-        """
-        try:
-            h, w = bgr.shape[:2]
-            det = self.detector._ensure(w, h)  # type: ignore[attr-defined]
-            _, res = det.detect(bgr)
-            if res is None:
-                return []
-            return list(res)
-        except Exception as e:
-            log.debug("detect failed: %s", e)
-            return []
-
-    @staticmethod
-    def _largest_row(rows):
-        """The biggest box in the frame -- the one being enrolled."""
-        return max(rows, key=lambda r: float(r[2]) * float(r[3]))
-
-    def _evaluate_coach(self, frame, rows) -> CoachState:
-        """Grade this frame and pick the single most useful thing to say.
-
-        Ladder, most blocking first: no face -> framing -> quality -> ready.
-        Everything here works in RAW frame coordinates (pre-mirror); only the
-        drawing in _annotate crosses into preview space.
-        """
-        if not rows:
-            # Stage 9 (F-191): a detector that could not start is not "no face" -- say so, once
-            # logged at ERROR by the detector itself, instead of asking the user to look at the
-            # camera forever.
-            if getattr(self.detector, "unavailable", None):
-                return CoachState("enroll.coach.detector_unavailable", False, "err")
-            return CoachState("enroll.status.waiting", False, "err")
-
-        row = self._largest_row(rows)
-        fh, fw = frame.shape[:2]
-        x, y, w, h = (float(v) for v in row[0:4])
-
-        area_frac = (w * h) / float(fw * fh)
-        if area_frac < COACH_AREA_MIN_FRAC:
-            return CoachState("enroll.coach.closer", False, "warn")
-        if area_frac > COACH_AREA_MAX_FRAC:
-            return CoachState("enroll.coach.farther", False, "warn")
-
-        if (abs((x + w / 2) - fw / 2) / fw > COACH_OFFSET_MAX_FRAC
-                or abs((y + h / 2) - fh / 2) / fh > COACH_OFFSET_MAX_FRAC):
-            return CoachState("enroll.coach.center", False, "warn")
-
-        try:
-            q = frame_quality(frame, _YuNetFace(row))
-        except Exception as e:
-            log.debug("live quality failed: %s", e)
-            q = None
-        if q is None:
-            return CoachState("enroll.status.waiting", False, "err")
-
-        # Same gate function the build step uses, minus the det token: build-time
-        # det comes from InsightFace/SCRFD while this score is YuNet's, and the
-        # two are not on a comparable scale. Exposure and focus ARE comparable --
-        # both are measured on the identical 112x112 aligned crop.
-        heads = {_token_head(r) for r in qc_reasons(q, self._cfg)} - {"det"}
-        for tok in ("dark", "bright", "blur"):
-            if tok in heads:
-                return CoachState(_COACH_KEY_BY_TOKEN[tok], False, "warn")
-
-        return CoachState("enroll.status.ready", True, "ok")
-
-    def _annotate(self, bgr, faces, coach: CoachState | None = None):
-        import numpy as np
-        level = coach.level if coach is not None else "warn"
-        colour = _COACH_BGR[level]
-        img = bgr.copy()
-        # Face boxes are drawn in RAW coordinates on purpose: they ride through
-        # the mirror below and land on the face.
-        for row in faces:
-            x, y, w, h = (int(v) for v in row[0:4])
-            cv2.rectangle(img, (x, y), (x + w, y + h), colour, 3)
-        # Flip horizontally so the preview feels like a mirror.
-        img = cv2.flip(img, 1)
-        # Resize to the preview dims, keep aspect.
-        h0, w0 = img.shape[:2]
-        scale = min(PREVIEW_W / w0, PREVIEW_H / h0)
-        new_w, new_h = int(w0 * scale), int(h0 * scale)
-        img = cv2.resize(img, (new_w, new_h))
-        # Center-pad to (PREVIEW_W, PREVIEW_H)
-        canvas = np.zeros((PREVIEW_H, PREVIEW_W, 3), dtype=img.dtype)
-        ox = (PREVIEW_W - new_w) // 2
-        oy = (PREVIEW_H - new_h) // 2
-        canvas[oy:oy + new_h, ox:ox + new_w] = img
-        # The framing guide is a fixed on-screen target, so it is drawn HERE --
-        # after the mirror/scale/pad -- in PREVIEW coordinates. Drawing it with
-        # the boxes above would push it through the flip a second time.
-        cv2.ellipse(canvas, (PREVIEW_W // 2, PREVIEW_H // 2),
-                    (_GUIDE_AXIS_X, _GUIDE_AXIS_Y), 0, 0, 360, colour, 2)
-        return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-
-    def _post_preview(self, rgb) -> None:
-        # The camera thread prepares ONLY a PIL image and touches NO Tk object.
-        # ImageTk.PhotoImage binds to a Tcl interpreter, so constructing it here
-        # meant a foreign thread reaching into this window's interpreter -- the
-        # same cross-thread hazard that aborted the tray with Tcl_AsyncDelete
-        # (block1 fix2, 7932eb3). It is now built inside apply(), on the
-        # window's own thread.
-        try:
-            pil = Image.fromarray(rgb)
+            self.devices = [d.name for d in list_video_devices() if d.name]
         except Exception:
+            self.devices = []
+        values = list(self.devices)
+        cur = self.cfg.camera_name
+        if not cur:
+            label = t("settings.camera.by_index", i=self.cfg.camera_index)
+            values = [label] + values
+            self.cam_var.set(label)
+        else:
+            if cur not in values:
+                values.append(cur)
+            self.cam_var.set(cur)
+        self.cam_combo.configure(values=values)
+
+    def _start_camera(self) -> None:
+        prev = self.cam_thread
+        if self.session is not None:
+            self.session.stop.set()
+        self.camera_ok = False
+        self.session = Session(self.cfg, self.cfg.camera_name)
+        self.cam_thread = threading.Thread(target=camera_worker_after, args=(prev, self.session, self.q),
+                                           name="enroll-camera", daemon=True)
+        self.cam_thread.start()
+        self.retry_btn.pack_forget()
+        self._refresh_buttons()
+
+    def _on_camera_chosen(self) -> None:
+        name = self.cam_var.get()
+        if name not in self.devices:
+            name = ""                              # the by-index entry
+        if name == self.cfg.camera_name:
             return
+        self.cfg.camera_name = name
+        threading.Thread(target=save_camera_worker, args=(self.q, name), daemon=True).start()
+        log.info("camera chosen: %r", name)
+        self._start_camera()
 
-        def apply():
-            # Runs on the window's thread, so building the Tk image is safe.
-            if self._stop.is_set():
-                return   # closing: don't hand new Tk state to a dying window
-            try:
-                img = ImageTk.PhotoImage(pil)
-                # Hold the reference; ImageTk requires it.
-                self._latest_tk_image = img
-                self.preview.configure(image=img)
-            except (tk.TclError, AttributeError, RuntimeError):
-                # Window torn down mid-flight (widgets already nulled/destroyed).
-                pass
+    def _on_retry(self) -> None:
+        self.retry_btn.pack_forget()
+        self._set_line(t("enroll.status.retrying"), "info")
+        self.root.after(1500, self._start_camera)          # F-179: a beat after the release
 
+    # ---- the queue ----
+    def _drain(self) -> None:
+        frame = None
         try:
-            self.root.after(0, apply)
-        except RuntimeError:
+            while True:
+                msg = self.q.get_nowait()
+                if msg[0] == "frame":
+                    frame = msg[1]                   # only the newest one is drawn
+                else:
+                    self._handle(msg)
+        except queue.Empty:
+            pass
+        if frame is not None:
+            try:
+                self._tk_image = ImageTk.PhotoImage(Image.fromarray(frame), master=self.root)
+                self.preview.configure(image=self._tk_image)
+            except tk.TclError:
+                pass
+        try:
+            self.root.after(33, self._drain)
+        except tk.TclError:
             pass
 
-    def _process_capture(self, frame, rows, coach: CoachState,
-                         measured: bool = False) -> None:
-        if self._building:
-            return
-
-        if rows:
-            self._face_streak += 1
-        else:
-            self._face_streak = 0
-
-        # The coach owns the guidance line in both modes -- it already states the
-        # most blocking thing about this frame. The exception is a TERMINAL
-        # message ("all N captured", a build result): those pin the line, or the
-        # coach would overwrite them on the very next frame, ~66 ms later.
-        if not self._guide_pinned:
-            self._queue_coach(coach)
-
-        if not self._capture_armed.is_set():
-            return
-
-        now = time.time()
-        if self._captured >= self._target:
-            self._capture_armed.clear()
-            self._guide_pinned = True
-            self._queue_guide("enroll.guide.done_capture", n=self._target)
-            self._queue_refresh_buttons()
-            return
-        # The gate: framing + live QC (coach.ok) on top of the existing stability
-        # and cooldown rules. Only frames that would survive the build step's
-        # quality control reach the disk, so the bar counts ACCEPTED shots.
-        if not coach.ok or self._face_streak < FACE_STABLE_FRAMES:
-            return
-        if not measured:
-            # The verdict was computed on the PREVIOUS frame; THIS one never went
-            # through frame_quality. Writing it would put an unmeasured JPG on
-            # disk and count it as accepted -- exactly the dishonesty the gate
-            # exists to remove. Wait one frame; the cooldown is ~30 frames long,
-            # so nothing is lost.
-            return
-        if now - self._last_capture_ts < CAPTURE_COOLDOWN_S:
-            # Between shots. The line still reads "ready" (set above) -- it must
-            # not flicker to a warning just because the cooldown is running.
-            return
-
-        try:
-            self._capture_dir.mkdir(parents=True, exist_ok=True)
-            path = self._capture_dir / f"enroll_{int(now * 1000)}.jpg"
-            # Stage 9 (R8, F-116): Unicode-safe, and the result is CHECKED -- cv2.imwrite used to
-            # return False on any non-ASCII profile path and the frame was counted anyway.
-            if not imio.imwrite(path, frame):
-                log.error("enroll: could not save %s -- the frame is not counted", path.name)
+    def _handle(self, msg) -> None:
+        kind = msg[0]
+        if kind == "service":
+            _k, what, state, why = msg
+            if what == "ready":
+                self.service_ready = True
+                self.refusing = why if state == "refusing" else None
+                if self.refusing:
+                    self._set_line(t("enroll.error.refusing", why=t(f"why.{self.refusing}")), "err")
+                elif self.camera_ok:
+                    self._set_line(t("enroll.guide.idle"), "info")
+            else:
+                self._set_line(t("enroll.error.service_down"), "err")
+            self._refresh_buttons()
+        elif kind == "camera_failed":
+            self.camera_ok = False
+            key = "enroll.error.camera_missing" if msg[1] == "not-found" else "enroll.error.camera"
+            self._set_line(t(key, name=self.cfg.camera_name or "?"), "err")
+            self.retry_btn.pack(side="left", padx=3)
+            self._refresh_buttons()
+        elif kind == "first_frame":
+            self.camera_ok = True
+            if self.service_ready and not self.refusing:
+                self._set_line(t("enroll.guide.idle"), "info")
+            self._refresh_buttons()
+        elif kind == "coach":
+            coach = msg[1]
+            if self.building or not self.camera_ok or not self.service_ready or self.refusing:
                 return
-            self._captured += 1
-            self._last_capture_ts = now
-            log.info("enroll: saved %s (%d/%d)", path.name, self._captured, self._target)
-        except Exception:
-            log.exception("failed to save enroll frame")
-            return
+            if self.calibrating:
+                return                               # the calibration prompt owns the line
+            armed = bool(self.session and self.session.armed.is_set())
+            if coach.ok and not armed:
+                self._set_line(t("enroll.status.ready_idle"), "ok")      # F-177
+            else:
+                self._set_line(t(coach.key), coach.level)
+        elif kind == "captured":
+            self._show_count(msg[1])
+        elif kind == "done_capture":
+            self._show_count(msg[1])
+            self._set_line(t("enroll.guide.done_capture"), "ok")
+            self._refresh_buttons()
+        elif kind == "built":
+            self._on_built(msg[1])
+        elif kind == "calib_shots":
+            self._on_calib_shots(msg[1], msg[2])
+        elif kind == "calibrated":
+            self._on_calibrated(msg[1])
+        elif kind == "readiness":
+            self._show_ready(msg[1], msg[2], msg[3])
+        elif kind == "wiped":
+            self._on_wiped(msg[1])
 
-        self._queue_update_progress()
+    def _show_count(self, n: int) -> None:
+        target = self.session.target if self.session else COUNT_DEFAULT
+        self.progress.configure(maximum=max(target, n))
+        self.progress["value"] = n
+        self.count_lbl.configure(text=t("enroll.shots", n=n, target=target))
 
-    def _queue_guide(self, key: str, **kwargs) -> None:
-        try:
-            self.root.after(0, lambda: self._set_guide(key, **kwargs))
-        except RuntimeError:
-            pass
-
-    def _queue_coach(self, coach: CoachState) -> None:
-        # Only when the advice actually changes: the loop runs ~30x/s and
-        # re-posting an identical line would just flood the after() queue.
-        if coach.key == self._last_coach_key:
-            return
-        self._last_coach_key = coach.key
-        try:
-            self.root.after(0, lambda: self._apply_coach(coach))
-        except RuntimeError:
-            pass
-
-    def _apply_coach(self, coach: CoachState) -> None:
-        # Runs on the window's thread. Same swallow-list as _post_preview: the
-        # window may have been torn down (refs nulled) while this was queued.
-        try:
-            self.guide_var.set(t(coach.key))
-            self.guide.configure(style=_COACH_STYLE[coach.level])
-        except (tk.TclError, AttributeError, RuntimeError):
-            pass
-
-    def _queue_update_progress(self) -> None:
-        try:
-            self.root.after(0, self._update_progress)
-        except RuntimeError:
-            pass
-
-    def _queue_refresh_buttons(self) -> None:
-        try:
-            self.root.after(0, lambda: self.start_btn.configure(text=t("enroll.btn.start")))
-        except RuntimeError:
-            pass
-
-    # ---------------- button actions ----------------
-
+    # ---- capture ----
     def _on_start_stop(self) -> None:
-        if self._capture_armed.is_set():
-            self._capture_armed.clear()
-            self.start_btn.configure(text=t("enroll.btn.start"))
-            self._set_guide("enroll.guide.idle")
+        s = self.session
+        if s is None:
             return
-
-        if self._mode is None and not self._choose_mode():
+        if s.armed.is_set():
+            s.armed.clear()
+            self._set_line(t("enroll.guide.idle"), "info")
+            self._refresh_buttons()
             return
-        # (re)start a session: reset counters
-        self._captured = 0
-        self._last_capture_ts = 0.0
-        self._guide_pinned = False
-        try:
-            self._target = max(1, int(self.count_var.get()))
-        except Exception:
-            self._target = 15
-        self.progress.configure(maximum=self._target)
-        self._update_progress()
-        self._capture_armed.set()
-        self.start_btn.configure(text=t("enroll.btn.stop"))
-        self._set_guide("enroll.guide.capturing", i=0, n=self._target)
-
-    def _choose_mode(self) -> bool:
-        """First Start of this wizard: with an enrollment already present, ask Replace (default)
-        or Add. Returns False when the user cancels. Replace starts from an empty pending session:
-        whatever an interrupted earlier Replace left there is discarded first."""
-        if _count_enroll_images() == 0 and not _has_embeddings():
-            self._mode = "add"
-            self._capture_dir = ENROLL_DIR
-            return True
-        answer = messagebox.askyesnocancel(
-            t("enroll.confirm.mode.title"), t("enroll.confirm.mode.body"),
-            default=messagebox.YES, parent=self.root)
-        if answer is None:
-            return False
-        if answer:
-            from face_service.datadir import remove_tree_no_follow
-            remove_tree_no_follow(ENROLL_PENDING_DIR)
-            self._mode, self._capture_dir = "replace", ENROLL_PENDING_DIR
-        else:
-            self._mode, self._capture_dir = "add", ENROLL_DIR
-        log.info("enroll session mode: %s", self._mode)
-        return True
-
-    def _on_build(self) -> None:
-        if self._building:
-            return
-        if _count_enroll_images(self._capture_dir) == 0:
-            messagebox.showwarning(
-                t("enroll.title"),
-                t("enroll.guide.build_empty"),
-                parent=self.root,
-            )
-            return
-
-        self._building = True
-        self._capture_armed.clear()
-        self.start_btn.configure(state="disabled")
-        self.build_btn.configure(state="disabled")
-        self.wipe_btn.configure(state="disabled")
-        self._set_guide("enroll.guide.building")
-
-        req = {"cmd": "build_enrollment"}
-        if self._mode == "replace":
-            req["replace"] = True
-
-        def worker():
-            # Call the service — it already has the ONNX engine loaded and warm.
-            paused = _pause_watchdog(self._cfg.watchdog_pause_ttl_s)
-            try:
-                resp = pipe_call(req, timeout_s=120.0)
-            finally:
-                _resume_watchdog(paused)
-            ok = bool(resp and resp.get("ok"))
-            n = int(resp.get("count", 0)) if ok else 0
-            try:
-                # Toast fires even if this window was closed mid-build.
-                from .tray import notify_event  # lazy: avoids an import cycle
-                if ok and n > 0:
-                    notify_event("notify_enroll", t("notify.enroll_ok", n=n))
-                else:
-                    # Report what actually failed. Defaulting to "no-face" used
-                    # to blame the wrong cause for every blur/exposure drop.
-                    raw = (resp or {}).get("reason") or ""
-                    reason = _humanize_reason(raw) or raw or t("enroll.reason.unknown")
-                    notify_event("notify_enroll", t("notify.enroll_fail", reason=reason))
-            except Exception:
-                log.exception("enroll notify failed")
-            def done():
-                # Pin BEFORE clearing _building: the moment _building goes False
-                # the camera thread may queue a coach update, and that callback
-                # would land after this one and wipe the outcome off the line.
-                self._guide_pinned = True
-                self._building = False
-                self.start_btn.configure(state="normal")
-                self.build_btn.configure(state="normal")
-                self.wipe_btn.configure(state="normal")
-                self._refresh_existing_stats()
-                # Every branch below is a terminal message; the pin above keeps
-                # the coach from overwriting it on the next frame.
-                if resp and resp.get("ok"):
-                    n = int(resp.get("count", 0))
-                    pose = resp.get("pose") or {}
-                    if n > 0 and pose and pose_warning(float(pose.get("pitch", 0.0)),
-                                                       float(pose.get("yaw", 0.0))):
-                        # D-17: warn, never refuse -- the enrollment IS built and in use.
-                        msg = t("enroll.guide.pose_warn", n=n, pitch=round(pose["pitch"]),
-                                yaw=round(pose["yaw"]))
-                        log.info("enroll pose warning: pitch=%s yaw=%s n=%s",
-                                 pose.get("pitch"), pose.get("yaw"), pose.get("n"))
-                        self._set_guide("enroll.guide.pose_warn", n=n, pitch=round(pose["pitch"]),
-                                        yaw=round(pose["yaw"]))
-                        messagebox.showwarning(t("enroll.title"), msg, parent=self.root)
-                    elif n > 0:
-                        self._set_guide("enroll.guide.done", n=n)
-                    else:
-                        self._set_guide("enroll.guide.build_empty")
-                else:
-                    # Show the REAL reason the service returned. build_empty is
-                    # no longer hardcoded here: it claims "no face in any shot",
-                    # which is simply false when the drops were blur or exposure.
-                    raw = (resp or {}).get("reason") or ""
-                    why = _humanize_reason(raw)
-                    if why:
-                        self._set_guide("enroll.guide.build_rejected", why=why)
-                        body = t("enroll.build.failed", why=why)
-                    else:
-                        # Unparsed reason: surface it verbatim rather than
-                        # swallowing it behind a guessed message.
-                        self._set_guide("enroll.guide.build_failed")
-                        body = f"build_enrollment: {raw or '?'}"
-                    messagebox.showerror(
-                        t("enroll.title"), body, parent=self.root,
-                    )
-            try:
-                self.root.after(0, done)
-            except RuntimeError:
-                pass
-
-        threading.Thread(target=worker, name="enroll-build", daemon=True).start()
-
-    def _on_wipe(self) -> None:
-        """Stage 8b (F-06). Defect: this unlinked the top-level images and embeddings.npz itself,
-        while the running service kept matching the gallery it had cached in memory (and the adaptive
-        ring and sub-directories stayed). Consequence: a face the user had just "deleted" went on
-        unlocking until the next service restart. Fix: the service does the deleting through
-        clear_enrollment -- it forgets the gallery first, then removes the files, reparse-safe, and
-        audits it. Nothing is deleted from here, so a failed call leaves one consistent state."""
-        if not messagebox.askyesno(
-            t("enroll.confirm.wipe.title"),
-            t("enroll.confirm.wipe.body"),
-            parent=self.root,
-        ):
-            return
-        self.wipe_btn.configure(state="disabled")
-
-        def worker():
-            resp = pipe_call({"cmd": "clear_enrollment"}, timeout_s=20.0)
-
-            def done():
-                try:
-                    self.wipe_btn.configure(state="normal")
-                except (tk.TclError, AttributeError):
+        new_session = self.mode is None
+        if self.mode is None:
+            if count_images() == 0 and not EMBED_PATH.exists():
+                self.mode = "add"
+            else:
+                self.mode = ask_mode(self.root)
+                if self.mode is None:
                     return
-                if not (resp and resp.get("ok")):
-                    log.warning("clear_enrollment failed: %s", resp)
-                    messagebox.showerror(t("enroll.title"), t("enroll.error.wipe_failed"),
-                                         parent=self.root)
-                self._mode, self._capture_dir = None, ENROLL_DIR
-                self._captured = 0
-                self._guide_pinned = False
-                self._update_progress()
-                self._refresh_existing_stats()
-                self._set_guide("enroll.guide.idle")
-            try:
-                self.root.after(0, done)
-            except RuntimeError:
-                pass
+                if self.mode == "replace":
+                    from face_service.datadir import remove_tree_no_follow
+                    remove_tree_no_follow(ENROLL_PENDING_DIR)
+            log.info("enroll session mode: %s", self.mode)
+        target = clamp_count(self.count_var.get())
+        self.count_var.set(str(target))
+        if not self.lease.held and not self.lease.acquire():
+            self._set_line(t("enroll.error.lease"), "err")
+            return
+        with s.lock:
+            s.capture_dir = self._capture_dir()
+            s.target = target
+            if new_session:
+                s.captured = 0            # F-184: Stop / Start within a session keeps its count
+            n = s.captured
+        self._show_count(n)
+        if n >= target:
+            self._set_line(t("enroll.guide.done_capture"), "ok")
+            self._refresh_buttons()
+            return
+        s.armed.set()
+        self._set_line(t("enroll.guide.capturing"), "ok")
+        self._refresh_buttons()
 
-        threading.Thread(target=worker, name="enroll-clear", daemon=True).start()
+    # ---- build ----
+    def _on_build(self) -> None:
+        if self.building:
+            return
+        n = count_images(self._capture_dir())
+        if n == 0:
+            messagebox.showwarning(t("enroll.title"), t("enroll.guide.build_empty"), parent=self.root)
+            return
+        if self.session:
+            self.session.armed.clear()
+        if not self.lease.held and not self.lease.acquire():
+            self._set_line(t("enroll.error.lease"), "err")
+            return
+        self.building = True
+        self._refresh_buttons()
+        self._set_line(t("enroll.guide.building"), "info")
+        req = {"cmd": "build_enrollment"}
+        if self.mode == "replace":
+            req["replace"] = True
+        threading.Thread(target=build_worker,
+                         args=(self.q, req, build_timeout_s(n), self.cfg.watchdog_pause_ttl_s),
+                         name="enroll-build", daemon=True).start()
 
-    def _on_close(self) -> None:
-        # Signal the camera thread first and WAIT for it to release the
-        # webcam before we tear down Tk. Skipping the join would let the
-        # daemon thread get cut mid-read(), which on Windows leaks the camera
-        # handle and black-frames the service until a full restart (hit in
-        # production 2026-04-21). read() is still not reliably interruptible
-        # on this hardware, so the join below can and does time out -- but
-        # that is no longer terminal: this window owns its process, so
-        # returning from main() ends it and the OS releases the camera handle
-        # unconditionally, wedged thread or not. That is what actually closes
-        # KNOWN_ISSUES #1; the polite path below just makes the common case
-        # clean instead of relying on process teardown every time.
-        self._stop.set()
-        self._capture_armed.clear()
-        t_cam = self._cam_thread
-        if t_cam is not None and t_cam.is_alive():
-            # Budget for the loop to notice _stop between frames and run its
-            # finally (cap.release()). On a healthy device a read returns in
-            # ~30 ms, so 3 s is generous; on a wedged one it will time out.
-            t_cam.join(timeout=3.0)
-            if t_cam.is_alive():
-                # Do NOT cross-thread release here: that escalation waits on a
-                # confirmed process topology (block5 follow-up). Leave the log.
-                log.warning("enroll camera thread did not exit within 3s")
-        # Separate try blocks: a failure while dropping references must never
-        # cost us the destroy() that actually tears the interpreter down.
+    def _on_built(self, resp) -> None:
+        self.building = False
+        self._refresh_existing()
+        if resp and resp.get("ok"):
+            n = int(resp.get("count", 0))
+            self.mode = None                        # F-187: the next Start asks again
+            pose = resp.get("pose") or {}
+            if n > 0 and pose and pose_warning(float(pose.get("pitch", 0.0)), float(pose.get("yaw", 0.0))):
+                self._set_line(t("enroll.guide.pose_warn", n=n), "warn")
+            else:
+                self._set_line(t("enroll.guide.done", n=n), "ok")
+            self._show_ready_panel()
+            self._offer_calibration()
+        else:
+            raw = (resp or {}).get("reason") or ("timeout" if resp is None else "")
+            why = humanize_reason(raw)
+            if why:
+                self._set_line(t("enroll.guide.build_rejected", why=why), "err")
+                messagebox.showerror(t("enroll.title"), t("enroll.build.failed", why=why), parent=self.root)
+            else:
+                self._set_line(t("enroll.guide.build_failed"), "err")
+                messagebox.showerror(t("enroll.title"),
+                                     t("enroll.build.failed_raw", reason=raw or "?"), parent=self.root)
+            self.lease.release()
+        self._refresh_buttons()
+
+    # ---- calibration (R6 / F-117) ----
+    def _offer_calibration(self) -> None:
+        if messagebox.askyesno(t("enroll.calib.title"), t("enroll.calib.offer"), parent=self.root):
+            self._on_calibrate()
+        else:
+            self._release_and_check()
+
+    def _on_calibrate(self) -> None:
+        if self.session is None or not self.camera_ok:
+            return
+        if not self.lease.held and not self.lease.acquire():
+            self._set_line(t("enroll.error.lease"), "err")
+            return
+        self.calibrating = True
+        self._refresh_buttons()
+        with self.session.lock:
+            self.session.calib_names = {"frontal": [], "left": []}
+            self.session.calib = ("frontal", CALIB_SHOTS)
+        self._set_line(t("enroll.calib.look_straight"), "info")
+
+    def _on_calib_shots(self, phase: str, names: list) -> None:
+        if phase == "frontal":
+            self._set_line(t("enroll.calib.turn_left"), "info")
+
+            def arm_left():
+                if self.session is not None:
+                    with self.session.lock:
+                        self.session.calib = ("left", CALIB_SHOTS)
+            self.root.after(int(CALIB_TURN_WAIT_S * 1000), arm_left)
+        else:
+            self._set_line(t("enroll.calib.measuring"), "info")
+            s = self.session
+            threading.Thread(target=calibrate_worker,
+                             args=(self.q, list(s.calib_names["frontal"]), list(s.calib_names["left"])),
+                             daemon=True).start()
+
+    def _on_calibrated(self, resp) -> None:
+        self.calibrating = False
+        if resp and resp.get("ok"):
+            self._set_line(t("enroll.calib.done"), "ok")
+        else:
+            reason = (resp or {}).get("reason") or "?"
+            key = {"turn-too-small": "enroll.calib.too_small",
+                   "no-face": "enroll.calib.no_face"}.get(reason, "enroll.calib.failed")
+            self._set_line(t(key, reason=reason), "warn")
+        self._release_and_check()
+
+    # ---- end state (F-180) ----
+    def _release_and_check(self) -> None:
+        threading.Thread(target=release_and_check_worker, args=(self.q, self.lease),
+                         name="enroll-ready", daemon=True).start()
+        self._refresh_buttons()
+
+    def _check_ready(self) -> None:
+        threading.Thread(target=readiness_worker, args=(self.q, not self.lease.held),
+                         daemon=True).start()
+
+    def _show_ready_panel(self) -> None:
+        if not self.ready_frm.winfo_ismapped():
+            self.ready_frm.pack(fill="x", pady=(8, 0))
+
+    def _show_ready(self, checks: dict, pwd: str, rejected: bool) -> None:
+        self._show_ready_panel()
+        for key, ok in checks.items():
+            text = t(f"enroll.ready.{key}.{'ok' if ok else 'bad'}")
+            if key == "password" and not ok:
+                text = t("enroll.ready.password.rejected" if rejected
+                         else f"enroll.ready.password.{pwd}")
+            self.ready_lines[key].configure(text=("✓ " if ok else "✗ ") + text,
+                                            foreground=_COACH_FG["ok" if ok else "err"])
+        if all(checks.values()):
+            self._set_line(t("enroll.ready.all_ok"), "ok")
+        self._refresh_buttons()
+
+    def _on_set_password(self) -> None:
+        import subprocess
+        import sys
+        frozen = bool(getattr(sys, "frozen", False))
+        argv = [sys.executable, "--set-password"] if frozen else \
+            [sys.executable, "-m", "presence_monitor.password_gui"]
         try:
-            self._teardown_tk_objects()
+            subprocess.Popen(argv, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
         except Exception:
-            log.exception("enroll tk teardown failed")
+            log.exception("could not open the password dialog")
+
+    # ---- delete ----
+    def _on_wipe(self) -> None:
+        if not messagebox.askyesno(t("enroll.confirm.wipe.title"), t("enroll.confirm.wipe.body"),
+                                   parent=self.root, icon="warning", default="no"):
+            return
+        if self.session:
+            self.session.armed.clear()               # F-186: nothing is written during the wipe
+        self.wipe_btn.configure(state="disabled")
+        threading.Thread(target=wipe_worker, args=(self.q,), daemon=True).start()
+
+    def _on_wiped(self, resp) -> None:
+        if not (resp and resp.get("ok")):
+            log.warning("clear_enrollment failed: %s", resp)
+            messagebox.showerror(t("enroll.title"), t("enroll.error.wipe_failed"), parent=self.root)
+        else:
+            self.mode = None
+            if self.session is not None:
+                with self.session.lock:
+                    self.session.captured = 0
+            self._show_count(0)
+            self._set_line(t("enroll.guide.idle"), "info")
+        self._refresh_existing()
+        self._refresh_buttons()
+
+    # ---- close ----
+    def _on_close(self) -> None:
+        if self.building or self.calibrating:
+            messagebox.showinfo(t("enroll.title"), t("enroll.busy_close"), parent=self.root)
+            return                                  # F-185
+        if self.mode == "replace":
+            n = count_images(ENROLL_PENDING_DIR)
+            if n:
+                choice = ask_unbuilt(self.root, n)
+                if choice is None:
+                    return
+                if choice == "build":
+                    self._on_build()
+                    return
+        self.stop_all.set()
+        if self.session is not None:
+            self.session.stop.set()
+            self.session.armed.clear()
+        th = self.cam_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=3.0)
+            if th.is_alive():
+                log.warning("enroll camera thread did not exit within 3s")
         try:
             self.root.destroy()
         except Exception:
             pass
-        # Only resume if we actually took the lease -- an unpaired resume would
-        # clear a lease we never set.
-        if self._lease_ok:
-            self._release_camera_lease()
-        # Stage 8b (F-12): an unbuilt Replace session is discarded -- the old gallery was never
-        # touched, and captured face images must not linger. Not while a build is still reading it.
-        if self._mode == "replace" and not self._building:
+        self.lease.release()
+        if self.mode == "replace":
             try:
                 from face_service.datadir import remove_tree_no_follow
                 remove_tree_no_follow(ENROLL_PENDING_DIR)
             except Exception:
                 log.exception("discarding the pending session failed")
 
-    def _teardown_tk_objects(self) -> None:
-        """Drop every Tk reference we hold, BEFORE root.destroy().
-
-        Same rationale as the tray windows (block1 fix2, 7932eb3): with several
-        Tk roots alive in this process, a Variable or PhotoImage finalized later
-        by ANOTHER thread's GC talks to a dead interpreter -- that raises
-        "main thread is not in main loop" and can abort the process with
-        Tcl_AsyncDelete. Releasing them here, on this window's own thread while
-        its interpreter is still alive, keeps finalization deterministic.
-
-        Deliberately independent of the camera thread: this only touches Tk
-        state, so it still runs when that thread is wedged in read() (the
-        leaked-handle debt deferred to Stage 7).
-        """
-        self.guide_var = None
-        self.progress_var = None
-        self.count_var = None
-        self.existing_var = None
-        self._latest_tk_image = None
-        for name in ("preview", "guide", "progress", "count_spin",
-                     "start_btn", "build_btn", "wipe_btn"):
-            setattr(self, name, None)
-
     def run(self) -> None:
         self.root.mainloop()
 
 
 def main() -> int:
-    """Process entry point: ``python -m presence_monitor.enroll_gui``.
-
-    The wizard used to run on a daemon thread inside the tray process. It does not any more, and
-    the reason is the whole point of this module's isolation: ``cv2.VideoCapture.read()`` is not
-    reliably interruptible on this hardware, so a wedged camera thread never ran its
-    ``finally: cap.release()`` and kept the physical device inside the TRAY's address space --
-    every later verify then read black frames, and with ``persistent_camera=True`` that black
-    capture got cached (KNOWN_ISSUES #1). Releasing it from another thread was not an option
-    either: ``VideoCapture`` is not thread-safe, and a native crash would take presence
-    monitoring -- i.e. walk-away locking -- down with it.
-
-    Owning a process solves it by construction. Closing the window returns from here, the process
-    exits, and the OS reclaims the camera handle no matter what state the native call is stuck in.
-    It also removes the crash hole the old in-thread launcher had: a window that died before
-    setting ``_stop`` left its camera thread looping inside the tray forever.
-
-    Tk lives on the MAIN thread here (the camera stays a worker), which is what Tk wants anyway.
-
-    Logging goes to its own ``enroll.log`` beside ``presence.log`` -- same level, format and
-    handlers as the presence process, but a separate file, because two processes appending to one
-    log file interleave badly on Windows.
-    """
+    """Process entry point (``python -m presence_monitor.enroll_gui`` / tray exe ``--enroll``)."""
     from face_service.config import LOG_PATH
     from face_service.logging_setup import setup_logging
+    from presence_monitor.instance import first_instance, raise_by_title
+    from presence_monitor.ui import enable_dpi_awareness
     setup_logging(LOG_PATH.with_name("enroll.log"))
     try:
-        # i18n state is per-process: the tray's set_language() never ran here, and the module
-        # default is English, so without this the wizard would ignore the user's saved language.
-        # EnrollWindow loads its own Config for the QC/camera knobs; this second read is the
-        # cheap price of not reshaping its constructor.
         cfg = Config.load()
         set_language(cfg.language)
-        # One startup line per run. enroll.log is APPENDED to (and rotated at 5 MB), not truncated,
-        # so this is what separates one wizard run from the last and tells you which process and
-        # which settings produced everything below it.
+        if not first_instance(ENROLL_MUTEX):              # F-189: in this module, both layouts
+            raise_by_title(t("enroll.title"))
+            return 0
+        enable_dpi_awareness()
         log.info("enroll wizard starting: pid=%s lang=%s camera_name=%r camera_index=%s",
                  os.getpid(), cfg.language, cfg.camera_name, cfg.camera_index)
         EnrollWindow().run()

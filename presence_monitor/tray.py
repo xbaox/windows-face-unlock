@@ -1,6 +1,26 @@
+"""The tray icon and its menu (Stage 9, act 9b R12 / R14 / R15).
+
+* **State at a glance** (F-172, R9, R13): a transparent icon drawn per state -- green (ready),
+  amber (needs attention: paused, no face enrolled, the stored password was rejected at the lock
+  screen), grey (off: the service is not running or refuses, the camera cannot see) -- and the same
+  state as the first, disabled line of the menu and in the tooltip. It follows the monitor's ticks,
+  not only menu clicks. While the service refuses face functions, "Set up face" and "Check
+  presence now" are disabled.
+* **Notifications** (R14): WinRT toasts under the product's AppUserModelID (presence_monitor.toast);
+  pystray balloons are not used. Every event also goes to the Status window's "Recent events".
+* **Quit asks first** (F-157): it switches face sign-in and walk-away lock off.
+* **Windows** run on the one Tk thread (presence_monitor.ui); a second click raises the open window
+  (F-173). The password dialog and the wizard are their own processes, each with its own mutex;
+  the dev layout opens the same password dialog as the installed one (F-162).
+* **Updates** (R15): the background check runs at most once a day, only with update_check on, and
+  stays silent unless a newer release exists (then: a toast, an event, and an "Open releases page"
+  menu item). The menu item always checks and answers in a dialog (F-197), with a separate text for
+  each failure (F-183). One check at a time.
+* **Languages** (R16): English and Russian.
+"""
 from __future__ import annotations
+
 import logging
-import os
 import subprocess
 import sys
 import threading
@@ -10,232 +30,174 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import pystray
 
-from face_service.config import Config, LOG_PATH
-from face_service.i18n import LANGUAGES, get_language, set_language, t
+from face_service.config import Config
+from face_service.i18n import get_language, set_language, shown_languages, t
 
-from .gui import open_help, open_settings, open_status
+from .gui import open_help, open_log_folder, open_settings, open_status, probe_text
 from .monitor import PresenceMonitor, pipe_call
-from .updater import RELEASES_PAGE_URL, check_latest_status, current_version
+from .toast import set_process_app_id, show_toast
+from .ui import UiThread, enable_dpi_awareness
+from .updater import (RELEASES_PAGE_URL, check_latest_status, current_version, due_for_auto_check,
+                      record_auto_check)
 
 log = logging.getLogger(__name__)
 
-SET_PASSWORD_CMD = ["-m", "tools.set_password"]
 ENROLL_CMD = ["-m", "presence_monitor.enroll_gui"]
+PASSWORD_CMD = ["-m", "presence_monitor.password_gui"]
 
-# A frozen bundle has no ``-m`` entry point: the bootloader runs the script the EXE was built from
-# and passes the rest of argv to it, so `face_unlock_tray.exe -m presence_monitor.enroll_gui` would
-# start a SECOND TRAY and hand it an argv it ignores. presence_monitor/__main__.py therefore routes
-# on these flags, and the launchers below re-exec sys.executable (which IS face_unlock_tray.exe
-# when frozen) with the matching one. The dev paths are untouched.
+# A frozen bundle has no ``-m`` entry point: presence_monitor/__main__.py routes these flags, and
+# the launchers below re-exec sys.executable (face_unlock_tray.exe when frozen) with them.
 FROZEN = bool(getattr(sys, "frozen", False))
 ENROLL_FLAG = "--enroll"
 SET_PASSWORD_FLAG = "--set-password"
 
-# Live tray icon for event toasts; filled by run_with_tray while it runs.
-_notify_icon: list[pystray.Icon] = []
+AUTO_UPDATE_DELAY_S = 120.0
 
-# The live re-enroll wizard child, or empty. A list for the same reason as _notify_icon above:
-# the module-level helpers rebind it without needing `global`. KEEPING the Popen is the point --
-# _launch_tool throws its handle away, which is exactly why a stuck wizard could never be stopped.
-_enroll_proc: list[subprocess.Popen] = []
+# The live child processes, kept so Quit can take them down (a list: rebound without `global`).
+_children: dict[str, subprocess.Popen] = {}
 
 
-def notify_event(gate: str, message: str) -> None:
-    """Config-gated event toast via the live tray icon.
+# ---- icon ------------------------------------------------------------------------------------
 
-    Works whenever the tray is running (all windows may be closed). Silent
-    no-op when there is no icon, the ``notify_*`` gate is off in config, or
-    notify itself fails — an event toast must never take the caller down.
-    """
-    try:
-        if not _notify_icon:
-            return
-        if not bool(getattr(Config.load(), gate, False)):
-            return
-        _notify_icon[0].notify(message, t("tray.title"))
-    except Exception:
-        log.exception("notify_event(%s) failed", gate)
-
-# Visual icons that sit after the label text in each tray menu entry.
-# Placed at the end with a tab so they right-align nicely in the Windows
-# context menu font. pystray does not support real per-item icons on
-# Windows, so these emoji are the best we can do.
-EMOJI = {
-    "status":       "📊",
-    "settings":     "⚙",
-    "probe":        "📸",
-    "pause":        "⏸",
-    "resume":       "▶",
-    "enroll":       "🧑",
-    "set_password": "🔑",
-    "open_log":     "📄",
-    "language":     "🌐",
-    "check_update": "⬆",
-    "help":         "❓",
-    "quit":         "⏻",
-}
+_COLOURS = {"ok": (46, 160, 67, 255), "attention": (214, 150, 20, 255), "off": (140, 140, 140, 255)}
 
 
-def _decorate(label: str, emoji_key: str) -> str:
-    """Append a right-side emoji icon to the menu label."""
-    return f"{label}\t{EMOJI.get(emoji_key, '')}"
-
-
-def _icon_image(active: bool, paused: bool = False) -> Image.Image:
-    img = Image.new("RGB", (64, 64), "white")
+def icon_image(level: str) -> Image.Image:
+    """A transparent 64x64 face in the state colour (F-172: no white square on a dark taskbar)."""
+    colour = _COLOURS.get(level, _COLOURS["off"])
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    if paused:
-        color = (200, 150, 30)
-    elif active:
-        color = (30, 130, 30)
-    else:
-        color = (130, 130, 130)
-    d.ellipse((8, 8, 56, 56), outline=color, width=4)
-    d.ellipse((22, 24, 28, 30), fill=color)
-    d.ellipse((36, 24, 42, 30), fill=color)
-    d.arc((20, 30, 44, 48), start=0, end=180, fill=color, width=3)
+    d.ellipse((6, 6, 58, 58), outline=colour, width=6)
+    d.ellipse((21, 22, 29, 30), fill=colour)
+    d.ellipse((35, 22, 43, 30), fill=colour)
+    d.arc((18, 28, 46, 50), start=20, end=160, fill=colour, width=5)
     return img
 
 
-def _launch_tool(args: list[str], frozen_flag: str = "") -> None:
-    """Spawn a tool in a new console window using the same Python that runs us.
+def tray_state(status: "dict | None", snap: dict, reachable_known: bool = True) -> "tuple[str, str]":
+    """(level, state line) from the last status reply and the monitor snapshot. Pure."""
+    if status is None:
+        return "off", t("tray.state.no_service") if reachable_known else t("tray.state.starting")
+    if status.get("state") == "refusing":
+        why = str(status.get("why") or "")
+        return "off", t("tray.state.refusing", why=t(f"why.{why}") if why else "?")
+    if status.get("password_rejected"):
+        return "attention", t("tray.state.password_rejected")
+    if not status.get("enrollment"):
+        return "attention", t("tray.state.no_enrollment")
+    if snap.get("paused"):
+        return "attention", t("tray.state.paused")
+    if snap.get("last_result") == "unknown":
+        return "off", t("tray.state.camera_unknown", why=snap.get("last_why") or "?")
+    return "ok", (t("tray.state.ready_autolock") if snap.get("auto_lock") else t("tray.state.ready"))
 
-    Frozen builds take the flag branch instead: there is no console to open (the bundle is built
-    windowed), no ``tools/`` tree under {app}, and no interpreter to run ``-m`` with. The frozen
-    counterpart of the console set_password tool is the tkinter dialog in password_gui.py.
-    """
+
+def update_result_text(release, status: str, current: str) -> "tuple[str, str]":
+    """What a MANUAL update check says, in a dialog (F-197: never only a toast), with one text per
+    outcome (F-183). ("ask", text) when a newer release exists, else ("info", text). Pure."""
+    if release is not None and release.is_newer_than(current):
+        return "ask", t("update.available", latest=release.tag, current=current)
+    if release is not None:
+        return "info", t("update.up_to_date", v=current)
+    if status.startswith("no-asset:"):
+        return "info", t("update.no_asset", tag=status.split(":", 1)[1])
+    key = {"no-release": "update.no_releases", "rate-limited": "update.rate_limited",
+           "proxy-auth": "update.proxy_auth", "network": "update.network",
+           "bad-response": "update.bad_response"}.get(status, "update.http_error")
+    return "info", t(key, err=status)
+
+
+# ---- child processes --------------------------------------------------------------------------
+
+def _spawn(role: str, dev_args: list, flag: str) -> None:
+    """Start the wizard / password dialog as its own windowed process and KEEP the handle, so Quit
+    can take it down. The child holds its own mutex and raises its window on a duplicate."""
+    proc = _children.get(role)
+    running = proc is not None and proc.poll() is None
+    if running:
+        # Still started: the new process finds the mutex taken, brings the open window to the
+        # front and exits. The handle of the running one is kept.
+        log.info("%s already running (pid=%s) -- raising it", role, proc.pid)
     if FROZEN:
-        if not frozen_flag:
-            log.error("no frozen entry point for %s -- not launching", args)
-            return
+        argv = [sys.executable, flag]
+        cwd = None
+    else:
+        repo = Path(__file__).resolve().parent.parent
+        pyw = repo / ".venv" / "Scripts" / "pythonw.exe"
+        argv = [str(pyw) if pyw.exists() else sys.executable, *dev_args]
+        cwd = str(repo)
+    try:
+        new = subprocess.Popen(argv, cwd=cwd,
+                               creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
+        if not running:
+            _children[role] = new
+            log.info("%s started (pid=%s)", role, new.pid)
+    except Exception:
+        log.exception("failed to start the %s", role)
+
+
+def _terminate_children() -> None:
+    for role, proc in list(_children.items()):
+        if proc.poll() is not None:
+            continue
         try:
-            subprocess.Popen(
-                [sys.executable, frozen_flag],
-                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
-            )
+            log.info("terminating the %s (pid=%s)", role, proc.pid)
+            proc.terminate()
+            proc.wait(timeout=3)
         except Exception:
-            log.exception("failed to launch tool: %s", frozen_flag)
-        return
-    repo_root = Path(__file__).resolve().parent.parent
-    venv_py = repo_root / ".venv" / "Scripts" / "python.exe"
-    py = str(venv_py) if venv_py.exists() else sys.executable
-    try:
-        subprocess.Popen(
-            [py, *args],
-            cwd=str(repo_root),
-            creationflags=subprocess.CREATE_NEW_CONSOLE,  # type: ignore[attr-defined]
-        )
-    except Exception:
-        log.exception("failed to launch tool: %s", args)
-
-
-def _enroll_alive() -> bool:
-    """True while the spawned wizard is still running (poll() is None until it exits)."""
-    return bool(_enroll_proc) and _enroll_proc[0].poll() is None
-
-
-def _launch_enroll() -> None:
-    """Spawn the re-enroll wizard as its OWN process, and KEEP the handle.
-
-    Deliberately not _launch_tool: that one opens a console window (set_password is an interactive
-    console tool) and discards its Popen. The wizard is a GUI, so it runs under pythonw with no
-    console at all, and its handle is kept so Quit can terminate it.
-
-    Why a process rather than the old daemon thread: closing the window ends the process and the
-    OS releases the camera handle even when the capture thread is wedged inside a native read(),
-    which an in-process wizard could never guarantee (KNOWN_ISSUES #1).
-
-    Frozen builds re-exec this same EXE with ``--enroll`` (routed by presence_monitor/__main__.py)
-    rather than ``-m``, which a bundle does not honour. Everything else is identical, the kept
-    handle included -- that is what lets Quit take a stuck wizard down.
-    """
-    if FROZEN:
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, ENROLL_FLAG],
-                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
-            )
-        except Exception:
-            log.exception("failed to launch the enroll wizard")
-            return
-        _enroll_proc[:] = [proc]
-        log.info("enroll wizard started (pid=%s, frozen)", proc.pid)
-        return
-    repo_root = Path(__file__).resolve().parent.parent
-    venv_py = repo_root / ".venv" / "Scripts" / "pythonw.exe"
-    py = str(venv_py) if venv_py.exists() else sys.executable
-    try:
-        proc = subprocess.Popen(
-            [py, *ENROLL_CMD],
-            cwd=str(repo_root),
-            creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
-        )
-    except Exception:
-        log.exception("failed to launch the enroll wizard")
-        return
-    _enroll_proc[:] = [proc]
-    log.info("enroll wizard started (pid=%s)", proc.pid)
-
-
-def _terminate_enroll() -> None:
-    """Best-effort stop of a live wizard when the tray exits. Never raises.
-
-    A wizard outliving the tray would keep holding the webcam with nothing left to reclaim it, so
-    Quit takes it down too. Bounded: wait() can time out (the wedged-read case), and that is
-    logged and accepted rather than allowed to stall the shutdown.
-    """
-    if not _enroll_alive():
-        return
-    proc = _enroll_proc[0]
-    try:
-        log.info("terminating the enroll wizard (pid=%s)", proc.pid)
-        proc.terminate()
-        proc.wait(timeout=3)
-    except Exception:
-        log.exception("terminating the enroll wizard failed")
+            log.exception("terminating the %s failed", role)
 
 
 def _save_language(code: str) -> None:
-    """Persist the language choice so it survives service restart."""
+    """Persist the language choice -- ONLY that key (Stage 9, R9)."""
     try:
         cfg = Config.load()
         cfg.language = code
         cfg.validate()
-        # Stage 9 (R9, B3-04): ONLY the language key is written -- the rest of the file (and a
-        # file with a bad value somewhere) is left exactly as it is; an unparsable file is refused.
         cfg.save(keys=["language"])
     except Exception:
         log.exception("failed to persist language=%s", code)
 
 
+# ---- the tray ---------------------------------------------------------------------------------
+
 def run_with_tray(cfg: Config) -> None:
-    # Honor saved language from config.
     set_language(cfg.language)
+    set_process_app_id()
+    log.info("DPI awareness: %s", enable_dpi_awareness())
+    ui = UiThread()
 
     monitor = PresenceMonitor(cfg)
-    thread = threading.Thread(target=monitor.run, name="presence-loop", daemon=True)
-    thread.start()
-
     icon_ref: list[pystray.Icon] = []
-    monitor.on_update = lambda: refresh_icon()
+    newer: dict = {}                       # {"tag": "v0.2.1"} once a newer release is known
+    update_busy = threading.Lock()
 
     def refresh_icon() -> None:
         if not icon_ref:
             return
         icon = icon_ref[0]
-        snap = monitor.snapshot()
-        # Stage 9 (act 9b R10): a probe that could not see ("unknown") greys the icon and names the
-        # cause in the tooltip -- it is neither presence nor absence.
-        blind = snap.get("last_result") == "unknown"
-        icon.icon = _icon_image(active=not blind, paused=monitor.is_paused())
-        title = t("tray.title")
-        if blind:
-            title = f"{title} -- {t('tray.camera_unknown', why=snap.get('last_why') or '?')}"
-        icon.title = title[:127]           # Shell_NotifyIcon tooltip limit
+        level, line = tray_state(monitor.last_status(), monitor.snapshot(),
+                                 reachable_known=monitor._svc_reachable is not None)
+        icon.icon = icon_image(level)
+        icon.title = f"{t('tray.title')} -- {line}"[:127]     # NOTIFYICONDATA szTip limit
         icon.update_menu()
 
-    # ------------------------- actions ------------------------------------
+    def on_event(gate: str, message: str) -> None:
+        """Monitor events: a toast when its gate is on (the monitor's config, not a file read per
+        toast -- F-154), and a state refresh either way."""
+        if bool(getattr(monitor.cfg, gate, True)):
+            show_toast(t("tray.title"), message)
+        refresh_icon()
 
+    monitor.on_event = on_event
+    monitor.on_update = refresh_icon
+    threading.Thread(target=monitor.run, name="presence-loop", daemon=True).start()
+
+    def refusing() -> bool:
+        st = monitor.last_status()
+        return bool(st and st.get("state") == "refusing")
+
+    # ---- actions ----
     def on_toggle(icon, item):
         if monitor.is_paused():
             monitor.resume()
@@ -244,121 +206,90 @@ def run_with_tray(cfg: Config) -> None:
         refresh_icon()
 
     def on_status(icon, item):
-        open_status(monitor)
+        open_status(ui, monitor)
 
     def on_settings(icon, item):
-        def on_saved(new_cfg: Config) -> None:
-            monitor.reload_config(new_cfg)
-            set_language(new_cfg.language)
-            refresh_icon()
-        open_settings(monitor, on_saved=on_saved)
+        open_settings(ui, monitor, on_saved=lambda _c: refresh_icon())
 
     def on_help(icon, item):
-        open_help()
+        open_help(ui)
 
     def on_enroll(icon, item):
-        # One wizard at a time. The live child IS the lock now, replacing the old in-process
-        # _enroll_lock -- and unlike that lock it cannot be left stuck held, because a crashed
-        # window is a dead process and poll() stops returning None.
-        if _enroll_alive():
-            log.info("enroll wizard already running (pid=%s); ignoring", _enroll_proc[0].pid)
-            return
-        _launch_enroll()
+        _spawn("wizard", ENROLL_CMD, ENROLL_FLAG)
 
     def on_set_password(icon, item):
-        _launch_tool(SET_PASSWORD_CMD, SET_PASSWORD_FLAG)
+        _spawn("password dialog", PASSWORD_CMD, SET_PASSWORD_FLAG)
 
     def on_open_log(icon, item):
-        try:
-            os.startfile(str(LOG_PATH.parent))  # type: ignore[attr-defined]
-        except Exception:
-            log.exception("open log folder failed")
+        open_log_folder()
 
     def on_probe_now(icon, item):
-        def _probe():
-            resp = pipe_call({"cmd": "presence"}, timeout_s=10.0)
-            log.info("manual probe: %s", resp)
-        threading.Thread(target=_probe, daemon=True).start()
+        key = ui.new_key("tray-probe")
 
-    def _update_notify(icon_obj, title: str, message: str) -> None:
+        def show(resp):
+            ui.off(key)
+            from tkinter import messagebox
+            text = probe_text(resp)
+            monitor.record_event(t("event.probe", result=text))
+            messagebox.showinfo(t("tray.probe").rstrip("…"), text, parent=_parent())
+        ui.post(ui.on, key, show)
+        ui.run_bg(pipe_call, {"cmd": "presence"}, 20.0, reply=key)
+
+    def _parent():
+        """A throw-away topmost owner so a dialog of the hidden root comes to the front."""
+        import tkinter as tk
+        top = tk.Toplevel(ui.root)
+        top.withdraw()
+        top.attributes("-topmost", True)
+        top.after(60000, top.destroy)
+        return top
+
+    # ---- updates ----
+    def check_updates(interactive: bool) -> None:
+        if not update_busy.acquire(blocking=False):
+            return                                   # F-173: one check at a time
         try:
-            icon_obj.notify(message, title)
-        except Exception:
-            log.exception("tray.notify failed")
-
-    def _run_update_flow(interactive: bool = True) -> None:
-        """Background worker that checks GitHub and tells the user (Stage 8b: NOTIFY-ONLY).
-
-        interactive=True comes from a menu click → always report the outcome.
-        interactive=False is the startup auto-check → only speak up for a newer version.
-
-        Stage 8b (F-28). Defect: a 404 (nothing published yet) was shown as a network error, the
-        dialogs had no parent, and after "install" the tray quit even if Setup was then declined.
-        Fix: the updater installs nothing (updater.APPLY_ENABLED); a newer version opens the
-        releases page on request, the tray keeps running, 404 has its own text, dialogs have a
-        parent.
-        """
-        from tkinter import Tk, messagebox
-        import webbrowser
-
-        release, status = check_latest_status(timeout=8.0)
-        current = current_version()
-
-        if release is None:
-            if interactive and icon_ref:
-                msg = (t("update.no_releases") if status == "no-release"
-                       else t("update.check_failed", err=status))
-                _update_notify(icon_ref[0], t("update.title"), msg)
-            return
-
-        if not release.is_newer_than(current):
-            if interactive and icon_ref:
-                _update_notify(icon_ref[0], t("update.title"),
-                               t("update.up_to_date", v=current))
-            return
-
-        # Ask the user. Use a small Tk root we immediately destroy afterwards.
-        if icon_ref:
-            _update_notify(icon_ref[0], t("update.title"),
-                           t("notify.update_available", latest=release.tag))
-
-        root = Tk()
-        root.withdraw()
-        try:
-            notes = (release.body or "")[:600]
-            if messagebox.askyesno(
-                t("update.title"),
-                t("update.available", latest=release.tag,
-                  current=current, notes=notes),
-                parent=root,
-            ):
-                webbrowser.open(RELEASES_PAGE_URL)
+            release, status = check_latest_status(timeout=8.0)
         finally:
-            try:
-                root.destroy()
-            except Exception:
-                pass
+            update_busy.release()
+        current = current_version()
+        if release is not None and release.is_newer_than(current):
+            newer["tag"] = release.tag
+            monitor._notify("notify_update", t("notify.update_available", latest=release.tag))
+            refresh_icon()
+        if interactive:
+            ui.post(_show_update_result, release, status, current)
+
+    def _show_update_result(release, status, current) -> None:
+        from tkinter import messagebox
+        import webbrowser
+        kind, text = update_result_text(release, status, current)
+        if kind == "ask":
+            if messagebox.askyesno(t("update.title"), text, parent=_parent()):
+                webbrowser.open(RELEASES_PAGE_URL)
+        else:
+            messagebox.showinfo(t("update.title"), text, parent=_parent())
 
     def on_check_update(icon, item):
-        threading.Thread(target=lambda: _run_update_flow(interactive=True),
-                         name="update-check", daemon=True).start()
+        threading.Thread(target=check_updates, args=(True,), name="update-check", daemon=True).start()
 
-    # Non-blocking auto-check on startup (silent if up to date).
-    def _startup_update_check():
-        time.sleep(30)  # let TF warm up first, don't hit GH immediately
-        _run_update_flow(interactive=False)
-    threading.Thread(target=_startup_update_check,
-                     name="update-startup", daemon=True).start()
+    def on_open_releases(icon, item):
+        import webbrowser
+        webbrowser.open(RELEASES_PAGE_URL)
 
+    def _auto_update_loop():
+        # R15: at most once per 24 h, never in the first minutes after logon, only when enabled.
+        time.sleep(AUTO_UPDATE_DELAY_S)
+        while True:
+            if monitor.cfg.update_check and due_for_auto_check():
+                record_auto_check()
+                check_updates(False)
+            time.sleep(3600)
+
+    threading.Thread(target=_auto_update_loop, name="update-auto", daemon=True).start()
+
+    # ---- quit ----
     def _stop_service_process() -> None:
-        """Ask face_service to shut down, synchronously and bounded (Stage 8b, F-49).
-
-        Defect: the shutdown ran on a DAEMON thread started just before icon.stop(), and the process
-        exits as soon as icon.run() returns. Consequence: whether the request was sent at all was a
-        race, and the psutil sweep after it (python.exe / pythonw.exe with "face_service" in the
-        command line) never ran -- it is inert in the installed layout anyway, and in a dev layout
-        it would kill a debugging `python -m face_service` the watchdog deliberately spares. Fix:
-        send the shutdown on the Quit handler itself, before the icon stops; no sweep."""
         try:
             resp = pipe_call({"cmd": "shutdown"}, timeout_s=3.0)
             log.info("service shutdown on Quit: %s", "sent" if resp and resp.get("ok")
@@ -366,84 +297,78 @@ def run_with_tray(cfg: Config) -> None:
         except Exception:
             log.exception("service shutdown on Quit failed")
 
+    def _do_quit() -> None:
+        log.info("Quit confirmed")
+        monitor.stop()
+        _terminate_children()               # the wizard's camera lease first
+        _stop_service_process()
+        if icon_ref:
+            icon_ref[0].stop()
+        ui.stop()
+
+    def _confirm_quit() -> None:
+        from tkinter import messagebox
+        if messagebox.askyesno(t("quit.confirm.title"), t("quit.confirm.body"), parent=_parent(),
+                               icon="warning", default="no"):
+            threading.Thread(target=_do_quit, name="quit", daemon=True).start()
+
     def on_quit(icon, item):
         log.info("Quit requested from tray")
-        monitor.stop()
-        # Before the service teardown: the wizard holds the webcam under a lease, so taking it
-        # down first is what lets the device come back at all.
-        _terminate_enroll()
-        _stop_service_process()
-        icon.stop()
+        ui.post(_confirm_quit)
 
+    # ---- language ----
     def make_language_handler(code: str):
         def _handler(icon, item):
             set_language(code)
             _save_language(code)
-            # Propagate to the service too so presence_mode etc. use updated
-            # config on next tick (reload is cheap; ignore failures).
-            threading.Thread(
-                target=lambda: pipe_call({"cmd": "reload_config"}, timeout_s=3.0),
-                daemon=True,
-            ).start()
+            threading.Thread(target=lambda: pipe_call({"cmd": "reload_config"}, timeout_s=3.0),
+                             daemon=True).start()
             refresh_icon()
         return _handler
 
-    def make_language_checked(code: str):
-        return lambda item: get_language() == code
+    # ---- menu ----
+    def lbl(key: str):
+        return lambda item: t(key)
 
-    # ------------------------- menu ----------------------------------------
-
-    # All text callables so language switch rebuilds labels when the user
-    # opens the menu next time.
-    def lbl(key: str, emoji_key: str):
-        return lambda item: _decorate(t(key), emoji_key)
+    def state_line(item):
+        return tray_state(monitor.last_status(), monitor.snapshot(),
+                          reachable_known=monitor._svc_reachable is not None)[1]
 
     def pause_text(item):
-        key = "tray.resume" if monitor.is_paused() else "tray.pause"
-        icon = "resume" if monitor.is_paused() else "pause"
-        return _decorate(t(key), icon)
+        return t("tray.resume") if monitor.is_paused() else t("tray.pause")
 
-    # Language submenu built from the LANGUAGES table. Each row is labelled
-    # in its OWN language (native), so the label text is static — no need
-    # for a t() callable here.
-    language_items = tuple(
-        pystray.MenuItem(
-            text=f"{emoji}  {native}",
-            action=make_language_handler(code),
-            checked=make_language_checked(code),
-            radio=True,
-        )
-        for code, native, emoji in LANGUAGES
-    )
-    language_submenu = pystray.Menu(*language_items)
+    language_submenu = pystray.Menu(*(
+        pystray.MenuItem(native, make_language_handler(code),
+                         checked=(lambda c: (lambda item: get_language() == c))(code), radio=True)
+        for code, native in shown_languages()))
 
     menu = pystray.Menu(
-        pystray.MenuItem(lbl("tray.status", "status"), on_status),
-        pystray.MenuItem(lbl("tray.settings", "settings"), on_settings),
+        pystray.MenuItem(state_line, None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lbl("tray.probe", "probe"), on_probe_now),
-        pystray.MenuItem(pause_text, on_toggle),
+        pystray.MenuItem(lbl("tray.status"), on_status, default=True),
+        pystray.MenuItem(lbl("tray.settings"), on_settings),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lbl("tray.enroll", "enroll"), on_enroll),
-        pystray.MenuItem(lbl("tray.set_password", "set_password"), on_set_password),
-        pystray.MenuItem(lbl("tray.open_log", "open_log"), on_open_log),
+        pystray.MenuItem(lbl("tray.probe"), on_probe_now,
+                         enabled=lambda item: bool(monitor.cfg.auto_lock) and not refusing()),
+        pystray.MenuItem(pause_text, on_toggle, visible=lambda item: bool(monitor.cfg.auto_lock)),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lbl("tray.language", "language"), language_submenu),
-        pystray.MenuItem(lbl("tray.check_update", "check_update"), on_check_update),
-        pystray.MenuItem(lbl("tray.help", "help"), on_help),
+        pystray.MenuItem(lbl("tray.enroll"), on_enroll, enabled=lambda item: not refusing()),
+        pystray.MenuItem(lbl("tray.set_password"), on_set_password),
+        pystray.MenuItem(lbl("tray.open_log"), on_open_log),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lbl("tray.quit", "quit"), on_quit),
+        pystray.MenuItem(lbl("tray.language"), language_submenu),
+        pystray.MenuItem(lbl("tray.check_update"), on_check_update),
+        pystray.MenuItem(lambda item: t("tray.open_releases", tag=newer.get("tag", "")),
+                         on_open_releases, visible=lambda item: bool(newer)),
+        pystray.MenuItem(lbl("tray.help"), on_help),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(lbl("tray.quit"), on_quit),
     )
 
-    icon = pystray.Icon(
-        "face-unlock-presence",
-        _icon_image(active=True, paused=monitor.is_paused()),     # F-147: pause persists
-        t("tray.title"),
-        menu,
-    )
+    icon = pystray.Icon("face-unlock-presence", icon_image("off"), t("tray.title"), menu)
     icon_ref.append(icon)
-    _notify_icon.append(icon)
+    refresh_icon()
     try:
         icon.run()
     finally:
-        _notify_icon.clear()
+        icon_ref.clear()

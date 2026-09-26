@@ -464,7 +464,8 @@ def test_small():
     check("threshold 0.51 rejected", _rejects(threshold=0.51))
     from presence_monitor.gui import SETTINGS_FIELDS
     spec = {f[0]: f[2] for f in SETTINGS_FIELDS}
-    check("Settings offers threshold up to 0.5", spec.get("threshold") == (0.05, 0.5),
+    # Stage 9 (R12, F-155): Settings offers only 0.28-0.35 (validate() still allows up to 0.5).
+    check("Settings offers threshold 0.28-0.35 only", (spec.get("threshold") or ())[:2] == (0.28, 0.35),
           spec.get("threshold"))
 
 

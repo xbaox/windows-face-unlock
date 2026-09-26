@@ -192,8 +192,13 @@ $fuKnownData = @(
     'config.toml',
     'service.log', 'presence.log', 'enroll.log', 'watchdog.log',
     'lockout.json', 'audit.jsonl', 'watchdog.pause',
-    'threshold_samples.json', 'session_lock_probe.log'
+    'threshold_samples.json', 'session_lock_probe.log',
+    # Stage 9: calibration, lock-screen verdict, presence pause, watchdog heartbeat, updater state
+    'calibration.json', 'password_rejected.flag', 'presence_paused.json',
+    'watchdog_heartbeat.json', 'update_state.json'
 )
+# Stage 9 (R12): the logs moved into their own folder; the same names are known there.
+$fuLogDir = 'logs'
 $fuKnownPatterns = @(
     '^audit\.jsonl\.\d+$', '^lowlight_probe_.*\.csv$', '^service\.log\.\d+$',
     '^presence\.log\.\d+$', '^enroll\.log\.\d+$', '^watchdog\.log\.\d+$'
@@ -481,7 +486,7 @@ function Invoke-Inventory {
         $fuUnknown = @($fuAll | Where-Object {
                            $fuN = $_.Name
                            (-not $_.Class) -and
-                           (($_.Sub -ne '') -or (
+                           ((($_.Sub -ne '') -and ($_.Sub -ne $fuLogDir)) -or (
                                (-not ($fuKnownData -contains $fuN)) -and
                                (-not ($fuKnownPatterns | Where-Object { $fuN -match $_ }))))
                        })

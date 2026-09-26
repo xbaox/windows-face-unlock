@@ -160,9 +160,9 @@ def main(argv=None) -> int:
 
     print("\n[7] the updater points at this repository")
     up = _read(REPO_ROOT / "presence_monitor" / "updater.py")
-    owner = re.search(r'GITHUB_OWNER\s*=\s*"([^"]+)"', up)
-    t.ok(bool(owner) and owner.group(1) == "xbaox",
-         f"GITHUB_OWNER is this fork (got {owner.group(1)!r} )" if owner else "GITHUB_OWNER found")
+    owner = re.search(r'^REPO\s*=\s*"([^"]+)"', up, re.M)       # Stage 9 (R15): one constant
+    t.ok(bool(owner) and owner.group(1) == "xbaox/windows-face-unlock",
+         f"REPO is this fork (got {owner.group(1)!r} )" if owner else "REPO found")
     t.ok("WindowsFaceUnlock-Setup-" in up,
          "the installer asset is selected by its exact published name pattern")
 

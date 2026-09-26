@@ -95,6 +95,11 @@ HIDDEN += [
     "presence_monitor.gui",
     "presence_monitor.updater",
     "presence_monitor.widgets",
+    # Stage 9 (R12 / R14): the tray's UI thread, single-instance guards and toasts -- named for
+    # the same reason as the modules above.
+    "presence_monitor.ui",
+    "presence_monitor.instance",
+    "presence_monitor.toast",
     # Stage 9 (R10): imported lazily inside functions -- named so a build never ships without them.
     "face_service.camera_devices",
     "face_service.session_state",
@@ -320,6 +325,36 @@ service_exe = EXE(
     icon=None,
 )
 
+# Stage 9 (act 9b R12, F-170): the tray exe hosts every window (tray, wizard, password dialog), so it
+# declares per-monitor-v2 DPI awareness in its manifest -- sharp text at 125-200 % instead of a
+# bitmap-stretched blur. The rest is PyInstaller's default manifest (asInvoker, supported OS,
+# long paths); PyInstaller adds the Common-Controls dependency itself. The process also sets the
+# same mode at run time (presence_monitor.ui.enable_dpi_awareness) for the dev layout.
+TRAY_MANIFEST = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
+"""
+
 tray_exe = EXE(
     tray_pyz,
     tray_analysis.scripts,
@@ -334,6 +369,7 @@ tray_exe = EXE(
     windowed=True,
     disable_windowed_traceback=False,
     icon=None,
+    manifest=TRAY_MANIFEST,
 )
 
 watchdog_exe = EXE(

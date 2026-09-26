@@ -435,6 +435,10 @@ def _fmt_luma(luma_max) -> str:
 # longer than this. The lock state is polled every CAMERA_WARM_POLL_S by a small service thread.
 CAMERA_WARM_HOLD_S = 60.0
 CAMERA_WARM_POLL_S = 1.0
+# Stage 9 (F-77): the Credential Provider's field caps (PipeClient.h kMax*Chars), in UTF-16 units.
+CP_MAX_USERNAME = 256
+CP_MAX_DOMAIN = 256
+CP_MAX_PASSWORD = 1024
 # F-138: the heal retry and the low-light re-capture each cost one more burst. They are started only
 # when the request still has the last burst's duration plus this margin left in its budget.
 EXTRA_BURST_MARGIN_S = 1.0
@@ -1065,6 +1069,17 @@ class FaceService:
         creds = load_password()
         if not creds:
             return None
+        # Stage 9 (F-77): the CP accepts non-empty fields up to 256 / 256 / 1024 UTF-16 units with
+        # no NUL and answers malformed-response otherwise -- after this side had already granted,
+        # reset the lockout and grown the gallery. The same rule here makes such a blob
+        # "no-credentials" before anything is released.
+        u, pw, d = creds.get("u"), creds.get("p"), creds.get("d") or "."
+        for value, cap in ((u, CP_MAX_USERNAME), (pw, CP_MAX_PASSWORD), (d, CP_MAX_DOMAIN)):
+            if (not isinstance(value, str) or not value or "\0" in value
+                    or len(value.encode("utf-16-le")) // 2 > cap):
+                log.warning("stored credential is not usable by the sign-in screen "
+                            "(empty, too long or NUL) -- treated as no-credentials")
+                return None
         return {
             "ok": True,
             "username": creds["u"],
@@ -2522,6 +2537,13 @@ class FaceService:
                     t0 = time.time()
                     self.recog.verify_frame(img)
                     log.info("model warmup ok in %.2fs", time.time() - t0)
+            else:
+                # Stage 9 (F-190): no enrollment yet -- the first run. Build the engine anyway (its
+                # own black-frame warmup included), so the wizard's first Build does not pay the
+                # whole engine load inside its pipe call.
+                t0 = time.time()
+                self.recog._lazy_app()
+                log.info("engine loaded without an enrollment in %.2fs", time.time() - t0)
         except Exception as e:
             # Stage 8b (D-07): with the traceback -- "failed: <text>" alone never told a missing
             # enrollment from a broken model.

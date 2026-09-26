@@ -25,7 +25,11 @@ ENROLL_DIR = APP_DIR / "enroll"
 ENROLL_PENDING_DIR = ENROLL_DIR / ".pending"
 EMBED_PATH = APP_DIR / "embeddings.npz"
 CREDS_PATH = APP_DIR / "credentials.bin"
-LOG_PATH = APP_DIR / "service.log"
+# Stage 9 (act 9b R12, F-156): the logs live in their own folder, so "Open log folder" never opens
+# the data directory with the face images, templates and the sealed password beside them. Files
+# from before are moved there by logging_setup.migrate_logs.
+LOG_DIR = APP_DIR / "logs"
+LOG_PATH = LOG_DIR / "service.log"
 LOCKOUT_PATH = APP_DIR / "lockout.json"
 AUDIT_PATH = APP_DIR / "audit.jsonl"
 ADAPTIVE_PATH = APP_DIR / "adaptive.npz"   # Stage 3: adaptive gallery (separate from embeddings.npz)
@@ -227,9 +231,14 @@ class Config:
     # from the system locale on first run if the config file is missing.
     language: str = field(default_factory=_default_language)
     # --- Stage 6: event-notification gates (tray toasts, presence_monitor UI) ---
-    notify_enroll: bool = True          # toast on enrollment build success/failure
+    # (Stage 9, D-96: notify_enroll is gone -- the wizard is its own process and never had a tray
+    # icon to toast through; it shows the result itself. An old file with the key loads with an
+    # "unknown key" warning.)
     notify_lockout: bool = True         # toast when a face-lockout episode starts
     notify_service_state: bool = False  # toast on service reachable<->unreachable transitions
+    # Stage 9 (act 9b R15): the background check for a newer release -- at most once per 24 h,
+    # silent on "nothing published" and network errors. Off = only the manual menu item asks.
+    update_check: bool = True
     # False = presence off: no camera probe at all (the monitor only polls status for its
     # notifications). True = walk-away lock. Stage 9 (R10): off by default. Face sign-in works
     # either way.
@@ -610,10 +619,10 @@ class Config:
         if not (0.0 < self.watchdog_pause_ttl_s <= 3600.0):
             raise ValueError("watchdog_pause_ttl_s must be in (0, 3600]")
         # Stage 6: notification gates must be real booleans (same rationale).
-        if not isinstance(self.notify_enroll, bool):
-            raise ValueError("notify_enroll must be a boolean")
         if not isinstance(self.notify_lockout, bool):
             raise ValueError("notify_lockout must be a boolean")
+        if not isinstance(self.update_check, bool):
+            raise ValueError("update_check must be a boolean")
         if not isinstance(self.notify_service_state, bool):
             raise ValueError("notify_service_state must be a boolean")
         if not isinstance(self.auto_lock, bool):

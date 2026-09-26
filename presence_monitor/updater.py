@@ -1,91 +1,49 @@
-"""Self-updater — checks GitHub Releases and runs a new installer.
+"""Update CHECK -- is a newer release published? (Stage 9, act 9b R15.) It installs nothing.
 
-Flow
-----
-1. ``check_latest()`` hits ``/repos/OWNER/REPO/releases/latest`` on the
-   GitHub API and parses ``tag_name`` + the installer asset.
-2. If the tag is newer than the bundled ``__version__``, ask the user.
-3. On yes, download the installer to ``%TEMP%`` and verify its SHA-256.
-4. Launch Inno Setup with ``/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS``.
-   The installer will stop the tray + service itself, replace files, then
-   restart everything.
-
-Three properties this deliberately has (Stage 7d-G), because it did not before:
-
-* It points at THIS fork. The owner was the upstream repo, so releases built by
-  this repository's own workflow would never have been offered -- and every
-  installed client would instead have downloaded and silently run, with /SILENT,
-  an executable published by a third party.
-* The checksum is MANDATORY. It used to be skipped entirely when the release
-  carried no ``.sha256`` asset, and skipped again when the checksum body failed
-  to parse; both fell through to launching the executable. Now either of those
-  aborts and deletes the download. This is an integrity check, not an
-  authenticity one -- the hash travels over the same channel as the payload --
-  but "no hash at all" is not a defensible default for something we then run.
-* It only APPLIES an update when frozen. A source checkout is not updatable by
-  running an installer: that would install a second, frozen copy into Program
-  Files and re-point all three scheduled tasks at it, leaving the repo, its
-  .venv and the CLSID-registered build-cp DLL stale but still registered. The
-  dev layout is told where the release is and updates itself with git.
-
-No external dependencies — urllib only. Safe to call from the tray thread
-but the network + download run in a background worker so the UI doesn't
-freeze.
-
-Stage 8b: NOTIFY-ONLY (F-27, F-28 / P-01). Defect: the only thing vouching for a downloaded
-installer was a checksum published in the same release as the installer -- integrity, not
-authenticity -- and that installer was then run elevated with /SILENT. The flow also treated a
-404 (no release yet) as a network error and took pre-release tags as final. Consequence: whoever
-could publish a release to the repository could have every installed client run their executable.
-Fix: APPLY_ENABLED below is False, so download_and_launch refuses before any download; the tray
-only tells the user a newer version exists and offers the releases page. A 404 gets its own text,
-pre-releases (flagged, or a tag with a suffix) are ignored, and dialogs have a parent. The apply
-code stays for the day releases are signed and the signature is verified here.
+* The repository is ONE constant, ``REPO`` (changed in stage 9g); every URL derives from it.
+* ``check_latest_status`` asks GitHub's ``releases/latest`` once and never raises. Its status tells
+  apart: a newer/older final release ("ok"), nothing published or only a pre-release
+  ("no-release", HTTP 404), a release without the installer asset ("no-asset", with the tag), a
+  rate limit (403/429), a proxy asking for credentials (407), other HTTP errors, a network error
+  and an unusable answer (F-183). The tray shows each with its own text on a manual check and
+  stays silent about all but "a newer version exists" on the background check.
+* The background check runs at most once per 24 hours (``due_for_auto_check`` over a small state
+  file in the data directory) and only while ``update_check`` is on (F-194, F-175).
+* Installing updates stays OFF until stage 9f. Stage 8b kept a disabled download-verify-run path
+  here; it had no caller and several latent defects (F-196: the file hashed in one open and run by
+  path in another, a server-chosen file name, any lone .sha256 accepted, a sweep that deleted every
+  file in the folder, no size cap) -- so it is gone rather than kept dormant (D-97). 9f brings it
+  back designed around WinVerifyTrust + a publisher pin checked on the same handle that runs.
 """
 from __future__ import annotations
-import hashlib
+
 import json
 import logging
-import os
 import re
-import subprocess
-import sys
-import tempfile
-import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from face_service._version import __version__
-from face_service.i18n import t
 
 log = logging.getLogger(__name__)
 
-# THIS fork, not upstream. Releases are produced by .github/workflows/release.yml in this repo.
-GITHUB_OWNER = "xbaox"
-GITHUB_REPO = "windows-face-unlock"
-RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-USER_AGENT = f"windows-face-unlock/{__version__} (updater)"
+REPO = "xbaox/windows-face-unlock"                # the ONE place the repository is named (9g)
+RELEASES_LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
+RELEASES_PAGE_URL = f"https://github.com/{REPO}/releases/latest"
+# F-194: the product name only -- not the exact installed version -- goes to GitHub.
+USER_AGENT = "windows-face-unlock-updater"
 
-# Exactly what installer.iss emits: OutputBaseFilename=WindowsFaceUnlock-Setup-{version}. A bare
-# ".exe" suffix test matched any executable attached to the release, and the old loop had no
-# break, so with more than one the LAST one silently won. First match of this pattern, in the
-# order GitHub returns the assets, is deterministic.
-INSTALLER_RE = re.compile(r"^WindowsFaceUnlock-Setup-.+\.exe$", re.IGNORECASE)
+# Exactly what installer.iss emits: OutputBaseFilename=WindowsFaceUnlock-Setup-{version}.
+INSTALLER_RE = re.compile(r"^WindowsFaceUnlock-Setup-[0-9A-Za-z.\-]+\.exe$", re.IGNORECASE)
 
-# Applying an update means running an installer, which only makes sense for an installed layout.
-FROZEN = bool(getattr(sys, "frozen", False))
-
-# Stage 8b (P-01): the apply path is OFF. Enable ONLY together with signed releases and a signature
-# check of the downloaded installer against a pinned signer (WinVerifyTrust) -- never on its own.
-APPLY_ENABLED = False
-
-# A FINAL release tag: vX.Y.Z and nothing after it. "v0.2.0-rc1" parses to the same (0, 2, 0) as
-# the final, so without this a pre-release would be offered as the release itself.
+# A FINAL release tag: vX.Y.Z and nothing after it.
 _FINAL_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+$")
+_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-.].*)?$")
+
+AUTO_CHECK_INTERVAL_S = 24 * 3600.0
 
 
 @dataclass
@@ -94,14 +52,9 @@ class ReleaseInfo:
     version: str            # e.g. "0.2.0"
     body: str               # release notes (markdown)
     asset_name: str         # installer filename
-    asset_url: str          # browser_download_url
-    checksum_url: str | None  # optional .sha256 sibling
 
     def is_newer_than(self, current: str) -> bool:
         return _parse_version(self.version) > _parse_version(current)
-
-
-_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-.].*)?$")
 
 
 def _parse_version(v: str) -> tuple[int, int, int]:
@@ -117,29 +70,32 @@ def _http_get(url: str, timeout: float = 15.0) -> bytes:
         "Accept": "application/vnd.github+json",
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
-
-
-def check_latest(timeout: float = 10.0) -> ReleaseInfo | None:
-    """Fetch the latest release. Returns None on any error (callers warn)."""
-    return check_latest_status(timeout)[0]
+        return resp.read(1 << 20)          # a release document is small; never read unbounded
 
 
 def check_latest_status(timeout: float = 10.0) -> "tuple[ReleaseInfo | None, str]":
-    """``(release, "ok")`` or ``(None, status)`` with status one of ``"no-release"`` (404: nothing
-    published, or only a pre-release / draft), ``"no-asset"``, ``"network"``, ``"http <code>"``,
-    ``"bad-response"``. Never raises."""
+    """``(release, "ok")`` or ``(None, status)``; status is one of "no-release", "no-asset:<tag>",
+    "rate-limited", "proxy-auth", "http <code>", "network", "bad-response". Never raises."""
     try:
         payload = json.loads(_http_get(RELEASES_LATEST_URL, timeout=timeout))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             log.info("releases/latest: 404 -- no release has been published")
             return None, "no-release"
-        log.warning("releases/latest HTTP %s: %s", e.code, e)
+        if e.code in (403, 429):
+            log.info("releases/latest: HTTP %s -- rate limited", e.code)
+            return None, "rate-limited"
+        if e.code == 407:
+            log.info("releases/latest: HTTP 407 -- the proxy asks for credentials")
+            return None, "proxy-auth"
+        log.info("releases/latest: HTTP %s", e.code)
         return None, f"http {e.code}"
-    except Exception:
-        log.exception("releases/latest fetch failed")
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        log.info("releases/latest: network error (%s)", e.__class__.__name__)   # no traceback
         return None, "network"
+    except Exception as e:
+        log.info("releases/latest: unusable answer (%r)", e)
+        return None, "bad-response"
     if not isinstance(payload, dict):
         return None, "bad-response"
 
@@ -147,167 +103,48 @@ def check_latest_status(timeout: float = 10.0) -> "tuple[ReleaseInfo | None, str
     if payload.get("prerelease") or payload.get("draft") or not _FINAL_TAG_RE.match(tag):
         log.info("releases/latest: %r is a pre-release or not a final tag -- ignored", tag)
         return None, "no-release"
-    version = tag.lstrip("v")
-    body = payload.get("body") or ""
     assets = payload.get("assets") or []
-
-    installer = None
-    for a in assets:
-        if INSTALLER_RE.match(a.get("name") or ""):
-            installer = a
-            break                      # first match wins, deterministically
-
-    if not (tag and installer):
+    installer = next((a for a in assets if INSTALLER_RE.match(str(a.get("name") or ""))), None)
+    if installer is None:
         log.info("latest release %s has no WindowsFaceUnlock-Setup-*.exe asset", tag)
-        return None, "no-asset"
-
-    # Prefer the checksum that belongs to THIS asset; fall back to a lone .sha256 in the release.
-    installer_name = installer.get("name") or ""
-    checksum_url = None
-    for a in assets:
-        if (a.get("name") or "").lower() == f"{installer_name.lower()}.sha256":
-            checksum_url = a.get("browser_download_url")
-            break
-    if checksum_url is None:
-        for a in assets:
-            name = (a.get("name") or "").lower()
-            if name.endswith(".sha256") or name.endswith(".sha256.txt"):
-                checksum_url = a.get("browser_download_url")
-                break
-
+        return None, f"no-asset:{tag}"
     log.info("releases/latest: %s (current %s)", tag, __version__)
-    return ReleaseInfo(
-        tag=tag,
-        version=version,
-        body=body,
-        asset_name=installer.get("name") or "installer.exe",
-        asset_url=installer.get("browser_download_url") or "",
-        checksum_url=checksum_url,
-    ), "ok"
-
-
-def _download(url: str, dest: Path,
-              progress: Callable[[int, int], None] | None = None) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=30.0) as resp, dest.open("wb") as f:
-        total = int(resp.headers.get("Content-Length") or 0)
-        seen = 0
-        while True:
-            chunk = resp.read(65536)
-            if not chunk:
-                break
-            f.write(chunk)
-            seen += len(chunk)
-            if progress:
-                try:
-                    progress(seen, total)
-                except Exception:
-                    pass
-
-
-def _sha256_of(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _expected_sha256(url: str) -> str | None:
-    try:
-        raw = _http_get(url).decode("utf-8", errors="replace").strip()
-    except Exception:
-        log.exception("checksum fetch failed")
-        return None
-    # Accept either raw hex, or "<hex>  filename" style.
-    token = raw.split()[0] if raw else ""
-    if re.fullmatch(r"[0-9a-fA-F]{64}", token):
-        return token.lower()
-    return None
-
-
-def _discard(path: Path) -> None:
-    """Delete a downloaded installer we have decided not to run. Never raises."""
-    try:
-        path.unlink()
-    except Exception:
-        log.warning("could not delete the rejected download %s", path, exc_info=True)
-
-
-def _sweep_old_downloads(tmp_dir: Path, keep: Path) -> None:
-    """Remove installers left by previous updates. Never raises.
-
-    The success path used to keep every downloaded installer forever -- one ~100 MB+ file per
-    update, in a directory nothing ever cleaned and no uninstall path knew about.
-    """
-    for stale in tmp_dir.iterdir():
-        if stale == keep or not stale.is_file():
-            continue
-        try:
-            stale.unlink()
-            log.info("removed a stale downloaded installer: %s", stale.name)
-        except Exception:
-            log.warning("could not remove %s", stale, exc_info=True)
-
-
-def download_and_launch(
-    release: ReleaseInfo,
-    progress: Callable[[int, int], None] | None = None,
-) -> tuple[bool, str]:
-    """Download the installer, verify its checksum, and spawn it.
-
-    Returns (ok, message). On ok=True, the caller should exit the tray —
-    the installer will kill any lingering processes itself.
-
-    Fail-closed: every path that cannot PROVE the download matches the published hash deletes it
-    and returns False. A source checkout never gets here at all.
-
-    Stage 8b: with APPLY_ENABLED False (notify-only) this refuses before downloading anything.
-    """
-    if not APPLY_ENABLED:
-        return False, t("update.notify_only", url=RELEASES_PAGE_URL)
-    if not FROZEN:
-        # Running an installer would not update this checkout; it would install a second, frozen
-        # copy beside it and re-point the scheduled tasks at that. Point at the release instead.
-        return False, t("update.source_only", tag=release.tag, url=RELEASES_PAGE_URL)
-
-    tmp_dir = Path(tempfile.gettempdir()) / "windows-face-unlock-update"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    dest = tmp_dir / release.asset_name
-
-    try:
-        _download(release.asset_url, dest, progress=progress)
-    except Exception as e:
-        _discard(dest)
-        return False, t("update.download_failed", err=str(e))
-
-    # MANDATORY. No asset, an unfetchable body, or one that is not 64 hex chars are all refusals
-    # now -- each of them used to fall through to launching the executable unverified.
-    if not release.checksum_url:
-        _discard(dest)
-        return False, t("update.checksum_missing")
-    expected = _expected_sha256(release.checksum_url)
-    if not expected:
-        _discard(dest)
-        return False, t("update.checksum_missing")
-    if _sha256_of(dest) != expected:
-        _discard(dest)
-        return False, t("update.checksum_failed")
-
-    _sweep_old_downloads(tmp_dir, keep=dest)
-
-    # Launch silently. The installer itself signals CloseApplications so
-    # any running tray/service gets stopped before files are replaced.
-    try:
-        subprocess.Popen(
-            [str(dest), "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,  # type: ignore[attr-defined]
-        )
-    except Exception as e:
-        return False, t("update.download_failed", err=str(e))
-
-    return True, t("update.launching")
+    return ReleaseInfo(tag=tag, version=tag.lstrip("v"), body=str(payload.get("body") or ""),
+                       asset_name=str(installer.get("name"))), "ok"
 
 
 def current_version() -> str:
     return __version__
+
+
+# ---- the 24-hour gate of the background check ------------------------------------------------
+
+def _state_path() -> Path:
+    from face_service.config import APP_DIR
+    return APP_DIR / "update_state.json"
+
+
+def due_for_auto_check(now: "float | None" = None, path: "Path | None" = None) -> bool:
+    """True when the last background check is 24 h or more ago (or there was none, or the stored
+    time is unusable -- in the future, not a number)."""
+    now = time.time() if now is None else now
+    path = _state_path() if path is None else path
+    try:
+        last = float(json.loads(path.read_text(encoding="utf-8")).get("last_check", 0))
+    except Exception:
+        return True
+    if not (0 < last <= now):
+        return True
+    return now - last >= AUTO_CHECK_INTERVAL_S
+
+
+def record_auto_check(now: "float | None" = None, path: "Path | None" = None) -> None:
+    now = time.time() if now is None else now
+    path = _state_path() if path is None else path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"last_check": now}), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        log.debug("update state not written", exc_info=True)

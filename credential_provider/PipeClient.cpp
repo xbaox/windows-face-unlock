@@ -425,18 +425,25 @@ bool ParseUnlockReply(const std::string& response, UnlockReply& out) {
 
     std::string d;
     TakeString(obj, "domain", d);
+    // Stage 9 (act 9b R13): an Entra ID account is stored as its UPN (user@tenant) with an EMPTY
+    // domain -- the form LSA expects for a UPN logon. Only then does the domain stay empty; any
+    // other empty domain still means the local machine (".").
+    const bool upn = d.empty() && itU->second.str.find('@') != std::string::npos;
     const bool decoded = Utf8ToWideStrict(itU->second.str, out.username) &&
                          Utf8ToWideStrict(itP->second.str, out.password) &&
-                         Utf8ToWideStrict(d.empty() ? std::string(".") : d, out.domain);
+                         Utf8ToWideStrict(upn ? std::string() : (d.empty() ? std::string(".") : d),
+                                          out.domain);
 
     // 8b F-48: caps and no embedded NUL, checked before anything is stored or packed.
     auto badField = [](const std::wstring& w, size_t cap) {
         return w.empty() || w.size() > cap || w.find(L'\0') != std::wstring::npos;
     };
+    const bool badDomain = upn ? !out.domain.empty()
+                               : badField(out.domain, kMaxDomainChars);
     if (!decoded ||
         badField(out.username, kMaxUsernameChars) ||
         badField(out.password, kMaxPasswordChars) ||
-        badField(out.domain,   kMaxDomainChars)) {
+        badDomain) {
         WipeAndClear(out.username);
         WipeAndClear(out.password);
         WipeAndClear(out.domain);

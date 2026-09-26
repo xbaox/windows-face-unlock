@@ -152,7 +152,7 @@ def test_phase1():
           r.get("prompt") == "Turn your head left, then nod your head", r.get("prompt"))
     ru = _svc(Config(language="ru"))
     check("... and in Russian",
-          ru._prompt_for("nod,turn_right") == "Кивни головой, затем поверни голову вправо",
+          ru._prompt_for("nod,turn_right") == "Кивните, затем поверните голову вправо",  # D-102
           ru._prompt_for("nod,turn_right"))
     xx = _svc(Config(language="ja"))
     check("an unlisted language falls back to English",

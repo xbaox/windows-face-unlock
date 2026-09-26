@@ -755,6 +755,7 @@ int main() {
     CaseOk("type: non-string domain is ignored -> \".\"",
            R"({"ok":true,"username":"u","password":"x","domain":7})", L"u", L"x", L".");
 
+
     // --- Gesture prompt: C0/DEL stripped, capped at 120 UTF-16 units ---
     CasePrompt("prompt: escaped C0 controls and DEL stripped",
                "Bl\\n\\tink\\u0007 \\u001bnow\\u007f!", L"Blink now!");
@@ -789,6 +790,19 @@ int main() {
     std::printf("\nStage 9: protocol v2, strict JSON / UTF-8, sanitizer, texts, transport\n");
     std::printf("-----------------------------\n");
     const int pre9Count = g_pass + g_fail;
+
+    // --- Stage 9 (R13): an Entra ID account travels as its UPN with an empty domain ---
+    CaseOk("upn: user@tenant with empty domain keeps the domain empty",
+           R"({"ok":true,"username":"ann@contoso.com","password":"x","domain":""})",
+           L"ann@contoso.com", L"x", L"");
+    CaseOk("upn: user@tenant with no domain key keeps the domain empty",
+           R"({"ok":true,"username":"ann@contoso.com","password":"x"})",
+           L"ann@contoso.com", L"x", L"");
+    CaseOk("upn: an explicit domain is kept as sent",
+           R"({"ok":true,"username":"ann@contoso.com","password":"x","domain":"AzureAD"})",
+           L"ann@contoso.com", L"x", L"AzureAD");
+    CaseOk("upn: a plain name with an empty domain is still the local machine",
+           R"({"ok":true,"username":"ann","password":"x","domain":""})", L"ann", L"x", L".");
     using namespace FaceUnlock;
 
     // --- §2.1 version: a reply that is not v2 is refused whole, credentials included ---
