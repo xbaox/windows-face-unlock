@@ -186,8 +186,10 @@ def main(argv=None) -> int:
     prep = iss.split("function PrepareToInstall", 1)[1].split("procedure RegisterTasks", 1)[0]
     t.ok("-Action Stop'" in prep and "ExtractTemporaryFile('register_tasks.ps1')" in prep,
          "PrepareToInstall runs the NEW registrar with -Action Stop, not Unregister (F-35)")
-    t.ok("ExecAsOriginalUser" in iss and "-UserSid" in iss,
-         "the registrar is given the original user's SID (F-07)")
+    t.ok("WTSGetActiveConsoleSessionId" in iss and "' -UserSid ' + GetOwnerSid()" in iss
+         and "'OriginalUserSid', GetOwnerSid()" in iss and "/FORCEOWNER" in iss and "/OWNER" in iss,
+         "the registrar and the registry get the OWNER's SID -- the console user or /OWNER= "
+         "(Stage 9 R1; was the original user, F-07)")
     psd1 = _read(REPO_ROOT / "tools" / "tasks.psd1")
     t.ok(re.search(r"Priority\s*=\s*5", psd1) is not None and psd1.count("RestartOnFailure = $true") == 2,
          "service priority 5; restart policy on tray and watchdog (F-36)")

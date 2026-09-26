@@ -265,100 +265,295 @@ begin
   end;
 end;
 
-{ ---- Stage 8b (F-07): the ORIGINAL user -------------------------------------
+{ ---- Stage 9 (R1): the OWNER --------------------------------------------------
 
-  Defect: every per-user step used this process's own identity -- the registrar
-  took the current user name, and the data directory was the USERPROFILE of
-  Setup. Setup runs elevated, and when a different administrator typed their
-  credentials into UAC, all of that is the administrator's.
-  Consequence: on a standard-user machine the user who installed got no running
-  service, the data directory landed in the wrong profile, and the uninstaller's
-  "remove my data" cleaned the wrong profile.
-  Fix: ExecAsOriginalUser (a process of the user who started Setup) reports its
-  SID into a file; a SECOND original-user process confirms it through its exit
-  code -- the file sits where other accounts can write, so its content is only a
-  claim until then. The SID goes to the registrar (-UserSid) and is recorded
-  under the app key so the uninstaller can find that user's profile. When it
-  cannot be established, Setup falls back to its own identity (the pre-8b
-  behaviour) and says so in the log. On a same-account elevation -- this
-  machine -- both are the same account. }
+  The product is single-user. Its owner is the user of the ACTIVE CONSOLE SESSION
+  when Setup runs -- not the account Setup was elevated with, and never SYSTEM or
+  a service account. Setup records the owner's SID in
+  HKLM\Software\WindowsFaceUnlock\OriginalUserSid (writable by administrators
+  only); the service refuses to work for anyone else and the lock-screen tile is
+  shown to the owner only. The Ready page names the owner.
+
+  Before Stage 9 (F-07 / F-193 / F-213) the "original user" was whoever started
+  Setup, resolved through two PowerShell processes; when that failed Setup fell
+  back to its OWN account and left a stale SID from an earlier install in place.
+  Now an owner that cannot be established stops Setup, and the value is always
+  rewritten.
+
+  Silent installs: /OWNER=<DOMAIN\user or SID> names the owner explicitly. When a
+  DIFFERENT owner is already recorded, an interactive Setup asks before replacing
+  it; a silent one refuses (exit code 1) unless /FORCEOWNER is given.
+
+  Accepted SIDs: S-1-5-21-* (local / domain) and S-1-12-1-* (Entra ID). }
+const
+  WTS_USER_NAME = 5;
+  WTS_DOMAIN_NAME = 7;
+  NO_CONSOLE_SESSION = $FFFFFFFF;
+
+function WTSGetActiveConsoleSessionId(): Cardinal;
+  external 'WTSGetActiveConsoleSessionId@kernel32.dll stdcall';
+function WTSQuerySessionInformationW(hServer: Cardinal; SessionId: Cardinal; InfoClass: Integer;
+  var Buffer: Cardinal; var BytesReturned: Cardinal): Boolean;
+  external 'WTSQuerySessionInformationW@wtsapi32.dll stdcall';
+procedure WTSFreeMemory(Memory: Cardinal);
+  external 'WTSFreeMemory@wtsapi32.dll stdcall';
+function lstrlenW(Src: Cardinal): Integer;
+  external 'lstrlenW@kernel32.dll stdcall';
+function lstrcpynW(Dest: string; Src: Cardinal; MaxLen: Integer): Cardinal;
+  external 'lstrcpynW@kernel32.dll stdcall';
+function LookupAccountNameW(SystemName: Cardinal; AccountName: string; Sid: AnsiString;
+  var SidSize: Cardinal; Domain: string; var DomainSize: Cardinal; var Use: Integer): Boolean;
+  external 'LookupAccountNameW@advapi32.dll stdcall';
+function LookupAccountSidW(SystemName: Cardinal; Sid: Cardinal; Name: string;
+  var NameSize: Cardinal; Domain: string; var DomainSize: Cardinal; var Use: Integer): Boolean;
+  external 'LookupAccountSidW@advapi32.dll stdcall';
+function ConvertSidToStringSidW(Sid: AnsiString; var StringSid: Cardinal): Boolean;
+  external 'ConvertSidToStringSidW@advapi32.dll stdcall';
+function ConvertStringSidToSidW(StringSid: string; var Sid: Cardinal): Boolean;
+  external 'ConvertStringSidToSidW@advapi32.dll stdcall';
+function LocalFree(Mem: Cardinal): Cardinal;
+  external 'LocalFree@kernel32.dll stdcall';
+
 var
-  OrigUserSid: string;
-  OrigUserSidResolved: Boolean;
+  OwnerSid: string;
+  OwnerName: string;
+  OwnerResolved: Boolean;
 
+// A person's SID: S-1-5-21-a-b-c-rid (local / domain) or S-1-12-1-a-b-c-d (Entra ID).
 function IsUserSid(const S: string): Boolean;
 var
-  I: Integer;
+  I, Dashes: Integer;
 begin
-  Result := (Length(S) > 12) and (Copy(S, 1, 9) = 'S-1-5-21-');
+  Result := ((Copy(S, 1, 9) = 'S-1-5-21-') or (Copy(S, 1, 9) = 'S-1-12-1-')) and (Length(S) > 10);
   if not Result then
     exit;
-  for I := 1 to Length(S) do
-    if not (((S[I] >= '0') and (S[I] <= '9')) or (S[I] = '-') or ((I = 1) and (S[I] = 'S'))) then
+  Dashes := 0;
+  for I := 3 to Length(S) do
+  begin
+    if S[I] = '-' then
+      Dashes := Dashes + 1
+    else if not ((S[I] >= '0') and (S[I] <= '9')) then
     begin
       Result := False;
       exit;
     end;
+  end;
+  Result := Dashes >= 6;
+end;
+
+function PtrToString(P: Cardinal): string;
+var
+  N: Integer;
+begin
+  Result := '';
+  if P = 0 then
+    exit;
+  N := lstrlenW(P);
+  if N <= 0 then
+    exit;
+  SetLength(Result, N);
+  lstrcpynW(Result, P, N + 1);
+end;
+
+function ConsoleSessionString(SessionId: Cardinal; InfoClass: Integer): string;
+var
+  Buf, Bytes: Cardinal;
+begin
+  Result := '';
+  Buf := 0;
+  Bytes := 0;
+  if WTSQuerySessionInformationW(0, SessionId, InfoClass, Buf, Bytes) then
+  begin
+    Result := PtrToString(Buf);
+    WTSFreeMemory(Buf);
+  end;
+end;
+
+// DOMAIN\user (or a bare user) -> string SID; '' when it cannot be resolved.
+function SidOfAccount(const Account: string): string;
+var
+  Sid: AnsiString;
+  SidSize, DomSize, StrPtr: Cardinal;
+  Dom: string;
+  Use: Integer;
+begin
+  Result := '';
+  SidSize := 256;
+  DomSize := 256;
+  Sid := StringOfChar(#0, SidSize);
+  Dom := StringOfChar(#0, DomSize);
+  if not LookupAccountNameW(0, Account, Sid, SidSize, Dom, DomSize, Use) then
+    exit;
+  StrPtr := 0;
+  if ConvertSidToStringSidW(Sid, StrPtr) then
+  begin
+    Result := PtrToString(StrPtr);
+    LocalFree(StrPtr);
+  end;
+end;
+
+// String SID -> DOMAIN\user for display; the SID itself when it cannot be resolved.
+function AccountOfSid(const S: string): string;
+var
+  Bin, NameSize, DomSize: Cardinal;
+  Name, Dom: string;
+  Use: Integer;
+begin
+  Result := S;
+  Bin := 0;
+  if not ConvertStringSidToSidW(S, Bin) then
+    exit;
+  NameSize := 256;
+  DomSize := 256;
+  Name := StringOfChar(#0, NameSize);
+  Dom := StringOfChar(#0, DomSize);
+  if LookupAccountSidW(0, Bin, Name, NameSize, Dom, DomSize, Use) then
+    Result := Copy(Dom, 1, DomSize) + '\' + Copy(Name, 1, NameSize);
+  LocalFree(Bin);
+end;
+
+// The value of a /NAME=value switch on Setup's command line ('' when absent).
+function CmdLineValue(const Name: string): string;
+var
+  I: Integer;
+  P: string;
+begin
+  Result := '';
+  for I := 1 to ParamCount do
+  begin
+    P := ParamStr(I);
+    if CompareText(Copy(P, 1, Length(Name) + 1), Name + '=') = 0 then
+    begin
+      Result := Trim(Copy(P, Length(Name) + 2, MaxInt));
+      exit;
+    end;
+  end;
+end;
+
+// Establish the owner: /OWNER= if given, else the user of the active console session.
+// Returns '' and sets Why when there is none (Setup then stops).
+function ResolveOwner(var Why: string): string;
+var
+  Session: Cardinal;
+  Arg, User, Dom: string;
+begin
+  Result := '';
+  Arg := CmdLineValue('/OWNER');
+  if Arg <> '' then
+  begin
+    if IsUserSid(Arg) then
+      Result := Arg
+    else
+      Result := SidOfAccount(Arg);
+    if not IsUserSid(Result) then
+    begin
+      Why := '/OWNER=' + Arg + ' is not a person''s account on this PC (SYSTEM and service '
+             + 'accounts cannot own Face Unlock).';
+      Result := '';
+    end;
+    exit;
+  end;
+  Session := WTSGetActiveConsoleSessionId();
+  if Session = NO_CONSOLE_SESSION then
+  begin
+    Why := 'Nobody is signed in at this PC''s console, so Setup cannot tell whose Face Unlock '
+           + 'this is. Sign in at the PC itself and run Setup there, or pass /OWNER=DOMAIN\user.';
+    exit;
+  end;
+  User := ConsoleSessionString(Session, WTS_USER_NAME);
+  Dom := ConsoleSessionString(Session, WTS_DOMAIN_NAME);
+  if User = '' then
+  begin
+    Why := 'The console session has no signed-in user. Sign in at the PC and run Setup there, '
+           + 'or pass /OWNER=DOMAIN\user.';
+    exit;
+  end;
+  if Dom <> '' then
+    Result := SidOfAccount(Dom + '\' + User)
+  else
+    Result := SidOfAccount(User);
+  if not IsUserSid(Result) then
+  begin
+    Why := 'The console user ' + Dom + '\' + User + ' could not be resolved to a person''s '
+           + 'account (' + Result + '). Pass /OWNER=DOMAIN\user or /OWNER=<SID>.';
+    Result := '';
+  end;
+end;
+
+function GetOwnerSid(): string;
+var
+  Why: string;
+begin
+  if not OwnerResolved then
+  begin
+    OwnerSid := ResolveOwner(Why);
+    OwnerResolved := True;
+    if OwnerSid <> '' then
+    begin
+      OwnerName := AccountOfSid(OwnerSid);
+      Log('Owner: ' + OwnerName + ' (' + OwnerSid + ')');
+    end else
+      Log('Owner could not be established: ' + Why);
+  end;
+  Result := OwnerSid;
+end;
+
+// InitializeSetup: no owner -> no install; a different recorded owner -> ask (or refuse silently).
+function InitializeSetup(): Boolean;
+var
+  Why, Recorded: string;
+begin
+  Result := False;
+  OwnerSid := ResolveOwner(Why);
+  OwnerResolved := True;
+  if OwnerSid = '' then
+  begin
+    Log('Setup stops: ' + Why);
+    if not WizardSilent() then
+      MsgBox('Face Unlock cannot be installed yet.' + #13#10#13#10 + Why, mbCriticalError, MB_OK);
+    exit;
+  end;
+  OwnerName := AccountOfSid(OwnerSid);
+  Log('Owner: ' + OwnerName + ' (' + OwnerSid + ')');
+  if RegQueryStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', Recorded)
+     and IsUserSid(Recorded) and (CompareText(Recorded, OwnerSid) <> 0) then
+  begin
+    if WizardSilent() then
+    begin
+      if not CmdLineParamExists('/FORCEOWNER') then
+      begin
+        Log('Setup stops: Face Unlock belongs to ' + AccountOfSid(Recorded) + ' (' + Recorded
+            + '); installing for ' + OwnerName + ' needs /FORCEOWNER.');
+        exit;
+      end;
+      Log('Owner changes from ' + Recorded + ' to ' + OwnerSid + ' (/FORCEOWNER).');
+    end else if MsgBox('Face Unlock on this PC belongs to ' + AccountOfSid(Recorded) + '.'
+                       + #13#10#13#10 + 'Make ' + OwnerName + ' the owner instead? Face sign-in '
+                       + 'then works for ' + OwnerName + ' only; the previous owner signs in '
+                       + 'with PIN or password as usual.', mbConfirmation, MB_YESNO) <> IDYES then
+    begin
+      Log('Setup stops: the user kept the recorded owner ' + Recorded + '.');
+      exit;
+    end;
+  end;
+  Result := True;
+end;
+
+// The Ready page names the owner (R1).
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
+  MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
+begin
+  Result := 'Face Unlock owner (the only account that can sign in with its face):' + NewLine
+            + Space + OwnerName + NewLine + Space + OwnerSid + NewLine;
+  if MemoDirInfo <> '' then
+    Result := Result + NewLine + MemoDirInfo + NewLine;
+  if MemoTasksInfo <> '' then
+    Result := Result + NewLine + MemoTasksInfo + NewLine;
 end;
 
 function PowerShellExe(): string;
 begin
   Result := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
-end;
-
-function ResolveOriginalUserSid(): string;
-var
-  SidFile, Sid: string;
-  Raw: AnsiString;
-  ResultCode: Integer;
-begin
-  Result := '';
-  SidFile := ExpandConstant('{commonappdata}') + '\WindowsFaceUnlock-setup-'
-             + IntToStr(Random(2147483647)) + '.sid';
-  DeleteFile(SidFile);
-  if not ExecAsOriginalUser(PowerShellExe(),
-      '-NoProfile -NonInteractive -Command "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'
-      + ' | Set-Content -Encoding ascii -LiteralPath ''' + SidFile + '''"',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
-  begin
-    Log('Original user: the SID query did not run (code ' + IntToStr(ResultCode) + ').');
-    DeleteFile(SidFile);
-    exit;
-  end;
-  if not LoadStringFromFile(SidFile, Raw) then
-  begin
-    Log('Original user: no SID file came back.');
-    exit;
-  end;
-  DeleteFile(SidFile);
-  Sid := Trim(String(Raw));
-  if not IsUserSid(Sid) then
-  begin
-    Log('Original user: the reply is not a user SID: ' + Sid);
-    exit;
-  end;
-  if not ExecAsOriginalUser(PowerShellExe(),
-      '-NoProfile -NonInteractive -Command "if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value'
-      + ' -ceq ''' + Sid + ''') { exit 0 } else { exit 3 }"',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
-  begin
-    Log('Original user: SID ' + Sid + ' was NOT confirmed (code ' + IntToStr(ResultCode) + ').');
-    exit;
-  end;
-  Log('Original user: SID ' + Sid + ' confirmed.');
-  Result := Sid;
-end;
-
-function GetOriginalUserSid(): string;
-begin
-  if not OrigUserSidResolved then
-  begin
-    OrigUserSid := ResolveOriginalUserSid();
-    OrigUserSidResolved := True;
-    if OrigUserSid = '' then
-      Log('Original user could not be established; per-user steps use Setup''s own account.');
-  end;
-  Result := OrigUserSid;
 end;
 
 // The profile directory of a SID, from ProfileList; '' when unknown.
@@ -466,8 +661,7 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  // Resolved here, once, before anything is stopped or copied (Stage 8b, F-07).
-  GetOriginalUserSid();
+  // Stage 9 (R1): the owner was established in InitializeSetup; nothing to resolve here.
   AppDir := ExpandConstant('{app}');
   // Stage 8b (F-35): an existing installation is recognised by its registrar, but the
   // registrar that RUNS is the new one, extracted to the temporary folder -- the old one
@@ -521,8 +715,7 @@ begin
   Params := '-NoProfile -ExecutionPolicy Bypass -File "'
             + ExpandConstant('{app}\postinstall\register_tasks.ps1') + '"'
             + ' -Mode Installed -InstallDir "' + ExpandConstant('{app}') + '" -Action Register';
-  if GetOriginalUserSid() <> '' then
-    Params := Params + ' -UserSid ' + GetOriginalUserSid();
+  Params := Params + ' -UserSid ' + GetOwnerSid();
   if not Exec(PowerShellExe(), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     ResultCode := -1;
   if ResultCode = 0 then
@@ -543,9 +736,9 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    // Recorded for the uninstaller, which has no original-user process to ask (F-07).
-    if GetOriginalUserSid() <> '' then
-      RegWriteStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', GetOriginalUserSid());
+    // R1: the owner, always rewritten (F-213) -- the service, the tile and the uninstaller
+    // all read it from here.
+    RegWriteStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', GetOwnerSid());
     RegisterTasks();
   end;
 end;
@@ -556,7 +749,7 @@ end;
   user. Existence only; the DPAPI blob itself is never opened here. }
 function CredentialsSaved(): Boolean;
 begin
-  Result := FileExists(DataDirFor(GetOriginalUserSid()) + '\credentials.bin');
+  Result := FileExists(DataDirFor(GetOwnerSid()) + '\credentials.bin');
 end;
 
 var

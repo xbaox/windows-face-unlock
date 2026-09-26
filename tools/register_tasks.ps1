@@ -311,9 +311,10 @@ foreach ($fuTask in $fuTasks) {
 # got no running service. Fix: Setup passes the ORIGINAL user's SID (obtained with
 # ExecAsOriginalUser and confirmed by a second process of that user); the account is resolved from
 # it here. No -UserSid: the current user, exactly as before.
+# Stage 9 (R1, F-103): the owner may also be an Entra ID account, whose SID is S-1-12-1-*.
 if ($UserSid) {
-    if ($UserSid -notmatch '^S-1-5-21-\d+-\d+-\d+-\d+$') {
-        Write-Host "ERROR: -UserSid is not a local or domain user SID: $UserSid" -ForegroundColor Red
+    if ($UserSid -notmatch '^S-1-(5-21|12-1)-\d+-\d+-\d+-\d+$') {
+        Write-Host "ERROR: -UserSid is not a local, domain or Entra ID user SID: $UserSid" -ForegroundColor Red
         exit 1
     }
     try {
