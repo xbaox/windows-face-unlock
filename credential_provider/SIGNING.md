@@ -1,112 +1,50 @@
-# Signing the Credential Provider DLL
+# Code signing
 
-## Read this first: signing does not gate loading
+## What signing is for here
 
-**Windows does not require a Credential Provider to be Authenticode-signed in
-order to load it** on a normal Windows 10/11 x64 installation. A CP is an
-in-process COM server loaded by `LogonUI.exe`, an ordinary user-mode process. The
-policies that would demand a signature — WDAC / Device Guard user-mode code
-integrity, HVCI — are opt-in enterprise configurations, not the default.
+Windows does not require a Credential Provider to be signed for LogonUI to load it on an ordinary
+Windows 10/11 installation, so a signature is not what makes the face tile appear. It matters for:
 
-The evidence is in this repository's own troubleshooting notes. `INSTALL.md`
-documents the case where LogonUI has loaded a **stale, unsigned** DLL and the
-tile then returns `Parameter is incorrect` from `GetSerialization`. A DLL blocked
-by a signature gate never reaches the point of returning an HRESULT at all.
+- **Smart App Control (SAC)** and enterprise code-integrity policies, which block unsigned or
+  self-signed executables and DLLs -- including the provider LogonUI loads, the three product
+  executables and every DLL in the bundle (F-70). A public-trust signature is the only thing that
+  lets Face Unlock run on such a machine.
+- Provenance: users and administrators can see who published the files.
 
-So if your tile does not appear, **signing is not the fix**. Check the
-registration (`register.ps1 -Action register` verifies by reading the registry
-back), check that you rebuilt into `build-cp\` — the tree the registered CLSID
-actually points at — and lock/unlock once to make LogonUI reload.
+## The release pipeline (act 9b R18, P-24)
 
-What signing *does* buy:
+- **Azure Trusted Signing** through `signtool` and the Azure.CodeSigning dlib, driven by
+  `installer\build.py`. In CI the `sign` job logs in with OIDC and has no repository rights.
+- The expected signer is **pinned by subject** (`FU_SIGN_SUBJECT`), and every signed file must
+  verify `Valid` -- no "unknown chain" allowance.
+- Order: the CP DLL on its own step -> PyInstaller -> every unsigned PE of ours -> the gate
+  (which compares PE content without the certificate table) -> Setup and the uninstaller through
+  Inno's SignTool.
+- **NVIDIA files are never re-signed or modified** (their EULA). The cuDNN DLLs carry NVIDIA's own
+  signature; for the NVIDIA DLLs that ship unsigned in the official wheels (CUDA runtime, cuBLAS,
+  cuFFT, NVRTC) the fallback is a **catalog (`.cat`) signature** under our identity, installed by
+  the installer, which leaves the files byte-identical. It is designed and verified in a VM in 9f.
+- Without credentials every signing step prints `SIGNING SKIPPED` and says what is missing; such a
+  build is a test build, not a release.
 
-- **Provenance.** The file says who built it and that it has not been altered.
-- **Enterprise readiness.** On a machine that *does* enforce UMCI, an unsigned CP
-  will not load. Shipping signed means you are not the reason it fails there.
-- **A quieter installer story.** SmartScreen reputation attaches to the signed
-  installer (see `installer/README.md`), which is a separate artefact from this
-  DLL — the release workflow's SignPath step submits the installer only.
+Until 9f no release is signed. The 0.1.0 / 0.1.1 builds carried a development certificate
+(`CN=Windows Face Unlock (development)`) on the CP DLL only; that key was created
+plaintext-exportable before Stage 8b and is **retired** -- the build no longer accepts a local
+certificate thumbprint (F-244).
 
-## Quick start (development, self-signed)
+## Signing a local test DLL (developers only)
 
-```powershell
-# Admin PowerShell, from the repo root.
-# 1. See what is there now. Changes nothing.
-.\tools\sign_cp.ps1 -DryRun
-
-# 2. Create a dev certificate, sign, and trust it on THIS machine only.
-.\tools\sign_cp.ps1 -SelfSigned -TrustLocally -IUnderstandTrustLocally
-```
-
-Since Stage 8b the self-signed key is created **non-exportable**, and
-`-TrustLocally` refuses to run without `-IUnderstandTrustLocally` (a script cannot
-add a root certificate by accident). The removal steps are in the script's help
-(`Get-Help .\tools\sign_cp.ps1 -Full`, `.NOTES`) and are printed after trust is added.
-
-`-TrustLocally` is a separate switch on purpose. Signing a file and *trusting the
-signer machine-wide* are different decisions, and the second one installs your
-certificate into `LocalMachine\Root` — the same store as every public CA. Without
-that switch nothing is written to any certificate store, and the signature is
-simply "present but from an untrusted issuer", which is the correct state for a
-build you are about to hand to someone else.
-
-Do not use `-TrustLocally` with a certificate you did not create yourself.
-
-## Real certificate
-
-An OV/EV code-signing certificate from a CA. Two ways in:
+`tools\sign_cp.ps1` signs a DLL with a certificate in `CurrentUser\My` (`-Thumbprint`) or a fresh,
+non-exportable self-signed development certificate (`-SelfSigned`). `-TrustLocally` (only with
+`-SelfSigned`, only elevated, only together with `-IUnderstandTrustLocally`) adds that certificate
+to the machine's Root and TrustedPublisher stores -- a machine-wide trust decision; the script
+prints how to undo it. The `.pfx` mode is gone: `Get-PfxCertificate -Password` does not exist in
+Windows PowerShell 5.1 (F-243) -- import the `.pfx` into your store and use `-Thumbprint`.
 
 ```powershell
-# Already installed in CurrentUser\My or LocalMachine\My (including most tokens):
-.\tools\sign_cp.ps1 -Thumbprint 1A2B3C4D...
-
-# A .pfx on disk (prompts securely if it needs a password):
-.\tools\sign_cp.ps1 -PfxPath C:\keys\codesign.pfx
+.\tools\sign_cp.ps1 -DryRun                     # what is signed now; changes nothing
+.\tools\sign_cp.ps1 -SelfSigned                  # development certificate, this user only
+.\tools\sign_cp.ps1 -Thumbprint <40-hex thumbprint>
 ```
 
-Notes that matter in practice:
-
-- **EV certificates live on hardware tokens.** The private key cannot be
-  exported, so `-PfxPath` will not work; install the token's CSP and use
-  `-Thumbprint`. Signing will prompt for the token PIN.
-- **Timestamping is on by default** (`-TimestampServer`,
-  `http://timestamp.digicert.com`). Without it the signature stops validating the
-  day the certificate expires. With it, it stays valid for the life of the
-  timestamp. There is no good reason to turn this off.
-- **SHA-256** is used explicitly; SHA-1 signatures are rejected by current
-  Windows.
-- Signing does **not** change the CLSID and does **not** require re-running
-  `register.ps1`. Re-register only if you rebuilt the DLL, in which case the
-  usual rule applies — rebuild into `build-cp\`.
-
-## Where this fits in the build
-
-Stage 8b (F-13): signing is a **required** step of `installer/build.py` (step 2).
-The 7l rebuild shipped an unsigned DLL because the old hook silently did nothing
-without `SIGN_CP`; now a build without it aborts unless `--allow-unsigned-cp` is
-given, and that choice is recorded in the gate stamp. After signing, the signer's
-thumbprint must equal `SIGN_CP`, and the gate re-checks the staged copy.
-
-```powershell
-# the certificate already in the store (a dev certificate made once with -SelfSigned,
-# or a real one)
-$env:SIGN_CP = "1A2B3C4D..."      # a 40-char thumbprint
-python installer\build.py --half 1
-```
-
-`SIGN_CP=self` is refused: a certificate minted during the build has a thumbprint
-nobody could have pinned.
-
-## What is still unsigned
-
-- **The installer executable.** Handled separately by SignPath in
-  `.github/workflows/release.yml`, and only when all three `SIGNPATH_*` secrets
-  are present. Without them the release ships an unsigned installer and
-  SmartScreen says "Unknown publisher".
-- **The frozen Python executables** (`face_service.exe`, `face_unlock_tray.exe`,
-  `face_unlock_watchdog.exe`). They are not loaded by LogonUI and have no
-  signature requirement; they inherit whatever trust the installer has.
-
-If SignPath is ever configured to sign nested files, the DLL inside the installer
-would be covered by that instead — but that configuration lives in the SignPath
-project, not in this repository, so nothing here can assert it.
+A development signature never makes a build releasable.

@@ -16,7 +16,19 @@ try:
 except ImportError:  # pragma: no cover - optional for read-only usage
     tomli_w = None  # type: ignore
 
-APP_DIR = Path(os.environ.get("FACE_UNLOCK_HOME", Path.home() / ".face-unlock"))
+def _app_dir() -> Path:
+    """The data directory. Stage 9 (F-106): an INSTALLED (frozen) copy always uses
+    %USERPROFILE%\\.face-unlock -- FACE_UNLOCK_HOME is honoured only in a source checkout (the
+    selftests' isolated homes), so no environment variable can point the product's secrets and
+    face data at an arbitrary, possibly shared, folder."""
+    import sys
+    env = os.environ.get("FACE_UNLOCK_HOME")
+    if env and not getattr(sys, "frozen", False):
+        return Path(env)
+    return Path.home() / ".face-unlock"
+
+
+APP_DIR = _app_dir()
 CONFIG_PATH = APP_DIR / "config.toml"
 ENROLL_DIR = APP_DIR / "enroll"
 # Stage 8b (F-12): a "Replace" enrollment session is captured here and only promoted into

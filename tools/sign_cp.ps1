@@ -25,9 +25,6 @@
                              CurrentUser\My or LocalMachine\My. This is the
                              option for a real purchased certificate that lives
                              in the store (or on a token, if its CSP is set up).
-      -PfxPath <file>        use a .pfx on disk. -PfxPassword optional; you are
-                             prompted securely if the file needs one and none was
-                             given.
 
     A self-signed certificate is NOT trusted by anything until it is installed
     into a trust store, and that is a machine-wide security decision, so it never
@@ -36,9 +33,14 @@
     is refused unless -IUnderstandTrustLocally is given as well. How to remove
     everything this script creates: see NOTES.
 
-    installer\build.py calls this script with -Thumbprint <SIGN_CP> and then
-    verifies the signer thumbprint itself; it never passes -SelfSigned or
-    -TrustLocally.
+    Stage 9 (act 9b R18, P-24, F-244): installer\build.py no longer calls this script. Release
+    builds sign through Azure Trusted Signing with the signer pinned by subject (build.py); the
+    development key this script created before 8b was plaintext-exportable and is retired from
+    the build path. This script remains a DEVELOPER tool for signing a local test DLL.
+
+    Stage 9 (F-243): the -PfxPath mode is gone -- Get-PfxCertificate has no -Password in Windows
+    PowerShell 5.1, so it never worked here; import the .pfx into CurrentUser\My and use
+    -Thumbprint instead.
 
 .PARAMETER DllPath
     The DLL to sign. Defaults to the dev build tree, build-cp\Release.
@@ -51,7 +53,8 @@
     Install the signing certificate into LocalMachine\Root and
     LocalMachine\TrustedPublisher. Development convenience for a self-signed
     certificate; do not do this with anything you did not create yourself.
-    Needs elevation AND -IUnderstandTrustLocally; refused otherwise.
+    Needs elevation AND -IUnderstandTrustLocally AND -SelfSigned; refused otherwise, BEFORE
+    anything is signed (Stage 9, F-242).
 
 .PARAMETER IUnderstandTrustLocally
     Required together with -TrustLocally. Defect (8a F-40): one switch used to
@@ -72,8 +75,6 @@
     .\tools\sign_cp.ps1 -SelfSigned -TrustLocally -IUnderstandTrustLocally
 .EXAMPLE
     .\tools\sign_cp.ps1 -Thumbprint 1A2B3C...
-.EXAMPLE
-    .\tools\sign_cp.ps1 -PfxPath C:\keys\codesign.pfx
 
 .NOTES
     REMOVING WHAT THIS SCRIPT CREATED. Replace <THUMBPRINT> with the value the
@@ -103,12 +104,6 @@ param(
 
     [Parameter(ParameterSetName = 'Thumbprint', Mandatory = $true)]
     [string]$Thumbprint,
-
-    [Parameter(ParameterSetName = 'Pfx', Mandatory = $true)]
-    [string]$PfxPath,
-
-    [Parameter(ParameterSetName = 'Pfx')]
-    [System.Security.SecureString]$PfxPassword,
 
     [string]$DllPath,
 
@@ -143,6 +138,17 @@ Write-Host "Trust locally  : $TrustLocally"
 
 # Refused before anything else -- -DryRun included, so a dry run never presents a plan
 # the real run would reject. See .PARAMETER IUnderstandTrustLocally.
+# Stage 9 (F-242): -TrustLocally only for a certificate this script creates, and only elevated --
+# checked here, before anything is signed or any store is touched.
+if ($TrustLocally -and $PSCmdlet.ParameterSetName -ne 'SelfSigned') {
+    Write-Host 'REFUSED: -TrustLocally is only for a certificate created with -SelfSigned.' -ForegroundColor Red
+    exit 1
+}
+if ($TrustLocally -and -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+                              ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host 'REFUSED: -TrustLocally writes machine stores and needs an elevated PowerShell.' -ForegroundColor Red
+    exit 1
+}
 if ($TrustLocally -and -not $IUnderstandTrustLocally) {
     Write-Host ''
     Write-Host 'REFUSED: -TrustLocally adds this certificate to LocalMachine\Root and' -ForegroundColor Red
@@ -181,7 +187,7 @@ else {
 if ($PSCmdlet.ParameterSetName -eq 'Inspect') {
     Write-Host ''
     Write-Host 'No signing mode given -- inspection only. Nothing was changed.' -ForegroundColor Green
-    Write-Host 'Pass -SelfSigned, -Thumbprint <hex> or -PfxPath <file> to sign.' -ForegroundColor DarkGray
+    Write-Host 'Pass -SelfSigned or -Thumbprint <hex> to sign.' -ForegroundColor DarkGray
     exit 0
 }
 
@@ -200,7 +206,6 @@ if ($DryRun) {
             Write-Host "     Type      : CodeSigningCert, 3 years, private key NonExportable"
         }
         'Thumbprint' { Write-Host "  1. look up certificate $Thumbprint in CurrentUser\My then LocalMachine\My" }
-        'Pfx'        { Write-Host "  1. load the certificate from $PfxPath" }
     }
     Write-Host "  2. Set-AuthenticodeSignature on $DllPath"
     Write-Host "     with -TimestampServer $TimestampServer"
@@ -244,16 +249,6 @@ switch ($PSCmdlet.ParameterSetName) {
             exit 1
         }
     }
-    'Pfx' {
-        if (-not (Test-Path -LiteralPath $PfxPath -PathType Leaf)) {
-            Write-Host "ERROR: no .pfx at $PfxPath" -ForegroundColor Red
-            exit 1
-        }
-        if (-not $PfxPassword) {
-            $PfxPassword = Read-Host -Prompt 'PFX password (blank if none)' -AsSecureString
-        }
-        $fuCert = Get-PfxCertificate -FilePath $PfxPath -Password $PfxPassword
-    }
 }
 
 if (-not $fuCert.HasPrivateKey) {
@@ -281,6 +276,7 @@ if ($TrustLocally) {
     Write-Host 'Installing the certificate into the machine trust stores...' -ForegroundColor Yellow
     Write-Host '  (this is a machine-wide trust decision -- see SIGNING.md)' -ForegroundColor DarkGray
     $fuPublic = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($fuCert.RawData)
+    $fuTrustFailed = $false
     foreach ($fuStoreName in @('Root', 'TrustedPublisher')) {
         $fuStore = [System.Security.Cryptography.X509Certificates.X509Store]::new(
             $fuStoreName, 'LocalMachine')
@@ -291,6 +287,7 @@ if ($TrustLocally) {
         }
         catch {
             Write-Host ("  FAILED for LocalMachine\{0}: {1}" -f $fuStoreName, $_.Exception.Message) -ForegroundColor Red
+            $fuTrustFailed = $true
         }
         finally { $fuStore.Close() }
     }
@@ -310,4 +307,8 @@ if ($fuFinal.SignerCertificate) {
 Write-Host ''
 Write-Host 'Done. Re-register the DLL only if you also rebuilt it -- signing does not' -ForegroundColor Green
 Write-Host 'change the CLSID and does not require re-running register.ps1.' -ForegroundColor DarkGray
+if ($TrustLocally -and $fuTrustFailed) {
+    Write-Host 'The DLL is signed, but adding the certificate to a machine store FAILED (see above).' -ForegroundColor Red
+    exit 3
+}
 exit 0

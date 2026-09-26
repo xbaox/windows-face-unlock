@@ -1100,6 +1100,8 @@ def main() -> int:
             raise_by_title(t("enroll.title"))
             return 0
         enable_dpi_awareness()
+        from face_service.ort_privacy import disable_ort_telemetry
+        disable_ort_telemetry()          # the wizard imports insightface -> onnxruntime (§2.11)
         log.info("enroll wizard starting: pid=%s lang=%s camera_name=%r camera_index=%s",
                  os.getpid(), cfg.language, cfg.camera_name, cfg.camera_index)
         EnrollWindow().run()

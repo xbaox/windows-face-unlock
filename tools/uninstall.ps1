@@ -102,6 +102,12 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 
 $fuRepoRoot   = Split-Path -Parent $PSScriptRoot
+
+# F-234: a 32-bit host sees another registry view; refuse rather than report the wrong machine.
+if (-not [Environment]::Is64BitProcess) {
+    Write-Host 'Run this from a 64-bit PowerShell.' -ForegroundColor Red
+    exit 2
+}
 $fuTaskPrefix = 'FaceUnlock-'
 # The Programs and Features entry Inno writes: AppId from installer.iss + "_is1" (F-39).
 $fuArpKey     = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{2F7A9B14-3C31-4B1E-9AB9-5E0D1B02B6A7}_is1'
@@ -548,6 +554,32 @@ if (-not $fuIsAdmin) {
     Write-Host 'the install tree belong to an administrator. Nothing was changed.' -ForegroundColor Red
     exit 2
 }
+# Stage 9 (act 9b R19): phase B runs the repo's own scripts ELEVATED; that is only acceptable from a
+# tree that administrators alone can change (the same rule as tools\register_tasks.ps1 -Mode Dev).
+$fuTrustedSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+$fuWriteMask = [int](0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000)
+$fuTreeProblems = @()
+foreach ($fuTreePath in @($fuRepoRoot, (Join-Path $fuRepoRoot 'tools'), (Join-Path $fuRepoRoot 'credential_provider'))) {
+    if (-not (Test-Path -LiteralPath $fuTreePath)) { continue }
+    $fuTreeAcl = Get-Acl -LiteralPath $fuTreePath
+    $fuTreeOwner = (New-Object Security.Principal.NTAccount($fuTreeAcl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value
+    if ($fuTrustedSids -notcontains $fuTreeOwner) { $fuTreeProblems += "$fuTreePath : owner $($fuTreeAcl.Owner)" }
+    foreach ($fuTreeAce in $fuTreeAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($fuTreeAce.AccessControlType -ne 'Allow') { continue }
+        if (-not ([int]$fuTreeAce.FileSystemRights -band $fuWriteMask)) { continue }
+        $fuTreeSid = $fuTreeAce.IdentityReference.Value
+        if ($fuTrustedSids -contains $fuTreeSid) { continue }
+        if ($fuTreeSid -eq 'S-1-3-0' -and ($fuTreeAce.PropagationFlags -band 'InheritOnly')) { continue }
+        $fuTreeProblems += "$fuTreePath : $fuTreeSid may write"
+    }
+}
+if ($fuTreeProblems.Count) {
+    Write-Host 'Refusing -Force: the repo tree can be changed by accounts other than administrators, and' -ForegroundColor Red
+    Write-Host 'phase B would run its scripts elevated (act 9b R19). Nothing was changed.' -ForegroundColor Red
+    foreach ($fuTp in $fuTreeProblems) { Write-Host "  - $fuTp" }
+    Write-Host 'For an installed copy use Programs and Features (its uninstaller).'
+    exit 2
+}
 Write-Host 'PHASE B -- removing' -ForegroundColor Yellow
 Write-Host ('=' * 60)
 
@@ -555,11 +587,22 @@ Write-Host ('=' * 60)
 #    gracefully first (7d-E), so the persistent camera is handed back rather
 #    than torn away -- the Frame Server wedge is a reboot to clear.
 Write-Host ''
-Write-Host '[1/4] scheduled tasks (delegated to register_tasks.ps1)' -ForegroundColor Cyan
-if (Test-Path -LiteralPath $fuRegistrar) {
-    $fuRegArgs = @{ Action = 'Unregister'; Mode = $Mode }
-    if ($InstallDir) { $fuRegArgs['InstallDir'] = $InstallDir }
-    try { & $fuRegistrar @fuRegArgs }
+Write-Host '[1/4] scheduled tasks' -ForegroundColor Cyan
+if ($Mode -eq 'Installed') {
+    # Stage 9 (R17): an installed copy removes its tasks through its own executable.
+    $fuTrayExe = if ($fuBefore['appDir']) { Join-Path $fuBefore['appDir'] 'face_unlock_tray.exe' } else { '' }
+    if ($fuTrayExe -and (Test-Path -LiteralPath $fuTrayExe)) {
+        & $fuTrayExe --unregister
+        if ($LASTEXITCODE) { Write-Warning ("face_unlock_tray.exe --unregister exited {0}" -f $LASTEXITCODE) }
+    }
+    else { Write-Warning "no $fuTrayExe -- run the installed copy's unins000.exe instead" }
+}
+elseif (Test-Path -LiteralPath $fuRegistrar) {
+    try {
+        & $fuRegistrar -Action Unregister -Mode Dev
+        # F-233: the registrar's exit code decides, not the absence of an exception.
+        if ($LASTEXITCODE) { Write-Warning ("register_tasks.ps1 -Action Unregister exited {0}" -f $LASTEXITCODE) }
+    }
     catch { Write-Warning ("registrar failed: {0}" -f $_.Exception.Message) }
 }
 else { Write-Warning "registrar not found at $fuRegistrar; skipping task removal" }

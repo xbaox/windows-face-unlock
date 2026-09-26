@@ -14,6 +14,8 @@ picks the flag form when ``sys.frozen`` is set and the ``-m`` form when it is no
     face_unlock_tray.exe --enroll           -> the enrollment wizard, in its own process
     face_unlock_tray.exe --set-password     -> the DPAPI password dialog
     face_unlock_tray.exe --pipe-shutdown    -> ask the service to stop, then exit
+    face_unlock_tray.exe --register --user-sid S | --unregister | --stop | --start | --verify-acl
+                                            -> Setup / the uninstaller (face_service.taskreg)
 
 ``--pipe-shutdown`` exists for tools/register_tasks.ps1. Its graceful-shutdown step shells out to
 ``python -m tools.pipe_client shutdown``, which cannot work on an installed machine: there is no
@@ -71,6 +73,12 @@ def main(argv: "list[str] | None" = None) -> int:
     if flag == "--set-password":
         from presence_monitor.password_gui import main as password_main
         return int(password_main() or 0)
+
+    if flag in ("--register", "--unregister", "--stop", "--start", "--verify-acl"):
+        # Stage 9 (act 9b R17): Setup and the uninstaller register, stop and remove the scheduled
+        # tasks through this signed executable (Task Scheduler over COM) -- no PowerShell.
+        from face_service.taskreg import main as taskreg_main
+        return int(taskreg_main(args))
 
     if flag == "--pipe-shutdown":
         # Same request the dev path sends, through the same client, so the SID checks and the

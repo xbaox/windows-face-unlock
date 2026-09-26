@@ -12,7 +12,11 @@ import sys
 # Stage 8b-2: the hidden custody self-check the build gate runs out of the FROZEN exe (see
 # face_service/selfcheck.py). Routed here, BEFORE face_service.service is imported, so the mode
 # never loads the engine, the camera or the pipe code, and never reads the config.
+# Stage 9 (D-73): only when installer/build.py's gate sets FU_BUILD_GATE=1 -- a mistyped path from
+# anyone else must not re-ACL a folder.
 if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck-custody":
+    if os.environ.get("FU_BUILD_GATE") != "1":
+        raise SystemExit(2)
     from face_service.selfcheck import selfcheck_custody_main
     raise SystemExit(selfcheck_custody_main(sys.argv[1:]))
 

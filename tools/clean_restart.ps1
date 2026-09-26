@@ -26,6 +26,22 @@ param(
     [switch]$DryRun
 )
 
+# Stage 9 (R17): an installed copy restarts through its own executable (elevated prompt needed).
+if ($Mode -eq 'Installed') {
+    $fuDir = $InstallDir
+    if (-not $fuDir) {
+        $fuReg = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WindowsFaceUnlock' -Name 'InstallLocation' -ErrorAction SilentlyContinue
+        if ($fuReg -and $fuReg.PSObject.Properties['InstallLocation']) { $fuDir = $fuReg.InstallLocation }
+    }
+    $fuExe = if ($fuDir) { Join-Path $fuDir 'face_unlock_tray.exe' } else { '' }
+    if (-not $fuExe -or -not (Test-Path -LiteralPath $fuExe)) { Write-Host 'No installed Face Unlock found.'; exit 1 }
+    if ($DryRun) { Write-Host "Would run: `"$fuExe`" --stop, then --start"; exit 0 }
+    & $fuExe --stop
+    if ($LASTEXITCODE) { Write-Warning "--stop exited $LASTEXITCODE" }
+    & $fuExe --start
+    exit $LASTEXITCODE
+}
+
 # Splatted rather than positional so -InstallDir is omitted entirely when empty.
 # fu* prefix per the naming rule in register_tasks.ps1: never assign to a name
 # that is a parameter of the script being called.

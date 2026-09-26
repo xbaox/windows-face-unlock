@@ -1,9 +1,19 @@
 <#
 .SYNOPSIS
-    Register, unregister or start the Face Unlock scheduled tasks.
+    Register, unregister or start the Face Unlock scheduled tasks -- DEVELOPER layout.
 
 .DESCRIPTION
-    The single registrar for both layouts. The task list lives in tasks.psd1
+    Stage 9 (act 9b R17 / R19): an INSTALLED copy is registered, stopped and removed by the signed
+    product executable (face_unlock_tray.exe --register / --stop / --unregister, called by Setup and
+    the uninstaller) -- no PowerShell in install or uninstall. This script is the developer's
+    registrar for a source checkout (-Mode Dev); -Mode Installed hands over to that executable.
+
+    R19: the Dev tasks run code from the repo tree at every logon, so this script refuses to
+    register or start them unless the tree is writable by administrators only (the same rule the
+    installer applies to its program folder). A checkout under a user profile fails that check by
+    design -- see CONTRIBUTING.
+
+    The registrar for the dev layout. The task list lives in tasks.psd1
     next to this script and is the only place task names appear; the trigger,
     principal and settings are built once, here, so the dev and installed
     deployments cannot drift apart.
@@ -125,9 +135,49 @@ $fuDeathWaitSec = 10
 $fuTaskPrefix   = 'FaceUnlock-'
 $fuRequiredKeys = @('Name', 'Description', 'DevArgs', 'InstalledExe', 'SkipReason')
 $fuNeedles      = @('face_service', 'presence_monitor', 'tools.watchdog')
-# Stage 8b (F-36): the session this script runs in. Setup runs it elevated but in the user's own
-# interactive session, so this is the session the user's Face Unlock processes live in.
+# Stage 8b (F-36): the session this script runs in -- the session the user's processes live in.
 $fuSession      = (Get-Process -Id $PID).SessionId
+
+# F-234: a 32-bit host sees another registry and file system; refuse rather than half-work.
+if (-not [Environment]::Is64BitProcess) {
+    Write-Host "ERROR: run this from a 64-bit PowerShell." -ForegroundColor Red
+    exit 1
+}
+
+# Stage 9 (R17): installed copies are managed by the product executable, never by this script.
+if ($Mode -eq 'Installed') {
+    $fuExeMap = @{ Register = '--register'; Unregister = '--unregister'; Stop = '--stop'; Start = '--start' }
+    Write-Host ("An installed Face Unlock is managed by its own executable, e.g.:") -ForegroundColor Yellow
+    Write-Host ('  "<InstallDir>\face_unlock_tray.exe" {0}' -f $(if ($fuExeMap.ContainsKey($Action)) { $fuExeMap[$Action] } else { '--stop / --start' }))
+    Write-Host "(Setup and the uninstaller call it; it needs an elevated prompt.)"
+    exit 2
+}
+
+# R19: the dev tasks run repo code at every logon -- only from a tree administrators alone can change.
+function Get-FuWritableByOthers {
+    param([string[]]$Paths)
+    $fuTrusted = @('S-1-5-18', 'S-1-5-32-544',
+                   'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    # WriteData/CreateFiles, AppendData/CreateDirectories, DeleteSubdirectoriesAndFiles, DELETE,
+    # WRITE_DAC, WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE -- never the read / execute / synchronize bits.
+    $fuWriteRights = [int](0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000)
+    $fuProblems = @()
+    foreach ($fuPath in $Paths) {
+        if (-not (Test-Path -LiteralPath $fuPath)) { continue }
+        $fuAcl = Get-Acl -LiteralPath $fuPath
+        $fuOwnerSid = (New-Object Security.Principal.NTAccount($fuAcl.Owner)).Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($fuTrusted -notcontains $fuOwnerSid) { $fuProblems += "$fuPath : owner $($fuAcl.Owner)" }
+        foreach ($fuAce in $fuAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($fuAce.AccessControlType -ne 'Allow') { continue }
+            if (-not ([int]$fuAce.FileSystemRights -band $fuWriteRights)) { continue }
+            $fuSid = $fuAce.IdentityReference.Value
+            if ($fuTrusted -contains $fuSid) { continue }
+            if ($fuSid -eq 'S-1-3-0' -and ($fuAce.PropagationFlags -band 'InheritOnly')) { continue }
+            $fuProblems += "$fuPath : $fuSid may write ($($fuAce.FileSystemRights))"
+        }
+    }
+    return ,$fuProblems
+}
 
 
 # --- helpers (pure) ---------------------------------------------------------
@@ -145,12 +195,16 @@ function Get-FuProcess {
     param([string]$LayoutMode, [string[]]$ExeNames, [string[]]$CommandLineNeedles)
 
     if ($LayoutMode -eq 'Dev') {
+        # Stage 9 (F-237): this session only, and the module as an ARGUMENT (-m <module>) -- not a
+        # substring anywhere in the command line, which also matched a checkout path.
         return @(Get-CimInstance Win32_Process `
                     -Filter "Name='python.exe' OR Name='pythonw.exe'" `
                     -ErrorAction SilentlyContinue |
                  Where-Object {
                      $fuCmdLine = $_.CommandLine
-                     $fuCmdLine -and ($CommandLineNeedles | Where-Object { $fuCmdLine -like "*$_*" })
+                     $_.SessionId -eq $fuSession -and $fuCmdLine -and
+                     ($CommandLineNeedles | Where-Object {
+                         $fuCmdLine -match ('(^|\s)-m\s+' + [regex]::Escape($_) + '(\s|$)') })
                  })
     }
     if (-not $ExeNames) { return @() }
@@ -164,9 +218,14 @@ function Get-FuProcess {
              })
 }
 
-# Read-only: which FaceUnlock-* tasks exist right now.
+# Read-only: which FaceUnlock-* tasks of THIS checkout exist right now (Stage 9, F-239/F-231: a
+# task whose action runs from anywhere else -- an installed copy, another checkout -- is not ours).
 function Get-FuExistingTaskName {
+    $fuVenv = (Join-Path $fuRepoRoot '.venv') + '\'
     return @(Get-ScheduledTask -TaskName "$fuTaskPrefix*" -ErrorAction SilentlyContinue |
+             Where-Object { $_.Actions.Count -ge 1 -and
+                            $_.Actions[0].Execute -and
+                            $_.Actions[0].Execute.StartsWith($fuVenv, [StringComparison]::OrdinalIgnoreCase) } |
              ForEach-Object { $_.TaskName })
 }
 
@@ -239,6 +298,26 @@ if ($Mode -eq 'Installed') {
     }
 }
 
+# Stage 9 (F-232, R19): the interpreter the tasks will run exists, and the tree is admin-only.
+$fuPythonw = Join-Path $fuRepoRoot '.venv\Scripts\pythonw.exe'
+if ($Action -in @('Register', 'Start', 'Restart')) {
+    if (-not (Test-Path -LiteralPath $fuPythonw -PathType Leaf)) {
+        Write-Host "ERROR: $fuPythonw not found -- run setup.ps1 first." -ForegroundColor Red
+        exit 1
+    }
+    $fuAclProblems = Get-FuWritableByOthers @($fuRepoRoot,
+        (Join-Path $fuRepoRoot '.venv'), (Join-Path $fuRepoRoot '.venv\Scripts'),
+        (Join-Path $fuRepoRoot 'face_service'), (Join-Path $fuRepoRoot 'presence_monitor'),
+        (Join-Path $fuRepoRoot 'tools'))
+    if ($fuAclProblems.Count) {
+        Write-Host ("ERROR: the repo tree can be changed by accounts other than administrators, and the " +
+                    "Dev tasks would run that code at every logon (act 9b R19). Refusing.") -ForegroundColor Red
+        foreach ($fuP in $fuAclProblems) { Write-Host "  - $fuP" }
+        Write-Host "Move the checkout under a folder only administrators can write, or use the installer."
+        exit 1
+    }
+}
+
 # Resolve every declared task for this layout, and build its scheduler objects.
 # A task the layout cannot run is skipped out loud, not silently.
 $fuPlan     = @()
@@ -302,6 +381,7 @@ foreach ($fuTask in $fuTasks) {
         TaskSettings     = $fuTaskSettings
         PriorityText     = $fuPriorityText
         RestartText      = $fuRestartText
+        Description      = [string]$fuTask.Description
     }
 }
 
@@ -534,7 +614,7 @@ function Invoke-GracefulServiceShutdown {
     # risk. Fix: $fuGraceClientMs = 10 s. Measured in the 8b dist smoke (frozen tray exe,
     # --pipe-shutdown, cold start + exchange): 1.13 s and 1.01 s, x2 = 2.3 s. The bound stays at
     # 10 s by the architect's decision (8b-2): the first run after an install goes under an AV scan
-    # of the freshly written exe, which the smoke did not measure. See audit-notes "Этап 8".
+    # of the freshly written exe, which the smoke did not measure. See audit-notes, section "Stage 8" (D-120: this file stays ASCII-only).
     $fuGraceClientMs = 10000
     if (-not $fuClient.WaitForExit($fuGraceClientMs)) {
         Write-Warning ("pipe client did not return within {0}s; killing the client and falling back to hard kill" -f `
@@ -675,11 +755,18 @@ if ($Action -eq 'Stop') {
 }
 
 if ($Action -eq 'Start') {
+    $fuStartFailed = $false
     foreach ($fuItem in $fuPlan) {
-        Start-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
-        Write-Host ("Started: {0}" -f $fuItem.Name)
+        try {
+            Start-ScheduledTask -TaskName $fuItem.Name -ErrorAction Stop
+            Write-Host ("Started: {0}" -f $fuItem.Name)
+        }
+        catch {
+            Write-Warning ("could not start {0}: {1}" -f $fuItem.Name, $_.Exception.Message)
+            $fuStartFailed = $true
+        }
     }
-    exit 0
+    exit $(if ($fuStartFailed) { 1 } else { 0 })
 }
 
 if ($Action -eq 'Restart') {
@@ -711,7 +798,8 @@ if ($Action -eq 'Restart') {
 foreach ($fuItem in $fuPlan) {
     Register-ScheduledTask -TaskName $fuItem.Name -Action $fuItem.TaskAction `
                            -Trigger $fuTrigger -Principal $fuPrincipal `
-                           -Settings $fuItem.TaskSettings -Force | Out-Null
+                           -Settings $fuItem.TaskSettings -Description $fuItem.Description `
+                           -Force | Out-Null
     Write-Host ("Registered (hidden, no time limit, priority {3}, restart {4}) for {5}: {0} -> {1} {2}" -f `
                 $fuItem.Name, $fuItem.Execute, $fuItem.Argument, $fuItem.PriorityText,
                 $fuItem.RestartText, $fuTargetUser)
@@ -743,5 +831,18 @@ foreach ($fuItem in $fuPlan) {
     Write-Host ("Started: {0}" -f $fuItem.Name)
 }
 
-Write-Host "Done."
+# Stage 9 (F-233): verify instead of assuming.
+Start-Sleep -Seconds 1
+$fuBad = @()
+foreach ($fuItem in $fuPlan) {
+    $fuT = Get-ScheduledTask -TaskName $fuItem.Name -ErrorAction SilentlyContinue
+    if (-not $fuT -or $fuT.State -notin @('Ready', 'Running')) {
+        $fuBad += ("{0} ({1})" -f $fuItem.Name, $(if ($fuT) { $fuT.State } else { 'missing' }))
+    }
+}
+if ($fuBad) {
+    Write-Warning ("not registered / not runnable: {0}" -f ($fuBad -join ', '))
+    exit 1
+}
+Write-Host "Done: every task registered and ready or running."
 exit 0

@@ -185,10 +185,12 @@ def main(argv=None) -> int:
     entries = [ln for ln in uninst.splitlines() if ln.startswith("Filename:")]
     t.ok(len(entries) == 2 and uninst.count("RunOnceId:") == 2,
          f"both [UninstallRun] entries carry RunOnceId (F-34): {uninst.count('RunOnceId:')}")
-    prep = iss.split("function PrepareToInstall", 1)[1].split("procedure RegisterTasks", 1)[0]
-    t.ok("-Action Stop'" in prep and "ExtractTemporaryFile('register_tasks.ps1')" in prep,
-         "PrepareToInstall runs the NEW registrar with -Action Stop, not Unregister (F-35)")
-    t.ok("WTSGetActiveConsoleSessionId" in iss and "' -UserSid ' + GetOwnerSid()" in iss
+    prep = iss.split("function PrepareToInstall", 1)[1].split("function InstallModels", 1)[0]
+    # Stage 9 (R17): the stop runs in [Code] over COM / WMI (no registrar to extract); the
+    # registrations stay, the Register after the copy overwrites them (F-35 semantics kept).
+    t.ok("StopStack(Dir)" in prep and "Unregister" not in prep and "DeleteTask" not in prep,
+         "PrepareToInstall STOPS the stack (registrations kept), no unregister (F-35)")
+    t.ok("WTSGetActiveConsoleSessionId" in iss and "'--register --user-sid ' + GetOwnerSid()" in iss
          and "'OriginalUserSid', GetOwnerSid()" in iss and "/FORCEOWNER" in iss and "/OWNER" in iss,
          "the registrar and the registry get the OWNER's SID -- the console user or /OWNER= "
          "(Stage 9 R1; was the original user, F-07)")

@@ -35,8 +35,6 @@
     Optional explicit path to FaceCredentialProvider.dll. When omitted the
     script probes the installed layout first, then the dev build tree.
 
-.EXAMPLE
-    .\register.ps1 -Action register
 .PARAMETER DryRun
     Preflight only. Resolves the DLL, prints both probe candidates and which
     of them exists, prints the exact regsvr32 command line that would run, and
@@ -47,6 +45,8 @@
     Elevation is still required: a dry run that skipped the admin check would
     not be validating the conditions the real run executes under.
 
+.EXAMPLE
+    .\register.ps1 -Action register
 .EXAMPLE
     .\register.ps1 -Action unregister
 .EXAMPLE
@@ -173,6 +173,14 @@ if (-not [Environment]::Is64BitProcess) {
     Write-Host "ERROR: this must run in 64-bit PowerShell." -ForegroundColor Red
     Write-Host "       A 32-bit host cannot register the x64 DLL and reads a redirected registry view."
     Write-Host "       Use C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    exit 1
+}
+
+# Stage 9 (F-98): on ARM64 Windows LogonUI is a native ARM64 process and cannot load this x64 DLL at
+# all -- say so instead of failing later with a generic regsvr32 error.
+if ((Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).Architecture -eq 12) {
+    Write-Host "ERROR: this is ARM64 Windows. The Face Unlock sign-in tile is built for x64 and cannot" -ForegroundColor Red
+    Write-Host "       be loaded by the ARM64 sign-in screen; Face Unlock supports x64 Windows only."
     exit 1
 }
 

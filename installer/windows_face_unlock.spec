@@ -1,9 +1,11 @@
-# PyInstaller spec — builds face_service.exe and face_unlock_tray.exe into a
-# single shared dist folder. Run from the repo root:
+# PyInstaller spec -- builds face_service.exe, face_unlock_tray.exe and face_unlock_watchdog.exe into
+# one shared dist folder. installer/build.py runs it; by hand, from the repo root:
+#     set FU_VARIANT=cpu   (or gpu)
 #     pyinstaller installer/windows_face_unlock.spec --noconfirm --clean
 #
-# The two entry points share runtime binaries via MERGE so the ONNX runtime and
-# the CUDA libraries are only laid down once.
+# Stage 9 (act 9b R17): two variants. "cpu" (the main one) ships no NVIDIA file and no CUDA
+# provider. "gpu" adds ONLY the NVIDIA DLLs the ORT CUDA provider needs (NVIDIA_ALLOWLIST below);
+# build.py checks their Authenticode signatures and never modifies them.
 
 from pathlib import Path
 from PyInstaller.utils.hooks import (
@@ -14,8 +16,15 @@ from PyInstaller.utils.hooks import (
 from PyInstaller.building.api import PYZ, EXE, COLLECT, MERGE
 from PyInstaller.building.build_main import Analysis
 
+import os
+import sys
+
 REPO_ROOT = Path(SPECPATH).resolve().parent
-BLOCK_CIPHER = None
+VARIANT = os.environ.get("FU_VARIANT", "cpu").strip().lower()
+if VARIANT not in ("cpu", "gpu"):
+    raise SystemExit(f"FU_VARIANT must be cpu or gpu, got {VARIANT!r}")
+print(f"[spec] building the {VARIANT.upper()} variant")
+# (Stage 9, D-109: no cipher -- PyInstaller 6 removed bytecode encryption; the argument was dead.)
 
 # ---------------------------------------------------------------------------
 # Hidden imports + data collection.
@@ -85,8 +94,7 @@ HIDDEN += collect_submodules("scipy._external")
 HIDDEN += [
     "onnxruntime.capi._pybind_state",
     "nvidia",                    # see the CUDA block below
-    "requests", "tqdm",          # insightface.utils.download (fetches buffalo_l)
-    "pystray._win32",
+    "requests", "tqdm",          # imported by insightface at import time (its download helper)
     "PIL._tkinter_finder",
     "win32api", "win32security", "win32file", "win32pipe",
     "win32event", "win32process", "winerror",
@@ -104,6 +112,11 @@ HIDDEN += [
     "face_service.camera_devices",
     "face_service.session_state",
     "psutil",
+    # Stage 9 (R17): Setup / the uninstaller call the tray exe with --register / --unregister /
+    # --stop / --verify-acl: the Task Scheduler over COM (pywin32) and the ACL check.
+    "face_service.taskreg",
+    "face_service.ort_privacy",
+    "win32com", "win32com.client", "pythoncom", "ntsecuritycon",
     # THE ENTRY-POINT MODULES THEMSELVES. Kept deliberately, and the history is
     # worth writing down because it cost two blocks.
     #
@@ -159,9 +172,11 @@ HIDDEN += [
 ]
 
 DATAS = []
-DATAS += collect_data_files("insightface")
+# Stage 9 (D-152, F-51): no sample media. insightface's data/images (a celebrity photo, a group
+# photo) and gui assets, and skimage's data/ (LFW face crops and more) are never read by the product.
+DATAS += collect_data_files("insightface", excludes=["data/images/**", "gui/**"])
 DATAS += collect_data_files("onnxruntime")
-DATAS += collect_data_files("skimage")
+DATAS += collect_data_files("skimage", excludes=["data/**"])
 DATAS += collect_data_files("cv2")
 
 # Mine 3. insightface.data.get_object carries an EXPLICIT frozen branch
@@ -181,9 +196,23 @@ import insightface as _insightface
 _IF_OBJECTS = Path(_insightface.__file__).resolve().parent / "data" / "objects"
 DATAS += [(str(p), "objects") for p in sorted(_IF_OBJECTS.iterdir()) if p.is_file()]
 
+def _keep_binary(entry) -> bool:
+    name = Path(entry[0]).name.lower()
+    # F-51: the TensorRT provider has no TensorRT runtime to load -- never shipped.
+    if name.startswith("onnxruntime_providers_tensorrt"):
+        return False
+    # The CUDA provider only in the GPU variant.
+    if name.startswith("onnxruntime_providers_cuda"):
+        return VARIANT == "gpu"
+    # D-151: the FFmpeg plugin serves files and URLs; the product opens cameras by index/name only.
+    if name.startswith("opencv_videoio_ffmpeg"):
+        return False
+    return True
+
+
 BINARIES = []
-BINARIES += collect_dynamic_libs("onnxruntime")   # onnxruntime.dll + CUDA/TensorRT providers
-BINARIES += collect_dynamic_libs("cv2")
+BINARIES += [b for b in collect_dynamic_libs("onnxruntime") if _keep_binary(b)]
+BINARIES += [b for b in collect_dynamic_libs("cv2") if _keep_binary(b)]
 
 # Bundle the YuNet detector. It is the only model committed to the repo.
 DATAS += [
@@ -212,21 +241,41 @@ DATAS += [
 # binaries is deliberate -- binaries land flat at the bundle root, which would
 # break the directory walk.
 #
-# If nvidia-* is not installed in the build environment this collects nothing
-# and the bundle is CPU-only, which _select_providers() already handles.
+# Stage 9 (act 9b R17, F-262, F-263): the GPU variant ships ONLY the allowlist below -- what the
+# ORT CUDA provider imports (cudart, cublas, cublasLt, cufft, cudnn64_9), the cuDNN 9 sublibraries
+# it loads by name, and NVRTC, which cuDNN's runtime-compiled engines load. nvblas, cufftw, curand
+# (imported by nothing), the nvrtc ".alt" copy and nvJitLink (not in the CUDA EULA's redistributable
+# list) are left out. Files are copied byte-for-byte; build.py verifies each one's Authenticode
+# signature and NEVER re-signs or modifies them. The CPU variant ships none of them, and a GPU build
+# without the nvidia packages is an error, not a silent CPU build (F-219).
 # ---------------------------------------------------------------------------
-try:
-    import nvidia as _nvidia
-
-    for _root in _nvidia.__path__:
-        _root = Path(_root)
-        for _sub in sorted(p for p in _root.iterdir() if p.is_dir()):
-            _bin = _sub / "bin"
-            if _bin.is_dir():
-                for _dll in sorted(_bin.glob("*.dll")):
-                    DATAS.append((str(_dll), f"nvidia/{_sub.name}/bin"))
-except ImportError:
-    pass
+NVIDIA_ALLOWLIST = {
+    "cuda_runtime": ["cudart64_12.dll"],
+    "cublas": ["cublas64_12.dll", "cublasLt64_12.dll"],
+    "cufft": ["cufft64_11.dll"],
+    "cuda_nvrtc": ["nvrtc64_120_0.dll", "nvrtc-builtins64_129.dll"],
+    "cudnn": ["cudnn64_9.dll", "cudnn_adv64_9.dll", "cudnn_cnn64_9.dll",
+              "cudnn_engines_precompiled64_9.dll", "cudnn_engines_runtime_compiled64_9.dll",
+              "cudnn_engines_tensor_ir64_9.dll", "cudnn_ext64_9.dll", "cudnn_graph64_9.dll",
+              "cudnn_heuristic64_9.dll", "cudnn_ops64_9.dll"],
+}
+if VARIANT == "gpu":
+    try:
+        import nvidia as _nvidia
+    except ImportError:
+        raise SystemExit("GPU variant requested but the nvidia CUDA/cuDNN packages are not installed "
+                         "(install the GPU lock) -- refusing to build a CPU bundle under a GPU name.")
+    _missing = []
+    for _pkg, _names in NVIDIA_ALLOWLIST.items():
+        for _n in _names:
+            _src = next((Path(r) / _pkg / "bin" / _n for r in _nvidia.__path__
+                         if (Path(r) / _pkg / "bin" / _n).is_file()), None)
+            if _src is None:
+                _missing.append(f"{_pkg}/{_n}")
+            else:
+                DATAS.append((str(_src), f"nvidia/{_pkg}/bin"))
+    if _missing:
+        raise SystemExit("GPU variant: NVIDIA files missing: " + ", ".join(_missing))
 
 EXCLUDES = [
     # Only insightface.thirdparty.face3d wants matplotlib, and only
@@ -235,7 +284,39 @@ EXCLUDES = [
     "matplotlib",
     "PyQt5", "PyQt6", "PySide2", "PySide6",
     "jupyter", "ipykernel", "notebook",
+    # Stage 9 (F-51, D-153): packages no product code imports.
+    "pandas", "sympy", "mpmath", "pip", "setuptools", "pkg_resources", "fsspec", "imageio",
+    "tifffile", "jinja2", "bs4", "soupsieve", "filelock", "pytest", "IPython",
 ]
+
+# Stage 9 (act 9b §2.9, F-261): pystray (LGPL-3.0) is collected as replaceable .py SOURCE files
+# under _internal\pystray, outside every PYZ -- the user can swap in a modified pystray, as LGPL-3
+# section 4(d) asks. Its license texts ship beside it (build.py stages them); only the tray uses it.
+COLLECTION_MODE = {"pystray": "py"}
+
+# Stage 9 (D-108, D-156): version resources for the three executables, from face_service/_version.py.
+sys.path.insert(0, str(REPO_ROOT))
+from face_service._version import __version__ as _APP_VERSION  # noqa: E402
+from PyInstaller.utils.win32.versioninfo import (  # noqa: E402
+    FixedFileInfo, StringFileInfo, StringStruct, StringTable, VarFileInfo, VarStruct, VSVersionInfo)
+
+
+def _version_info(description: str, internal: str) -> VSVersionInfo:
+    nums = tuple(int(x) for x in _APP_VERSION.split(".")[:3]) + (0,)
+    return VSVersionInfo(
+        ffi=FixedFileInfo(filevers=nums, prodvers=nums, mask=0x3F, flags=0x0, OS=0x40004,
+                          fileType=0x1, subtype=0x0, date=(0, 0)),
+        kids=[StringFileInfo([StringTable("040904B0", [
+            StringStruct("CompanyName", "xbaox"),
+            StringStruct("FileDescription", description),
+            StringStruct("FileVersion", _APP_VERSION),
+            StringStruct("InternalName", internal),
+            StringStruct("LegalCopyright",
+                         "Copyright (c) 2026 Cao Chí Tâm; modifications (c) 2026 xbaox. MIT License."),
+            StringStruct("OriginalFilename", internal + ".exe"),
+            StringStruct("ProductName", "Windows Face Unlock"),
+            StringStruct("ProductVersion", _APP_VERSION)])]),
+              VarFileInfo([VarStruct("Translation", [0x0409, 1200])])])
 
 # ---------------------------------------------------------------------------
 # Three entry points.
@@ -255,7 +336,7 @@ service_analysis = Analysis(
     hookspath=[],
     runtime_hooks=[],
     excludes=EXCLUDES,
-    cipher=BLOCK_CIPHER,
+    module_collection_mode=COLLECTION_MODE,
     noarchive=False,
 )
 
@@ -264,11 +345,11 @@ tray_analysis = Analysis(
     pathex=[str(REPO_ROOT)],
     binaries=BINARIES,
     datas=DATAS,
-    hiddenimports=HIDDEN + ["tkinter", "tkinter.ttk", "tkinter.messagebox"],
+    hiddenimports=HIDDEN + ["tkinter", "tkinter.ttk", "tkinter.messagebox", "pystray._win32"],
     hookspath=[],
     runtime_hooks=[],
     excludes=EXCLUDES,
-    cipher=BLOCK_CIPHER,
+    module_collection_mode=COLLECTION_MODE,
     noarchive=False,
 )
 
@@ -293,7 +374,7 @@ watchdog_analysis = Analysis(
     hookspath=[],
     runtime_hooks=[],
     excludes=EXCLUDES,
-    cipher=BLOCK_CIPHER,
+    module_collection_mode=COLLECTION_MODE,
     noarchive=False,
 )
 
@@ -305,9 +386,9 @@ MERGE(
     (watchdog_analysis, "watchdog", "face_unlock_watchdog"),
 )
 
-service_pyz = PYZ(service_analysis.pure, service_analysis.zipped_data, cipher=BLOCK_CIPHER)
-tray_pyz = PYZ(tray_analysis.pure, tray_analysis.zipped_data, cipher=BLOCK_CIPHER)
-watchdog_pyz = PYZ(watchdog_analysis.pure, watchdog_analysis.zipped_data, cipher=BLOCK_CIPHER)
+service_pyz = PYZ(service_analysis.pure, service_analysis.zipped_data)
+tray_pyz = PYZ(tray_analysis.pure, tray_analysis.zipped_data)
+watchdog_pyz = PYZ(watchdog_analysis.pure, watchdog_analysis.zipped_data)
 
 service_exe = EXE(
     service_pyz,
@@ -320,9 +401,9 @@ service_exe = EXE(
     strip=False,
     upx=False,
     console=False,           # service has no UI; log to file
-    windowed=True,
     disable_windowed_traceback=False,
     icon=None,
+    version=_version_info("Windows Face Unlock service", "face_service"),
 )
 
 # Stage 9 (act 9b R12, F-170): the tray exe hosts every window (tray, wizard, password dialog), so it
@@ -366,10 +447,11 @@ tray_exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    windowed=True,
     disable_windowed_traceback=False,
     icon=None,
     manifest=TRAY_MANIFEST,
+    version=_version_info("Windows Face Unlock tray, setup wizard and task registrar",
+                          "face_unlock_tray"),
 )
 
 watchdog_exe = EXE(
@@ -382,13 +464,12 @@ watchdog_exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    # Windowed for the same reason as the other two: it runs from a Scheduled
-    # Task with no interactive console, and it already spawns its powershell and
-    # schtasks children with CREATE_NO_WINDOW so nothing flashes on a restart.
+    # Windowed for the same reason as the other two: it runs from a Scheduled Task with no
+    # interactive console; its schtasks child runs with CREATE_NO_WINDOW.
     console=False,
-    windowed=True,
     disable_windowed_traceback=False,
     icon=None,
+    version=_version_info("Windows Face Unlock watchdog", "face_unlock_watchdog"),
 )
 
 coll = COLLECT(

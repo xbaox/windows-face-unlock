@@ -1,21 +1,29 @@
 ; Inno Setup script for Windows Face Unlock.
-; Produces installer_output\WindowsFaceUnlock-Setup-<ver>.exe
+; Produces installer_output\WindowsFaceUnlock-Setup-<version>-<variant>.exe
 ;
-; Build with:   ISCC.exe installer\installer.iss
-; Or via:       python installer\build.py
+; Build with:   python installer\build.py --variant cpu   (or gpu)
+; build.py passes the version, the variant and the model pins (face_service/model_pins.py, the one
+; source) as /D defines; this script has no pin of its own.
 
 #define MyAppName "Windows Face Unlock"
 #define MyAppShortName "WindowsFaceUnlock"
-#define MyAppVersion "0.1.1"
-; Stage 8b (F-41 / D-33): this fork publishes the installer, so Programs and Features names it and
-; links to it -- not the upstream project whose name and URLs were inherited here.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.2.0"
+#endif
+#ifndef Variant
+  #define Variant "cpu"
+#endif
 #define MyAppPublisher "xbaox"
 #define MyAppURL "https://github.com/xbaox/windows-face-unlock"
 #define MyAppExeName "face_unlock_tray.exe"
-; NOTE: the service/watchdog executables are deliberately NOT defined here.
-; Scheduled tasks are declared once, in postinstall\tasks.psd1, and this script
-; never names them -- see [Run] / [UninstallRun].
-#define BuildRoot "..\dist\WindowsFaceUnlock"
+; The Credential Provider class (credential_provider/guid.h).
+#define CPClsid "{{8414D7B6-D536-461B-B31B-ADF77B3A8974}"
+#ifndef BuildRoot
+  #define BuildRoot "..\dist\WindowsFaceUnlock"
+#endif
+#ifndef BuffaloURL
+  #error The model pins come from installer/build.py (/DBuffaloURL, /DBuffaloSHA256, /DBuffaloBytes, /DModel1..5, /DModelSHA1..5).
+#endif
 
 [Setup]
 AppId={{2F7A9B14-3C31-4B1E-9AB9-5E0D1B02B6A7}
@@ -26,213 +34,121 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
+AppCopyright=Copyright (c) 2026 Cao Chí Tâm; modifications (c) 2026 xbaox. MIT License.
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoProductName={#MyAppName}
+VersionInfoDescription={#MyAppName} Setup ({#Variant})
+; Stage 9 (act 9b R17, F-87): ALWAYS Program Files\WindowsFaceUnlock -- no directory page, no reuse
+; of a previously recorded directory, and a /DIR= elsewhere is refused in InitializeSetup. The
+; directory holds the DLL LogonUI loads as SYSTEM, so it must be writable by administrators only;
+; that is checked before the DLL is registered.
 DefaultDirName={autopf}\{#MyAppShortName}
-; Stage 8b (F-09). Defect: the directory page let the installing admin pick ANY folder. Consequence:
-; a folder ordinary users can write to would hold the DLL LogonUI loads as SYSTEM and the scripts
-; Setup runs elevated. Fix: no directory page -- always Program Files (or, on an upgrade, the
-; directory the previous version recorded).
 DisableDirPage=yes
+UsePreviousAppDir=no
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\installer_output
-OutputBaseFilename=WindowsFaceUnlock-Setup-{#MyAppVersion}
-SetupIconFile=
+OutputBaseFilename=WindowsFaceUnlock-Setup-{#MyAppVersion}-{#Variant}
+UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64
 SolidCompression=yes
+; buffalo_l.zip is a zip archive: ExtractArchive needs the full 7-Zip engine for it.
+ArchiveExtraction=full
 WizardStyle=modern
-ArchitecturesInstallIn64BitMode=x64
-ArchitecturesAllowed=x64
+ArchitecturesInstallIn64BitMode=x64os
+ArchitecturesAllowed=x64os
+; R17: Windows 10 22H2 (19045) is the hard floor; below 11 24H2 (26100) Setup warns.
+MinVersion=10.0.19045
 PrivilegesRequired=admin
 CloseApplications=yes
-RestartApplications=yes
-UsePreviousAppDir=yes
+; The tray is started by its scheduled task, never by the Restart Manager (D-107).
+RestartApplications=no
 UsePreviousTasks=yes
+#ifdef SignToolName
+; R18: only when build.py has signing credentials; otherwise the build says loudly it is unsigned.
+SignTool={#SignToolName}
+SignedUninstaller=yes
+#endif
 
 [Languages]
-; Stage 9 (act 9b R16, F-215): English and Russian, like the app. Inno's own texts come from its
-; message files, ours from lang\*.isl ([CustomMessages]); Setup picks the one that matches the
-; Windows display language.
+; English and Russian, like the app (R16). Inno's own texts come from its message files, ours from
+; lang\*.isl ([CustomMessages]); Setup picks the one that matches the Windows display language.
 Name: "english"; MessagesFile: "compiler:Default.isl,lang\en.isl"
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl,lang\ru.isl"
 
 [Tasks]
-; Deliberately NO Check: on this entry. A task's Check runs while the Select Tasks
-; page is being built, which is BEFORE [Files] copies anything, so the FileExists
-; test that used to live here was False on every FIRST install: the checkbox never
-; appeared, and the regsvr32 entry below -- gated on Tasks: cp -- therefore never
-; ran. The Credential Provider got registered only when reinstalling over an
-; install that already had the DLL on disk, which is the opposite of the intent.
-; The file test moved to the [Run] entry, where it is evaluated at the right time.
-;
-; CHECKED by default (Stage 7l). Signing in with your face from the lock screen IS
-; the definition of done for this product, and an installer that leaves it off
-; unless the user finds and ticks a box ships the tray without the feature. It
-; used to carry Flags: unchecked, which is how a silent install ended with no
-; Credential Provider registered at all.
-;
-; The provider is ADDITIVE. regsvr32 adds one more tile to LogonUI; it filters
-; nothing and replaces nothing, so the PIN / password tiles stay exactly where
-; they were and remain the way in whenever the face tile cannot unlock.
-;
-; UsePreviousTasks=yes (see [Setup]) carries the previous choice into an upgrade:
-; a machine whose last install recorded cp as DESELECTED keeps it deselected, and
-; this default then applies only to a first install. That is Inno's intended
-; behaviour and it is kept -- a user who opted out stays opted out. For a scripted
-; install that must end with the provider registered regardless of history, pass
-;     /MERGETASKS="cp"
-; which adds the task to whatever the previous selection was.
+; Checked by default: signing in with your face IS the product. The provider is additive -- PIN and
+; password tiles stay. UsePreviousTasks keeps an opt-out across upgrades; unticking it on an upgrade
+; unregisters the provider (F-212). /MERGETASKS="cp" forces it for a scripted install.
 Name: "cp"; Description: "{cm:TaskCP}"; GroupDescription: "{cm:TaskGroup}"
 
-[Files]
-; The whole PyInstaller output, which already includes postinstall\ (the task
-; registrar and its declaration, staged there by installer/build.py step 4).
-Source: "{#BuildRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
-; Stage 8b (F-35): the NEW registrar and its declaration, again, as dontcopy entries. PrepareToInstall
-; runs before [Files], so on an upgrade the registrar under the installed directory is the OLD one,
-; which has no -Action Stop; these two are extracted to a temporary folder for that step instead.
-Source: "{#BuildRoot}\postinstall\register_tasks.ps1"; Flags: dontcopy
-Source: "{#BuildRoot}\postinstall\tasks.psd1"; Flags: dontcopy
+[InstallDelete]
+; Leftovers of 0.1.x that 0.2.0 no longer ships: the PowerShell registrar, the CP dev script and the
+; bundled model pack (now downloaded into {app}\models).
+Type: filesandordirs; Name: "{app}\postinstall"
+Type: files; Name: "{app}\credential_provider\register.ps1"
+Type: filesandordirs; Name: "{app}\_internal\insightface_home"
 
-; There is deliberately NO [Dirs] section (Stage 8b, F-01).
-;
-; Defect: up to 0.1.0 this section pre-created the data directory
-; (USERPROFILE\.face-unlock) with "Permissions: users-modify" -- an explicit,
-; inheritable BUILTIN\Users:Modify ACE that every file below it inherited,
-; including the encrypted password blob, the per-install entropy and the face
-; images. Consequence: other local accounts could read and alter data the service
-; trusts. Fix: the installer no longer creates or touches that directory at all.
-; face_service creates it on first start and, on EVERY start, re-secures it to
-; SELF / SYSTEM / Administrators (face_service/datadir.py) -- which also heals a
-; machine that was installed with the old ACE, since a reinstall never removes an
-; ACE Inno added. Do not reinstate an entry here: an installer-side ACL is exactly
-; what broke custody.
+[Files]
+; The whole PyInstaller output except the CP DLL, which gets its own entry.
+Source: "{#BuildRoot}\*"; Excludes: "credential_provider\FaceCredentialProvider.dll"; DestDir: "{app}"; \
+  Flags: recursesubdirs createallsubdirs ignoreversion uninsrestartdelete
+; The CP DLL may be loaded by LogonUI right now: replaced at the next restart if it is in use, and
+; removed at the next restart by the uninstaller if it is still loaded (F-217).
+Source: "{#BuildRoot}\credential_provider\FaceCredentialProvider.dll"; DestDir: "{app}\credential_provider"; \
+  Flags: ignoreversion restartreplace uninsrestartdelete skipifsourcedoesntexist
+
+; There is deliberately NO [Dirs] section (Stage 8b, F-01): the installer never creates or touches
+; the user's data directory; face_service creates and secures it.
 
 [Icons]
-; Stage 9 (act 9b R14): the Start-menu shortcut carries the tray's AppUserModelID -- Windows shows
-; the tray's toast notifications only for an app ID it knows from such a shortcut. The same ID is
-; set by the tray process itself (presence_monitor\toast.py, APP_ID).
+; R14: the Start-menu shortcut carries the tray's AppUserModelID -- Windows shows the tray's toasts
+; only for an app ID it knows from such a shortcut (presence_monitor\toast.py, APP_ID).
 Name: "{group}\{cm:IconTray}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "WindowsFaceUnlock.Tray"
 Name: "{group}\{cm:IconUninstall}"; Filename: "{uninstallexe}"
 
 [Registry]
-; InstallLocation is read by tools\register_tasks.ps1 when -Mode Installed is used without an
-; explicit -InstallDir, so -Action Unregister and clean_restart.ps1 work without re-typing the
-; path. Version is informational: it is what Programs and Features shows, and it is the only
-; on-disk record of which build produced this install.
-;
-; This comment used to claim the values were "used by the auto-updater fallback". They were not --
-; no Python module in the tree imports winreg at all, and the updater compares against the
-; __version__ baked into the executable. Corrected rather than deleted, because the keys ARE
-; written and something does read one of them now.
 Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: "InstallLocation"; ValueData: "{app}"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: "Version";         ValueData: "{#MyAppVersion}"
+Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: "Version"; ValueData: "{#MyAppVersion}"
+Root: HKLM; Subkey: "Software\{#MyAppShortName}"; ValueType: string; ValueName: "Variant"; ValueData: "{#Variant}"
+; R17 / F-229: the provider's keys are removed by the uninstaller even when regsvr32 /u could not
+; run (the DLL already gone). dontcreatekey: Setup never writes them itself -- the DLL does.
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{#CPClsid}"; Flags: uninsdeletekey dontcreatekey
+Root: HKLM64; Subkey: "SOFTWARE\Classes\CLSID\{#CPClsid}"; Flags: uninsdeletekey dontcreatekey
 
 [Run]
-; Every system tool below is named through {sys}, never by bare filename, and that
-; is load-bearing rather than tidy. Setup is a 32-bit process even in 64-bit
-; install mode -- Inno's Setup.e32 and the setup stub this script compiles into are
-; both IMAGE_FILE_MACHINE_I386 -- so a bare "regsvr32.exe" resolves through WOW64
-; file-system redirection to SysWOW64\regsvr32.exe, which is 32-bit and cannot load
-; our x64 DLL at all. The install would have reported success and left the
-; Credential Provider unregistered. {sys} is the 64-bit System32 in 64-bit install
-; mode and is not subject to that redirection.
-;
-; credential_provider\register.ps1:62 already refuses to run in a 32-bit host for
-; exactly this reason ("Refuse rather than lie"). This section had no equivalent
-; guard, and it had never been executed -- the installer had never been built.
-;
-; 1. Register the Credential Provider DLL (only if the user ticked the task).
-;    The Check lives here rather than on the [Tasks] entry because a [Run] Check
-;    is evaluated AFTER [Files] has copied the payload -- see the note in [Tasks].
-;    It keeps the original intent intact: never hand regsvr32 a path that is not
-;    in the layout, which is what a SKIP_CP=1 build produces.
-Filename: "{sys}\regsvr32.exe"; Parameters: "/s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
-  Tasks: cp; \
-  Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll')); \
-  StatusMsg: "{cm:StatusRegCP}"; Flags: runhidden
-
-; 2. Creating AND starting the scheduled tasks moved to [Code] (RegisterTasks, from
-;    CurStepChanged ssPostInstall) in Stage 8b. Defects (F-33, F-07): a [Run]
-;    entry cannot look at the exit code and Inno does not capture its output, so
-;    a failed registrar left no trace; and the registrar ran for whoever
-;    elevated rather than for the user who started Setup. Task names,
-;    executables and settings still come only from postinstall\tasks.psd1.
-
-; 3. There is deliberately NO "Launch ..." checkbox on the Finish page, and this
-;    comment is what is left of the one that used to be here
-;    (Flags: nowait postinstall skipifsilent).
-;
-;    Step 2 does not merely register the tasks, it STARTS them: register_tasks.ps1
-;    ends in a Start-ScheduledTask pass over every planned task, and one of them --
-;    FaceUnlock-Presence -- IS {#MyAppExeName}. The tray is therefore already
-;    running by the time the Finish page is drawn, and ticking the box started a
-;    SECOND one on top of it. That is not theory: it happened on the 7g acceptance
-;    install.
-;
-;    Since Stage 8b the tray holds Local\FaceUnlockTray and a duplicate exits at
-;    once (KNOWN_ISSUES #4), but the rule stands: the tray is started by its
-;    scheduled task and by nothing else. Do not reinstate this entry.
-;
-; 4. Onboarding on the Finish page (Stage 7l): save the Windows password, then
-;    enroll the face. Without both, the face tile registered in step 1 has
-;    nothing to match and nothing to hand LogonUI.
-;
-;    These do NOT break the rule in step 3. They run {#MyAppExeName} with a
-;    FLAG, and presence_monitor\__main__.py is a flag router: --set-password and
-;    --enroll import the dialog or the wizard and return from main() when it
-;    closes. Neither reaches the no-flag branch that starts the tray and the
-;    presence monitor, so no second tray is ever started from here. The wizard
-;    borrows the camera from the service through the pause_camera lease, the same
-;    way the tray menu's "Enroll" item launches it.
-;
-;    Flags, each load-bearing:
-;      postinstall        - a checkbox on the Finish page, run after Finish.
-;      runasoriginaluser  - Setup is elevated, and the password is DPAPI-sealed
-;                           under the account that runs the dialog; the data
-;                           lives in that user's profile, not the admin's.
-;      skipifsilent       - the updater reinstalls with /SILENT; an update must
-;                           never pop a password dialog or a camera window.
-;    Deliberately NO nowait: Setup waits for each to exit before the next, so the
-;    password dialog and the wizard are never on screen at the same time.
-;
-;    The password entry is split in two with mutually exclusive Checks, because
-;    a [Run] entry has one Description and one default state. Without a saved
-;    credential it is offered checked; with one it is offered UNCHECKED as an
-;    update, so a reinstall does not push the user into re-typing a password
-;    that already works. CredentialsSaved only tests that the file exists; it
-;    never opens it.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; \
-  Description: "{cm:RunSavePassword}"; \
+; Onboarding on the Finish page: save the Windows password, then set up the face. They run the tray
+; exe with a FLAG (a flag router, never a second tray), as the original user (the password is sealed
+; for that account and the data lives in that profile), never during a silent (update) install, and
+; one after the other. Each is offered checked only when it is still missing (F-192).
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; Description: "{cm:RunSavePassword}"; \
   Check: not CredentialsSaved; Flags: postinstall runasoriginaluser skipifsilent
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; \
-  Description: "{cm:RunUpdatePassword}"; \
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; Description: "{cm:RunUpdatePassword}"; \
   Check: CredentialsSaved; Flags: postinstall runasoriginaluser skipifsilent unchecked
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--enroll"; \
-  Description: "{cm:RunEnroll}"; \
-  Flags: postinstall runasoriginaluser skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--enroll"; Description: "{cm:RunEnroll}"; \
+  Check: not EnrollmentExists; Flags: postinstall runasoriginaluser skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--enroll"; Description: "{cm:RunReEnroll}"; \
+  Check: EnrollmentExists; Flags: postinstall runasoriginaluser skipifsilent unchecked
 
 [UninstallRun]
-; Stop and delete the scheduled tasks first so files aren't held open. This
-; walks the SAME postinstall\tasks.psd1 the install used, so a task can never be
-; created by one path and left behind by the other.
-;
-; {sys} for the same reason as [Run] -- see the note there. The uninstaller is the
-; same 32-bit binary, so an unregister through a bare name would hit the 32-bit
-; regsvr32 and leave the Credential Provider registered after removal.
-;
-; RunOnceId on both (Stage 8b, F-34). Defect: without it Inno appends one more
-; copy of each entry per upgrade to the uninstall log. Consequence: an uninstall
-; after upgrades ran the registrar and regsvr32 /u once per version ever
-; installed (twice in 7g). Fix: a stable RunOnceId, so each runs exactly once.
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\postinstall\register_tasks.ps1"" -Mode Installed -InstallDir ""{app}"" -Action Unregister"; \
-  Flags: runhidden; RunOnceId: "FaceUnlockUnregisterTasks"
-; Unregister the Credential Provider if it was installed.
+; 1. Stop the stack and remove the tasks through the product exe (Task Scheduler over COM, no
+;    PowerShell; R17). 2. Unregister the provider; its keys are removed by [Registry] as a fallback.
+; {sys}: Setup is 32-bit; a bare regsvr32 would be the 32-bit one. Each runs once (RunOnceId).
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--unregister"; Flags: runhidden waituntilterminated; \
+  RunOnceId: "FaceUnlockUnregisterTasks"
 Filename: "{sys}\regsvr32.exe"; Parameters: "/u /s ""{app}\credential_provider\FaceCredentialProvider.dll"""; \
-  Flags: runhidden; RunOnceId: "FaceUnlockUnregisterCP"; \
+  Flags: runhidden waituntilterminated; RunOnceId: "FaceUnlockUnregisterCP"; \
   Check: FileExists(ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll'))
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{app}"
+; Only what Setup and the product put there -- never a recursive delete of the install directory
+; itself, which could be shared with something else (F-209).
+Type: filesandordirs; Name: "{app}\models\buffalo_l"
+Type: dirifempty; Name: "{app}\models"
+Type: filesandordirs; Name: "{app}\logs"
+Type: dirifempty; Name: "{app}\credential_provider"
+Type: dirifempty; Name: "{app}"
 
 [Code]
 
@@ -497,12 +413,233 @@ begin
   Result := OwnerSid;
 end;
 
-// InitializeSetup: no owner -> no install; a different recorded owner -> ask (or refuse silently).
-function InitializeSetup(): Boolean;
+
+{ ---- Stage 9 (R7): the recognition models -----------------------------------------------------
+
+  buffalo_l is not redistributed (decision 9-02). When models\buffalo_l in the program folder lacks
+  any of the five pinned files, Setup obtains the official buffalo_l.zip -- downloaded from the source
+  insightface itself uses, or a local copy (/MODELZIP=<path> or the file chooser) -- checks its
+  size and SHA-256 against the pins, and unpacks exactly the five pinned files, each checked again.
+  The InsightFace terms are shown first and must be accepted; a silent install needs
+  /ACCEPTMODELLICENSE and fails closed without it. }
+const
+  MODEL_COUNT = 5;
+
 var
-  Why, Recorded: string;
+  ModelsNeeded: Boolean;
+  ModelZip: string;
+  ModelsPage: TWizardPage;
+  ModelsTerms: TNewMemo;
+  RadioDownload, RadioLocal: TNewRadioButton;
+  LocalZipEdit: TNewEdit;
+  BrowseButton: TNewButton;
+  AcceptBox: TNewCheckBox;
+  DownloadPage: TDownloadWizardPage;
+  StackStopped, InstallDone: Boolean;
+  FailCode: Integer;
+
+function ExpectedAppDir(): string;
+begin
+  Result := ExpandConstant('{autopf}') + '\{#MyAppShortName}';
+end;
+
+function ModelName(I: Integer): string;
+begin
+  case I of
+    1: Result := '{#Model1}';
+    2: Result := '{#Model2}';
+    3: Result := '{#Model3}';
+    4: Result := '{#Model4}';
+  else
+    Result := '{#Model5}';
+  end;
+end;
+
+function ModelSha(I: Integer): string;
+begin
+  case I of
+    1: Result := '{#ModelSHA1}';
+    2: Result := '{#ModelSHA2}';
+    3: Result := '{#ModelSHA3}';
+    4: Result := '{#ModelSHA4}';
+  else
+    Result := '{#ModelSHA5}';
+  end;
+end;
+
+function Sha256Of(const Path: string): string;
+begin
+  Result := '';
+  try
+    Result := Lowercase(GetSHA256OfFile(Path));
+  except
+    Log('SHA-256 of ' + Path + ' failed: ' + GetExceptionMessage);
+  end;
+end;
+
+// The five pinned files are present in Dir with their pinned hashes.
+function ModelsValidIn(const Dir: string): Boolean;
+var
+  I: Integer;
 begin
   Result := False;
+  for I := 1 to MODEL_COUNT do
+    if Sha256Of(Dir + '\' + ModelName(I)) <> ModelSha(I) then
+      exit;
+  Result := True;
+end;
+
+// A buffalo_l.zip is the pinned one: its size and SHA-256.
+function ZipValid(const Path: string): Boolean;
+var
+  Size: Integer;
+begin
+  Result := False;
+  if not FileExists(Path) then
+    exit;
+  if not FileSize(Path, Size) or (Size <> {#BuffaloBytes}) then
+  begin
+    Log('buffalo_l.zip size mismatch: ' + Path);
+    exit;
+  end;
+  Result := Sha256Of(Path) = '{#BuffaloSHA256}';
+  if not Result then
+    Log('buffalo_l.zip SHA-256 mismatch: ' + Path);
+end;
+
+{ ---- Stage 9 (R17): stopping / restarting the installed stack without PowerShell --------------
+
+  The Task Scheduler and WMI over COM. Tasks and processes are "ours" by PATH: the task's action or
+  the process image lies inside the install directory -- never by a name prefix (F-239), and in any
+  session (F-227). }
+function PathUnder(const Path, Dir: string): Boolean;
+begin
+  Result := (Path <> '') and (CompareText(Copy(Path, 1, Length(Dir) + 1), Dir + '\') = 0);
+end;
+
+function TaskActionPath(const Task: Variant): string;
+var
+  Acts, A: Variant;
+begin
+  Result := '';
+  try
+    Acts := Task.Definition.Actions;
+    if Acts.Count >= 1 then
+    begin
+      A := Acts.Item(1);
+      Result := A.Path;
+    end;
+  except
+    Result := '';
+  end;
+end;
+
+// Stop (Run=False) or start (Run=True) every task whose action is inside Dir. Returns how many.
+function ForOurTasks(const Dir: string; Run: Boolean): Integer;
+var
+  Svc, Folder, Tasks, T: Variant;
+  I: Integer;
+begin
+  Result := 0;
+  try
+    Svc := CreateOleObject('Schedule.Service');
+    Svc.Connect();
+    Folder := Svc.GetFolder('\');
+    Tasks := Folder.GetTasks(1);
+    for I := 1 to Tasks.Count do
+    begin
+      T := Tasks.Item(I);
+      if PathUnder(TaskActionPath(T), Dir) then
+      begin
+        Result := Result + 1;
+        try
+          if Run then
+            T.Run('')
+          else
+            T.Stop(0);
+        except
+          Log('task ' + T.Name + ': ' + GetExceptionMessage);
+        end;
+      end;
+    end;
+  except
+    Log('Task Scheduler not reachable: ' + GetExceptionMessage);
+  end;
+end;
+
+// Count (and with Kill, terminate) the processes of this install, in every session.
+function StackProcesses(const Dir: string; Kill: Boolean): Integer;
+var
+  Loc, Wmi, Procs, P: Variant;
+  I: Integer;
+  Path: string;
+begin
+  Result := 0;
+  try
+    Loc := CreateOleObject('WbemScripting.SWbemLocator');
+    Wmi := Loc.ConnectServer('.', 'root\CIMV2');
+    Procs := Wmi.ExecQuery('SELECT ProcessId, ExecutablePath FROM Win32_Process WHERE '
+      + 'Name = ''face_service.exe'' OR Name = ''face_unlock_tray.exe'' OR '
+      + 'Name = ''face_unlock_watchdog.exe''');
+    for I := 0 to Procs.Count - 1 do
+    begin
+      P := Procs.ItemIndex(I);
+      Path := '';
+      try
+        Path := P.ExecutablePath;
+      except
+        Path := '';
+      end;
+      if PathUnder(Path, Dir) then
+      begin
+        Result := Result + 1;
+        if Kill then
+          try
+            P.Terminate(0);
+          except
+            Log('terminate failed: ' + GetExceptionMessage);
+          end;
+      end;
+    end;
+  except
+    Log('process scan failed: ' + GetExceptionMessage);
+  end;
+end;
+
+// Graceful first (the service releases its camera and marks the stop deliberate), as the ORIGINAL
+// user -- the pipe admits its owner only (F-228) -- then the scheduler, then a bounded kill.
+function StopStack(const Dir: string): Integer;
+var
+  ResultCode, Waited: Integer;
+begin
+  if FileExists(Dir + '\{#MyAppExeName}') then
+    try
+      ExecAsOriginalUser(Dir + '\{#MyAppExeName}', '--pipe-shutdown', Dir, SW_HIDE,
+                         ewWaitUntilTerminated, ResultCode);
+      Log('graceful shutdown request: exit ' + IntToStr(ResultCode));
+    except
+      Log('graceful shutdown request not possible: ' + GetExceptionMessage);    // F-214
+    end;
+  ForOurTasks(Dir, False);
+  StackProcesses(Dir, True);
+  Waited := 0;
+  Result := StackProcesses(Dir, False);
+  while (Result > 0) and (Waited < 10000) do
+  begin
+    Sleep(250);
+    Waited := Waited + 250;
+    Result := StackProcesses(Dir, False);
+  end;
+end;
+
+// InitializeSetup: the owner (R1), the Windows version (R17), the directory (R17), the models (R7).
+function InitializeSetup(): Boolean;
+var
+  Why, Recorded, DirArg: string;
+  Ver: TWindowsVersion;
+begin
+  Result := False;
+  FailCode := 0;
   OwnerSid := ResolveOwner(Why);
   OwnerResolved := True;
   if OwnerSid = '' then
@@ -533,10 +670,170 @@ begin
       exit;
     end;
   end;
+
+  // R17: /DIR= outside Program Files\WindowsFaceUnlock is refused (the directory is fixed).
+  DirArg := CmdLineValue('/DIR');
+  if (DirArg <> '') and (CompareText(RemoveBackslashUnlessRoot(DirArg), ExpectedAppDir()) <> 0) then
+  begin
+    Log('Setup stops: /DIR=' + DirArg + ' is not ' + ExpectedAppDir());
+    if not WizardSilent() then
+      MsgBox(FmtMessage(CustomMessage('DirRefused'), [ExpectedAppDir()]), mbCriticalError, MB_OK);
+    exit;
+  end;
+
+  // R17: officially supported are Windows 11 24H2 and 25H2 (build 26100+); older builds are warned.
+  GetWindowsVersionEx(Ver);
+  if (Ver.Build < 26100) and not WizardSilent() then
+    MsgBox(CustomMessage('WinOld'), mbInformation, MB_OK);
+  if Ver.Build < 26100 then
+    Log('Windows build ' + IntToStr(Ver.Build) + ' is below 26100: not officially supported');
+
+  // R7: are the models already there (an upgrade)? Otherwise consent + a source are required.
+  ModelsNeeded := not ModelsValidIn(ExpectedAppDir() + '\models\buffalo_l');
+  ModelZip := '';
+  if ModelsNeeded then
+  begin
+    Log('recognition models: needed');
+    if CmdLineValue('/MODELZIP') <> '' then
+    begin
+      if not ZipValid(CmdLineValue('/MODELZIP')) then
+      begin
+        Log('Setup stops: /MODELZIP is not the pinned buffalo_l.zip');
+        if not WizardSilent() then
+          MsgBox(CustomMessage('ModelsBadFile'), mbCriticalError, MB_OK);
+        exit;
+      end;
+      ModelZip := CmdLineValue('/MODELZIP');
+    end;
+    if WizardSilent() and not CmdLineParamExists('/ACCEPTMODELLICENSE') then
+    begin
+      // Fails closed: no consent, no download, no install.
+      Log('Setup stops: a silent install that has to obtain the InsightFace models needs '
+          + '/ACCEPTMODELLICENSE (the models are licensed for non-commercial research use only).');
+      exit;
+    end;
+  end else
+    Log('recognition models: present and pinned');
   Result := True;
 end;
 
-// The Ready page names the owner (R1).
+procedure BrowseClick(Sender: TObject);
+var
+  FileName: string;
+begin
+  FileName := LocalZipEdit.Text;
+  if GetOpenFileName(CustomMessage('ModelsBrowseTitle'), FileName, '', 'buffalo_l.zip|buffalo_l.zip|*.zip|*.zip', 'zip') then
+  begin
+    LocalZipEdit.Text := FileName;
+    RadioLocal.Checked := True;
+  end;
+end;
+
+procedure InitializeWizard();
+var
+  Top: Integer;
+begin
+  ModelsPage := CreateCustomPage(wpSelectTasks, CustomMessage('ModelsTitle'), CustomMessage('ModelsDesc'));
+  ModelsTerms := TNewMemo.Create(ModelsPage);
+  ModelsTerms.Parent := ModelsPage.Surface;
+  ModelsTerms.Left := 0;
+  ModelsTerms.Top := 0;
+  ModelsTerms.Width := ModelsPage.SurfaceWidth;
+  ModelsTerms.Height := ScaleY(110);
+  ModelsTerms.ScrollBars := ssVertical;
+  ModelsTerms.ReadOnly := True;
+  ModelsTerms.Text := CustomMessage('ModelsTerms');
+  Top := ModelsTerms.Top + ModelsTerms.Height + ScaleY(8);
+  AcceptBox := TNewCheckBox.Create(ModelsPage);
+  AcceptBox.Parent := ModelsPage.Surface;
+  AcceptBox.Top := Top;
+  AcceptBox.Width := ModelsPage.SurfaceWidth;
+  AcceptBox.Height := ScaleY(34);
+  AcceptBox.Caption := CustomMessage('ModelsAccept');
+  AcceptBox.Checked := CmdLineParamExists('/ACCEPTMODELLICENSE');
+  Top := Top + AcceptBox.Height + ScaleY(6);
+  RadioDownload := TNewRadioButton.Create(ModelsPage);
+  RadioDownload.Parent := ModelsPage.Surface;
+  RadioDownload.Top := Top;
+  RadioDownload.Width := ModelsPage.SurfaceWidth;
+  RadioDownload.Caption := CustomMessage('ModelsDownload');
+  RadioDownload.Checked := ModelZip = '';
+  Top := Top + ScaleY(22);
+  RadioLocal := TNewRadioButton.Create(ModelsPage);
+  RadioLocal.Parent := ModelsPage.Surface;
+  RadioLocal.Top := Top;
+  RadioLocal.Width := ModelsPage.SurfaceWidth;
+  RadioLocal.Caption := CustomMessage('ModelsLocal');
+  RadioLocal.Checked := ModelZip <> '';
+  Top := Top + ScaleY(22);
+  LocalZipEdit := TNewEdit.Create(ModelsPage);
+  LocalZipEdit.Parent := ModelsPage.Surface;
+  LocalZipEdit.Top := Top;
+  LocalZipEdit.Left := ScaleX(18);
+  LocalZipEdit.Width := ModelsPage.SurfaceWidth - ScaleX(110);
+  LocalZipEdit.Text := ModelZip;
+  BrowseButton := TNewButton.Create(ModelsPage);
+  BrowseButton.Parent := ModelsPage.Surface;
+  BrowseButton.Top := Top - ScaleY(1);
+  BrowseButton.Left := LocalZipEdit.Left + LocalZipEdit.Width + ScaleX(8);
+  BrowseButton.Width := ScaleX(80);
+  BrowseButton.Height := ScaleY(23);
+  BrowseButton.Caption := CustomMessage('ModelsBrowse');
+  BrowseButton.OnClick := @BrowseClick;
+
+  DownloadPage := CreateDownloadPage(CustomMessage('ModelsTitle'), CustomMessage('ModelsDownloading'), nil);
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = ModelsPage.ID) and not ModelsNeeded;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (CurPageID = ModelsPage.ID) and ModelsNeeded then
+  begin
+    if not AcceptBox.Checked then
+    begin
+      MsgBox(CustomMessage('ModelsNeedAccept'), mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+    if RadioLocal.Checked then
+    begin
+      if not ZipValid(LocalZipEdit.Text) then
+      begin
+        MsgBox(CustomMessage('ModelsBadFile'), mbError, MB_OK);
+        Result := False;
+        exit;
+      end;
+      ModelZip := LocalZipEdit.Text;
+    end else
+      ModelZip := '';
+  end;
+  // Interactive download with a progress page, after the Ready page.
+  if (CurPageID = wpReady) and ModelsNeeded and (ModelZip = '') then
+  begin
+    DownloadPage.Clear;
+    DownloadPage.Add('{#BuffaloURL}', 'buffalo_l.zip', '{#BuffaloSHA256}');
+    DownloadPage.Show;
+    try
+      try
+        DownloadPage.Download;          // verifies the SHA-256 itself
+        ModelZip := ExpandConstant('{tmp}\buffalo_l.zip');
+      except
+        if not DownloadPage.AbortedByUser then
+          MsgBox(FmtMessage(CustomMessage('ModelsDownloadFailed'), [GetExceptionMessage]), mbCriticalError, MB_OK);
+        Result := False;
+      end;
+    finally
+      DownloadPage.Hide;
+    end;
+  end;
+end;
+
+// The Ready page names the owner (R1) and says where the models come from (R7).
 function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
   MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
 begin
@@ -546,11 +843,9 @@ begin
     Result := Result + NewLine + MemoDirInfo + NewLine;
   if MemoTasksInfo <> '' then
     Result := Result + NewLine + MemoTasksInfo + NewLine;
-end;
-
-function PowerShellExe(): string;
-begin
-  Result := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  if ModelsNeeded then
+    Result := Result + NewLine + CustomMessage('ReadyModels') + NewLine + Space
+              + '{#BuffaloURL}' + NewLine;
 end;
 
 // The profile directory of a SID, from ProfileList; '' when unknown.
@@ -569,174 +864,168 @@ begin
   end;
 end;
 
-// The data directory face_service uses for that user: <profile>\.face-unlock. Falls back to
-// Setup's own USERPROFILE when the original user is unknown (the pre-8b behaviour).
+// The owner's data directory: <profile>\.face-unlock; '' when the owner's profile is unknown.
 function DataDirFor(const Sid: string): string;
 var
   Profile: string;
 begin
+  Result := '';
   Profile := ProfileDirOf(Sid);
-  if Profile = '' then
-    Profile := ExpandConstant('{%USERPROFILE}');
-  Result := Profile + '\.face-unlock';
+  if Profile <> '' then
+    Result := Profile + '\.face-unlock';
 end;
 
-{ Stop the running stack BEFORE [Files] overwrites it.
-
-  NOTE FOR WHOEVER EDITS THIS COMMENT: a Pascal Script comment is delimited by
-  braces and they do NOT nest, so the first closing brace ENDS it -- including one
-  that is merely part of a constant being described in prose. Writing the app
-  constant in the usual brace form here does not document the code, it terminates
-  the comment mid-sentence and the remaining words are compiled as statements:
-
-      Error on line 185, Column 65: 'BEGIN' expected.
-
-  That is why the install directory is spelled out in words below rather than as
-  the constant. ExpandConstant does the real work in the code itself.
-
-  Reinstalling over a live install used to abort. CloseApplications=yes asks the
-  Restart Manager to shut down whatever holds a file under the install directory,
-  and the Restart Manager can only close what it knows how to close: a process
-  with a message loop and a window to send WM_CLOSE to. face_unlock_watchdog.exe
-  has neither -- it is a windowless supervisor loop -- so RM reported "Some
-  applications could not be shut down", the wizard offered Abort, and an
-  unattended run (presence_monitor/updater.py launches Setup with /SILENT) took
-  that Abort automatically. /SUPPRESSMSGBOXES would only have made the abort
-  quieter, not rarer.
-
-  CloseApplications=force was the other half-fix considered, and it is recorded
-  here as REJECTED rather than left for someone to rediscover. The documented
-  behaviour is "Setup will force close when closing applications... Use with care
-  since this may cause the user to lose unsaved work", applied to whatever holds
-  files listed in Files or InstallDelete. Three reasons it is the wrong tool:
-
-    1. It is a hard kill by another name, and it would land on the live owner of
-       a camera capture -- the exact condition KNOWN_ISSUES #2 exists about, and
-       the reason the registrar tries a graceful pipe shutdown FIRST. Trading an
-       aborted install for a wedged Frame Server until reboot is not a trade.
-    2. It is indiscriminate. It closes anything holding a file under the install
-       directory, including a user application that merely has something open
-       there, and the documentation's warning about unsaved work is aimed at
-       precisely that.
-    3. It treats the symptom. Force-closing the processes leaves their scheduled
-       tasks registered, so the machine is briefly in a state the uninstaller
-       never produces: no processes, live registrations. Unregistering is what
-       makes install and uninstall symmetric, which is the property worth having.
-
-  So Setup does what the uninstaller has always done: it walks the SAME
-  postinstall\tasks.psd1 through the SAME registrar and unregisters every declared
-  task, which stops the processes and releases the files. A reinstall is therefore
-  unregister -> copy -> register, with [Run] step 2 creating the tasks again from
-  the payload that was just laid down. This script still names no task, so the
-  invariant in [Run]/[UninstallRun] holds here too.
-
-  Gated on the registrar EXISTING, which is what makes this a no-op on a first
-  install: there is no postinstall\ directory under the target yet, nothing is
-  running, and nothing needs stopping.
-
-  A failed unregister IS fatal, and that is a deliberate reversal of how this
-  function was first written. The registrar used to exit 0 no matter what, so
-  there was nothing to react to; as of the same block it re-checks after killing
-  and exits non-zero, printing the surviving PIDs, when the stack is still up.
-  Given a trustworthy signal, stopping is better than continuing: the documented
-  effect of a non-empty Result is that Setup halts on the Preparing to Install
-  page and shows that text, which names the problem, whereas continuing hands the
-  question to the Restart Manager -- and RM on a windowless watchdog is the exact
-  failure this function exists to remove. Under /SILENT nobody would see either
-  message, but one path stops with a logged reason and the other overwrites files
-  belonging to a process that is still running.
-
-  Note the ordering this depends on, which is documented rather than assumed:
-  PrepareToInstall is called BEFORE Setup checks for files being in use when
-  CloseApplications is set to yes. So the stack is stopped first and the in-use
-  check then finds nothing to complain about; CloseApplications stays yes as the
-  second line of defence for anything outside the registrar's remit. }
+{ Before [Files]: obtain the models (a silent install downloads here -- there is no Ready page),
+  then stop a running stack. A non-empty result halts Setup on the Preparing page with that text.
+  If Setup is then cancelled or fails, DeinitializeSetup starts the stopped tasks again (F-238). }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  Registrar: string;
-  AppDir: string;
-  ResultCode: Integer;
+  Dir: string;
+  Left: Integer;
 begin
   Result := '';
-  // Stage 9 (R1): the owner was established in InitializeSetup; nothing to resolve here.
-  AppDir := ExpandConstant('{app}');
-  // Stage 8b (F-35): an existing installation is recognised by its registrar, but the
-  // registrar that RUNS is the new one, extracted to the temporary folder -- the old one
-  // has no -Action Stop. Stop only: the registrations stay until the Register after the
-  // copy overwrites them, so an aborted install no longer leaves the machine without tasks.
-  if not FileExists(AppDir + '\postinstall\register_tasks.ps1') then
-    exit;
-  try
-    ExtractTemporaryFile('register_tasks.ps1');
-    ExtractTemporaryFile('tasks.psd1');
-  except
-    Result := FmtMessage(CustomMessage('UnpackFailed'), [GetExceptionMessage]);
-    exit;
-  end;
-  Registrar := ExpandConstant('{tmp}\register_tasks.ps1');
-  if not Exec(PowerShellExe(),
-              '-NoProfile -ExecutionPolicy Bypass -File "' + Registrar + '"'
-              + ' -Mode Installed -InstallDir "' + AppDir + '" -Action Stop',
-              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  if ModelsNeeded and (ModelZip = '') then
   begin
-    Result := FmtMessage(CustomMessage('RegistrarRunFailed'), [Registrar]);
-    exit;
+    try
+      DownloadTemporaryFile('{#BuffaloURL}', 'buffalo_l.zip', '{#BuffaloSHA256}', nil);
+      ModelZip := ExpandConstant('{tmp}\buffalo_l.zip');
+    except
+      Result := FmtMessage(CustomMessage('ModelsDownloadFailed'), [GetExceptionMessage]);
+      FailCode := 23;
+      exit;
+    end;
   end;
-  if ResultCode <> 0 then
-  begin
-    Result := FmtMessage(CustomMessage('StillRunning'), [IntToStr(ResultCode),
-                          'powershell -NoProfile -ExecutionPolicy Bypass -File "' + AppDir
-                          + '\postinstall\register_tasks.ps1" -Mode Installed -Action Unregister']);
-    exit;
-  end;
+  Dir := ExpectedAppDir();
+  if (not FileExists(Dir + '\{#MyAppExeName}')) and (StackProcesses(Dir, False) = 0) then
+    exit;                                   // a first install: nothing runs
+  Left := StopStack(Dir);
+  StackStopped := True;
+  if Left > 0 then
+    Result := FmtMessage(CustomMessage('StillRunning'), [IntToStr(Left)]);
 end;
 
-{ Stage 8b (F-33, F-07): register and start the tasks for the original user, and
-  LOOK at the result. The registrar transcribes itself to the logs folder under
-  the install directory; this adds one line to the Setup log either way, and an
-  interactive install also gets a message box on failure. }
-procedure RegisterTasks();
+// Unpack exactly the five pinned files into {app}\models\buffalo_l, each checked.
+function InstallModels(): Boolean;
 var
-  Params: string;
+  Tmp, Dest: string;
+  I: Integer;
+begin
+  Result := not ModelsNeeded;
+  if Result then
+    exit;
+  WizardForm.StatusLabel.Caption := CustomMessage('StatusModels');
+  Tmp := ExpandConstant('{tmp}\buffalo_l_unpacked');
+  Dest := ExpandConstant('{app}\models\buffalo_l');
+  try
+    ExtractArchive(ModelZip, Tmp, '', False, nil);
+  except
+    Log('model archive extraction failed: ' + GetExceptionMessage);
+    exit;
+  end;
+  if not ModelsValidIn(Tmp) then
+  begin
+    Log('the extracted model files do not match the pins');
+    exit;
+  end;
+  DelTree(Dest, True, True, True);
+  if not ForceDirectories(Dest) then
+    exit;
+  for I := 1 to MODEL_COUNT do
+    if not FileCopy(Tmp + '\' + ModelName(I), Dest + '\' + ModelName(I), False) then
+    begin
+      Log('copying ' + ModelName(I) + ' failed');
+      exit;
+    end;
+  Result := ModelsValidIn(Dest);
+  Log('recognition models installed: ' + IntToStr(Ord(Result)));
+end;
+
+function RunTrayFlag(const Params: string): Integer;
+begin
+  if not Exec(ExpandConstant('{app}\{#MyAppExeName}'), Params, ExpandConstant('{app}'), SW_HIDE,
+              ewWaitUntilTerminated, Result) then
+    Result := -1;
+  Log(Params + ': exit ' + IntToStr(Result));
+end;
+
+procedure Fail(Code: Integer; const Msg: string);
+begin
+  if FailCode = 0 then
+    FailCode := Code;
+  Log('FAILED (' + IntToStr(Code) + '): ' + Msg);
+  if not WizardSilent() then
+    MsgBox(Msg, mbError, MB_OK);
+end;
+
+// Register (or, when the task was unticked, unregister) the provider -- only from {app}, only after
+// the ACL check says administrators alone can write there.
+procedure RegisterProvider(AclOk: Boolean);
+var
+  Dll: string;
   ResultCode: Integer;
 begin
-  WizardForm.StatusLabel.Caption := CustomMessage('StatusRegTasks');
-  Params := '-NoProfile -ExecutionPolicy Bypass -File "'
-            + ExpandConstant('{app}\postinstall\register_tasks.ps1') + '"'
-            + ' -Mode Installed -InstallDir "' + ExpandConstant('{app}') + '" -Action Register';
-  Params := Params + ' -UserSid ' + GetOwnerSid();
-  if not Exec(PowerShellExe(), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    ResultCode := -1;
-  if ResultCode = 0 then
-    Log('Face Unlock task registrar: OK')
-  else
+  Dll := ExpandConstant('{app}\credential_provider\FaceCredentialProvider.dll');
+  if not FileExists(Dll) then
+    exit;
+  if not WizardIsTaskSelected('cp') then
   begin
-    Log('Face Unlock task registrar FAILED with exit code ' + IntToStr(ResultCode) + '; see '
-        + ExpandConstant('{app}\logs\register_tasks.log'));
-    if not WizardSilent() then
-      MsgBox(FmtMessage(CustomMessage('TasksFailed'), [IntToStr(ResultCode), ExpandConstant('{app}\logs\register_tasks.log')]),
-             mbError, MB_OK);
+    Exec(ExpandConstant('{sys}\regsvr32.exe'), '/u /s "' + Dll + '"', '', SW_HIDE,
+         ewWaitUntilTerminated, ResultCode);
+    Log('sign-in tile not selected: regsvr32 /u exit ' + IntToStr(ResultCode));
+    exit;
   end;
+  if not AclOk then
+  begin
+    Fail(22, CustomMessage('AclFailed'));
+    exit;
+  end;
+  WizardForm.StatusLabel.Caption := CustomMessage('StatusRegCP');
+  if not Exec(ExpandConstant('{sys}\regsvr32.exe'), '/s "' + Dll + '"', '', SW_HIDE,
+              ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    Fail(22, FmtMessage(CustomMessage('CPFailed'), [IntToStr(ResultCode)]));
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  AclOk: Boolean;
 begin
   if CurStep = ssPostInstall then
   begin
-    // R1: the owner, always rewritten (F-213) -- the service, the tile and the uninstaller
-    // all read it from here.
+    // R1: the owner, always rewritten (F-213).
     RegWriteStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', GetOwnerSid());
-    RegisterTasks();
+    AclOk := RunTrayFlag('--verify-acl') = 0;
+    RegisterProvider(AclOk);
+    if not InstallModels() then
+      Fail(23, CustomMessage('ModelsInstallFailed'));
+    WizardForm.StatusLabel.Caption := CustomMessage('StatusRegTasks');
+    if RunTrayFlag('--register --user-sid ' + GetOwnerSid()) <> 0 then
+      Fail(21, FmtMessage(CustomMessage('TasksFailed'), [ExpandConstant('{app}\logs\register_tasks.log')]));
+    InstallDone := True;
   end;
 end;
 
-{ Check for the two password entries in [Run] step 4: the ORIGINAL user's data
-  directory (Stage 8b, F-07) -- the profile the runasoriginaluser dialog writes
-  to -- which is what face_service/config.py resolves as Path.home() for that
-  user. Existence only; the DPAPI blob itself is never opened here. }
+// R17: a failure after the files were copied still ends a silent install with a non-zero code:
+// 21 tasks, 22 sign-in tile, 23 models.
+function GetCustomSetupExitCode(): Integer;
+begin
+  Result := FailCode;
+end;
+
+procedure DeinitializeSetup();
+begin
+  // F-238: Setup stopped the old stack and then did not finish -- start its tasks again.
+  if StackStopped and not InstallDone then
+    ForOurTasks(ExpectedAppDir(), True);
+end;
+
 function CredentialsSaved(): Boolean;
 begin
-  Result := FileExists(DataDirFor(GetOwnerSid()) + '\credentials.bin');
+  Result := (DataDirFor(GetOwnerSid()) <> '') and FileExists(DataDirFor(GetOwnerSid()) + '\credentials.bin');
+end;
+
+function EnrollmentExists(): Boolean;
+begin
+  Result := (DataDirFor(GetOwnerSid()) <> '') and FileExists(DataDirFor(GetOwnerSid()) + '\embeddings.npz');
 end;
 
 var
@@ -744,25 +1033,15 @@ var
 
 function InitializeUninstall(): Boolean;
 begin
-  // Task teardown is [UninstallRun]. The user whose data this is was recorded at install
-  // time (Stage 8b, F-07); read it now, before the app key is deleted with the rest.
   if not RegQueryStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', UninstallUserSid)
      or not IsUserSid(UninstallUserSid) then
     UninstallUserSid := '';
   Result := True;
 end;
 
-{ The user's enrollment data is KEPT unless they say otherwise.
-
-  This runs during an unattended upgrade too: presence_monitor/updater.py launches
-  the installer with /SILENT, and a MsgBox in that context either blocks forever
-  or is answered by nobody. Silently deleting biometric images and the DPAPI
-  credential blob because a dialog could not be shown is the worst of the
-  available outcomes, so silent mode now always keeps the data, and only an
-  interactive uninstall asks. /REMOVEDATA forces removal for scripted teardown.
-
-  tools\uninstall.ps1 is the fuller story (model cache, %TEMP% downloads,
-  leftover verification); this stays deliberately minimal. }
+{ The owner's data is KEPT unless they say otherwise: a silent uninstall never deletes it
+  (/REMOVEDATA forces removal for scripted teardown), and without a recorded owner nothing is
+  offered at all -- never the uninstalling administrator's own profile (F-216). }
 function WantsDataRemoved(DataDir: string): Boolean;
 begin
   Result := False;
@@ -771,22 +1050,13 @@ begin
     Result := True;
     exit;
   end;
-  { UninstallSilent() covers both /SILENT and /VERYSILENT. }
   if UninstallSilent() then
     exit;
   Result := MsgBox(FmtMessage(CustomMessage('RemoveData'), [DataDir]),
                    mbConfirmation, MB_YESNO) = IDYES;
 end;
 
-{ Stage 8b (F-02). Defect: the data directory is removed ELEVATED with
-  rmdir /S /Q, and up to 0.1.0 other accounts could write inside it.
-  Consequence: whether the delete stays inside the directory depended only on how
-  rmdir treats a link. Fix, defence in depth: the directory itself must not be a
-  reparse point (then nothing is deleted and the uninstall log says why), and below
-  it rmdir /S removes a junction as a link without entering it -- measured on this
-  Windows build in 8b (ps51-junction-test.txt: target survived). $400 is
-  FILE_ATTRIBUTE_REPARSE_POINT; FindFirst on a path without a wildcard describes
-  that entry itself, not its target. }
+// FILE_ATTRIBUTE_REPARSE_POINT ($400) on the entry itself (FindFirst without a wildcard).
 function IsReparsePoint(const Path: string): Boolean;
 var
   FindRec: TFindRec;
@@ -802,26 +1072,24 @@ begin
   end;
 end;
 
+{ The data directory is removed with rmdir /S /Q, which deletes a junction or a symbolic link as
+  a link and never enters it (measured in 8b); a data directory that IS a reparse point is not
+  touched at all (F-02, F-236). }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: string;
   ResultCode: Integer;
 begin
-  if CurUninstallStep = usPostUninstall then
+  if (CurUninstallStep = usPostUninstall) and (UninstallUserSid <> '') then
   begin
-    // The recorded original user's profile (F-07); Setup's own profile for an install
-    // made before 8b, which recorded nothing.
     DataDir := DataDirFor(UninstallUserSid);
-    if DirExists(DataDir) then
+    if (DataDir <> '') and DirExists(DataDir) and WantsDataRemoved(DataDir) then
     begin
-      if WantsDataRemoved(DataDir) then
-      begin
-        if IsReparsePoint(DataDir) then
-          Log('Data directory is a reparse point, not removed: ' + DataDir)
-        else
-          Exec(ExpandConstant('{cmd}'), '/C rmdir /S /Q "' + DataDir + '"',
-               '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-      end;
+      if IsReparsePoint(DataDir) then
+        Log('Data directory is a reparse point, not removed: ' + DataDir)
+      else
+        Exec(ExpandConstant('{cmd}'), '/C rmdir /S /Q "' + DataDir + '"',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
   end;
 end;

@@ -35,6 +35,7 @@ from face_service.pipe_io import (PipeServerIdentityError, SYSTEM_SID_STRING, ex
 # Whole-exchange budget. Generous: this is the dev tool and the installed graceful-shutdown path,
 # and a gesture round can hold the sequential server for ~11 s before it gets to us.
 SEND_TIMEOUT_S = 30.0
+SHUTDOWN_TIMEOUT_S = 5.0
 
 
 def send(req: dict, connect_timeout_s: float = SEND_TIMEOUT_S) -> dict:
@@ -60,7 +61,9 @@ def main(argv: list[str]) -> int:
 
     t0 = time.time()
     try:
-        resp = send(req)
+        # Stage 9 (D-47, D-117): a shutdown is asked with a short budget -- when no service is
+        # running, the caller (Setup, the uninstaller, a dev restart) must not wait 30 s for it.
+        resp = send(req, SHUTDOWN_TIMEOUT_S if cmd == "shutdown" else SEND_TIMEOUT_S)
     except PipeServerIdentityError as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 3

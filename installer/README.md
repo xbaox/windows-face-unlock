@@ -1,292 +1,121 @@
 # Installer build
 
-This folder builds the end-user installer that drops Windows Face Unlock onto a
-machine with nothing installed — no Python, no ONNX runtime, no Visual C++
-redist beyond what Windows ships. One `.exe`, users double-click, done.
+This folder builds the end-user installer: one `.exe` that puts Windows Face Unlock onto a machine
+with nothing installed -- no Python, no ONNX runtime. Two variants (Stage 9, act 9b R17):
 
-Two ways to build: locally (for testing) and in CI (for releases).
+| Variant | File | For |
+|---|---|---|
+| **CPU** (main, recommended) | `WindowsFaceUnlock-Setup-<ver>-cpu.exe` | every x64 PC |
+| **GPU** | `WindowsFaceUnlock-Setup-<ver>-gpu.exe` | PCs with an NVIDIA GPU; adds only the NVIDIA DLLs the ONNX Runtime CUDA provider needs |
 
-## What you get
+Each comes with `<file>.sha256` and `<file>.buildinfo.json` (bundle manifest hash, git head,
+variant, signing state). Neither contains a face recognition model.
 
-`installer_output\WindowsFaceUnlock-Setup-<version>.exe`, plus a `.sha256`
-next to it.
+## What the installer does
 
-The installer:
-- Copies everything into `C:\Program Files\WindowsFaceUnlock\`.
-- Registers the scheduled tasks declared in `tools\tasks.psd1` (staged into
-  `{app}\postinstall`) and starts them.
-- Registers `FaceCredentialProvider.dll` with `regsvr32` so the face tile
-  appears on the Windows lock screen. This is the `cp` task, checked by default;
-  the provider is additive, so the PIN and password tiles stay as they were.
-- Offers the first-run onboarding on the Finish page (see below).
-- On uninstall: walks the same task declaration to stop and remove the tasks,
-  unregisters the DLL, removes all files, and asks whether to also wipe
-  `%USERPROFILE%\.face-unlock`.
+- Installs into `C:\Program Files\WindowsFaceUnlock` -- always; a `/DIR=` elsewhere is refused.
+- **Models (decision 9-02):** shows the InsightFace terms (non-commercial research use) and asks for
+  consent, then downloads the official `buffalo_l.zip` (the source insightface uses) or takes a
+  local copy (`/MODELZIP=<path>` or the file chooser), checks size + SHA-256 against
+  `face_service/model_pins.py`, and unpacks the five pinned files into `{app}\models\buffalo_l`.
+  An upgrade that already has valid models skips all of this. A silent install that needs the
+  models fails closed without `/ACCEPTMODELLICENSE`.
+- Checks that the program folder is writable by administrators only, then registers the sign-in
+  tile (`regsvr32` of `credential_provider\FaceCredentialProvider.dll`, the `cp` task, checked by
+  default; unticking it on an upgrade unregisters it).
+- Registers and starts the three scheduled tasks through the product itself:
+  `face_unlock_tray.exe --register --user-sid <owner>` (Task Scheduler over COM,
+  `face_service/taskreg.py`). **No PowerShell runs during install or uninstall.**
+- Offers the first-run steps on the Finish page: save the Windows password, set up the face.
+- Upgrade: stops the running copy first (graceful pipe shutdown as the owner, the scheduler, then a
+  bounded kill -- all over COM/WMI); if Setup is cancelled after that, the old tasks are started
+  again.
+- Uninstall: `face_unlock_tray.exe --unregister` (stop, remove the tasks, count survivors),
+  `regsvr32 /u` plus a fallback removal of the provider's registry keys, busy files removed at the
+  next restart, only its own folders deleted; the owner's data is kept unless they say otherwise.
+
+Exit codes of a silent install that failed after the files were copied: **21** tasks, **22**
+sign-in tile, **23** models (the Inno Setup codes 1-8 keep their usual meaning).
 
 ## Local build
 
-Prerequisites:
-- Windows 10 / 11 x64
-- Python 3.11 or 3.12 in PATH
-- [Inno Setup 6](https://jrsoftware.org/isdl.php) (installs `ISCC.exe`)
-- Visual Studio 2022 Build Tools with the C++ workload, to build the Credential
-  Provider DLL. Set `SKIP_CP=1` to deliberately build a
-  presence-auto-lock-only installer without it.
-- `cmake` on `PATH`. Build Tools ships one but does not put it there, so a plain
-  shell fails at step 1 (the CP build) with `FileNotFoundError: [WinError 2]` — which reads like
-  a broken CP build rather than a missing tool. It lives under
-  `<BuildTools>\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`.
-
-Steps from the repo root:
+Prerequisites: Windows 10/11 x64; Python **3.12**; Inno Setup **6.5+** (`ISCC.exe`); Visual Studio
+2022 Build Tools with the C++ workload and its `cmake` on `PATH`
+(`<BuildTools>\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`). `SKIP_CP=1` builds without
+the sign-in tile on purpose.
 
 ```powershell
-.\setup.ps1
-.\.venv\Scripts\pip install -r installer\requirements-build.txt
-
-$env:SIGN_CP = '<40-hex thumbprint of your code-signing certificate>'
-.\.venv\Scripts\python installer\build.py --half 1     # steps 0-5: build, stage, GATE
-#   operator dist-smoke out of dist\WindowsFaceUnlock (see below)
-.\.venv\Scripts\python installer\build.py --half 2     # steps 6-7: Inno Setup + checksums
+.\setup.ps1 -SkipAutostart                         # .venv + requirements.lock (hash-checked)
+.\.venv\Scripts\python -m pip install --require-hashes -r installer\requirements-build.txt
+.\.venv\Scripts\python installer\build.py --variant cpu
 ```
 
-`build.py` runs, in order (Stage 8b: eight steps, 0-7, in two official halves):
+For the GPU variant install `requirements-gpu.lock` instead (`setup.ps1 -Gpu`) and pass
+`--variant gpu`; without the NVIDIA wheels the GPU build refuses rather than producing a CPU
+bundle under a GPU name.
 
-0. Check the `buffalo_l` recognition pack: all five files present, SHA-256 pinned.
-1. CMake → `build-cp\Release\FaceCredentialProvider.dll` (`-S credential_provider
-   -B build-cp`). The tree is **not** wiped first. Skipped only with `SKIP_CP=1`;
-   any other failure aborts the build.
-2. Authenticode-sign the CP DLL with the certificate `SIGN_CP` names, then verify
-   that the signer thumbprint equals `SIGN_CP`. **`SIGN_CP` is required**: a build
-   without it aborts unless `--allow-unsigned-cp` is given (recorded in the gate
-   stamp). `SIGN_CP=self` is refused — create the certificate once with
-   `tools\sign_cp.ps1 -SelfSigned` and pass its thumbprint.
-3. PyInstaller against `windows_face_unlock.spec` → three exes
-   (`face_service.exe`, `face_unlock_tray.exe`, `face_unlock_watchdog.exe`)
-   sharing one runtime folder in `dist\WindowsFaceUnlock\`.
-4. Stage into that folder: the CP DLL + `register.ps1` under
-   `credential_provider\`, the task registrar + `tasks.psd1` under `postinstall\`,
-   and the top-level docs.
-5. **The gate**: `tools\verify_frozen_entrypoints.py --dist dist\WindowsFaceUnlock`,
-   `tools\packaging_selftest.py`, model hashes and the staged DLL's signature. On
-   success it writes `dist\WindowsFaceUnlock.gate.json` — a stamp with the hash of
-   every bundle file.
-6. `ISCC.exe installer\installer.iss` → installer in `installer_output\`. Refused
-   unless the stamp matches the bundle byte for byte.
-7. SHA-256 checksum next to the installer.
+`build.py` steps (the signing order is act 9b R18's):
 
-`--half 1` = steps 0-5, `--half 2` = steps 6-7, no `--half` = 0-7. `--gate-only`
-re-runs step 5 on the existing `dist\` and re-stamps it (after a change to a staged
-file); `--check-models` runs step 0 only.
+0. **Preflight** -- tools, the variant's packages, LICENSE; the old outputs of this variant are
+   removed.
+1. CMake -> `build-cp\Release\FaceCredentialProvider.dll`.
+2. Sign the CP DLL (Azure Trusted Signing) -- **loudly skipped** without credentials.
+3. PyInstaller (`FU_VARIANT=<variant>`) -> `dist\WindowsFaceUnlock\` (three exes, one runtime
+   folder); the CP DLL, the docs and pystray's license texts are staged.
+4. GPU only: every NVIDIA DLL is checked with Authenticode. The cuDNN DLLs are signed by NVIDIA;
+   the CUDA runtime / cuBLAS / cuFFT / NVRTC wheels ship unsigned DLLs. They are never modified or
+   re-signed (their EULA); the catalog (`.cat`) signature that would cover them needs our signing
+   identity and is **skipped** until 9f -- a GPU build is not releasable before that.
+5. Sign every unsigned PE of ours (never NVIDIA's, never an already-signed file) -- **skipped**
+   without credentials.
+6. **The gate** on the (signed) bundle: `tools\verify_frozen_entrypoints.py` (PE content compared
+   without the certificate table), `tools\packaging_selftest.py`, the frozen custody self-check,
+   no model in the bundle, the variant's shape (CPU: no CUDA provider, no NVIDIA file; GPU: exactly
+   the allowlist; no FFmpeg, no TensorRT provider; pystray as replaceable `.py` files), then
+   `dist\WindowsFaceUnlock.gate.json`.
+7. ISCC with the version, the variant and the model pins as `/D` defines (plus SignTool /
+   SignedUninstaller when signing is configured). The artefact is exactly
+   `WindowsFaceUnlock-Setup-<ver>-<variant>.exe`; the bundle is re-hashed after ISCC and must still
+   match the stamp.
+8. `.sha256` and `.buildinfo.json`.
 
-### The gate between step 5 and step 6
+`--half 1` = steps 0-6 (the operator dist-smoke can follow), `--half 2` = steps 7-8,
+`--gate-only` re-runs step 6, `--resign` runs steps 2, 4, 5, 6 on an existing `dist\` (the CI sign
+job).
 
-Do not compile the installer around a bundle nobody has run. Two Stage-7 blocks
-shipped a `dist\` that every check of the day called green and that could not
-start: `face_unlock_tray.exe` died instantly on a relative import in its entry
-script, and `face_service.exe` died ninety seconds in, inside numpy, on a Python
-module that only numpy's C extension imports. Neither is visible in
-`warn-*.txt`, and neither is visible by reading the PYZ — which is exactly how
-both survived a validation pass that consisted of reading the PYZ.
+### Signing (act 9b R18, until 9f)
 
-So the gate has two halves, and step 6 waits for both:
+Signing uses Azure Trusted Signing when `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
+`AZURE_CODESIGN_ENDPOINT`, `AZURE_CODESIGN_ACCOUNT`, `AZURE_CODESIGN_PROFILE`, `SIGNTOOL` and
+`AZURE_CODESIGN_DLIB` are set; `FU_SIGN_SUBJECT` pins the expected signer, and every signed file
+must verify `Valid`. Without them every signing step prints `SIGNING SKIPPED` with the missing
+names, and the result is a test build. See `credential_provider\SIGNING.md`.
 
-```powershell
-.\.venv\Scripts\python tools\verify_frozen_entrypoints.py --dist dist\WindowsFaceUnlock
-```
+## CI (`.github/workflows/release.yml`)
 
-is the static half, and since Stage 8b build.py runs it itself (step 5) and
-refuses ISCC without its stamp. It walks the entry-point sources for relative
-imports, disassembles the entry bytecode **out of the built EXEs** to ask the
-artefact the same question, checks the PYZ holds every absolute target, verifies
-numpy's extension has both its native dependencies and every Python module it
-imports by name from C, checks the three KNOWN_ISSUES §5 mines by name
-(`scipy._cyutility`, `scipy._external`, `_internal\objects\meanshape_68.pkl`), and
-runs a class guard over every bundled extension module and every vendor
-`sys.frozen` / `_MEIPASS` / dynamic-import site. Exit code 0 means clear to compile.
-
-The other half is a human running the executables out of `dist\` — at minimum
-`face_unlock_tray.exe --set-password` (a dialog must appear) and
-`face_service.exe` (silence; it exits as a mutex-loser if a service is already
-running). A static check proves what was collected. It never proves the result
-runs.
-
-### Environment knobs
-
-| Variable          | Effect |
-|-------------------|--------|
-| `SKIP_CP=1`       | Build without the Credential Provider DLL. The installer still shows the (checked) task box, but the `FileExists` check on its `[Run]` entry is false, so `regsvr32` never runs. |
-| `INNO_SETUP_ISCC` | Full path to `ISCC.exe` if it is not at the default `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`. |
-
-## Onboarding on the Finish page
-
-Two things have to exist before the face tile can sign anyone in: the Windows
-password (sealed with DPAPI into `%USERPROFILE%\.face-unlock\credentials.bin`)
-and the enrolled face (`embeddings.npz`). The Finish page offers both, and runs
-the ticked ones one after the other, as the user who started Setup (not the
-elevated token):
-
-| Checkbox | Runs | Default |
-|---|---|---|
-| Save your Windows password for face sign-in | `face_unlock_tray.exe --set-password` | checked, when no `credentials.bin` exists |
-| Update your saved Windows password for face sign-in | same | unchecked, shown instead of the above when `credentials.bin` exists |
-| Set up face recognition now | `face_unlock_tray.exe --enroll` | checked |
-
-Both run the tray executable with a flag, which `presence_monitor\__main__.py`
-routes to the dialog or the wizard, so neither starts a second tray (the reason
-there is no "Launch" checkbox — KNOWN_ISSUES #4). The tray itself is already
-running from its scheduled task.
-
-The scheduled tasks are started a few seconds before the Finish page appears,
-and the service opens its pipe only after its models have loaded. The wizard
-therefore shows "Connecting to the Face Unlock service…" and waits up to 90 s
-for the pipe before it asks for the camera, instead of failing the lease at once.
-
-Silent installs (`/SILENT`, `/VERYSILENT`, which is also how the updater runs)
-skip all three.
+`test` (selftests + CP unit tests) -> `build` (cpu and gpu, read-only token, no secrets,
+hash-checked installs, unsigned) -> `sign` (only when the Azure variables exist; OIDC, no
+repository rights; `--resign` + `--half 2`) -> `publish` (only for a `vX.Y.Z` tag equal to
+`face_service/_version.py`; the only job with `contents: write`; a **draft** release that the
+operator smokes and publishes by hand).
 
 ## Scripted install
 
-```powershell
-.\WindowsFaceUnlock-Setup-0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /MERGETASKS="cp" /LOG="$env:TEMP\wfu-setup.log"
+```
+WindowsFaceUnlock-Setup-0.2.0-cpu.exe /VERYSILENT /ACCEPTMODELLICENSE [/MODELZIP=C:\path\buffalo_l.zip]
+    [/OWNER=DOMAIN\user] [/FORCEOWNER] [/MERGETASKS="cp"]
+unins000.exe /VERYSILENT [/REMOVEDATA]
 ```
 
-`/MERGETASKS="cp"` is what guarantees the Credential Provider gets registered.
-The `cp` task is checked by default, but `UsePreviousTasks=yes` restores the
-previous install's choice on an upgrade: a machine whose last install recorded
-`cp` as deselected (every install made before Stage 7l, when the box started
-out unchecked) keeps it deselected, silently. `/MERGETASKS` adds the task to that
-remembered selection instead of replacing it. The previous choice is recorded as
-`Inno Setup: Deselected Tasks` under the `{2F7A9B14-...}_is1` Uninstall key.
-
-A silent run skips the Finish-page onboarding, so a scripted install still needs
-the password and the enrollment done afterwards, from the tray menu or with
-`face_unlock_tray.exe --set-password` and `face_unlock_tray.exe --enroll`.
-
-## Serialization rule (hard)
-
-Setup and the uninstaller never run at the same time. This is not a preference:
-whichever starts second breaks, and it takes the first one's work with it. On
-2026-08-08 `unins000.exe /REMOVEDATA` was started while a silent install was
-still running — a message box the silent run could not display was auto-answered
-*Abort*, the install rolled back, and four completed acceptance steps went with
-it.
-
-The only signal that a run has finished is `Log closed` in its Inno log. Not the
-window going away, not the process leaving the task list. The uninstaller needs a
-second signal on top of that, because `unins000.exe` copies itself into `%TEMP%`
-and runs from the copy: the process you can watch exit is the copy, and its exit
-code is not observable from where you started it. For the uninstaller, the
-install directory under `Program Files` disappearing is what says the removal
-actually completed.
-
-A silent run can print nothing for up to fifteen minutes — the bundled models
-alone are ~325 MiB, compressed `lzma2/ultra64`. That is normal, and it is not
-evidence of a hang. Do not interrupt it; `Ctrl+C` leaves a half-written install
-directory and a registration state with no name. When a wait is unavoidable, wait
-in a loop that echoes progress, so that "still working" and "wedged" stay
-distinguishable from each other.
-
-## CI build
-
-`.github/workflows/release.yml` reproduces the local pipeline on `windows-2022`
-runners and publishes a GitHub Release attached to the `v<version>` tag:
-
-```bash
-git tag v0.1.0
-```
-
-The workflow stamps `__version__` and Inno Setup's `MyAppVersion` from the tag
-before building. It does **not** set `SKIP_CP`: a release that cannot build the
-Credential Provider should fail, not ship a face-unlock installer that cannot
-unlock.
-
-## The recognition models are bundled (Stage 7d)
-
-The engine is InsightFace `buffalo_l`. It used to be the pipeline's known gap:
-`FaceAnalysis(name="buffalo_l")` was called without a `root=`, so insightface
-looked in `%USERPROFILE%\.insightface\models\buffalo_l\` and, finding it empty on
-a fresh machine, downloaded the pack over plain HTTP at the first unlock attempt
-— unpinned, unchecksummed, with no timeout, and impossible offline. The spec even
-shipped `requests` and `tqdm` to make that download work.
-
-Now the five `.onnx` files are shipped as `datas`, and
-`face_service.recognizer.model_root()` points a frozen build at
-`insightface_home/models/buffalo_l` inside the bundle. An installed machine
-therefore needs no network for recognition.
-
-What that costs, and why the numbers differ from the old "~290 MB":
-
-| what | size |
-|---|---|
-| `buffalo_l.zip`, the download | ~275 MiB |
-| the five unpacked `.onnx` — what ships | ~325 MiB |
-| both, which is what an auto-download leaves on disk | ~600 MiB |
-
-Only the unpacked set goes into the installer. The archive is deliberately not
-shipped: nothing reads it, and it would nearly double the download for no gain.
-The release workflow removes it after fetching, because insightface extracts and
-then keeps it (its `os.remove` is commented out).
-
-Only four of the five models are used (`ALLOWED_MODULES` in `recognizer.py`), but
-all five must be present: `FaceAnalysis` globs every `*.onnx` in the directory and
-builds a session for each **before** the filter runs. `genderage.onnx` is 1.3 MiB,
-so there is nothing to save by trimming it.
-
-Both `installer/build.py` (step 0) and the spec itself refuse to build if the pack
-on the build machine is incomplete — an installer without models is precisely the
-defect this replaced.
-
-## Code signing
-
-The installer is published unsigned by default. First-time users will see
-Windows SmartScreen flag it as *Unknown publisher* — they click **More info →
-Run anyway**. Acceptable for tinkerers, not ideal for wider distribution.
-
-The workflow integrates with [SignPath.io](https://signpath.io/open-source),
-which offers free code signing to vetted open-source projects. Once approved,
-add these repository secrets:
-
-| Secret                  | From SignPath |
-|-------------------------|---------------|
-| `SIGNPATH_API_TOKEN`    | CI token |
-| `SIGNPATH_ORG_ID`       | Organization ID |
-| `SIGNPATH_PROJECT_SLUG` | Project slug |
-
-With all three present, the workflow auto-detects them and submits the installer
-for signing between PyInstaller and Release publish. Without them, the unsigned
-installer goes out unchanged — no workflow edits needed.
-
-Alternatives if SignPath isn't an option:
-- **Certum Open Source Code Signing** — ~USD 25/year, requires ID verification.
-- **Azure Trusted Signing** — ~USD 10/month, fastest if you already have Azure.
-  Plug into the workflow via `azure/trusted-signing-action`.
-- **Self-signed certs do NOT help SmartScreen** — reputation requires a CA
-  Microsoft trusts. Don't bother.
+The owner is the user signed in at the console (R1); `/OWNER=` names one explicitly, and replacing
+a different recorded owner in a silent install needs `/FORCEOWNER`.
 
 ## Anatomy
 
-- `windows_face_unlock.spec` — PyInstaller: two Analyses merged via `MERGE()` so
-  the shared runtime lands once. Collects `insightface` (minus its PySide GUI and
-  its face3d thirdparty tree), `onnxruntime`, `skimage.transform` — which
-  `insightface.utils.face_align` imports and scikit-image hides behind
-  `lazy_loader` — and `cv2`. Also reproduces the `nvidia\<pkg>\bin` layout that
-  `recognizer._prep_cuda_dlls()` walks, without which the CUDA provider silently
-  falls back to CPU. Excludes matplotlib and Qt.
-- `requirements-build.txt` — build-time-only pins (PyInstaller). Kept out of the
-  runtime `requirements.txt` on purpose.
-- `installer.iss` — Inno Setup script. Admin install, `lzma2/ultra64`,
-  `CloseApplications=yes` so the updater can replace files in place, one task
-  (register the CP, checked by default), uninstall asks about user data. It contains no
-  scheduled-task names: install and uninstall both call the registrar.
-- `build.py` — glue script that runs all of the above.
-
-## Updating
-
-The tray process checks GitHub Releases 30 seconds after start and whenever the
-user picks *"Check for updates…"* in the tray menu. If a newer `tag_name` is
-found with an `.exe` asset, it offers to download and launch the installer
-silently (`/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS`). The installer then
-stops the running tray and service, replaces files, and restarts both.
-
-See [`presence_monitor/updater.py`](../presence_monitor/updater.py) and the
-`[Setup] CloseApplications=yes` line in `installer.iss`.
+- `installer.iss` -- the Inno Setup script (owner, models, stop / register through the product,
+  uninstall).
+- `lang\en.isl`, `lang\ru.isl` -- the installer's own texts, English and Russian.
+- `windows_face_unlock.spec` -- PyInstaller (variants, NVIDIA allowlist, exclusions, version
+  resources, the tray's PerMonitorV2 manifest).
+- `build.py` -- the pipeline above. `requirements-build.txt` -- PyInstaller and its dependencies,
+  hashed.

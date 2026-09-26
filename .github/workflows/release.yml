@@ -1,23 +1,26 @@
 name: release
 
-# Builds and releases the Windows installer whenever a `v*` tag is pushed.
-# If the repo has configured the SIGNPATH_* secrets, the installer is
-# code-signed through SignPath.io's free open-source program. Otherwise
-# the unsigned installer is published directly (users will see a
-# SmartScreen "unknown publisher" prompt the first time they run it —
-# README documents how to bypass).
+# Stage 9 (act 9b R18). Three kinds of job, each with only the rights it needs:
 #
-#     git tag v0.1.0
-#     git push origin v0.1.0
-# ...triggers this workflow.
+#   test     -- the selftests (isolated FACE_UNLOCK_HOME) and the Credential Provider unit tests
+#   build    -- per variant (cpu, gpu): builds and gates the bundle and an UNSIGNED installer.
+#               Read-only token, no secrets, checkout without persisted credentials, every pip
+#               install hash-checked (--require-hashes).
+#   sign     -- per variant, only when Azure Trusted Signing is configured (repository variables
+#               AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CODESIGN_*): OIDC login, no repository
+#               rights; signs the CP DLL and our unsigned PE files (never NVIDIA's), re-runs the gate
+#               on the signed bundle and compiles the installer with SignTool + SignedUninstaller.
+#   publish  -- only for a vX.Y.Z tag, the ONLY job with contents: write; creates a DRAFT release
+#               (the operator smokes the artefacts, then publishes by hand -- F-223).
 #
-# Supply chain (8a F-38). Everything this job runs or ships is pinned: every action by
-# full commit SHA (the tag it was taken from is in the trailing comment), Inno Setup by
-# version AND installer SHA-256, pyinstaller-hooks-contrib and pip by version, the
-# buffalo_l models by SHA-256 (installer/build.py MODEL_SHA256 is the one list). To bump
-# an action: resolve the new tag with
-#     git ls-remote https://github.com/<owner>/<repo> refs/tags/<tag>
-# and replace SHA and comment together.
+# Assets: WindowsFaceUnlock-Setup-<ver>-cpu.exe and -gpu.exe, each with .sha256 and
+# .buildinfo.json. Neither contains a recognition model (the installer downloads them; the gate
+# fails the build otherwise).
+#
+# Pinned: every action by full commit SHA (tag in the comment), Python by patch version, Inno Setup
+# by version and installer SHA-256, every Python package by the hashes in requirements*.lock and
+# installer/requirements-build.txt. NOT pinned: the runner image (windows-2022) and with it the
+# MSVC toolset and CMake that build the CP DLL; their versions go into the build log (D-112).
 
 on:
   push:
@@ -25,196 +28,202 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # needed to create a GitHub Release
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12.10"
+  INNO_VERSION: "6.7.3"
+  INNO_SHA256: "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
 
 jobs:
-  build:
-    name: Build + (optional) sign Windows installer
+  test:
     runs-on: windows-2022
-    timeout-minutes: 75
-    env:
-      SIGNPATH_API_TOKEN:    ${{ secrets.SIGNPATH_API_TOKEN }}
-      SIGNPATH_ORG_ID:       ${{ secrets.SIGNPATH_ORG_ID }}
-      SIGNPATH_PROJECT_SLUG: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
-      # Same versions as the local build venv (8a: .venv == requirements.lock + these).
-      PIP_VERSION: "26.1.2"
-      HOOKS_CONTRIB_VERSION: "2026.6"
-      INNO_VERSION: "6.7.3"
-      # SHA-256 of innosetup-6.7.3.exe as published on the jrsoftware/issrc GitHub release
-      # (asset digest, 10,592,232 bytes).
-      INNO_SHA256: "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
+    timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0 (v4)
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0 (v5)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
-          python-version: "3.12"
-          cache: pip
-
-      # requirements.lock, NOT requirements.txt. The latter is mostly >= ranges, so two releases
-      # built from identical repo state could ship different transitive versions -- and the lock
-      # file that exists to prevent exactly that was read by nothing in the build or release path.
-      # PyInstaller stays in its own build-only file: it is not a runtime dependency and has no
-      # business in a venv that only wants to run the service.
-      #
-      # pip and pyinstaller-hooks-contrib are pinned here: pip is bundled into the app (insightface
-      # references it), and hooks-contrib supplies hook-cv2, hook-skimage.* and the
-      # pyi_rth_pywintypes rthook -- an unpinned bump silently changes what ships (8a F-38).
-      - name: Install Python dependencies
-        shell: powershell
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install (hash-checked)
+        shell: pwsh
         run: |
-          python -m pip install "pip==$env:PIP_VERSION"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pip install -r requirements.lock
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pip install -r installer/requirements-build.txt "pyinstaller-hooks-contrib==$env:HOOKS_CONTRIB_VERSION"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pip show pyinstaller pyinstaller-hooks-contrib pip | Select-String '^(Name|Version):'
-
-      # The spec bundles the buffalo_l pack from the BUILD MACHINE's %USERPROFILE%\.insightface,
-      # so CI has to populate it before PyInstaller runs. Uses insightface's own resolver rather
-      # than a hardcoded URL, so the pack always matches the pinned library version.
-      #
-      # The download is then checked against the SHA-256 pins in installer/build.py
-      # (--check-models: the five .onnx files AND buffalo_l.zip while it still exists). Defect:
-      # the models were fetched and shipped unverified -> a substituted model could recognise the
-      # wrong face -> the release now fails instead.
-      #
-      # The leftover archive is removed afterwards on purpose: insightface extracts buffalo_l.zip
-      # and then does NOT delete it (the os.remove in utils/storage.py is commented out), so leaving
-      # it would put ~275 MB of dead weight next to the 325 MiB that is actually needed.
-      - name: Fetch and verify the buffalo_l recognition models
-        shell: powershell
+          python -m pip install --require-hashes -r requirements.lock
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Selftests (each in its own FACE_UNLOCK_HOME)
+        shell: pwsh
         run: |
-          python -c "from insightface.utils.storage import ensure_available; print(ensure_available('models', 'buffalo_l'))"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python installer\build.py --check-models
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $zip = Join-Path $env:USERPROFILE '.insightface\models\buffalo_l.zip'
-          if (Test-Path $zip) { Remove-Item -Force $zip; Write-Host "removed the extracted buffalo_l.zip" }
-          Get-ChildItem (Join-Path $env:USERPROFILE '.insightface\models\buffalo_l') |
-            Select-Object Name, Length | Format-Table -AutoSize
+          $fail = @()
+          foreach ($t in Get-ChildItem tools -Filter '*selftest*.py') {
+            $home_ = Join-Path $env:RUNNER_TEMP ("home-" + $t.BaseName)
+            $env:FACE_UNLOCK_HOME = $home_
+            python -m ("tools." + $t.BaseName)
+            if ($LASTEXITCODE) { $fail += $t.BaseName }
+          }
+          if ($fail) { Write-Error ("failed: " + ($fail -join ', ')); exit 1 }
+      - name: Credential Provider unit tests
+        shell: pwsh
+        run: |
+          cmake --version
+          cmake -S credential_provider/tests -B build-tests -A x64
+          cmake --build build-tests --config Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./build-tests/Release/test_parser.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      # Pinned Inno Setup. The runner image ships its own (unpinned) Inno Setup, and choco
-      # installed "latest": a compiler bump could change [Code]/RunOnceId semantics under us.
-      # Download the exact release, check its SHA-256, install into a private folder, and hand
-      # build.py that ISCC.exe explicitly via INNO_SETUP_ISCC (which build.py prefers over
-      # every default location).
+  build:
+    needs: test
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        variant: [cpu, gpu]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install (hash-checked)
+        shell: pwsh
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          $lock = if ($env:VARIANT -eq 'gpu') { 'requirements-gpu.lock' } else { 'requirements.lock' }
+          python -m pip install --require-hashes -r $lock
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m pip install --require-hashes -r installer/requirements-build.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Install Inno Setup (pinned)
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = 'is-' + $env:INNO_VERSION.Replace('.', '_')
-          $url = "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$env:INNO_VERSION.exe"
           $exe = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_VERSION.exe"
-          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-          $got = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLower()
-          if ($got -ne $env:INNO_SHA256) {
-            throw "innosetup-$env:INNO_VERSION.exe sha256 $got != pinned $env:INNO_SHA256 -- refusing to run it"
-          }
-          $dir = Join-Path $env:RUNNER_TEMP "InnoSetup-$env:INNO_VERSION"
-          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
-            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$dir`"")
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$env:INNO_VERSION.exe" -OutFile $exe
+          if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLower() -ne $env:INNO_SHA256) { throw 'Inno Setup hash mismatch' }
+          $dir = Join-Path $env:RUNNER_TEMP "InnoSetup"
+          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$dir`"")
           if ($p.ExitCode -ne 0) { throw "Inno Setup installer exited $($p.ExitCode)" }
-          $iscc = Join-Path $dir 'ISCC.exe'
-          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe not found at $iscc" }
-          "INNO_SETUP_ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Inno Setup $env:INNO_VERSION -> $iscc"
-
-      - name: Sync installer + app version with tag
-        shell: powershell
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v\d+\.\d+\.\d+') { $tag = "v0.0.0-${{ github.run_number }}" }
-          $ver = $tag.TrimStart('v')
-          Write-Host "Stamping app + installer with version $ver"
-          (Get-Content face_service\_version.py) -replace '(__version__\s*=\s*")[^"]+(")', "`$1$ver`$2" | Set-Content face_service\_version.py
-          (Get-Content installer\installer.iss) -replace '(#define MyAppVersion ")[^"]+(")', "`$1$ver`$2" | Set-Content installer\installer.iss
-
-      # The Credential Provider DLL is built by installer/build.py (step 1), into
-      # build-cp/. There is deliberately no separate CMake step here and no
-      # SKIP_CP: if the DLL cannot be built, the release must fail rather than
-      # ship an installer whose face tile can never appear.
-      #
-      # Half 1 = steps 0-5: models, CP DLL, signing policy, PyInstaller, staging and THE GATE
-      # (tools/verify_frozen_entrypoints.py against the staged bundle -- entry points, PYZ,
-      # numpy native imports, KNOWN_ISSUES #5 mines 1-3, the class guard over every extension
-      # and vendor frozen/computed import -- plus tools/packaging_selftest.py, model hashes and
-      # the staged CP signature). Any failure fails the job before ISCC exists in the picture.
-      #
-      # --allow-unsigned-cp: CI holds no code-signing certificate for the DLL, so without the flag
-      # build.py refuses (8a F-13: an unsigned DLL must be a decision, not an accident). The
-      # choice is recorded in dist\WindowsFaceUnlock.gate.json. SignPath below signs the
-      # installer only; credential_provider/SIGNING.md explains why the DLL signature does not
-      # decide whether the lock-screen tile loads.
-      - name: Build half 1 - stage + gate
-        shell: powershell
-        run: python installer\build.py --half 1 --allow-unsigned-cp
-
-      # Half 2 = steps 6-7: refuses unless the gate stamp matches dist\ byte for byte.
-      - name: Build half 2 - Inno Setup + checksums
-        shell: powershell
-        run: python installer\build.py --half 2
-
-      - name: Detect SignPath config
-        id: signcheck
-        shell: powershell
-        run: |
-          if ($env:SIGNPATH_API_TOKEN -and $env:SIGNPATH_ORG_ID -and $env:SIGNPATH_PROJECT_SLUG) {
-            "have_signpath=true"  | Out-File -Append $env:GITHUB_OUTPUT
-            Write-Host "SignPath secrets detected — installer will be signed."
-          } else {
-            "have_signpath=false" | Out-File -Append $env:GITHUB_OUTPUT
-            Write-Host "SignPath secrets absent — publishing unsigned installer."
-          }
-
-      - name: Upload unsigned installer for SignPath
-        if: steps.signcheck.outputs.have_signpath == 'true'
-        id: upload_unsigned
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2 (v4)
-        with:
-          name: installer-unsigned
-          path: installer_output\WindowsFaceUnlock-Setup-*.exe
-          retention-days: 1
-
-      - name: Submit to SignPath
-        if: steps.signcheck.outputs.have_signpath == 'true'
-        uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e  # v1.3 (v1)
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
-          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: release-signing
-          github-artifact-id: ${{ steps.upload_unsigned.outputs.artifact-id }}
-          artifact-configuration-slug: installer
-          wait-for-completion: true
-          output-artifact-directory: installer_output
-
-      - name: Regenerate checksum (covers signed & unsigned)
-        shell: powershell
-        run: |
-          Get-ChildItem installer_output\WindowsFaceUnlock-Setup-*.exe | ForEach-Object {
-            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$hash  $($_.Name)" | Set-Content ($_.FullName + '.sha256') -Encoding ascii
-          }
-
-      - name: Collect artefacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2 (v4)
-        with:
-          name: installer
-          path: |
-            installer_output\WindowsFaceUnlock-Setup-*.exe
-            installer_output\WindowsFaceUnlock-Setup-*.exe.sha256
-
-      - name: Publish GitHub Release
+          "INNO_SETUP_ISCC=$(Join-Path $dir 'ISCC.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Check the tag against the version (F-222)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2 (v2)
+        shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if ($env:REF_NAME -notmatch '^v\d+\.\d+\.\d+$') { Write-Error "not a release tag: $env:REF_NAME"; exit 1 }
+          $v = python -c "from face_service._version import __version__ as v; print(v)"
+          if ("v$v" -ne $env:REF_NAME) { Write-Error "tag $env:REF_NAME != face_service/_version.py $v"; exit 1 }
+      - name: Build (unsigned in this job)
+        shell: pwsh
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          cmake --version
+          python installer/build.py --variant $env:VARIANT
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          files: |
-            installer_output/WindowsFaceUnlock-Setup-*.exe
-            installer_output/WindowsFaceUnlock-Setup-*.exe.sha256
-          draft: false
+          name: installer-${{ matrix.variant }}-unsigned
+          path: |
+            installer_output/WindowsFaceUnlock-Setup-*-${{ matrix.variant }}.exe*
+            dist/WindowsFaceUnlock.gate.json
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist-${{ matrix.variant }}
+          path: |
+            dist/WindowsFaceUnlock
+            dist/WindowsFaceUnlock.build-env.json
+          retention-days: 3
+
+  sign:
+    needs: build
+    if: vars.AZURE_CLIENT_ID != ''
+    runs-on: windows-2022
+    timeout-minutes: 120
+    environment: release-signing
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        variant: [cpu, gpu]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install (hash-checked)
+        shell: pwsh
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          $lock = if ($env:VARIANT -eq 'gpu') { 'requirements-gpu.lock' } else { 'requirements.lock' }
+          python -m pip install --require-hashes -r $lock
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m pip install --require-hashes -r installer/requirements-build.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: dist-${{ matrix.variant }}
+          path: dist
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906  # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Sign, re-gate, package (signing tools are provisioned in 9f)
+        shell: pwsh
+        env:
+          VARIANT: ${{ matrix.variant }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_CODESIGN_ENDPOINT: ${{ vars.AZURE_CODESIGN_ENDPOINT }}
+          AZURE_CODESIGN_ACCOUNT: ${{ vars.AZURE_CODESIGN_ACCOUNT }}
+          AZURE_CODESIGN_PROFILE: ${{ vars.AZURE_CODESIGN_PROFILE }}
+          FU_SIGN_SUBJECT: ${{ vars.FU_SIGN_SUBJECT }}
+        run: |
+          python installer/build.py --variant $env:VARIANT --resign
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python installer/build.py --variant $env:VARIANT --half 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: installer-${{ matrix.variant }}-signed
+          path: |
+            installer_output/WindowsFaceUnlock-Setup-*-${{ matrix.variant }}.exe*
+            dist/WindowsFaceUnlock.gate.json
+
+  publish:
+    needs: [build, sign]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.sign.result != 'failure'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: installer-*
+          path: out
+      - name: Pick the signed build when there is one
+        shell: bash
+        run: |
+          mkdir release
+          for v in cpu gpu; do
+            src="out/installer-$v-signed"; [ -d "$src" ] || src="out/installer-$v-unsigned"
+            cp "$src"/installer_output/* release/
+          done
+          ls -l release
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          files: release/*
+          draft: true
           prerelease: false
+          make_latest: false
           generate_release_notes: true

@@ -275,6 +275,8 @@ class Recognizer:
 
         _prep_cuda_dlls()  # must run before any CUDA session is created
         import onnxruntime as ort
+        from .ort_privacy import disable_ort_telemetry
+        disable_ort_telemetry()          # Stage 9 (§2.11): before the first session
         try:
             ort.preload_dlls()
         except Exception as e:  # pragma: no cover - defensive
@@ -294,6 +296,17 @@ class Recognizer:
             **({"root": str(root)} if root is not None else {}),
         )
         app.prepare(ctx_id=ctx_id, det_size=(DET_SIZE, DET_SIZE))
+        # Stage 9 (D-76): get_available_providers() lists what the wheel was COMPILED with, so a
+        # machine without NVIDIA never warned. Log what each session actually runs on, and warn
+        # when CUDA was asked for and did not come up.
+        for task_name, model in getattr(app, "models", {}).items():
+            try:
+                got = list(model.session.get_providers())
+            except Exception:
+                continue
+            log.info("model %s runs on %s", task_name, ", ".join(got))
+            if "CUDAExecutionProvider" in providers and "CUDAExecutionProvider" not in got:
+                log.warning("model %s fell back to the CPU (CUDA was requested)", task_name)
 
         # Warmup so the first real verify_frame doesn't pay CUDA kernel init. A black frame has no
         # face, so its get() runs the DETECTOR only (Stage 9, D-77: the landmark models run per

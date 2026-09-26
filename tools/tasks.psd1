@@ -1,7 +1,8 @@
-# The Face Unlock scheduled tasks. THIS IS THE ONLY PLACE THEY ARE LISTED.
+# The Face Unlock scheduled tasks for the DEVELOPER layout (tools/register_tasks.ps1 -Mode Dev).
+# Stage 9 (act 9b R17): an installed copy registers the same three tasks through
+# face_service/taskreg.py (TASKS); tools/packaging_selftest.py keeps the two lists equal.
 #
-# tools/register_tasks.ps1 registers, unregisters and starts exactly what is
-# declared here, in both layouts:
+# The layouts, for reference:
 #
 #   Dev       -- .venv\Scripts\pythonw.exe <DevArgs>, working dir = repo root
 #   Installed -- <InstallDir>\<InstalledExe>,          working dir = InstallDir
@@ -52,8 +53,9 @@
             # the honest skip, so this line was flipped LAST: 7d-D made the
             # matcher layout-aware, 7d-H added the third Analysis to
             # installer/windows_face_unlock.spec, and only then did this change.
-            # Until it is exercised on a real installed machine, treat the
-            # installed restart path as untested rather than proven.
+            # (Stage 9, D-128: the installed restart path HAS run on a real machine -- 9 restarts in
+            # watchdog.log, 08-08..09-25; installed copies are now registered by
+            # face_service/taskreg.py, whose TASKS mirror this list.)
             InstalledExe = 'face_unlock_watchdog.exe'
             SkipReason   = ''
             RestartOnFailure = $true

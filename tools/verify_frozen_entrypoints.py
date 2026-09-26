@@ -95,7 +95,10 @@ from PyInstaller.archive.readers import CArchiveReader
 
 REPO = Path(__file__).resolve().parent.parent
 DIST = REPO / "dist" / "WindowsFaceUnlock"
-INTERNAL = DIST / "_internal"
+# (Stage 9, D-124: the unused INTERNAL / MINE1_MODULE constants are gone.)
+
+# F-245: the bytecode readers below are verified for these interpreters only.
+SUPPORTED_PY = ((3, 10), (3, 14))
 
 # The spec's three Analysis targets, paired with the EXE each one produces.
 ENTRIES = (
@@ -107,14 +110,17 @@ ENTRIES = (
 # The EXE that runs recognition: mines 1-3 all fired inside FaceAnalysis.get().
 SERVICE_EXE = "face_service.exe"
 
-# Absolute targets the entry points import by name.
-REQUIRED_MODULES = (
-    "face_service.service",
-    "presence_monitor.monitor",
-    "presence_monitor.enroll_gui",
-    "presence_monitor.password_gui",
-    "tools.pipe_client",
-)
+# Absolute targets the entry points import by name -- per EXE (Stage 9, D-121: each EXE has its
+# OWN PYZ; the union of the three proved nothing about the one that imports the module).
+REQUIRED_MODULES = {
+    "face_service.service": "face_service.exe",
+    "presence_monitor.monitor": "face_unlock_tray.exe",
+    "presence_monitor.enroll_gui": "face_unlock_tray.exe",
+    "presence_monitor.password_gui": "face_unlock_tray.exe",
+    "tools.pipe_client": "face_unlock_tray.exe",
+    "face_service.taskreg": "face_unlock_tray.exe",
+    "face_service.watchdog": "face_unlock_watchdog.exe",
+}
 
 MODULE_NAME_RE = re.compile(rb"numpy(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 
@@ -130,7 +136,6 @@ PROJECT_ROOTS = frozenset({"face_service", "presence_monitor", "tools"})
 PYINSTALLER_ROOT_PREFIXES = ("pyimod", "pyi_", "_pyi_", "PyInstaller")
 
 # --------------------------------------------------------------------------- mine data
-MINE1_MODULE = "scipy._cyutility"
 MINE2_MODULES = (
     "scipy._external",
     "scipy._external.array_api_compat",
@@ -263,6 +268,38 @@ def header(title: str) -> None:
     print("=" * 78)
     print(title)
     print("=" * 78)
+
+
+def pe_content_digest(path: Path) -> str:
+    """SHA-256 of a PE file with the CheckSum field, the security (certificate) directory entry and
+    the certificate table left out -- the same bytes before and after Authenticode signing. Up to
+    7 zero bytes of alignment padding in front of the table are ignored too."""
+    import struct
+    data = path.read_bytes()
+    try:
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe:pe + 4] != b"PE\0\0":
+            raise ValueError("no PE signature")
+        opt = pe + 24
+        magic = struct.unpack_from("<H", data, opt)[0]
+        dd = opt + (112 if magic == 0x20B else 96)
+        checksum = opt + 64
+        secdir = dd + 4 * 8
+        cert_off, cert_size = struct.unpack_from("<II", data, secdir)
+    except (struct.error, ValueError):
+        return hashlib.sha256(data).hexdigest()
+    body_end = cert_off if cert_off and cert_size else len(data)
+    tail = data[body_end + cert_size:] if cert_off and cert_size else b""
+    body = data[:body_end]
+    stripped = body.rstrip(b"\0")
+    if len(body) - len(stripped) < 8:
+        body = stripped
+    h = hashlib.sha256()
+    h.update(data[:checksum])
+    h.update(data[checksum + 4:secdir])
+    h.update(body[secdir + 8:])
+    h.update(tail)
+    return h.hexdigest()
 
 
 def sha256_file(path: Path) -> str:
@@ -485,7 +522,9 @@ def bytecode_relative_imports(code) -> list[str]:
                 continue
             level = None
             for back in (i - 2, i - 1):
-                if back >= 0 and instrs[back].opname == "LOAD_CONST" and isinstance(instrs[back].argval, int):
+                # F-245: from Python 3.14 small ints load with LOAD_SMALL_INT.
+                if back >= 0 and instrs[back].opname in ("LOAD_CONST", "LOAD_SMALL_INT") \
+                        and isinstance(instrs[back].argval, int):
                     level = instrs[back].argval
                     break
             if level:
@@ -543,12 +582,11 @@ def pass_pyz(rep: Report, bundle: Bundle) -> None:
             print(f"  {exe_name}: {len(bundle.pyz_by_exe[exe_name])} module names")
         else:
             rep.fail(f"{exe_name}: not built, no PYZ to read")
-    names = bundle.pyz_all
-    for mod in REQUIRED_MODULES:
-        if mod in names:
-            rep.ok(mod)
+    for mod, exe_name in REQUIRED_MODULES.items():
+        if mod in bundle.pyz_by_exe.get(exe_name, set()):
+            rep.ok(f"{mod} in {exe_name}")
         else:
-            rep.fail(f"{mod} absent from PYZ")
+            rep.fail(f"{mod} absent from the PYZ of {exe_name}")
 
 
 # --------------------------------------------------------------------------- 4
@@ -593,10 +631,12 @@ def pass_native(rep: Report, bundle: Bundle) -> None:
     rep.ok(f"{ext_rel.as_posix()} present ({bundled.stat().st_size:,} bytes)")
 
     if installed.is_file():
-        h_b = sha256_file(bundled)
-        h_i = sha256_file(installed)
+        # F-240: compared WITHOUT the Authenticode certificate table, the security-directory entry
+        # and the PE checksum -- signing the bundle (R18) changes exactly those and nothing else.
+        h_b = pe_content_digest(bundled)
+        h_i = pe_content_digest(installed)
         if h_b == h_i:
-            rep.ok(f"identical to the installed numpy ({h_b[:16]}...)")
+            rep.ok(f"identical to the installed numpy, signature aside ({h_b[:16]}...)")
         else:
             rep.fail("the bundled extension differs from the installed one")
 
@@ -872,10 +912,21 @@ def pass_class(rep: Report, bundle: Bundle, dirs: list[Path]) -> None:
     unresolved: list[str] = []
     hits_by_module: dict[str, list[tuple[int, str]]] = {}
     origin: dict[str, Path] = {}
+    not_namespace: list[str] = []
     for name, path in modules.items():
         src = path if path is not None else resolve_source(name, dirs)
         if src is None:
             unresolved.append(name)     # namespace packages have no source to scan
+            # D-122: a module with no source that is NOT a namespace package is a miss -- the
+            # interpreter scanned here is not the one the bundle was built from.
+            try:
+                import importlib.util
+                spec = importlib.util.find_spec(name)
+                if spec is not None and spec.origin not in (None, "namespace") \
+                        and not str(spec.origin).lower().endswith((".pyd", ".dll")):
+                    not_namespace.append(name)
+            except Exception:
+                pass
             continue
         try:
             text = src.read_text(encoding="utf-8", errors="replace")
@@ -895,6 +946,28 @@ def pass_class(rep: Report, bundle: Bundle, dirs: list[Path]) -> None:
     if scanned == 0:
         rep.fail("no vendor module could be matched to its source -- wrong interpreter?")
         return
+    if not_namespace:
+        rep.fail(f"{len(not_namespace)} vendor module(s) have no source here although they are not "
+                 f"namespace packages ({', '.join(not_namespace[:5])}) -- this interpreter is not "
+                 "the one that built the bundle (D-122)")
+    env_file = bundle.dist.parent / (bundle.dist.name + ".build-env.json")
+    if env_file.is_file():
+        import json
+        from importlib import metadata
+        recorded = json.loads(env_file.read_text(encoding="utf-8"))
+        changed = []
+        for dist_name, ver in recorded.items():
+            try:
+                now = metadata.version(dist_name)
+            except metadata.PackageNotFoundError:
+                now = None
+            if now != ver:
+                changed.append(f"{dist_name} {ver} -> {now}")
+        if changed:
+            rep.fail("the build interpreter's packages changed since PyInstaller ran (6b would scan "
+                     f"code that does not ship): {', '.join(changed[:5])}")
+        else:
+            rep.ok(f"the scanned interpreter is the one that built the bundle ({len(recorded)} packages)")
     unreviewed = 0
     reviewed_hits = 0
     used_keys: set[str] = set()
@@ -934,6 +1007,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--passes", default=",".join(ALL_PASSES),
                     help="comma-separated subset of: " + ",".join(ALL_PASSES))
     args = ap.parse_args(argv)
+    # F-246: a non-Latin path must not crash the report when stdout is a pipe in a legacy code page.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
+    if not (SUPPORTED_PY[0] <= sys.version_info[:2] <= SUPPORTED_PY[1]):
+        print(f"RESULT: Python {sys.version.split()[0]} is outside the verified range "
+              f"{SUPPORTED_PY} (F-245). NOT clear to go to ISCC.")
+        return 1
 
     dist = (args.dist or DIST).resolve()
     passes = [p.strip() for p in args.passes.split(",") if p.strip()]

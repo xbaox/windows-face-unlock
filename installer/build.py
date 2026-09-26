@@ -1,51 +1,45 @@
-"""End-to-end installer build.
+"""End-to-end installer build (Stage 9, act 9b R17 / R18).
 
-Runs these steps in order (numbered 0-7):
-  0. check the buffalo_l recognition pack: all five files present, SHA-256 pinned
-  1. build the Credential Provider DLL via CMake (Release x64) into build-cp/
-  2. Authenticode-sign the CP DLL with the pinned certificate (SIGN_CP) and verify
-     the signer thumbprint
-  3. run PyInstaller on installer/windows_face_unlock.spec
-  4. stage the CP DLL, the task registrar and the docs into the dist folder
-  5. THE GATE: tools/verify_frozen_entrypoints.py against the staged bundle,
-     tools/packaging_selftest.py, model hashes and the CP signature of the staged
-     copy; on success writes a gate stamp next to the bundle
-  6. compile installer/installer.iss with Inno Setup -- refused unless the gate
-     stamp matches the bundle byte for byte
-  7. emit SHA-256 checksums next to the installer
+    python installer\\build.py --variant cpu          (the main variant)
+    python installer\\build.py --variant gpu          (NVIDIA; needs requirements-gpu.lock)
 
-Two official halves, so the operator dist-smoke (installer/README.md, "The gate")
-can sit between the automated gate and ISCC:
+Steps, in this order (the signing order is R18's):
+  0. preflight -- cmake, ISCC, PyInstaller, the variant's packages; the output directory for this
+     variant is cleaned (F-220, F-221: fail in seconds, not after the whole build)
+  1. build the Credential Provider DLL (CMake, Release x64)
+  2. sign the CP DLL                                   -- Azure Trusted Signing, or LOUDLY SKIPPED
+  3. PyInstaller (FU_VARIANT=<variant>), then stage the CP DLL, the docs and the LGPL texts
+  4. GPU only: every shipped NVIDIA DLL is checked with Authenticode (signed by NVIDIA Corporation)
+     and never modified; unsigned ones need a catalog signature (.cat) under our identity --
+     LOUDLY SKIPPED without signing credentials, recorded in the stamp
+  5. sign every unsigned PE of ours in the bundle -- never NVIDIA's, never an already-signed file
+                                                       -- Azure Trusted Signing, or LOUDLY SKIPPED
+  6. THE GATE on the (signed) bundle: verify_frozen_entrypoints (PE content compared WITHOUT the
+     certificate table and checksum), packaging_selftest, the frozen custody self-check, no model
+     in the bundle, the variant's shape (CPU: no CUDA provider and no NVIDIA file; GPU: exactly the
+     allowlist), the CP DLL; then the stamp
+  7. ISCC (version, variant and the model pins as /D defines; SignTool + SignedUninstaller only
+     with credentials); the EXACT file ISCC was told to write is the artefact (F-220); the bundle
+     is re-hashed after ISCC and must still match the stamp (F-225)
+  8. SHA-256 sidecar and a build-info sidecar (manifest, git head, variant, signing state)
 
-    python installer\\build.py --half 1    steps 0-5: stage + gate, writes the stamp
-    (operator dist-smoke out of dist\\WindowsFaceUnlock)
-    python installer\\build.py --half 2    steps 6-7: Inno Setup + checksums
+Signing (R18, P-24): Azure Trusted Signing through signtool + the Azure.CodeSigning dlib, when all
+of AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CODESIGN_ENDPOINT, AZURE_CODESIGN_ACCOUNT,
+AZURE_CODESIGN_PROFILE, SIGNTOOL and AZURE_CODESIGN_DLIB are set (in CI: OIDC). The expected
+signer is pinned by subject (FU_SIGN_SUBJECT) and every signed file must verify 'Valid'. Without
+the credentials every signing step says SKIPPED and why; the build still completes (until 9f).
 
-With no --half the whole 0-7 chain runs, gate included. Also:
-
-    --gate-only       re-run step 5 on the existing dist (e.g. after a smoke) and
-                      re-stamp it; nothing is rebuilt
-    --check-models    run step 0 only (CI calls this right after fetching the pack)
-    --allow-unsigned-cp
-                      build without SIGN_CP. See step_sign_cp for why this is an
-                      explicit opt-out rather than the default.
-
-Intended to run both locally and in CI. Environment:
-    SIGN_CP         -- 40-hex thumbprint of the code-signing certificate for the
-                       CP DLL (CurrentUser\\My or LocalMachine\\My). Required unless
-                       --allow-unsigned-cp or SKIP_CP=1.
-    INNO_SETUP_ISCC -- full path to ISCC.exe (default: search known locations/PATH)
-    SKIP_CP         -- set to 1 to build a presence-auto-lock-only installer
-                       with no Credential Provider. This is the ONLY way to
-                       skip the DLL; a failing CP build aborts the run.
+    --half 1 / --half 2     steps 0-6 / steps 7-8 (the operator dist-smoke sits between)
+    --gate-only             re-run step 6 on the existing dist
+    --resign                on an existing dist: steps 2, 4, 5, 6 (the CI sign job)
 """
 from __future__ import annotations
+
 import argparse
 import datetime
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -53,32 +47,28 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER_DIR = REPO_ROOT / "installer"
-CP_DIR = REPO_ROOT / "credential_provider"          # C++ sources
-CP_BUILD_DIR = REPO_ROOT / "build-cp"               # CMake tree for the CP DLL
+CP_DIR = REPO_ROOT / "credential_provider"
+CP_BUILD_DIR = REPO_ROOT / "build-cp"
 TOOLS_DIR = REPO_ROOT / "tools"
 DIST_DIR = REPO_ROOT / "dist"
-DIST_ROOT = DIST_DIR / "WindowsFaceUnlock"          # installer.iss BuildRoot
-BUILD_DIR = REPO_ROOT / "build"                     # PyInstaller work dir, unrelated to CP
+DIST_ROOT = DIST_DIR / "WindowsFaceUnlock"
+BUILD_DIR = REPO_ROOT / "build"
 OUTPUT_DIR = REPO_ROOT / "installer_output"
 ISS = INSTALLER_DIR / "installer.iss"
 CP_DLL_NAME = "FaceCredentialProvider.dll"
-
-# Written by the gate, read by Inno Setup's step. Lives NEXT TO the bundle, not in it:
-# installer.iss packs dist\WindowsFaceUnlock\*, and PyInstaller's step wipes dist\,
-# so a fresh build can never inherit a stale stamp.
 GATE_STAMP = DIST_DIR / "WindowsFaceUnlock.gate.json"
-GATE_STAMP_SCHEMA = 1
+GATE_STAMP_SCHEMA = 2
+TOTAL_STEPS = 8
 
-TOTAL_STEPS = 7
-
-# Stage 9 (act 9b R7): the pins live in face_service/model_pins.py -- the ONE source that build.py,
-# the installer generator and the service all read (F-38: a substituted model is a wrong-party
-# unlock). This file keeps no SHA literal of its own.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from face_service.model_pins import BUFFALO_FILES, BUFFALO_ZIP_SHA256  # noqa: E402
+sys.path.insert(0, str(REPO_ROOT))
+from face_service._version import __version__ as VERSION  # noqa: E402
+from face_service.model_pins import (BUFFALO_FILES, BUFFALO_ZIP_BYTES,  # noqa: E402
+                                     BUFFALO_ZIP_SHA256, BUFFALO_ZIP_URL)
 
 MODEL_SHA256 = {name: digest for name, (_size, digest) in BUFFALO_FILES.items()}
-MODELS_PACK = Path.home() / ".insightface" / "models" / "buffalo_l"
+AZURE_VARS = ("AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CODESIGN_ENDPOINT",
+              "AZURE_CODESIGN_ACCOUNT", "AZURE_CODESIGN_PROFILE", "SIGNTOOL", "AZURE_CODESIGN_DLIB")
+NVIDIA_SUBJECT = "CN=NVIDIA Corporation"
 
 
 class BuildAbort(RuntimeError):
@@ -89,36 +79,26 @@ def log(msg: str) -> None:
     print(f"[build] {msg}", flush=True)
 
 
+def loud(msg: str) -> None:
+    bar = "!" * 78
+    print(f"[build] {bar}\n[build] {msg}\n[build] {bar}", flush=True)
+
+
 def step(n: int, msg: str) -> None:
     log(f"step {n}/{TOTAL_STEPS} -- {msg}")
 
 
-def run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> None:
+def run(cmd: list, cwd: "Path | None" = None, env: "dict | None" = None) -> None:
     log("$ " + " ".join(str(c) for c in cmd))
-    subprocess.check_call(cmd, cwd=str(cwd) if cwd else None, env=env)
+    try:
+        subprocess.check_call([str(c) for c in cmd], cwd=str(cwd) if cwd else None, env=env)
+    except FileNotFoundError as e:
+        raise BuildAbort(f"{cmd[0]} was not found ({e}). Install it or put it on PATH.") from e
 
 
-def python_exe() -> str:
-    return sys.executable
-
-
-def gate_no_models(dist_root: Path) -> None:
-    """Stage 9 (act 9b R7, F-259): buffalo_l is not redistributed -- the installer downloads it.
-    Fail the build if ANY file of the pack (by name, or by size + SHA-256 under any name) or any
-    directory named buffalo_l / insightface_home is inside the bundle."""
-    names = set(MODEL_SHA256)
-    sizes = {size for size, _d in BUFFALO_FILES.values()}
-    found = []
-    for p in dist_root.rglob("*"):
-        if p.is_dir() and p.name.lower() in ("buffalo_l", "insightface_home"):
-            found.append(str(p.relative_to(dist_root)))
-        elif p.is_file() and (p.name in names or (p.stat().st_size in sizes
-                                                   and sha256_file(p) in MODEL_SHA256.values())):
-            found.append(str(p.relative_to(dist_root)))
-    if found:
-        raise BuildAbort("GATE FAILED: recognition models are inside the bundle ("
-                         + ", ".join(found[:5]) + ") -> decision 9-02: the installer downloads "
-                         "them; nothing may redistribute them -> refusing.")
+def child_env(**extra) -> dict:
+    """F-246: UTF-8 stdio for every Python child, whatever the console code page."""
+    return dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", **extra)
 
 
 def sha256_file(path: Path) -> str:
@@ -129,281 +109,245 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-# --------------------------------------------------------------------------- 0
-def verify_model_pack(pack: Path, where: str) -> None:
-    missing = [n for n in MODEL_SHA256 if not (pack / n).is_file()]
-    if missing:
-        raise BuildAbort(
-            f"buffalo_l is incomplete in {pack} ({where}): missing {', '.join(missing)}.\n"
-            "The installer ships the recognition models, so this build machine must have a "
-            "complete pack. Populate it (run the service once with an internet connection, or "
-            "copy the five .onnx files there) and re-run."
-        )
-    bad = []
-    for name, want in MODEL_SHA256.items():
-        got = sha256_file(pack / name)
-        if got != want:
-            bad.append(f"{name}: sha256 {got} != pinned {want}")
-    if bad:
-        raise BuildAbort(
-            f"buffalo_l in {pack} ({where}) does not match the pinned SHA-256 -> the installer "
-            "would ship recognition models nobody reviewed (a substituted model can match the "
-            "wrong face) -> refusing. Mismatches:\n  " + "\n  ".join(bad) + "\n"
-            "Fix: restore the pack from the pinned source; the pins are in face_service/model_pins.py "
-            "only as a deliberate, reviewed model change."
-        )
+def artefact_name(variant: str) -> str:
+    return f"WindowsFaceUnlock-Setup-{VERSION}-{variant}.exe"
 
 
-def step_check_models() -> Path:
-    """Fail before PyInstaller if the buffalo_l pack is incomplete or not the pinned one.
-
-    The spec bundles the five recognition models, so the build machine's own
-    %USERPROFILE%\\.insightface IS the source of what ships. Checking here rather
-    than only inside the spec buys a readable failure at the top of the run
-    instead of a stack trace 40 minutes in, and keeps the reason in the build log.
-
-    An installer built without these produces exactly the gap Stage 7d exists to
-    close: a machine that cannot sign in offline and silently retries a ~290 MB
-    download instead of saying so. An installer built with DIFFERENT ones ships
-    unreviewed recognition models (8a F-38), hence the SHA-256 pins.
-    """
-    step(0, "check the buffalo_l recognition pack (presence + SHA-256)")
-    verify_model_pack(MODELS_PACK, "build machine")
-    zip_path = MODELS_PACK.parent / "buffalo_l.zip"
-    if zip_path.is_file():
-        got = sha256_file(zip_path)
-        if got != BUFFALO_ZIP_SHA256:
-            raise BuildAbort(
-                f"{zip_path} sha256 {got} != pinned {BUFFALO_ZIP_SHA256} -> the pack next to it "
-                "came from an archive nobody reviewed -> refusing. Fix: delete both and re-fetch "
-                "from the pinned source."
-            )
-        log("buffalo_l.zip matches the pinned SHA-256")
-    total = sum((MODELS_PACK / n).stat().st_size for n in MODEL_SHA256)
-    log(f"buffalo_l complete and pinned: {len(MODEL_SHA256)} files, {total / (1024 * 1024):.0f} MiB")
-    return MODELS_PACK
+def iscc_defines(variant: str) -> "list[str]":
+    """Everything installer.iss takes from outside: version, variant, the model pins."""
+    d = [f"/DMyAppVersion={VERSION}", f"/DVariant={variant}", f"/DBuffaloURL={BUFFALO_ZIP_URL}",
+         f"/DBuffaloSHA256={BUFFALO_ZIP_SHA256}", f"/DBuffaloBytes={BUFFALO_ZIP_BYTES}"]
+    for i, (name, (_size, sha)) in enumerate(BUFFALO_FILES.items(), 1):
+        d += [f"/DModel{i}={name}", f"/DModelSHA{i}={sha}"]
+    return d
 
 
-# --------------------------------------------------------------------------- 1
-def cp_skipped() -> bool:
-    return os.environ.get("SKIP_CP") == "1"
+# ---------------------------------------------------------------------------------- signing
+def azure_ready() -> bool:
+    return all(os.environ.get(v) for v in AZURE_VARS)
 
 
-def step_build_cp() -> Path | None:
-    """Build the Credential Provider DLL into build-cp/ (repo root).
-
-    Two deliberate properties:
-
-    * The tree is build-cp/ at the repo root, never a subdirectory of the
-      sources. build-cp/ is what LogonUI's registered CLSID actually points at,
-      and it is NOT wiped first: a build script has no business deleting the
-      DLL the lock screen is currently loading. CMake rebuilds incrementally.
-    * A CP build failure is fatal. It used to be swallowed, so a broken
-      toolchain silently produced an installer whose face tile could never
-      appear. Opting out is now explicit and only via SKIP_CP=1.
-    """
-    if cp_skipped():
-        step(1, "skipping Credential Provider DLL (SKIP_CP=1)")
-        return None
-    step(1, "build Credential Provider DLL")
-    run(["cmake", "-S", CP_DIR.name, "-B", CP_BUILD_DIR.name, "-A", "x64",
-         "-G", "Visual Studio 17 2022"], cwd=REPO_ROOT)
-    run(["cmake", "--build", CP_BUILD_DIR.name, "--config", "Release"], cwd=REPO_ROOT)
-    dll = CP_BUILD_DIR / "Release" / CP_DLL_NAME
-    if not dll.exists():
-        raise BuildAbort(
-            f"cmake reported success but {dll} is missing. Set SKIP_CP=1 to build "
-            "a presence-auto-lock-only installer on purpose."
-        )
-    return dll
-
-
-# --------------------------------------------------------------------------- 2
-def resolve_sign_policy(allow_unsigned: bool) -> dict:
-    """Decide, BEFORE anything is built, how the CP DLL will be signed.
-
-    Defect (8a F-13): signing was a silent no-op without SIGN_CP -> the 7l rebuild
-    shipped an unsigned DLL although 7d-L5 had signed one -> nobody noticed until the
-    audit. Fix: SIGN_CP=<thumbprint> is REQUIRED for a build with a CP; building
-    without it takes the explicit --allow-unsigned-cp and says so loudly in the log
-    and in the gate stamp. A signature does not decide whether LogonUI loads the tile
-    (credential_provider/SIGNING.md), which is why an opt-out exists at all -- CI has
-    no certificate -- but an unsigned build must be a decision, never an accident.
-
-    SIGN_CP=self is refused: a certificate minted during the build has no thumbprint
-    anyone could have pinned, so "is this the signer we meant" is unanswerable. Create
-    the development certificate once with tools\\sign_cp.ps1 -SelfSigned and pass its
-    thumbprint.
-    """
-    if cp_skipped():
-        return {"mode": "skip_cp", "thumbprint": None}
-    raw = os.environ.get("SIGN_CP", "")
-    tp = raw.replace(" ", "").strip()
-    if not tp:
-        if allow_unsigned:
-            log("WARNING: SIGN_CP is not set and --allow-unsigned-cp was given -> the CP DLL "
-                "ships UNSIGNED (recorded in the gate stamp).")
-            return {"mode": "unsigned-allowed", "thumbprint": None}
-        raise BuildAbort(
-            "SIGN_CP is not set -> the CP DLL would ship unsigned (8a F-13: the 7l rebuild did "
-            "exactly this, silently) -> refusing.\n"
-            "Fix: set SIGN_CP to the 40-hex thumbprint of the code-signing certificate, e.g.\n"
-            "    $env:SIGN_CP = '13F9BB6228DDD5B039628D1B0CEF1B598E46649C'\n"
-            "or pass --allow-unsigned-cp to build unsigned on purpose (CI does; see "
-            "credential_provider/SIGNING.md)."
-        )
-    if tp.lower() == "self":
-        raise BuildAbort(
-            "SIGN_CP=self is no longer accepted -> a certificate created during the build has "
-            "no pinned thumbprint, so the signer cannot be verified -> refusing.\n"
-            "Fix: create it once with tools\\sign_cp.ps1 -SelfSigned, then set SIGN_CP to the "
-            "thumbprint it prints."
-        )
-    if allow_unsigned:
-        raise BuildAbort("SIGN_CP is set AND --allow-unsigned-cp was given; pick one.")
-    if not re.fullmatch(r"[0-9A-Fa-f]{40}", tp):
-        raise BuildAbort(f"SIGN_CP={raw!r} is not a 40-hex certificate thumbprint.")
-    return {"mode": "pinned", "thumbprint": tp.upper()}
+def azure_missing() -> "list[str]":
+    return [v for v in AZURE_VARS if not os.environ.get(v)]
 
 
 _SIG_PS = (
     "$ErrorActionPreference = 'Stop'; "
     "$s = Get-AuthenticodeSignature -LiteralPath $env:FU_SIG_PATH; "
     "$c = $s.SignerCertificate; "
-    "[pscustomobject]@{ "
-    "Status = [string]$s.Status; "
-    "Type = [string]$s.SignatureType; "
-    "Thumbprint = $(if ($c) { $c.Thumbprint } else { '' }); "
-    "Subject = $(if ($c) { $c.Subject } else { '' }); "
-    "Message = [string]$s.StatusMessage "
+    "[pscustomobject]@{ Status = [string]$s.Status; Type = [string]$s.SignatureType; "
+    "Subject = $(if ($c) { $c.Subject } else { '' }); Message = [string]$s.StatusMessage "
     "} | ConvertTo-Json -Compress"
 )
 
 
 def authenticode(path: Path) -> dict:
-    """Get-AuthenticodeSignature, as data. The path travels in the environment, not
-    in the command line, so no quoting of spaces or quotes is ever involved."""
-    env = dict(os.environ, FU_SIG_PATH=str(path))
-    out = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-         "-Command", _SIG_PS],
-        capture_output=True, text=True, env=env,
-    )
+    """Get-AuthenticodeSignature as data (a BUILD-time check; the installer uses no PowerShell).
+    The path travels in the environment, never in the command line."""
+    out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                          "Bypass", "-Command", _SIG_PS], capture_output=True, text=True,
+                         env=dict(os.environ, FU_SIG_PATH=str(path)))
     if out.returncode != 0:
         raise BuildAbort(f"Get-AuthenticodeSignature failed on {path}: {out.stderr.strip()}")
-    return json.loads(out.stdout)
+    try:
+        return json.loads(out.stdout)
+    except ValueError as e:
+        raise BuildAbort(f"unreadable signature report for {path}: {out.stdout[:200]!r}") from e
 
 
-def verify_cp_signature(dll: Path, thumbprint: str) -> dict:
-    """The DLL carries an embedded Authenticode signature by exactly `thumbprint`.
-
-    Status 'Valid' and 'UnknownError' are both accepted: the latter is what a
-    development certificate whose root is not in this machine's trust store reports
-    (sign_cp.ps1 does not install trust unless asked). The PINNED THUMBPRINT is the
-    identity check, not the chain. NotSigned, HashMismatch (file altered after
-    signing), NotTrusted (explicitly distrusted) and anything else abort.
-    """
-    sig = authenticode(dll)
-    got = (sig.get("Thumbprint") or "").upper()
-    status = sig.get("Status")
-    if status not in ("Valid", "UnknownError"):
-        raise BuildAbort(
-            f"{dll}: Authenticode status {status} ({sig.get('Message')}) -> the CP DLL is not "
-            f"signed as required by SIGN_CP={thumbprint} -> refusing."
-        )
-    if sig.get("Type") and sig["Type"] != "Authenticode":
-        raise BuildAbort(
-            f"{dll}: signature type {sig['Type']} -> a catalog signature does not travel with "
-            "the file -> refusing. Fix: embed the signature (tools\\sign_cp.ps1)."
-        )
-    if got != thumbprint.upper():
-        raise BuildAbort(
-            f"{dll}: signed by {got or '(nobody)'} ({sig.get('Subject')}), expected "
-            f"SIGN_CP={thumbprint} -> the shipped DLL would carry a signer nobody pinned -> "
-            "refusing."
-        )
-    if status == "UnknownError":
-        log(f"note: signature chain is not trusted on this machine ({sig.get('Message')}); "
-            "accepted because the signer thumbprint is pinned")
-    log(f"CP DLL signer verified: {got} ({sig.get('Subject')}), status {status}")
-    return sig
+def azure_sign(files: "list[Path]", what: str) -> "dict":
+    """Sign ``files`` with Azure Trusted Signing and verify each ('Valid', pinned subject).
+    Without credentials: a loud SKIP, returned as data for the stamp."""
+    if not files:
+        return {"state": "nothing-to-sign", "files": 0}
+    if not azure_ready():
+        loud(f"SIGNING SKIPPED ({what}): no Azure Trusted Signing credentials "
+             f"(missing: {', '.join(azure_missing())}). {len(files)} file(s) stay UNSIGNED. "
+             "This build is not releasable until 9f.")
+        return {"state": "skipped-no-credentials", "files": len(files)}
+    meta = BUILD_DIR / "azure-codesign.json"
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text(json.dumps({"Endpoint": os.environ["AZURE_CODESIGN_ENDPOINT"],
+                                "CodeSigningAccountName": os.environ["AZURE_CODESIGN_ACCOUNT"],
+                                "CertificateProfileName": os.environ["AZURE_CODESIGN_PROFILE"]}),
+                    encoding="utf-8")
+    for chunk_start in range(0, len(files), 50):
+        chunk = files[chunk_start:chunk_start + 50]
+        run([os.environ["SIGNTOOL"], "sign", "/v", "/fd", "SHA256", "/tr",
+             "http://timestamp.acs.microsoft.com", "/td", "SHA256", "/dlib",
+             os.environ["AZURE_CODESIGN_DLIB"], "/dmdf", str(meta), *chunk])
+    subject = os.environ.get("FU_SIGN_SUBJECT", "")
+    for f in files:
+        sig = authenticode(f)
+        if sig.get("Status") != "Valid" or (subject and subject not in (sig.get("Subject") or "")):
+            raise BuildAbort(f"{f}: signature {sig.get('Status')} by {sig.get('Subject')!r} -- "
+                             f"expected Valid by {subject or '(FU_SIGN_SUBJECT not set)'}")
+    log(f"signed and verified {len(files)} file(s) ({what})")
+    return {"state": "signed", "files": len(files), "subject": subject}
 
 
-def step_sign_cp(dll: Path | None, policy: dict) -> None:
-    """Authenticode-sign the CP DLL with the pinned certificate, then VERIFY it.
-
-    Runs before step_stage so the SIGNED file is the one that reaches dist/, and the
-    gate re-verifies the staged copy. See resolve_sign_policy for why SIGN_CP is
-    required, and credential_provider/SIGNING.md -- including the part where a
-    signature is NOT what makes the lock-screen tile appear.
-    """
-    if policy["mode"] == "skip_cp" or dll is None:
-        step(2, "sign the CP DLL -- skipped (no CP in this build)")
-        return
-    if policy["mode"] == "unsigned-allowed":
-        step(2, "sign the CP DLL -- SKIPPED by --allow-unsigned-cp; the DLL ships UNSIGNED")
-        return
-    tp = policy["thumbprint"]
-    step(2, f"sign the CP DLL with {tp} and verify the signer")
-    script = TOOLS_DIR / "sign_cp.ps1"
-    run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-         "-File", str(script), "-DllPath", str(dll), "-Thumbprint", tp])
-    verify_cp_signature(dll, tp)
+# ---------------------------------------------------------------------------------------- 0
+def find_iscc() -> str:
+    env = os.environ.get("INNO_SETUP_ISCC")
+    if env and Path(env).exists():
+        return env
+    cands = [r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe", r"C:\Program Files\Inno Setup 6\ISCC.exe"]
+    if os.environ.get("LOCALAPPDATA"):
+        cands.append(str(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Inno Setup 6" / "ISCC.exe"))
+    for c in cands:
+        if Path(c).exists():
+            return c
+    exe = shutil.which("iscc") or shutil.which("ISCC")
+    if exe:
+        return exe
+    raise BuildAbort("ISCC.exe (Inno Setup 6.5+) not found: install it or set INNO_SETUP_ISCC.")
 
 
-# --------------------------------------------------------------------------- 3
-def step_pyinstaller() -> Path:
-    step(3, "PyInstaller")
+def step_preflight(variant: str, need_cp: bool) -> dict:
+    step(0, f"preflight ({variant.upper()} variant)")
+    tools = {"iscc": find_iscc()}
+    if need_cp:
+        cm = shutil.which("cmake")
+        if not cm:
+            raise BuildAbort("cmake not found (it ships inside Visual Studio 2022 Build Tools) -- "
+                             "put it on PATH, or set SKIP_CP=1 for a build without the sign-in tile.")
+        tools["cmake"] = cm
+    import importlib.util
+    if importlib.util.find_spec("PyInstaller") is None:
+        raise BuildAbort("PyInstaller missing: pip install --require-hashes -r "
+                         "installer/requirements-build.txt")
+    has_nvidia = importlib.util.find_spec("nvidia") is not None
+    if variant == "gpu" and not has_nvidia:
+        raise BuildAbort("the GPU variant needs the NVIDIA wheels: pip install --require-hashes -r "
+                         "requirements-gpu.lock (F-219: never a CPU bundle under a GPU name)")
+    if not (REPO_ROOT / "LICENSE").is_file():
+        raise BuildAbort("LICENSE is missing -- the MIT notice must ship (D-114)")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for old in OUTPUT_DIR.glob(f"WindowsFaceUnlock-Setup-*-{variant}.exe*"):
+        old.unlink()
+        log(f"removed stale output {old.name}")
+    log(f"version {VERSION}, variant {variant}, artefact {artefact_name(variant)}")
+    return tools
+
+
+def cp_skipped() -> bool:
+    return os.environ.get("SKIP_CP") == "1"
+
+
+# ---------------------------------------------------------------------------------------- 1
+def step_build_cp() -> "Path | None":
+    if cp_skipped():
+        step(1, "Credential Provider DLL -- skipped (SKIP_CP=1)")
+        return None
+    step(1, "build the Credential Provider DLL")
+    run(["cmake", "-S", CP_DIR.name, "-B", CP_BUILD_DIR.name, "-A", "x64", "-G", "Visual Studio 17 2022"],
+        cwd=REPO_ROOT)
+    run(["cmake", "--build", CP_BUILD_DIR.name, "--config", "Release"], cwd=REPO_ROOT)
+    dll = CP_BUILD_DIR / "Release" / CP_DLL_NAME
+    if not dll.exists():
+        raise BuildAbort(f"cmake reported success but {dll} is missing")
+    return dll
+
+
+# ---------------------------------------------------------------------------------------- 2
+def step_sign_cp(dll: "Path | None") -> dict:
+    step(2, "sign the CP DLL")
+    if dll is None:
+        return {"state": "no-cp"}
+    return azure_sign([dll], "Credential Provider DLL")
+
+
+# ---------------------------------------------------------------------------------------- 3
+def step_pyinstaller(variant: str, cp_dll: "Path | None") -> Path:
+    step(3, f"PyInstaller ({variant}) + staging")
     for d in (DIST_DIR, BUILD_DIR):
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
-    run([
-        python_exe(), "-m", "PyInstaller",
-        "--noconfirm", "--clean",
-        str(INSTALLER_DIR / "windows_face_unlock.spec"),
-    ], cwd=REPO_ROOT)
-    out = DIST_ROOT
-    if not out.exists():
-        raise BuildAbort(f"expected PyInstaller output at {out}")
-    return out
-
-
-# --------------------------------------------------------------------------- 4
-def step_stage(dist_root: Path, cp_dll: Path | None) -> None:
-    step(4, "stage CP DLL + task registrar + docs into dist")
-    if cp_dll and cp_dll.exists():
-        dest = dist_root / "credential_provider"
+    run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+         str(INSTALLER_DIR / "windows_face_unlock.spec")], cwd=REPO_ROOT,
+        env=child_env(FU_VARIANT=variant))
+    if not DIST_ROOT.exists():
+        raise BuildAbort(f"expected PyInstaller output at {DIST_ROOT}")
+    # D-122: the package versions the bundle was built from, so the gate can tell when it scans a
+    # different interpreter (verify_frozen_entrypoints 6b).
+    from importlib import metadata
+    (DIST_DIR / (DIST_ROOT.name + ".build-env.json")).write_text(json.dumps(
+        {d.metadata["Name"]: d.version for d in metadata.distributions() if d.metadata["Name"]},
+        indent=0, sort_keys=True), encoding="utf-8")
+    if cp_dll is not None:
+        dest = DIST_ROOT / "credential_provider"
         dest.mkdir(parents=True, exist_ok=True)
         shutil.copy2(cp_dll, dest / CP_DLL_NAME)
-        # keep the register script alongside the DLL for the installer
-        reg = CP_DIR / "register.ps1"
-        if reg.exists():
-            shutil.copy2(reg, dest / "register.ps1")
-
-    # Scheduled-task registrar + its declaration. installer.iss invokes this on
-    # install AND on uninstall, and tasks.psd1 is the only place the task list
-    # exists, so the two must travel together or neither is usable. Missing
-    # files are fatal: an installer that cannot register its tasks is not one.
-    post = dist_root / "postinstall"
-    post.mkdir(parents=True, exist_ok=True)
-    for name in ("register_tasks.ps1", "tasks.psd1"):
-        src = TOOLS_DIR / name
-        if not src.exists():
-            raise BuildAbort(f"cannot stage the task registrar: {src} is missing")
-        shutil.copy2(src, post / name)
-
-    for doc in ("README.md", "LICENSE", "INSTALL.md"):
+        # (D-114: register.ps1 is a developer tool; it no longer ships.)
+    for doc in ("LICENSE", "README.md", "INSTALL.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md"):
         p = REPO_ROOT / doc
         if p.exists():
-            shutil.copy2(p, dist_root / doc)
+            shutil.copy2(p, DIST_ROOT / doc)
+    # §2.9 (F-261): pystray's license texts beside its replaceable sources.
+    try:
+        from importlib import metadata
+        dist = metadata.distribution("pystray")
+        lic_dir = DIST_ROOT / "licenses" / "pystray"
+        lic_dir.mkdir(parents=True, exist_ok=True)
+        for f in dist.files or []:
+            if Path(str(f)).name.upper().startswith(("COPYING", "LICENSE")):
+                shutil.copy2(Path(dist.locate_file(f)), lic_dir / Path(str(f)).name)
+    except Exception as e:
+        raise BuildAbort(f"cannot stage the pystray license texts: {e!r}") from e
+    return DIST_ROOT
 
 
-# --------------------------------------------------------------------------- 5
+# ---------------------------------------------------------------------------------------- 4
+def nvidia_files(dist_root: Path) -> "list[Path]":
+    base = dist_root / "_internal" / "nvidia"
+    return sorted(base.rglob("*.dll")) if base.is_dir() else []
+
+
+def step_nvidia(variant: str, dist_root: Path) -> dict:
+    step(4, "NVIDIA files: Authenticode, never modified")
+    files = nvidia_files(dist_root)
+    if variant == "cpu":
+        if files:
+            raise BuildAbort(f"the CPU bundle contains NVIDIA files: {[f.name for f in files][:5]}")
+        return {"state": "cpu-none"}
+    signed, unsigned = [], []
+    for f in files:
+        sig = authenticode(f)
+        ok = sig.get("Status") == "Valid" and NVIDIA_SUBJECT in (sig.get("Subject") or "")
+        (signed if ok else unsigned).append(f.name)
+        log(f"  {f.name:44s} {sig.get('Status'):12s} {sig.get('Subject', '')[:40]}")
+    if unsigned:
+        if azure_ready():
+            raise BuildAbort("unsigned NVIDIA files need the catalog (.cat) path of act 9b R17, "
+                             "which is designed and verified in a VM in 9f: " + ", ".join(unsigned))
+        loud(f"GPU VARIANT: {len(unsigned)} NVIDIA DLL(s) are NOT signed by NVIDIA in the source "
+             f"packages ({', '.join(unsigned)}). They are shipped byte-for-byte (never re-signed); "
+             "the catalog signature that would cover them needs signing credentials -- SKIPPED. "
+             "The GPU installer is not releasable until 9f.")
+    return {"state": "checked", "signed_by_nvidia": signed, "unsigned": unsigned}
+
+
+# ---------------------------------------------------------------------------------------- 5
+def step_sign_bundle(dist_root: Path) -> dict:
+    step(5, "sign our unsigned PE files (never NVIDIA's, never an already-signed file)")
+    nvidia = {f.resolve() for f in nvidia_files(dist_root)}
+    todo = []
+    for f in sorted(dist_root.rglob("*")):
+        if f.suffix.lower() not in (".exe", ".dll", ".pyd") or f.resolve() in nvidia:
+            continue
+        if f.name == CP_DLL_NAME:
+            continue                              # signed on its own step
+        todo.append(f)
+    if not azure_ready():
+        return azure_sign(todo, "bundle PE files")   # loud skip, no per-file PowerShell run
+    unsigned = [f for f in todo if authenticode(f).get("Status") == "NotSigned"]
+    return azure_sign(unsigned, "bundle PE files")
+
+
+# ---------------------------------------------------------------------------------------- 6
 def bundle_manifest(dist_root: Path) -> dict:
-    """Content digest of everything ISCC will pack: sorted (path, size, sha256) lines."""
     h = hashlib.sha256()
-    files = 0
-    total = 0
+    files = total = 0
     for p in sorted(dist_root.rglob("*"), key=lambda q: q.relative_to(dist_root).as_posix().lower()):
         if not p.is_file():
             continue
@@ -415,49 +359,73 @@ def bundle_manifest(dist_root: Path) -> dict:
     return {"sha256": h.hexdigest(), "files": files, "bytes": total}
 
 
-def _git(*args: str) -> str | None:
+def _git(*args: str) -> "str | None":
     try:
-        return subprocess.run(["git", *args], cwd=str(REPO_ROOT), capture_output=True,
-                              text=True, check=True).stdout.strip()
+        return subprocess.run(["git", *args], cwd=str(REPO_ROOT), capture_output=True, text=True,
+                              check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None
 
 
-def _gate_run(label: str, cmd: list[str]) -> None:
+def _gate_run(label: str, cmd: list) -> None:
     log(f"gate: {label}")
-    log("$ " + " ".join(str(c) for c in cmd))
-    rc = subprocess.call(cmd, cwd=str(REPO_ROOT))
+    rc = subprocess.call([str(c) for c in cmd], cwd=str(REPO_ROOT), env=child_env())
     if rc != 0:
-        raise BuildAbort(
-            f"GATE FAILED: {label} exited {rc} -> the bundle in dist\\ is not proven to run "
-            "(KNOWN_ISSUES #5 class) -> refusing to compile an installer around it. Read the "
-            "FAIL lines above, fix the spec/build, rebuild (--half 1)."
-        )
+        raise BuildAbort(f"GATE FAILED: {label} exited {rc} -- read the FAIL lines above.")
+
+
+def gate_no_models(dist_root: Path) -> None:
+    """R7 / F-259: no file of the buffalo_l pack (by name, or by size + SHA-256) in the bundle."""
+    names = set(MODEL_SHA256)
+    sizes = {size for size, _d in BUFFALO_FILES.values()}
+    found = []
+    for p in dist_root.rglob("*"):
+        if p.is_dir() and p.name.lower() in ("buffalo_l", "insightface_home"):
+            found.append(str(p.relative_to(dist_root)))
+        elif p.is_file() and (p.name in names or (p.stat().st_size in sizes
+                                                   and sha256_file(p) in MODEL_SHA256.values())):
+            found.append(str(p.relative_to(dist_root)))
+    if found:
+        raise BuildAbort("GATE FAILED: recognition models are inside the bundle ("
+                         + ", ".join(found[:5]) + ") -- decision 9-02: the installer downloads them.")
+
+
+def gate_variant(variant: str, dist_root: Path) -> None:
+    """F-219: the bundle IS the variant it is named after."""
+    internal = dist_root / "_internal"
+    cuda = list(internal.rglob("onnxruntime_providers_cuda*.dll"))
+    trt = list(internal.rglob("onnxruntime_providers_tensorrt*.dll"))
+    nv = nvidia_files(dist_root)
+    if trt:
+        raise BuildAbort("GATE FAILED: the TensorRT provider ships without a TensorRT runtime (F-51)")
+    if variant == "cpu" and (cuda or nv):
+        raise BuildAbort("GATE FAILED: the CPU variant contains the CUDA provider or NVIDIA files")
+    if variant == "gpu":
+        if not cuda or not nv:
+            raise BuildAbort("GATE FAILED: the GPU variant lacks the CUDA provider or NVIDIA files")
+        spec = (INSTALLER_DIR / "windows_face_unlock.spec").read_text(encoding="utf-8")
+        allowed = {n for n in __import__("re").findall(r'"([\w.-]+\.dll)"', spec.split("NVIDIA_ALLOWLIST", 1)[1].split("}", 1)[0])}
+        extra = sorted(f.name for f in nv if f.name not in allowed)
+        if extra:
+            raise BuildAbort(f"GATE FAILED: NVIDIA files outside the allowlist: {extra}")
+    if list(internal.rglob("opencv_videoio_ffmpeg*.dll")):
+        raise BuildAbort("GATE FAILED: the FFmpeg plugin ships (D-151)")
+    pyst = internal / "pystray"
+    if not pyst.is_dir() or not list(pyst.glob("*.py")):
+        raise BuildAbort("GATE FAILED: pystray is not shipped as replaceable .py sources (F-261)")
+    log(f"gate: bundle shape matches the {variant.upper()} variant")
 
 
 def gate_frozen_custody(dist_root: Path) -> dict:
-    """Live half of the gate for the data-directory custody (Stage 8b-2).
-
-    Defect: the 8b bundle passed every static check, yet the FROZEN service could not heal the
-    data directory at all (pywin32 lazily imported win32timezone, which the bundle lacked).
-    Consequence: it surfaced only in a manual dist smoke, one step before the installer. Fix: run
-    the real code path out of the BUILT exe -- face_service.exe --selfcheck-custody -- on two seeded
-    scratch directories, before the stamp:
-      clean    -- BUILTIN\\Users:(OI)(CI)(M) + fake credentials.bin / pipe_entropy.bin (random
-                  bytes): exit 0, ok, 0 foreign ACEs, both secrets protected SELF + SYSTEM;
-      junction -- the same plus a junction inside the tree: exit 1, ok false.
-    FACE_UNLOCK_HOME points at a directory that must still not exist afterwards: the mode may act
-    on its argument only. Any deviation aborts the build.
-    """
+    """The frozen service heals a seeded directory (clean -> 0) and refuses a junction (-> 1).
+    Runs only because FU_BUILD_GATE=1 is set (D-73)."""
     import tempfile
-
     exe = dist_root / "face_service.exe"
     if not exe.is_file():
-        raise BuildAbort(f"GATE FAILED: {exe} missing -> cannot run the custody self-check.")
+        raise BuildAbort(f"GATE FAILED: {exe} missing")
     summary: dict = {}
     with tempfile.TemporaryDirectory(prefix="fu_gate_custody_") as tmp:
         td = Path(tmp)
-        never = td / "app-dir-must-not-appear"
         victim = td / "victim"
         victim.mkdir()
         (victim / "keep.txt").write_bytes(b"k")
@@ -469,251 +437,186 @@ def gate_frozen_custody(dist_root: Path) -> dict:
             subprocess.run(["icacls", str(home), "/grant", "*S-1-5-32-545:(OI)(CI)(M)"],
                            capture_output=True, check=True)
             if case == "junction":
-                subprocess.run(["cmd", "/c", "mklink", "/J", str(home / "enroll" / "link"),
-                                str(victim)], capture_output=True, check=True)
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(home / "enroll" / "link"), str(victim)],
+                               capture_output=True, check=True)
             out = td / f"{case}.json"
-            env = dict(os.environ, FACE_UNLOCK_HOME=str(never))
-            proc = subprocess.run([str(exe), "--selfcheck-custody", str(home), "--out", str(out)],
-                                  env=env, capture_output=True, timeout=180)
-            data = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else {}
+            try:
+                proc = subprocess.run([str(exe), "--selfcheck-custody", str(home), "--out", str(out)],
+                                      env=child_env(FU_BUILD_GATE="1"), capture_output=True, timeout=180)
+            except subprocess.TimeoutExpired as e:
+                raise BuildAbort(f"GATE FAILED: the custody self-check hung ({case})") from e
+            try:
+                data = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else {}
+            except ValueError:
+                data = {}
             summary[case] = {"rc": proc.returncode, "ok": data.get("ok"),
-                             "heal": data.get("heal"), "foreign": data.get("foreign_ace_problems"),
+                             "foreign": data.get("foreign_ace_problems"),
                              "secrets": {k: v.get("self_system_only")
                                          for k, v in (data.get("secrets") or {}).items()},
                              "frozen": data.get("frozen"), "exception": data.get("exception")}
-            log(f"gate: frozen custody [{case}] rc={proc.returncode} ok={data.get('ok')} "
-                f"heal={(data.get('heal') or {}).get('ok')} "
-                f"aces_removed={(data.get('heal') or {}).get('aces_removed')} "
-                f"relocked={(data.get('heal') or {}).get('relocked')} "
-                f"foreign={data.get('foreign_ace_problems')} "
-                f"exception={data.get('exception')}")
+            log(f"gate: frozen custody [{case}] rc={proc.returncode} ok={data.get('ok')}")
         clean, junc = summary["clean"], summary["junction"]
         bad = []
-        if clean["rc"] != 0 or clean["ok"] is not True:
-            bad.append(f"clean case rc={clean['rc']} ok={clean['ok']} ({clean['exception'] or clean['heal']})")
-        if clean["foreign"] != 0:
-            bad.append(f"clean case left {clean['foreign']} foreign-ACE problem(s)")
-        if sorted(clean["secrets"]) != ["credentials.bin", "pipe_entropy.bin"] or \
-                not all(clean["secrets"].values()):
-            bad.append(f"clean case secrets not SELF+SYSTEM protected: {clean['secrets']}")
+        if clean["rc"] != 0 or clean["ok"] is not True or clean["foreign"] != 0:
+            bad.append(f"clean case {clean}")
+        if sorted(clean["secrets"]) != ["credentials.bin", "pipe_entropy.bin"] or not all(clean["secrets"].values()):
+            bad.append(f"clean case secrets {clean['secrets']}")
         if clean["frozen"] is not True:
             bad.append("the self-check did not run frozen")
         if junc["rc"] != 1 or junc["ok"] is not False:
-            bad.append(f"junction case rc={junc['rc']} ok={junc['ok']} (expected 1 / false)")
-        if never.exists():
-            bad.append(f"the self-check created {never} -- it must act on its argument only")
+            bad.append(f"junction case {junc}")
         if not (victim / "keep.txt").exists():
             bad.append("the junction target was modified")
         if bad:
             raise BuildAbort("GATE FAILED: frozen custody self-check -> " + "; ".join(bad))
-    log("gate: frozen custody self-check passed (clean -> healed and locked; junction -> refused)")
     return summary
 
 
-def step_gate(dist_root: Path, cp_dll: Path | None, policy: dict) -> dict:
-    """The automated half of the gate, then the stamp that step 6 insists on.
-
-    Defect (8a F-08 / D-09): the build went PyInstaller -> stage -> ISCC and never ran
-    the gate the README demanded -> a CI release could ship a blind bundle straight to
-    the updater. Fix: this step, which aborts the build on the first failure.
-    """
-    step(5, "GATE -- verify_frozen_entrypoints + packaging_selftest + models + CP signature")
+def step_gate(variant: str, dist_root: Path, signing: dict) -> dict:
+    step(6, "GATE (on the signed bundle) + stamp")
     if not dist_root.is_dir():
         raise BuildAbort(f"no bundle at {dist_root}; run --half 1 first")
     if GATE_STAMP.exists():
-        GATE_STAMP.unlink()          # a failed gate must never leave an old stamp behind
-
+        GATE_STAMP.unlink()
     _gate_run("tools/verify_frozen_entrypoints.py",
-              [python_exe(), str(TOOLS_DIR / "verify_frozen_entrypoints.py"), "--dist", str(dist_root)])
-    _gate_run("tools/packaging_selftest.py", [python_exe(), "-m", "tools.packaging_selftest"])
+              [sys.executable, TOOLS_DIR / "verify_frozen_entrypoints.py", "--dist", dist_root])
+    _gate_run("tools/packaging_selftest.py", [sys.executable, "-m", "tools.packaging_selftest"])
     custody = gate_frozen_custody(dist_root)
-
-    log("gate: no recognition model in the bundle (decision 9-02, act 9b R7)")
     gate_no_models(dist_root)
-    log("no buffalo_l file anywhere in the bundle")
-
+    gate_variant(variant, dist_root)
     staged = dist_root / "credential_provider" / CP_DLL_NAME
-    cp = {"mode": policy["mode"], "thumbprint": policy["thumbprint"], "sha256": None}
-    if policy["mode"] == "skip_cp":
-        log("gate: no CP in this build (SKIP_CP=1)")
-    else:
-        if not staged.is_file():
-            raise BuildAbort(f"GATE FAILED: {staged} missing -> the installer would have no "
-                             "face tile -> refusing.")
-        cp["sha256"] = sha256_file(staged)
-        if cp_dll is not None and cp_dll.is_file() and sha256_file(cp_dll) != cp["sha256"]:
-            raise BuildAbort(f"GATE FAILED: staged {staged} differs from {cp_dll} -> the "
-                             "installer would ship a DLL other than the one built and signed "
-                             "-> refusing. Re-run --half 1.")
-        if policy["mode"] == "pinned":
-            log("gate: signer of the STAGED CP DLL")
-            verify_cp_signature(staged, policy["thumbprint"])
-        else:
-            sig = authenticode(staged)
-            log(f"WARNING: staged CP DLL signature status {sig.get('Status')} "
-                "(--allow-unsigned-cp)")
-
-    log("gate: hashing the bundle for the stamp")
+    cp = {"sha256": sha256_file(staged) if staged.is_file() else None}
+    if not cp_skipped() and not staged.is_file():
+        raise BuildAbort(f"GATE FAILED: {staged} missing")
     manifest = bundle_manifest(dist_root)
     stamp = {
-        "schema": GATE_STAMP_SCHEMA,
+        "schema": GATE_STAMP_SCHEMA, "variant": variant, "version": VERSION,
         "gated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "dist": str(dist_root.resolve()),
-        "manifest": manifest,
-        "installer_iss_sha256": sha256_file(ISS),
-        "cp": cp,
+        "dist": str(dist_root.resolve()), "manifest": manifest,
+        "installer_iss_sha256": sha256_file(ISS), "cp": cp, "signing": signing,
         "git_head": _git("rev-parse", "HEAD"),
         "git_dirty_paths": len((_git("status", "--porcelain") or "").splitlines()),
         "python": sys.version.split()[0],
-        "checks": ["verify_frozen_entrypoints rc=0", "packaging_selftest rc=0",
-                   "frozen custody self-check clean=0 junction=1",
-                   "buffalo_l sha256 pinned", f"cp {policy['mode']}"],
         "frozen_custody": custody,
     }
     GATE_STAMP.write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
     log(f"GATE PASSED: {manifest['files']} files, {manifest['bytes'] / 2**30:.2f} GiB, "
-        f"manifest {manifest['sha256'][:16]}... -> {GATE_STAMP}")
+        f"manifest {manifest['sha256'][:16]}...")
     return stamp
 
 
-def check_gate_stamp(dist_root: Path) -> dict:
-    """Step 6's precondition: the bundle ISCC is about to pack is the one the gate passed."""
+def check_gate_stamp(variant: str, dist_root: Path) -> dict:
     if not GATE_STAMP.is_file():
-        raise BuildAbort(
-            f"no gate stamp at {GATE_STAMP} -> the bundle in dist\\ was never gated -> refusing "
-            "to run Inno Setup. Fix: python installer\\build.py --half 1 (or --gate-only on an "
-            "existing dist)."
-        )
+        raise BuildAbort("no gate stamp -- run --half 1 (or --gate-only) first")
     try:
         stamp = json.loads(GATE_STAMP.read_text(encoding="utf-8"))
-    except ValueError as exc:
-        raise BuildAbort(f"gate stamp {GATE_STAMP} is unreadable ({exc}); re-run the gate") from exc
-    if stamp.get("schema") != GATE_STAMP_SCHEMA:
-        raise BuildAbort(f"gate stamp schema {stamp.get('schema')} != {GATE_STAMP_SCHEMA}; re-run the gate")
-    if stamp.get("dist") != str(dist_root.resolve()):
-        raise BuildAbort(f"gate stamp is for {stamp.get('dist')}, not {dist_root}; re-run the gate")
+    except ValueError as e:
+        raise BuildAbort(f"gate stamp unreadable ({e})") from e
+    if stamp.get("schema") != GATE_STAMP_SCHEMA or stamp.get("variant") != variant:
+        raise BuildAbort(f"the gate stamp is for {stamp.get('variant')} / schema {stamp.get('schema')}")
     if stamp.get("installer_iss_sha256") != sha256_file(ISS):
-        raise BuildAbort(
-            "installer.iss changed after the gate -> what ISCC packs is no longer what was "
-            "gated (packaging_selftest reads it) -> refusing. Re-run --gate-only.")
-    env_tp = os.environ.get("SIGN_CP", "").replace(" ", "").strip().upper()
-    stamp_tp = (stamp.get("cp") or {}).get("thumbprint") or ""
-    if env_tp and env_tp != stamp_tp.upper():
-        raise BuildAbort(
-            f"SIGN_CP={env_tp} but the gated bundle's CP is {stamp.get('cp')} -> this half would "
-            "package a DLL signed differently from what you asked for -> refusing. Re-run --half 1.")
-    log("verifying the gate stamp against the bundle (re-hashing)")
+        raise BuildAbort("installer.iss changed after the gate -- re-run --gate-only")
     now = bundle_manifest(dist_root)
     if now != stamp.get("manifest"):
-        raise BuildAbort(
-            f"dist\\ changed after the gate: now {now['files']} files / {now['sha256'][:16]}..., "
-            f"gated {stamp['manifest'].get('files')} files / {stamp['manifest'].get('sha256', '')[:16]}... "
-            "-> ISCC would pack a bundle nobody gated -> refusing. Re-run --gate-only (or --half 1).")
-    log(f"gate stamp OK: gated {stamp.get('gated_at')} at {stamp.get('git_head') or '?'}, "
-        f"{now['files']} files, CP {stamp['cp']['mode']}")
+        raise BuildAbort("dist changed after the gate -- re-run --gate-only")
     return stamp
 
 
-# --------------------------------------------------------------------------- 6
-def _find_iscc() -> str:
-    env = os.environ.get("INNO_SETUP_ISCC")
-    if env and Path(env).exists():
-        return env
-    candidates = [
-        r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-        r"C:\Program Files\Inno Setup 6\ISCC.exe",
-    ]
-    # winget installs Inno Setup to the user profile by default.
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        candidates.append(str(Path(local_appdata) / "Programs" / "Inno Setup 6" / "ISCC.exe"))
-    for candidate in candidates:
-        if Path(candidate).exists():
-            return candidate
-    exe = shutil.which("iscc") or shutil.which("ISCC")
-    if exe:
-        return exe
-    raise FileNotFoundError(
-        "ISCC.exe (Inno Setup) not found. Install from https://jrsoftware.org/isdl.php "
-        "or set INNO_SETUP_ISCC to its path."
-    )
+# ---------------------------------------------------------------------------------------- 7
+def step_inno(variant: str, dist_root: Path, iscc: str) -> Path:
+    step(7, "Inno Setup")
+    stamp = check_gate_stamp(variant, dist_root)
+    defines = iscc_defines(variant)
+    if azure_ready():
+        signtool = (f'"{os.environ["SIGNTOOL"]}" sign /fd SHA256 /tr http://timestamp.acs.microsoft.com '
+                    f'/td SHA256 /dlib "{os.environ["AZURE_CODESIGN_DLIB"]}" '
+                    f'/dmdf "{BUILD_DIR / "azure-codesign.json"}" $f')
+        defines += ["/DSignToolName=azure", f"/Sazure={signtool}"]
+    else:
+        loud("SETUP AND UNINSTALLER SIGNING SKIPPED: no Azure Trusted Signing credentials "
+             f"(missing: {', '.join(azure_missing())}).")
+    run([iscc, *defines, ISS], cwd=REPO_ROOT)
+    out = OUTPUT_DIR / artefact_name(variant)
+    if not out.is_file():
+        raise BuildAbort(f"ISCC finished but {out} is not there")
+    if bundle_manifest(dist_root) != stamp["manifest"]:              # F-225
+        raise BuildAbort("dist changed while ISCC ran -- the installer packs an ungated bundle")
+    return out
 
 
-def step_inno(dist_root: Path) -> Path:
-    step(6, "Inno Setup (gate stamp checked first)")
-    check_gate_stamp(dist_root)
-    iscc = _find_iscc()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    run([iscc, str(ISS)], cwd=REPO_ROOT)
-    # Expected output: installer_output\WindowsFaceUnlock-Setup-<ver>.exe
-    outputs = sorted(OUTPUT_DIR.glob("WindowsFaceUnlock-Setup-*.exe"))
-    if not outputs:
-        raise BuildAbort(f"Inno Setup produced no artefact in {OUTPUT_DIR}")
-    return outputs[-1]
-
-
-# --------------------------------------------------------------------------- 7
-def step_checksums(installer_path: Path) -> None:
-    step(7, "SHA-256 checksums")
+# ---------------------------------------------------------------------------------------- 8
+def step_checksums(installer_path: Path, variant: str) -> None:
+    step(8, "checksums + build info")
     digest = sha256_file(installer_path)
     (installer_path.parent / f"{installer_path.name}.sha256").write_text(
-        f"{digest}  {installer_path.name}\n", encoding="ascii"
-    )
+        f"{digest}  {installer_path.name}\n", encoding="ascii")
+    stamp = json.loads(GATE_STAMP.read_text(encoding="utf-8"))
+    info = {"installer": installer_path.name, "sha256": digest, "bytes": installer_path.stat().st_size,
+            "variant": variant, "version": VERSION, "manifest": stamp["manifest"],
+            "git_head": stamp.get("git_head"), "signing": stamp.get("signing"),
+            "cp": stamp.get("cp")}
+    (installer_path.parent / f"{installer_path.name}.buildinfo.json").write_text(
+        json.dumps(info, indent=2) + "\n", encoding="utf-8")
     log(f"sha256 = {digest}")
 
 
-# --------------------------------------------------------------------------- main
-def parse_args(argv: list[str] | None) -> argparse.Namespace:
+# ---------------------------------------------------------------------------------------- main
+def parse_args(argv):
     ap = argparse.ArgumentParser(description="Build the Windows Face Unlock installer.")
+    ap.add_argument("--variant", choices=("cpu", "gpu"), default="cpu")
     mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--half", type=int, choices=(1, 2),
-                      help="1 = steps 0-5 (stage + gate, writes the stamp); "
-                           "2 = steps 6-7 (Inno Setup + checksums, requires the stamp)")
-    mode.add_argument("--gate-only", action="store_true",
-                      help="re-run step 5 on the existing dist and re-stamp it")
-    mode.add_argument("--check-models", action="store_true",
-                      help="run step 0 only (pack presence + pinned SHA-256)")
-    ap.add_argument("--allow-unsigned-cp", action="store_true",
-                    help="build without SIGN_CP; the CP DLL ships unsigned (recorded in the stamp)")
+    mode.add_argument("--half", type=int, choices=(1, 2))
+    mode.add_argument("--gate-only", action="store_true")
+    mode.add_argument("--resign", action="store_true",
+                      help="on an existing dist (CI sign job): sign the staged CP DLL and our PE "
+                           "files, check NVIDIA's, re-run the gate")
     return ap.parse_args(argv)
 
 
-def _run(args: argparse.Namespace) -> int:
-    if args.check_models:
-        step_check_models()
-        return 0
-
+def _run(args) -> int:
+    variant = args.variant
+    tools = step_preflight(variant, need_cp=not cp_skipped() and args.half != 2 and not args.gate_only
+                           and not args.resign)
     if args.half == 2:
-        installer_path = step_inno(DIST_ROOT)
-        step_checksums(installer_path)
-        log(f"Installer ready: {installer_path}")
+        out = step_inno(variant, DIST_ROOT, tools["iscc"])
+        step_checksums(out, variant)
+        log(f"Installer ready: {out}")
         return 0
-
-    policy = resolve_sign_policy(args.allow_unsigned_cp)   # fail fast, before 40 minutes of build
-
+    if args.resign:
+        if not DIST_ROOT.is_dir():
+            raise BuildAbort(f"no bundle at {DIST_ROOT} to sign")
+        staged = DIST_ROOT / "credential_provider" / CP_DLL_NAME
+        signing = {"cp": step_sign_cp(staged if staged.is_file() else None)}
+        signing["nvidia"] = step_nvidia(variant, DIST_ROOT)
+        signing["bundle"] = step_sign_bundle(DIST_ROOT)
+        step_gate(variant, DIST_ROOT, signing)
+        return 0
     if args.gate_only:
-        cp_dll = None if cp_skipped() else CP_BUILD_DIR / "Release" / CP_DLL_NAME
-        step_gate(DIST_ROOT, cp_dll, policy)
-        log("gate-only: stamp refreshed; next: python installer\\build.py --half 2")
+        prev = {}
+        if GATE_STAMP.is_file():
+            try:
+                prev = json.loads(GATE_STAMP.read_text(encoding="utf-8")).get("signing") or {}
+            except ValueError:
+                prev = {}
+        step_gate(variant, DIST_ROOT, prev)
         return 0
-
-    step_check_models()   # cheapest check, and the one that invalidates the whole build
     cp_dll = step_build_cp()
-    step_sign_cp(cp_dll, policy)
-    dist_root = step_pyinstaller()
-    step_stage(dist_root, cp_dll)
-    step_gate(dist_root, cp_dll, policy)
+    signing = {"cp": step_sign_cp(cp_dll)}
+    dist_root = step_pyinstaller(variant, cp_dll)
+    signing["nvidia"] = step_nvidia(variant, dist_root)
+    signing["bundle"] = step_sign_bundle(dist_root)
+    step_gate(variant, dist_root, signing)
     if args.half == 1:
-        log("half 1 done: bundle staged and gated. Next: the operator dist-smoke out of "
-            f"{dist_root} (installer/README.md), then python installer\\build.py --half 2")
+        log(f"half 1 done: {dist_root} staged, signed as far as possible, gated. Next: the operator "
+            f"dist-smoke, then python installer\\build.py --variant {variant} --half 2")
         return 0
-    installer_path = step_inno(dist_root)
-    step_checksums(installer_path)
-    log(f"Installer ready: {installer_path}")
+    out = step_inno(variant, dist_root, tools["iscc"])
+    step_checksums(out, variant)
+    log(f"Installer ready: {out}")
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None) -> int:
     args = parse_args(argv)
     try:
         return _run(args)
@@ -723,6 +626,9 @@ def main(argv: list[str] | None = None) -> int:
     except subprocess.CalledProcessError as exc:
         log(f"BUILD ABORTED: command failed with exit code {exc.returncode}: "
             f"{' '.join(str(c) for c in exc.cmd)}")
+        return 1
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:     # F-221: no raw traceback
+        log(f"BUILD ABORTED: {exc.__class__.__name__}: {exc}")
         return 1
 
 

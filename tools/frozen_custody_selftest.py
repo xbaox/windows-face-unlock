@@ -94,7 +94,8 @@ def _seed(home: Path, junction_to: "Path | None" = None):
 
 
 def _run(args, never: Path):
-    env = dict(os.environ, FACE_UNLOCK_HOME=str(never), PYTHONUTF8="1")
+    # Stage 9 (D-73): the mode runs only for the build gate.
+    env = dict(os.environ, FACE_UNLOCK_HOME=str(never), PYTHONUTF8="1", FU_BUILD_GATE="1")
     return subprocess.run([sys.executable, "-m", "face_service", *args], cwd=str(REPO), env=env,
                           capture_output=True, text=True, timeout=120)
 
