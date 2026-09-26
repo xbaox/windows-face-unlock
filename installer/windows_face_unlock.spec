@@ -95,6 +95,10 @@ HIDDEN += [
     "presence_monitor.gui",
     "presence_monitor.updater",
     "presence_monitor.widgets",
+    # Stage 9 (R10): imported lazily inside functions -- named so a build never ships without them.
+    "face_service.camera_devices",
+    "face_service.session_state",
+    "psutil",
     # THE ENTRY-POINT MODULES THEMSELVES. Kept deliberately, and the history is
     # worth writing down because it cost two blocks.
     #
@@ -268,15 +272,18 @@ watchdog_analysis = Analysis(
     pathex=[str(REPO_ROOT)],
     binaries=BINARIES,
     datas=DATAS,
-    # tools/watchdog.py imports face_service.config, face_service.watchdog and
-    # face_service.logging_setup INSIDE functions, so they are named explicitly
-    # rather than trusted to bytecode scanning. It needs neither cv2 nor the
-    # models -- it only pings a named pipe and shells out to powershell -- but
+    # tools/watchdog.py imports face_service.config, face_service.watchdog,
+    # face_service.logging_setup and face_service.pipe_io INSIDE functions, so
+    # they are named explicitly rather than trusted to bytecode scanning. It
+    # needs neither cv2 nor the models -- it pings a named pipe and finds the
+    # service process with psutil (Stage 9, F-251: no PowerShell child) -- but
     # MERGE puts the shared payload in the first analysis anyway.
     hiddenimports=HIDDEN + [
         "face_service.config",
         "face_service.watchdog",
         "face_service.logging_setup",
+        "face_service.pipe_io",
+        "psutil",
     ],
     hookspath=[],
     runtime_hooks=[],

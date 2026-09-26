@@ -46,11 +46,15 @@ def main(argv=None) -> int:
     t.ok(W.should_restart(9, 3, True) is False, "paused suppresses restart even far past threshold")
 
     # --- 1b) restart_outcome (kill-then-start survival) -------------------------------------
-    print("\n[1b] restart_outcome(alive_after_start)")
-    t.ok(W.restart_outcome(1) == "started", "1 pythonw survived the start -> started (normal)")
-    t.ok(W.restart_outcome(3) == "started", ">=1 survived -> started")
-    t.ok(W.restart_outcome(0) == "unrecoverable",
-         "0 survived -> unrecoverable (non-pythonw dev instance holds the mutex / misconfig -> back off)")
+    print("\n[1b] restart_outcome(pong_after_start) and the back-off (Stage 9, R11)")
+    t.ok(W.restart_outcome(True) == "started", "pong after the start -> started")
+    t.ok(W.restart_outcome(False) == "unrecoverable", "no pong in the window -> unrecoverable")
+    t.ok([W.restart_backoff_s(n) for n in range(7)] == [60, 120, 240, 480, 960, 1800, 1800],
+         "back-off 60 s x 2^n, capped at 30 min")
+    t.ok(W.restart_backoff_s(10 ** 6) == 1800 and W.restart_backoff_s(-3) == 60,
+         "back-off is bounded for any n")
+    t.ok(W.POST_RESTART_PONG_S == 30.0 and W.HEALTHY_RESET_S == 600.0,
+         "pong window 30 s, reset after 10 min of health")
 
     # --- 2) pause lifecycle -----------------------------------------------------------------
     print("\n[2] pause file: write / is_paused / clear, with self-expiry")
@@ -154,30 +158,119 @@ def main(argv=None) -> int:
     # Plain dataclass defaults: this test never reads a config.toml (nor any file of a real home).
     TW.ping, TW.time.sleep, TW._setup_logging = boom, fake_sleep, (lambda: None)
     TW._load_config = lambda: Config(language="en")
+    saved_si = TW._single_instance
+    TW._single_instance = lambda: True
     try:
         rc = TW.main()
     finally:
         TW.ping, TW.time.sleep, TW._setup_logging = saved
         TW._load_config = saved_cfg
+        TW._single_instance = saved_si
     t.ok(rc == 0 and calls["n"] == 3, f"three failing iterations, loop survived (n={calls['n']})")
 
-    # --- 6) Stage 8b (F-36): the installed kill filter is path + session scoped ---------------
-    print("\n[6] F-36 installed kill filter")
-    ps = TW._match_ps(True)
-    t.ok("ExecutablePath -eq '" in ps and "face_service.exe'" in ps,
-         "installed filter pins the full exe path")
-    t.ok("SessionId -eq " in ps, "installed filter pins the session")
-    t.ok("CommandLine" in TW._match_ps(False), "dev filter unchanged (command-line needle)")
+    # --- 6) the process criterion: path + session (F-36), normcase/realpath (F-253), argv ------
+    print("\n[6] service-process criterion (psutil, no PowerShell -- F-251)")
+    me = os.getpid()
+    sess = TW._session_of(me)
+    tgt = r"C:\Program Files\Face Unlock\face_service.exe"
+    inst = dict(installed=True, target=tgt, session=sess)
+    t.ok(TW._is_service_proc({"pid": me, "exe": tgt}, **inst), "installed: exact path matches")
+    t.ok(TW._is_service_proc({"pid": me, "exe": tgt.upper()}, **inst),
+         "installed: case differences do not matter (F-253)")
+    t.ok(not TW._is_service_proc({"pid": me, "exe": r"C:\Other\face_service.exe"}, **inst),
+         "installed: same name elsewhere is not ours")
+    t.ok(not TW._is_service_proc({"pid": me, "exe": tgt}, installed=True, target=tgt,
+                                 session=(sess or 0) + 7777), "installed: another session is not ours")
+    dev = dict(installed=False, target="", session=sess)
+    t.ok(TW._is_service_proc({"pid": me, "name": "pythonw.exe",
+                              "cmdline": [r"C:\x\pythonw.exe", "-m", "face_service"]}, **dev),
+         "dev: pythonw -m face_service matches")
+    t.ok(not TW._is_service_proc({"pid": me, "name": "pythonw.exe",
+                                  "cmdline": [r"C:\face_service_repo\.venv\Scripts\pythonw.exe",
+                                              "-m", "presence_monitor"]}, **dev),
+         "dev: a checkout path containing face_service does not match the tray")
+    t.ok(not TW._is_service_proc({"pid": me, "name": "python.exe",
+                                  "cmdline": ["python.exe", "-m", "face_service"]}, **dev),
+         "dev: a debugging python.exe console instance is spared")
+    src = Path(TW.__file__).read_text(encoding="utf-8")
+    t.ok("powershell" not in src.lower().replace("no powershell", ""),
+         "the runner starts no PowerShell child")
+
+    # --- 7) N-21 / N-22 / N-23: pause lift, restart grace, single instance --------------------
+    print("\n[7] R11 runner: pause lift (N-21), restart grace (N-22), single instance (N-23)")
+    from face_service import config as C
+    pause = Path(os.environ["FACE_UNLOCK_HOME"]) / "watchdog.pause"
+    C.WATCHDOG_PAUSE_PATH = pause
+    clock = {"t": 1000.0}
+    script = {"ok": False}
+    restarts = []
+    saved7 = (TW.ping, TW.restart_service, TW.time.monotonic)
+    TW.ping = lambda _t: (script["ok"], None if script["ok"] else "no-pipe")
+    TW.time.monotonic = lambda: clock["t"]
+
+    def fake_restart(_timeout):
+        restarts.append(clock["t"])
+        return 1, script.get("pong", False)
+    TW.restart_service = fake_restart
+    try:
+        st = TW.State(clock["t"])
+        W.write_pause(pause, now=__import__("time").time(), ttl_s=300.0)
+        for _ in range(10):
+            TW._iteration(st, 2.0, 3, 300.0)
+            clock["t"] += 30
+        t.ok(st.fails == 0 and not restarts, "N-21: ten failed pings during a pause -> counter 0, no restart")
+        W.clear_pause(pause)
+        TW._iteration(st, 2.0, 3, 300.0)
+        t.ok(st.fails == 1 and not restarts, "N-21: pause lifted -> counting starts from 1, no instant restart")
+        TW._iteration(st, 2.0, 3, 300.0)
+        TW._iteration(st, 2.0, 3, 300.0)
+        t.ok(len(restarts) == 1, "threshold reached after the lift -> one restart")
+        # no pong -> failed restart; next attempt only after 60 s, then 120 s
+        for _ in range(3):
+            clock["t"] += 10
+            TW._iteration(st, 2.0, 3, 300.0)
+        t.ok(len(restarts) == 1, "N-22: a failed restart is not repeated before its 60 s back-off")
+        clock["t"] = restarts[0] + 61
+        for _ in range(3):
+            TW._iteration(st, 2.0, 3, 300.0)
+        t.ok(len(restarts) == 2, "N-22: after 60 s the second restart runs")
+        clock["t"] = restarts[1] + 100
+        for _ in range(3):
+            TW._iteration(st, 2.0, 3, 300.0)
+        t.ok(len(restarts) == 2, "N-22: the third waits 120 s")
+        clock["t"] = restarts[1] + 121
+        for _ in range(3):
+            TW._iteration(st, 2.0, 3, 300.0)
+        t.ok(len(restarts) == 3, "N-22: ...and then runs")
+        # healthy for 10 minutes -> back-off reset
+        script["ok"] = True
+        for _ in range(25):
+            clock["t"] += 30
+            TW._iteration(st, 2.0, 3, 300.0)
+        t.ok(st.restarts == 0, "N-22: 10 minutes of pongs reset the back-off")
+        # refusing = alive
+        saved_state = TW.last_ping_state
+        TW.last_ping_state = "refusing:custody"
+        TW._iteration(st, 2.0, 3, 300.0)
+        t.ok(st.fails == 0 and st.refusing == "refusing:custody", "a refusing service is alive (R11)")
+        TW.last_ping_state = saved_state
+    finally:
+        TW.ping, TW.restart_service, TW.time.monotonic = saved7
+    t.ok("clear_pause" not in src.split("def _iteration", 1)[1], "F-250: no clear_pause after a restart")
+    h1 = TW._single_instance()
+    h2 = TW._single_instance()
+    t.ok(h1 not in (None, True) and h2 is None, "N-23: a second watchdog in the session is refused")
+    del h1
 
     print()
     if t.fail:
         print(f"WATCHDOG SELFTEST FAILED: {t.fail} check(s) failed.")
         return 1
-    print("WATCHDOG SELFTEST OK: restart fires at threshold, pause suppresses a deliberate stop, "
-          "and a stale/expired pause self-heals (never silences the watchdog forever); a "
-          "non-finite or far-future pause is refused or clamped, a broken marker never raises, "
-          "a failing iteration does not end the loop, and the installed kill is path+session "
-          "scoped.")
+    print("WATCHDOG SELFTEST OK: restart fires at threshold, pause suppresses a deliberate stop "
+          "and resets the count, a stale/expired pause self-heals; a non-finite or far-future "
+          "pause is refused or clamped, a broken marker never raises, a failing iteration does "
+          "not end the loop, restarts wait for a pong and back off 60 s x 2^n, a refusing "
+          "service is alive, a second watchdog is refused, and the kill is path+session scoped.")
     return 0
 
 

@@ -1,5 +1,22 @@
+"""The webcam (cv2.VideoCapture) with bounded open AND bounded read (Stage 9, act 9b R10).
+
+Stage 9 changes:
+  * by NAME: ``Camera(name=...)`` resolves the configured device name to its DirectShow index at
+    every open (face_service.camera_devices) and opens that index on CAP_DSHOW only -- the index a
+    name maps to is only meaningful for the backend it was enumerated for (F-141). A name that is
+    not present fails the open with ``not_found`` set; there is no fallback to index 0. Without a
+    name the legacy index path (DSHOW -> MSMF -> ANY) stays, for configs from before the name.
+  * bounded READ: every read() runs on a worker and is waited on for at most ``read_cap_s`` (the
+    same ceiling as an open attempt, camera_open_attempt_cap_s). A read that does not return is
+    abandoned: the capture is dropped (released by the worker once the native call returns) and
+    CameraReadTimeout is raised -- the request answers camera-error instead of wedging the
+    sequential pipe server (F-144).
+  * the negotiated format (width x height, FPS, FOURCC, backend, device) is logged once per open
+    (F-151).
+"""
 from __future__ import annotations
 import logging
+import threading
 import time
 import cv2
 import numpy as np
@@ -32,13 +49,53 @@ def _apply_timeout_props(cap, backend) -> None:
             log.debug("%s set failed on backend %s", prop_name, backend, exc_info=True)
 
 
+class CameraReadTimeout(RuntimeError):
+    """A read did not return within the ceiling; the capture was abandoned."""
+
+
+def _fourcc_str(v: float) -> str:
+    try:
+        n = int(v)
+        return "".join(chr((n >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00") or "?"
+    except Exception:
+        return "?"
+
+
 class Camera:
     """Thin wrapper over cv2.VideoCapture with open/close safety."""
 
-    def __init__(self, index: int = 0, warmup_frames: int = 10):
+    def __init__(self, index: int = 0, warmup_frames: int = 10, name: str = "",
+                 read_cap_s: float = 5.0):
         self.index = index
+        self.name = (name or "").strip()
         self.warmup_frames = warmup_frames
+        self.read_cap_s = float(read_cap_s)
+        self.not_found = False            # the named device was not present at the last open
         self._cap: cv2.VideoCapture | None = None
+
+    def _log_format(self, cap, backend) -> None:
+        try:
+            log.info("camera open: device=%s index=%d backend=%s %dx%d fps=%.1f fourcc=%s",
+                     repr(self.name) if self.name else "(by index)", self.index,
+                     {cv2.CAP_DSHOW: "DSHOW", cv2.CAP_MSMF: "MSMF"}.get(backend, str(backend)),
+                     int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                     float(cap.get(cv2.CAP_PROP_FPS)), _fourcc_str(cap.get(cv2.CAP_PROP_FOURCC)))
+        except Exception:
+            log.debug("camera format query failed", exc_info=True)
+
+    def _backends(self):
+        """(index, backends) for this open. By name: the resolved DSHOW index on DSHOW only."""
+        if not self.name:
+            self.not_found = False
+            return self.index, (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY)
+        from .camera_devices import resolve_index
+        idx = resolve_index(self.name)
+        self.not_found = idx is None
+        if idx is None:
+            log.warning("camera %r is not present -- not opening another camera instead", self.name)
+            return None, ()
+        self.index = idx
+        return idx, (cv2.CAP_DSHOW,)
 
     def open(self) -> None:
         if self._cap is not None:
@@ -50,8 +107,11 @@ class Camera:
         # zombie capture + waiting a beat is enough for DirectShow to
         # hand the real device back.
         for attempt in range(3):
-            for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
-                cap = cv2.VideoCapture(self.index, backend)
+            index, backends = self._backends()
+            if index is None:
+                break
+            for backend in backends:
+                cap = cv2.VideoCapture(index, backend)
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -64,6 +124,7 @@ class Camera:
                     time.sleep(0.1)
                 if ok:
                     self._cap = cap
+                    self._log_format(cap, backend)
                     for _ in range(self.warmup_frames):
                         cap.read()
                         time.sleep(0.03)
@@ -82,7 +143,8 @@ class Camera:
         frame was grabbed (camera acquired), False if it could not be (e.g. the device is held by
         another process). Unlike ``open()`` it never raises and does NOT run the multi-second
         zombie-recovery retry -- the service wraps it in its own config-driven retry loop.
-        ``open()`` stays the authoritative, robust opener for enrollment / warmup.
+        (Stage 9, D-90: ``open()`` -- the slow 3x3 zombie recovery -- is used by the dev tools only;
+        the service and the wizard open through here.)
 
         ``deadline`` (monotonic) makes this COOPERATIVELY bounded: it is checked between backends
         and before each read, and once passed we release the candidate and give up. That is
@@ -95,10 +157,11 @@ class Camera:
         """
         if self._cap is not None:
             return True
-        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+        index, backends = self._backends()
+        for backend in backends:
             if deadline is not None and time.monotonic() >= deadline:
                 return False       # no candidate open yet -- nothing to release
-            cap = cv2.VideoCapture(self.index, backend)
+            cap = cv2.VideoCapture(index, backend)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -114,6 +177,7 @@ class Camera:
                     break
             if ok:
                 self._cap = cap
+                self._log_format(cap, backend)
                 for _ in range(self.warmup_frames):
                     if deadline is not None and time.monotonic() >= deadline:
                         # A real capture, but under-warmed and out of budget. Hand back nothing
@@ -143,8 +207,38 @@ class Camera:
                 log.exception("camera release failed")
 
     def read(self) -> np.ndarray | None:
-        assert self._cap is not None, "Camera not opened"
-        ok, frame = self._cap.read()
+        """One frame, or None when the driver returned none. Bounded by ``read_cap_s``: a read
+        that does not come back in time abandons the capture and raises CameraReadTimeout."""
+        cap = self._cap
+        assert cap is not None, "Camera not opened"
+        box: dict = {}
+        done = threading.Event()
+
+        def run():
+            try:
+                box["r"] = cap.read()
+            except Exception as e:           # a raising driver is a failed read, not a crash
+                box["e"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=run, name="camera-read", daemon=True).start()
+        if not done.wait(self.read_cap_s):
+            self._cap = None                 # never hand this capture out again
+
+            def reap():
+                done.wait()                  # the native call returns some day: release then
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            threading.Thread(target=reap, name="camera-read-reaper", daemon=True).start()
+            log.error("camera read did not return within %.1fs -- capture abandoned", self.read_cap_s)
+            raise CameraReadTimeout(f"camera read exceeded {self.read_cap_s:.1f}s")
+        if "e" in box:
+            log.warning("camera read raised: %r", box["e"])
+            return None
+        ok, frame = box.get("r", (False, None))
         return frame if ok else None
 
     def __enter__(self):

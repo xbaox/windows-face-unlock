@@ -28,14 +28,20 @@ threshold = 0.32                 # cosine distance cutoff; LOWER = stricter.
 
 # --- Camera ------------------------------------------------------------------
 
-camera_index = 0                 # OpenCV VideoCapture index; try 1 or 2 if you
-                                 # have several cameras
+camera_name = ""                 # the camera's device name, as the setup wizard
+                                 # lists it. A camera that is not connected is
+                                 # reported, never swapped for another one.
+camera_index = 0                 # used only when camera_name is empty: the
+                                 # position in DirectShow order (not "the
+                                 # Windows default camera")
 camera_warmup_frames = 10        # frames discarded after opening, so auto-
                                  # exposure has settled before the first capture
-persistent_camera = true         # true  = keep the device open between requests
-                                 #         (~0.9 s verify, LED stays on)
-                                 # false = open per request (~3 s verify, LED
-                                 #         only lights while verifying)
+persistent_camera = false        # false = open on demand; the camera is warmed
+                                 #         when the session locks and released on
+                                 #         unlock (60 s at most)
+                                 # true  = hold the device for the service's
+                                 #         lifetime (LED on; other apps such as
+                                 #         Teams or Zoom may not get the camera)
 camera_open_retries = 2          # extra open attempts before reporting the
                                  # camera as busy (held by another app)
 camera_open_timeout_s = 3.0      # wall-clock budget for that whole retry loop
@@ -128,9 +134,9 @@ watchdog_pause_ttl_s = 300.0     # a deliberate shutdown pauses the watchdog for
 
 # --- Presence auto-lock ------------------------------------------------------
 
-auto_lock = true                 # false = observe only: strikes are counted and
-                                 # shown in Status, but the workstation is never
-                                 # locked. Face sign-in works either way.
+auto_lock = false                # true  = lock the PC when you walk away
+                                 # false = presence off: no camera checks at all.
+                                 # Face sign-in works either way.
 presence_mode = "recognition"    # "recognition" = the enrolled face must match
                                  # "detection"   = any face in frame is enough
 presence_interval_s = 60         # seconds between presence probes

@@ -217,13 +217,21 @@ def run_with_tray(cfg: Config) -> None:
     thread.start()
 
     icon_ref: list[pystray.Icon] = []
+    monitor.on_update = lambda: refresh_icon()
 
     def refresh_icon() -> None:
         if not icon_ref:
             return
         icon = icon_ref[0]
-        icon.icon = _icon_image(active=True, paused=monitor.is_paused())
-        icon.title = t("tray.title")
+        snap = monitor.snapshot()
+        # Stage 9 (act 9b R10): a probe that could not see ("unknown") greys the icon and names the
+        # cause in the tooltip -- it is neither presence nor absence.
+        blind = snap.get("last_result") == "unknown"
+        icon.icon = _icon_image(active=not blind, paused=monitor.is_paused())
+        title = t("tray.title")
+        if blind:
+            title = f"{title} -- {t('tray.camera_unknown', why=snap.get('last_why') or '?')}"
+        icon.title = title[:127]           # Shell_NotifyIcon tooltip limit
         icon.update_menu()
 
     # ------------------------- actions ------------------------------------
@@ -429,7 +437,7 @@ def run_with_tray(cfg: Config) -> None:
 
     icon = pystray.Icon(
         "face-unlock-presence",
-        _icon_image(active=True, paused=False),
+        _icon_image(active=True, paused=monitor.is_paused()),     # F-147: pause persists
         t("tray.title"),
         menu,
     )

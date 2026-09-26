@@ -1,21 +1,23 @@
-"""Detect remote-access contexts so the presence monitor can skip auto-lock.
+"""Detect a session that is being remotely CONTROLLED, so the presence monitor can skip auto-lock.
 
-Two tiers of detection:
+Stage 9 (act 9b R10; F-142, F-148). Only a session that someone is actually driving counts:
 
-1. ALWAYS_REMOTE_PROCS — processes that only exist while a remote session is
-   *currently connected* (e.g. TeamViewer_Desktop.exe, Quick Assist).
-   Seeing them is enough to treat as remote.
+1. RDP: ``GetSystemMetrics(SM_REMOTESESSION)`` -- this session is itself a remote session -- or
+   ``SM_REMOTECONTROL`` -- the console session is being remotely controlled (RDP shadowing, Remote
+   Assistance over RDP).
+2. Third-party tools: a PER-CONNECTION process running in THIS session -- one the tool starts
+   only while a remote side is connected (``SESSION_MARKERS``).
 
-2. CONNECTION_CHECKED_PROCS — processes that run persistently (tray / service)
-   and only mean "active remote" when they hold an ESTABLISHED TCP connection
-   to a non-loopback peer (UltraViewer, AnyDesk, RustDesk, Parsec, ...).
+What no longer counts: a remote tool's tray or service process holding an ESTABLISHED TCP
+connection. Idle tools keep keep-alive connections to their relays all day, and that switched the
+walk-away lock off for hours (F-142). Tools with no known per-connection marker are simply not
+detected; presence then treats the session as local.
 
-Also: RDP session via GetSystemMetrics(SM_REMOTESESSION), and -- unrelated to
-remoting, but the same kind of ambient session probe -- whether the workstation
-is currently locked (see ``session_locked``).
+Also here, unrelated to remoting but the same kind of ambient session probe: whether the
+workstation is currently locked by its input desktop (``session_locked``, the fallback of
+face_service.session_state).
 """
 from __future__ import annotations
-import ipaddress
 import logging
 
 try:
@@ -35,29 +37,19 @@ except ImportError:  # pragma: no cover - pywin32 is present in every real insta
 
 log = logging.getLogger(__name__)
 
-# Always indicate an active remote connection on sight.
-ALWAYS_REMOTE_PROCS = {
-    "teamviewer_desktop.exe",      # TeamViewer spawns this on connect
-    "remoting_desktop.exe",        # Chrome Remote Desktop (per-connection)
+# Processes that exist only while a remote side is connected (per-connection helpers). Seen in THIS
+# session, they mean the session is being driven remotely.
+SESSION_MARKERS = {
+    "teamviewer_desktop.exe",      # TeamViewer: spawned into the session on connect
+    "remoting_desktop.exe",        # Chrome Remote Desktop: per-connection desktop agent
     "quickassist.exe",             # Microsoft Quick Assist
     "msra.exe",                    # Windows Remote Assistance
 }
-
-# Tray/service processes that run all the time; only treat as active when
-# they hold an ESTABLISHED external TCP connection.
-CONNECTION_CHECKED_PROCS = {
-    "ultraviewer_desktop.exe",
-    "ultraviewer_service.exe",
-    "anydesk.exe",
-    "rustdesk.exe",
-    "remoting_host.exe",           # Chrome Remote Desktop host
-    "parsecd.exe",
-    "sunshine.exe",
-    "srserver.exe",                # Splashtop
-    "teamviewer.exe",              # full idle tray (checked via connection)
-}
+# Kept as a public alias for older callers.
+ALWAYS_REMOTE_PROCS = SESSION_MARKERS
 
 SM_REMOTESESSION = 0x1000
+SM_REMOTECONTROL = 0x2001
 
 # Name of the interactive desktop of a normal, unlocked session. The lock screen
 # and the secure-desktop (UAC) prompt run on "Winlogon", the screen saver on
@@ -66,22 +58,26 @@ SM_REMOTESESSION = 0x1000
 UNLOCKED_DESKTOP = "Default"
 
 
-def _is_external(addr: str) -> bool:
-    if not addr:
-        return False
-    try:
-        ip = ipaddress.ip_address(addr)
-    except ValueError:
-        return False
-    return not (ip.is_loopback or ip.is_unspecified or ip.is_link_local)
-
-
 def is_rdp_session() -> bool:
+    """This session is an RDP session, or the console is being remotely controlled (F-148)."""
+    for metric in (SM_REMOTESESSION, SM_REMOTECONTROL):
+        try:
+            if win32api.GetSystemMetrics(metric):
+                return True
+        except Exception as e:
+            log.debug("GetSystemMetrics(0x%X) failed: %s", metric, e)
+    return False
+
+
+def _session_of(pid: int) -> "int | None":
+    import ctypes
+    sid = ctypes.c_ulong(0)
     try:
-        return bool(win32api.GetSystemMetrics(SM_REMOTESESSION))
-    except Exception as e:
-        log.debug("GetSystemMetrics failed: %s", e)
-        return False
+        if ctypes.windll.kernel32.ProcessIdToSessionId(ctypes.c_ulong(pid), ctypes.byref(sid)):
+            return int(sid.value)
+    except Exception:
+        pass
+    return None
 
 
 def session_locked() -> bool:
@@ -126,32 +122,23 @@ def session_locked() -> bool:
     return name != UNLOCKED_DESKTOP
 
 
-def _proc_has_external_established(proc: "psutil.Process") -> bool:
-    try:
-        for c in proc.net_connections(kind="tcp"):
-            if c.status == psutil.CONN_ESTABLISHED and c.raddr and _is_external(c.raddr.ip):
-                return True
-    except (psutil.AccessDenied, psutil.NoSuchProcess):
-        return False
-    except Exception as e:
-        log.debug("net_connections failed: %s", e)
-    return False
-
-
 def active_remote_tools() -> list[str]:
+    """The per-connection remote-tool processes running in THIS session."""
     if psutil is None:
         return []
+    import os
+    mine = _session_of(os.getpid())
     found: list[str] = []
-    for p in psutil.process_iter(attrs=["name"]):
+    for p in psutil.process_iter(attrs=["name", "pid"]):
         try:
             name = (p.info.get("name") or "").lower()
         except Exception:
             continue
-        if name in ALWAYS_REMOTE_PROCS:
-            found.append(name)
-        elif name in CONNECTION_CHECKED_PROCS:
-            if _proc_has_external_established(p):
-                found.append(f"{name}(connected)")
+        if name not in SESSION_MARKERS:
+            continue
+        if mine is not None and _session_of(int(p.info.get("pid") or 0)) not in (mine, None):
+            continue            # another user's session is being driven, not this one
+        found.append(name)
     return found
 
 

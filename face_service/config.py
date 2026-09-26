@@ -66,9 +66,15 @@ class Config:
                                      # reference webcam (D-71): genuine (self) max ~0.12 over 40
                                      # varied frames, impostor min ~0.97 -> huge gap; 0.32 keeps
                                      # self headroom (~2.6x) while staying far below any impostor.
-    camera_index: int = 0
+    camera_index: int = 0            # used ONLY when camera_name is empty (old configs)
+    # Stage 9 (act 9b R10, F-141): the camera's DirectShow friendly name, resolved to its index at
+    # every open. A name that is not present is a clear refusal -- never a fallback to index 0.
+    camera_name: str = ""
     camera_warmup_frames: int = 10   # discard N frames after opening for auto-exposure
-    persistent_camera: bool = True   # keep VideoCapture open between requests
+    # Stage 9 (R10, F-139): on demand by default. The service opens the camera per request, and
+    # keeps it warm only from a session lock until the unlock (60 s at most); a persistent capture
+    # would hold the device away from Teams, Zoom and the Camera app for the service's lifetime.
+    persistent_camera: bool = False
     verify_frames: int = 5            # frames in one unlock burst (D-72)
     verify_required: int = 2          # of those, this many must match the enrolled face
     presence_interval_s: int = 60
@@ -224,9 +230,10 @@ class Config:
     notify_enroll: bool = True          # toast on enrollment build success/failure
     notify_lockout: bool = True         # toast when a face-lockout episode starts
     notify_service_state: bool = False  # toast on service reachable<->unreachable transitions
-    # False = observe-only presence: strikes are counted and visible in Status,
-    # but LockWorkStation is never called. Face sign-in works either way.
-    auto_lock: bool = True
+    # False = presence off: no camera probe at all (the monitor only polls status for its
+    # notifications). True = walk-away lock. Stage 9 (R10): off by default. Face sign-in works
+    # either way.
+    auto_lock: bool = False
     # --- Stage 7h: frame dump (observability; diagnostics only, OFF by default) ---
     # Write every frame the verify burst and the presence probe are ABOUT TO analyse into
     # APP_DIR/debug_frames -- a .npy with the raw array plus a .png beside it to look at,
@@ -460,6 +467,10 @@ class Config:
             raise ValueError("camera_warmup_frames must be >= 0")
         if not isinstance(self.persistent_camera, bool):
             raise ValueError("persistent_camera must be a boolean")
+        if not isinstance(self.camera_name, str):
+            raise ValueError("camera_name must be a string")
+        if len(self.camera_name) > 256 or any(ord(c) < 32 for c in self.camera_name):
+            raise ValueError("camera_name must be at most 256 printable characters")
         # Verify burst: the service captures verify_frames frames and needs verify_required of them
         # to match (service.py::_verify). required > frames is not a tuning choice, it is an unlock
         # that can never succeed -- and it used to be accepted in silence.

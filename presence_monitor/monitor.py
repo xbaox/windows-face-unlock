@@ -1,124 +1,65 @@
 from __future__ import annotations
 import json
 import logging
+import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import ctypes
-import pywintypes  # type: ignore
-import win32file  # type: ignore
 
-from face_service.config import Config, PIPE_NAME
+from face_service.config import APP_DIR, Config
 from face_service.i18n import t
+
+from face_service.session_state import session_locked_wts
 
 from .remote_session import is_remote_context, session_locked
 
 log = logging.getLogger(__name__)
 
 
-def _lock_workstation() -> None:
-    ctypes.windll.user32.LockWorkStation()
+def _lock_workstation() -> bool:
+    """LockWorkStation, with its BOOL checked (Stage 9, F-149): a refused lock is logged with the
+    Win32 error and reported as not locked, instead of counting a lock that never happened."""
+    ok = bool(ctypes.windll.user32.LockWorkStation())
+    if not ok:
+        log.error("LockWorkStation failed: winerror=%d", ctypes.GetLastError())
+    return ok
+
+
+# Stage 9 (F-147): the tray's Pause survives a tray restart, a logon and a crash. One small file in
+# the data directory; present = paused. Written atomically (temp + replace).
+PAUSE_PATH = APP_DIR / "presence_paused.json"
+
+
+def _read_pause(path=None) -> bool:
+    path = PAUSE_PATH if path is None else path
+    try:
+        return bool(json.loads(path.read_text(encoding="utf-8")).get("paused"))
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        log.warning("presence pause file unreadable (%r) -- treating as paused", e)
+        return True
+
+
+def _write_pause(paused: bool, path=None) -> None:
+    path = PAUSE_PATH if path is None else path
+    try:
+        if not paused:
+            path.unlink(missing_ok=True)
+            return
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"paused": True, "at": time.time()}), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning("presence pause not persisted: %r", e)
 
 
 # --- "is this session locked" (7c-7) ---------------------------------------------------------
-#
-# remote_session.session_locked infers the answer from the INPUT DESKTOP: ACCESS_DENIED on
-# OpenInputDesktop, or a desktop name other than "Default", means locked. On this hardware it does
-# not work -- tools/session_lock_probe.log holds 609 samples reading desktop='Default' and NOT ONE
-# reading 'Winlogon', with a single one-sample True that is flanked by False two seconds either
-# side (a blip, not a lock). The live consequence is in presence.log: after the 17:32:47 lock the
-# probe kept running at 17:33:47 while the machine was on the lock screen, earned a strike, and
-# that strike survived the unlock and locked the machine again ~40s later. The same shape is
-# visible on 2026-07-18, two weeks before the gate existed, so this is not a 7c-6 regression --
-# the gate has simply never fired here.
-#
-# So ask the session about itself instead of inferring from a desktop handle:
-# WTSQuerySessionInformation(WTSSessionInfoEx) returns WTSINFOEX_LEVEL1.SessionFlags, which IS the
-# lock state. It is a plain poll (no window and no message loop, which a tray thread cannot host
-# without restructuring), needs no privilege from a medium-IL process, and reports our own session.
-#
-# NOTE the historical wart: on Windows 7 / Server 2008 R2 the LOCK and UNLOCK values are swapped.
-# We target Windows 11, and only the two documented values are trusted -- anything else, including
-# WTS_SESSIONSTATE_UNKNOWN, returns None and lets the caller fall back.
-_WTS_CURRENT_SERVER_HANDLE = 0
-_WTS_CURRENT_SESSION = -1
-_WTS_SESSION_INFO_EX = 25        # WTS_INFO_CLASS.WTSSessionInfoEx
-_WTS_SESSIONSTATE_LOCK = 0
-_WTS_SESSIONSTATE_UNLOCK = 1
-
-
-class _WTSINFOEX_LEVEL1(ctypes.Structure):
-    """WTSINFOEX_LEVEL1_W. Declared IN FULL on purpose: the trailing LARGE_INTEGERs give the
-    struct 8-byte alignment, and that alignment is what puts this union at offset 8 inside
-    WTSINFOEXW. Declaring only the first three fields would silently read from offset 4."""
-    _fields_ = [
-        ("SessionId", ctypes.c_ulong),
-        ("SessionState", ctypes.c_int),
-        ("SessionFlags", ctypes.c_long),
-        ("WinStationName", ctypes.c_wchar * 33),
-        ("UserName", ctypes.c_wchar * 21),
-        ("DomainName", ctypes.c_wchar * 18),
-        ("LogonTime", ctypes.c_longlong),
-        ("ConnectTime", ctypes.c_longlong),
-        ("DisconnectTime", ctypes.c_longlong),
-        ("LastInputTime", ctypes.c_longlong),
-        ("CurrentTime", ctypes.c_longlong),
-        ("IncomingBytes", ctypes.c_ulong),
-        ("OutgoingBytes", ctypes.c_ulong),
-        ("IncomingFrames", ctypes.c_ulong),
-        ("OutgoingFrames", ctypes.c_ulong),
-        ("IncomingCompressedBytes", ctypes.c_ulong),
-        ("OutgoingCompressedBytes", ctypes.c_ulong),
-    ]
-
-
-class _WTSINFOEX(ctypes.Structure):
-    _fields_ = [("Level", ctypes.c_ulong), ("Data", _WTSINFOEX_LEVEL1)]
-
-
-def _session_locked_wts() -> "bool | None":
-    """True/False from the session's own lock flag, or None when it cannot be determined.
-
-    None is not "unlocked": it means this probe has no opinion, and the caller falls back. Every
-    failure mode -- no wtsapi32, a failed call, a short buffer, an unexpected Level, a SessionFlags
-    value outside the two documented ones -- lands there rather than inventing an answer.
-    """
-    buf = ctypes.c_void_p()
-    size = ctypes.c_ulong(0)
-    try:
-        wts = ctypes.windll.wtsapi32
-        ok = wts.WTSQuerySessionInformationW(
-            ctypes.c_void_p(_WTS_CURRENT_SERVER_HANDLE), ctypes.c_int(_WTS_CURRENT_SESSION),
-            ctypes.c_int(_WTS_SESSION_INFO_EX), ctypes.byref(buf), ctypes.byref(size))
-    except Exception as e:
-        log.debug("WTSQuerySessionInformation unavailable: %s", e)
-        return None
-    if not ok or not buf or size.value < ctypes.sizeof(_WTSINFOEX):
-        log.debug("WTSQuerySessionInformation failed (ok=%s size=%s)", ok, size.value)
-        if buf:
-            try:
-                ctypes.windll.wtsapi32.WTSFreeMemory(buf)
-            except Exception:
-                pass
-        return None
-    try:
-        info = ctypes.cast(buf, ctypes.POINTER(_WTSINFOEX)).contents
-        if info.Level != 1:
-            log.debug("WTSINFOEX Level=%d, expected 1", info.Level)
-            return None
-        flags = info.Data.SessionFlags
-    finally:
-        try:
-            ctypes.windll.wtsapi32.WTSFreeMemory(buf)
-        except Exception:
-            pass
-    if flags == _WTS_SESSIONSTATE_LOCK:
-        return True
-    if flags == _WTS_SESSIONSTATE_UNLOCK:
-        return False
-    log.debug("WTSINFOEX SessionFlags=%r is neither LOCK nor UNLOCK", flags)
-    return None
+# The WTS detector (and why the desktop predicate is only its fallback) lives in
+# face_service.session_state since Stage 9: the service warms the camera on the same signal.
+_session_locked_wts = session_locked_wts
 
 
 def _is_session_locked() -> bool:
@@ -167,6 +108,11 @@ def _fullscreen_active() -> bool:
     except Exception as e:
         log.debug("SHQueryUserNotificationState failed: %s", e)
         return False
+
+
+# The probe states the monitor decides on. Anything else -- "unknown" (Stage 9) or a state this
+# monitor has never heard of -- is no decision (act 9b R10).
+_DECIDING_STATES = frozenset(("present", "absent", "uncertain"))
 
 
 def _state_of(resp: dict) -> str:
@@ -250,10 +196,11 @@ _pipe_call = pipe_call
 @dataclass
 class TickSnapshot:
     at: float = 0.0
-    result: str = "-"       # present / absent / skipped / error
+    result: str = "-"       # present / absent / uncertain / unknown / skipped / error
     reason: str = ""
     strikes: int = 0
     mode: str = ""
+    why: str = ""           # Stage 9: the cause of an "unknown" (busy / leased / not-found / ...)
 
 
 class PresenceMonitor:
@@ -261,6 +208,11 @@ class PresenceMonitor:
         self.cfg = cfg
         self._stop = threading.Event()
         self._paused = threading.Event()
+        self.on_update = None       # set by the tray: called when the shown state changes
+        self._pause_path = PAUSE_PATH
+        if _read_pause(self._pause_path):
+            self._paused.set()          # F-147: a Pause outlives the tray process
+            log.info("presence monitor starts paused (persisted pause)")
         self._strikes = 0
         # True once THIS absence episode has been logged as running on the fullscreen threshold,
         # so the switch is announced once per episode instead of on every tick. Cleared with the
@@ -291,10 +243,12 @@ class PresenceMonitor:
 
     def pause(self) -> None:
         self._paused.set()
+        _write_pause(True, self._pause_path)
         log.info("presence monitor paused")
 
     def resume(self) -> None:
         self._paused.clear()
+        _write_pause(False, self._pause_path)
         self._reset_strikes()
         log.info("presence monitor resumed")
         self.poke_events()
@@ -314,8 +268,11 @@ class PresenceMonitor:
         self._stop.set()
 
     def reload_config(self, cfg: Config) -> None:
+        was_on = self.cfg.auto_lock
         self.cfg = cfg
         self._reset_strikes()
+        if was_on and not cfg.auto_lock:
+            log.info("auto-lock switched off: presence probes stop")
         log.info(
             "presence monitor config reloaded: interval=%ss strikes=%s mode=%s",
             cfg.presence_interval_s, cfg.presence_absent_strikes, cfg.presence_mode,
@@ -331,21 +288,30 @@ class PresenceMonitor:
                 "last_at": last.at,
                 "last_result": last.result,
                 "last_reason": last.reason,
+                "last_why": last.why,
                 "last_mode": last.mode,
                 "interval_s": self.cfg.presence_interval_s,
                 "absent_strikes": self.cfg.presence_absent_strikes,
                 "mode": self.cfg.presence_mode,
             }
 
-    def _set_last(self, result: str, reason: str = "", mode: str = "") -> None:
+    def _set_last(self, result: str, reason: str = "", mode: str = "", why: str = "") -> None:
         with self._state_lock:
+            changed = (self._last.result, self._last.why) != (result, why)
             self._last = TickSnapshot(
                 at=time.time(),
                 result=result,
                 reason=reason,
                 strikes=self._strikes,
                 mode=mode or self.cfg.presence_mode,
+                why=why,
             )
+        cb = self.on_update
+        if changed and cb is not None:
+            try:
+                cb()                      # the tray repaints its icon and tooltip
+            except Exception:
+                log.debug("on_update callback failed", exc_info=True)
 
     def _notify(self, gate: str, message: str) -> None:
         try:
@@ -415,6 +381,22 @@ class PresenceMonitor:
             log.info("session unlocked: presence counters reset (%s)", self._fmt_counters())
             self._reset_strikes()
 
+        # Stage 9 (F-147): Pause is checked BEFORE the input gate, so Status says "paused" -- not
+        # "present src=input" -- while it is on. The status poll still runs for the toasts.
+        if self._paused.is_set():
+            self._check_service_events()
+            self._reset_strikes()
+            self._set_last("skipped", "paused")
+            return
+
+        # Stage 9 (act 9b R10): auto_lock off means presence is off -- not a single camera probe.
+        # Only the status poll runs, for the notifications.
+        if not self.cfg.auto_lock:
+            self._check_service_events()
+            self._reset_strikes()
+            self._set_last("skipped", "auto-lock-off")
+            return
+
         # 1. Live input IS presence (7c-8). Typing or moving the mouse proves the user is at the
         #    machine far better than a frame does, and it proves it while they are looking at a
         #    phone, reading something on the desk, or simply turned away -- all of which take the
@@ -436,10 +418,7 @@ class PresenceMonitor:
         #    pause/remote skips, so notifications work while paused too.
         reachable = self._check_service_events()
 
-        # 1. Skip if paused from the tray
-        if self._paused.is_set():
-            self._set_last("skipped", "paused")
-            return
+        # (Pause is handled at the top of the tick since Stage 9 -- F-147.)
 
         # 2. Skip if this is a remote session — face check doesn't make sense
         #    when nobody is physically at the machine.
@@ -480,6 +459,9 @@ class PresenceMonitor:
         mode = resp.get("mode", self.cfg.presence_mode)
         log.info("presence probe: state=%s src=camera real=%s mode=%s %s d4=-",
                  state, resp.get("real"), mode, self._fmt_counters())
+        if state not in _DECIDING_STATES:
+            self._no_decision(resp, mode, "probe")
+            return
 
         if state == "present":
             counters = self._fmt_counters()      # as OBSERVED, before the reset zeroes them
@@ -512,6 +494,9 @@ class PresenceMonitor:
             self._set_last("error", f"{why} {self._fmt_counters()} d4=unreachable")
             return
         state2 = _state_of(resp2)
+        if state2 not in _DECIDING_STATES:
+            self._no_decision(resp2, mode, "confirm")
+            return
         if state2 == "present":
             counters = self._fmt_counters()          # as OBSERVED, before the reset zeroes them
             log.info("absence retracted by confirmation probe after %.1fs: state=present %s "
@@ -523,6 +508,15 @@ class PresenceMonitor:
             self._on_uncertain(mode, "confirm", "uncertain")
             return
         self._award_strike(mode, "absent confirmed", "confirmed")
+
+    def _no_decision(self, resp: dict, mode: str, origin: str) -> None:
+        """Stage 9 (act 9b R10, F-143): the service could not see ("unknown": busy, leased, not
+        connected, black, a hung read) -- or answered a state this monitor does not know. Neither
+        presence nor absence: the counters stay as they are, and Status shows the cause."""
+        why = str(resp.get("why") or resp.get("state") or "?")
+        log.info("presence tick: state=%s src=camera (%s) why=%s %s -- no decision",
+                 resp.get("state"), origin, why, self._fmt_counters())
+        self._set_last("unknown", f"src=camera why={why} ({origin})", mode, why=why)
 
     def _fmt_counters(self, limit: "int | None" = None) -> str:
         """The two running counters, in the one format every tick outcome reports them in.
@@ -590,9 +584,11 @@ class PresenceMonitor:
                 return
             log.warning("absent %d ticks [%s] — locking workstation", self._strikes, why)
             self._reset_strikes()
-            with self._state_lock:
-                self._lock_count += 1
-            _lock_workstation()
+            if _lock_workstation():            # F-149: count only a lock that happened
+                with self._state_lock:
+                    self._lock_count += 1
+            else:
+                self._set_last("error", "lock-failed", mode)
 
     def run(self) -> None:
         log.info("presence monitor loop: interval=%ss strikes=%s mode=%s",

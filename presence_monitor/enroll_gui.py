@@ -557,18 +557,38 @@ class EnrollWindow:
         leak itself is contained by running this wizard in its own process
         (see ``main()``), so a stuck thread dies with it.
 
-        The device comes from ``cfg.camera_index``, the same knob the service
-        opens with -- a hardcoded 0 here would fight the service for a
-        different camera on a multi-cam machine.
+        The device is the one the service opens (Stage 9, act 9b R10 / F-141): ``cfg.camera_name``
+        resolved to its DirectShow index and opened on DSHOW only -- the index a name maps to means
+        nothing to another backend. A name that is not connected opens nothing. Only an empty name
+        (an old config) falls back to ``cfg.camera_index`` on DSHOW -> MSMF -> ANY.
         """
-        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
-            cap = cv2.VideoCapture(self._cfg.camera_index, backend)
+        index, backends = self._cfg.camera_index, (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY)
+        name = str(getattr(self._cfg, "camera_name", "") or "").strip()
+        if name:
+            from face_service.camera_devices import resolve_index
+            index = resolve_index(name)
+            if index is None:
+                log.warning("enroll camera %r is not connected", name)
+                return False
+            backends = (cv2.CAP_DSHOW,)
+        for backend in backends:
+            cap = cv2.VideoCapture(index, backend)
             if not cap.isOpened():
                 cap.release()   # never keep a candidate we didn't accept
                 continue
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # F-151: what the driver actually negotiated, once per open.
+            try:
+                fcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+                log.info("enroll camera open: device=%s index=%s backend=%s %dx%d fps=%.1f fourcc=%s",
+                         repr(name) if name else "(by index)", index, backend,
+                         int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                         int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), float(cap.get(cv2.CAP_PROP_FPS)),
+                         "".join(chr((fcc >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00") or "?")
+            except Exception:
+                log.debug("enroll camera format query failed", exc_info=True)
             # Open/read timeout hint. getattr(): these props only exist on newer
             # OpenCV; set() may be rejected by a backend -- both are non-fatal.
             # DSHOW ignores them outright; kept for hardware where MSMF wins.
@@ -1178,8 +1198,8 @@ def main() -> int:
         # One startup line per run. enroll.log is APPENDED to (and rotated at 5 MB), not truncated,
         # so this is what separates one wizard run from the last and tells you which process and
         # which settings produced everything below it.
-        log.info("enroll wizard starting: pid=%s lang=%s camera_index=%s",
-                 os.getpid(), cfg.language, cfg.camera_index)
+        log.info("enroll wizard starting: pid=%s lang=%s camera_name=%r camera_index=%s",
+                 os.getpid(), cfg.language, cfg.camera_name, cfg.camera_index)
         EnrollWindow().run()
     except Exception:
         log.exception("enroll wizard crashed")

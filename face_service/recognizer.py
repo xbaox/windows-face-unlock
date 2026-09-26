@@ -295,8 +295,10 @@ class Recognizer:
         )
         app.prepare(ctx_id=ctx_id, det_size=(DET_SIZE, DET_SIZE))
 
-        # Warmup so the first real verify_frame doesn't pay CUDA kernel init: a black-frame
-        # get() exercises detection + both landmark models; recognition gets a dummy crop.
+        # Warmup so the first real verify_frame doesn't pay CUDA kernel init. A black frame has no
+        # face, so its get() runs the DETECTOR only (Stage 9, D-77: the landmark models run per
+        # detected face and stay cold here -- the service's warmup on an enrolled photo warms
+        # them); recognition gets a dummy crop.
         # (No DeepFace/MiniFASNet warmup anymore -> ~5.6s and the TF import are gone.)
         try:
             app.get(np.zeros((DET_SIZE, DET_SIZE, 3), dtype=np.uint8))

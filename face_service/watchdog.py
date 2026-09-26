@@ -6,14 +6,15 @@ here -- only the restart decision and a self-expiring pause marker -- so the pol
 without processes (see ``tools.watchdog_selftest``).
 
 The pause is deliberately SELF-EXPIRING: a stale pause can never silence the watchdog forever. An
-expired (or unreadable) marker is ignored AND deleted, and any successful service start / watchdog
-restart clears it. For a permanent disable, stop the FaceUnlock-Watchdog task itself.
+expired (or unreadable) marker is ignored AND deleted, and a successful service start clears it
+(Stage 9, F-250: the runner no longer clears it after a restart of its own). For a permanent disable, stop the FaceUnlock-Watchdog task itself.
 """
 from __future__ import annotations
 
 import json
 import logging
 import math
+import os
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -21,6 +22,14 @@ log = logging.getLogger(__name__)
 # Stage 8b (F-29): the longest pause any legitimate writer can ask for -- the upper bound validate()
 # puts on watchdog_pause_ttl_s. A reader that knows the configured TTL passes it instead.
 MAX_PAUSE_TTL_S = 3600.0
+
+# Stage 9 (act 9b R11): after a restart the runner waits this long for a pong; none -> the restart
+# failed. Restarts are spaced by RESTART_BACKOFF_BASE_S x 2^n (n = restarts since the service was
+# last healthy for HEALTHY_RESET_S), capped at RESTART_BACKOFF_CAP_S.
+POST_RESTART_PONG_S = 30.0
+RESTART_BACKOFF_BASE_S = 60.0
+RESTART_BACKOFF_CAP_S = 1800.0
+HEALTHY_RESET_S = 600.0
 
 
 def should_restart(consecutive_fails: int, threshold: int, paused: bool) -> bool:
@@ -32,20 +41,36 @@ def should_restart(consecutive_fails: int, threshold: int, paused: bool) -> bool
     return int(consecutive_fails) >= int(threshold) and not paused
 
 
-def restart_outcome(alive_after_start: int) -> str:
-    """Classify a kill-then-start attempt by whether a service instance SURVIVED the start.
+def restart_outcome(pong_after_start) -> str:
+    """Classify a kill-then-start attempt. Pure -> unit-testable.
 
-    Pure -> unit-testable. ``alive_after_start`` is the number of pythonw ``-m face_service``
-    processes running a few seconds after the task start (long enough for a mutex-loser to exit):
+    Stage 9 (act 9b R11, F-248; D-53). The argument is whether the restarted service ANSWERED A
+    PING within POST_RESTART_PONG_S (truthy) or not. It used to be a process count taken 5 s after
+    the task start -- before the new instance had even bound its pipe, so "a process exists" was
+    read as recovery while the service was still warming up (or already wedged).
 
-    * ``>= 1`` -> ``"started"``: a pythonw service is up (the ping loop confirms recovery next cycle);
-      the normal "hung pythonw -> killed -> fresh one starts" path.
-    * ``== 0`` -> ``"unrecoverable"``: NOTHING survived the start -- the single-instance mutex is held
-      by a NON-pythonw instance (e.g. a dev ``python -m face_service``, which the kill deliberately
-      spares) or the task launch is misconfigured. The watchdog logs a clear warning and BACKS OFF
-      instead of tight-looping a no-op kill-start.
+    * truthy -> ``"started"``: the service answers again.
+    * falsy  -> ``"unrecoverable"``: no pong in time -- the start failed, the instance is wedged
+      in its warmup, or something else holds the single-instance mutex. The runner backs off
+      (restart_backoff_s) instead of tight-looping kill-start.
     """
-    return "started" if int(alive_after_start) >= 1 else "unrecoverable"
+    return "started" if int(bool(pong_after_start)) >= 1 else "unrecoverable"
+
+
+def restart_backoff_s(n: int) -> float:
+    """The pause before restart number ``n + 1`` of an unhealthy run (n >= 0): 60 s x 2^n,
+    capped at 30 min (R11). n resets once the service has been healthy for HEALTHY_RESET_S."""
+    n = max(0, int(n))
+    if n >= 16:
+        return RESTART_BACKOFF_CAP_S
+    return min(RESTART_BACKOFF_BASE_S * (2 ** n), RESTART_BACKOFF_CAP_S)
+
+
+def _write_atomic(p: Path, text: str) -> None:
+    """Stage 9 (F-254): temp + replace, so a reader never sees a truncated marker."""
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def write_pause(path, now: float, ttl_s: float) -> None:
@@ -58,11 +83,11 @@ def write_pause(path, now: float, ttl_s: float) -> None:
     ttl_s = min(ttl_s, MAX_PAUSE_TTL_S)
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"until": now + ttl_s, "created": now}), encoding="utf-8")
+    _write_atomic(p, json.dumps({"until": now + ttl_s, "created": now}))
 
 
 def clear_pause(path) -> None:
-    """Remove the pause marker (successful start / after a watchdog restart). Never raises.
+    """Remove the pause marker (a successful service start). Never raises.
     Stage 8b (F-29): it used to swallow only FileNotFoundError, so a marker it could not delete
     (sharing violation, access denied) raised out of here -- and out of the watchdog loop, which
     then ended with nothing to restart it."""
@@ -105,7 +130,7 @@ def is_paused(path, now: float, ttl_s: float = MAX_PAUSE_TTL_S) -> bool:
             log.warning("watchdog pause ran past its TTL (until in %.0fs > %.0fs); clamped",
                         until - now, limit - now)
             created = data.get("created", now) if isinstance(data, dict) else now
-            p.write_text(json.dumps({"until": limit, "created": created}), encoding="utf-8")
+            _write_atomic(p, json.dumps({"until": limit, "created": created}))
         return True
     except Exception as e:
         log.warning("watchdog pause marker %s unusable (%r) -- ignored and removed", p, e)

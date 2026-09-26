@@ -15,6 +15,13 @@ Facts baked in from the 3.1 roundtrip on this webcam:
     unlock and the presence loop, so the original exposure is restored on EVERY path (honored or
     not, match or not, exception or not) via a finally in try_exposure_boost.
 
+Stage 9 (act 9b R10, F-129): on other UVC drivers setting EXPOSURE also switches the control to
+MANUAL, and writing the old NUMBER back left auto-exposure off for the rest of the process -- blown
+out frames in normal light, strikes, false absences. Now CAP_PROP_AUTO_EXPOSURE is saved and
+restored together with EXPOSURE, and both are READ BACK. When the device does not come back to
+where it was, ``restored`` is False: the service then drops its capture (the next open gets the
+driver's defaults) and switches the boost off for that device until the service restarts.
+
 ``plan_exposure`` / ``honored`` are pure and camera-free (unit-tested). ``try_exposure_boost``
 takes a cv2.VideoCapture-like handle plus a ``recapture`` callable, so a fake camera can drive it
 in tests. Nothing here imports the recognizer or edits camera.py.
@@ -23,8 +30,9 @@ from __future__ import annotations
 
 from typing import Callable, NamedTuple
 
-DEFAULT_EXPOSURE_STEP = 2.0   # +EV; matches the honored Step-3.1 step (-6 -> -4). cfg overrides.
 HONORED_TOL = 0.5             # |readback - requested| <= this counts as the driver honoring the set
+AUTO_MODE_TOL = 0.1           # Stage 9: CAP_PROP_AUTO_EXPOSURE must read back as it was
+# (Stage 9, D-91: DEFAULT_EXPOSURE_STEP had no reader -- the step is cfg.low_light_exposure_step.)
 
 
 def plan_exposure(current: float, step: float) -> float:
@@ -49,6 +57,7 @@ class BoostOutcome(NamedTuple):
     exposure_readback: float      # what the driver actually reported after the set
     recapture: object | None      # the re-capture result from recapture(), or None
     error: str | None = None      # set if re-capture raised (boost abandoned; exposure restored)
+    restored: bool = True         # EXPOSURE and AUTO_EXPOSURE read back as before (Stage 9)
 
     def audit(self) -> dict:
         """Additive audit fields describing the boost attempt (never contains the password)."""
@@ -60,6 +69,8 @@ class BoostOutcome(NamedTuple):
         }
         if self.error:
             d["boost_error"] = self.error
+        if not self.restored:
+            d["boost_restore_failed"] = True
         return d
 
 
@@ -77,18 +88,31 @@ def try_exposure_boost(cap, step: float, recapture: Callable[[], object]) -> Boo
     """
     import cv2
     prop = cv2.CAP_PROP_EXPOSURE
+    aprop = cv2.CAP_PROP_AUTO_EXPOSURE
     before = float(cap.get(prop))
+    auto_before = float(cap.get(aprop))
     target = plan_exposure(before, step)
+    out = None
     try:
         cap.set(prop, target)
         readback = float(cap.get(prop))
         if not honored(target, readback):
-            return BoostOutcome(False, False, before, target, readback, None)
-        try:
-            rc = recapture()
-        except Exception as e:   # boost must never crash unlock; fall back to the dark outcome
-            return BoostOutcome(False, True, before, target, readback, None, error=repr(e))
-        return BoostOutcome(True, True, before, target, readback, rc)
+            out = BoostOutcome(False, False, before, target, readback, None)
+        else:
+            try:
+                rc = recapture()
+                out = BoostOutcome(True, True, before, target, readback, rc)
+            except Exception as e:   # boost must never crash unlock; fall back to the dark outcome
+                out = BoostOutcome(False, True, before, target, readback, None, error=repr(e))
     finally:
-        # GUARANTEED restore on every path: success / no-match / not-honored / exception.
+        # GUARANTEED restore on every path: success / no-match / not-honored / exception -- the
+        # exposure value first, then the auto mode (which may take over from the value).
         cap.set(prop, before)
+        cap.set(aprop, auto_before)
+    # Conservative on purpose: anything not read back as it was counts as NOT restored -- the
+    # price of a false alarm is one reopen and no boost until the next service start.
+    # The auto mode is compared tightly: DSHOW reports it as 0.25 (manual) / 0.75 (auto), which
+    # HONORED_TOL (0.5, an exposure-step tolerance) would not tell apart.
+    restored = (abs(float(cap.get(aprop)) - auto_before) < AUTO_MODE_TOL
+                and honored(before, float(cap.get(prop))))
+    return out._replace(restored=bool(restored))

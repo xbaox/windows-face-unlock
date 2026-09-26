@@ -197,6 +197,14 @@ class _StubSvc:
     _maybe_dump_frame = S.FaceService._maybe_dump_frame
     # Stage 8b (F-22): the probe body reports engine exceptions through this, once per episode.
     _note_probe_errors = S.FaceService._note_probe_errors
+    # Stage 9 (R10): the probe ends its camera use through _done_with and reports "cannot see"
+    # through _unknown; both are the shipping methods, with the class-level camera defaults.
+    _done_with = S.FaceService._done_with
+    _keep_open = S.FaceService._keep_open
+    _unknown = S.FaceService._unknown
+    _warm_until = 0.0
+    _probe_why = None
+    _camera_problem = None
 
     def __init__(self, cfg: Config, frame):
         self.cfg = cfg
@@ -361,8 +369,9 @@ def main(argv=None) -> int:
     # keys: a mandatory-checksum refusal and the source-checkout notice) -> 228 in 7h (label
     # and .desc for the debug_dump_frames diagnostics knob) -> 229 in 7l (enroll.status.connecting,
     # the wizard's wait-for-service line; added to all twelve locales).
-    t.ok(len(en) == 239, f"_EN has 239 keys (got {len(en)})")   # +gesture.then, +detector_unavailable (Stage 9)
-    t.ok(len(ru) == 239, f"_RU has 239 keys (got {len(ru)})")
+    # Stage 9: +gesture.then, +detector_unavailable (9c-2); +field.camera_name(.desc), +tray.camera_unknown (9c-3)
+    t.ok(len(en) == 242, f"_EN has 242 keys (got {len(en)})")
+    t.ok(len(ru) == 242, f"_RU has 242 keys (got {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
     # Key parity alone never caught a translation that drops or renames a {placeholder}: t()
     # swallows a failed .format() and returns the raw string, so the damage shows up as an
@@ -380,14 +389,14 @@ def main(argv=None) -> int:
 
     svc = _StubSvc(cfg, None)                      # every read fails -> no frames at all
     t.ok(svc._burst_defect(0, None) == "zero-frames", "_burst_defect(0, None) == 'zero-frames'")
-    t.ok(svc._presence_probe_recognition() == ("present", True),
-         "zero-frame burst -> ('present', True) = camera-error, so no absence strike")
+    t.ok(svc._presence_probe_recognition() == ("unknown", False) and svc._probe_why == "zero-frames",
+         "zero-frame burst -> ('unknown', False) why=zero-frames: no decision (Stage 9, F-143)")
     t.ok(svc.heals and svc.heals[0][0] == 0, "self-heal was still notified (frames_ok=0)")
 
     svc = _StubSvc(cfg, black)                     # frames arrive, all of them black
     t.ok(svc._burst_defect(3, 0.0) == "black-burst", "_burst_defect(3, 0.0) == 'black-burst'")
-    t.ok(svc._presence_probe_recognition() == ("present", True),
-         "black burst -> ('present', True) = camera-error, so no absence strike")
+    t.ok(svc._presence_probe_recognition() == ("unknown", False) and svc._probe_why == "black",
+         "black burst -> ('unknown', False) why=black: no decision (Stage 9, F-143)")
 
     svc = _StubSvc(cfg, lit)                       # a normal, well-lit burst with nobody in it
     t.ok(svc._burst_defect(3, 200.0) is None, "_burst_defect on a lit burst -> None (no defect)")

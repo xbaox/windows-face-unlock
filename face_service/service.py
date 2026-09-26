@@ -95,7 +95,7 @@ import winerror  # type: ignore
 def win32api_get_last_error() -> int:
     return win32api.GetLastError()
 
-from .camera import Camera
+from .camera import Camera, CameraReadTimeout
 from .config import Config, APP_DIR, LOG_PATH, LOCKOUT_PATH, AUDIT_PATH, PIPE_NAME
 from .credentials import load_password, mark_password_rejected, password_rejected
 from .identity import SYSTEM_SID, current_user_sid, owner_check
@@ -430,6 +430,23 @@ def _fmt_luma(luma_max) -> str:
     return "n/a" if luma_max is None else "%.2f" % luma_max
 
 
+# Stage 9 (act 9b R10, F-139): the camera is opened on demand. When the session locks, the service
+# opens it and keeps it warm for the unlock that is about to come -- until the unlock, and never
+# longer than this. The lock state is polled every CAMERA_WARM_POLL_S by a small service thread.
+CAMERA_WARM_HOLD_S = 60.0
+CAMERA_WARM_POLL_S = 1.0
+# F-138: the heal retry and the low-light re-capture each cost one more burst. They are started only
+# when the request still has the last burst's duration plus this margin left in its budget.
+EXTRA_BURST_MARGIN_S = 1.0
+
+
+def _camera_reason(detail: dict) -> str:
+    """The wire reason for a burst that never saw the camera: a read that hung or a named camera
+    that is not present is "camera-error" (R10); a busy or leased device stays "camera-busy"."""
+    return "camera-error" if detail.get("reason") in ("camera-error", "camera-not-found") \
+        else "camera-busy"
+
+
 class VerifyOutcome(NamedTuple):
     """Result of one capture burst: the legacy 3-tuple plus a detail dict for the audit log."""
     match: bool
@@ -442,6 +459,15 @@ class VerifyOutcome(NamedTuple):
 
 
 class FaceService:
+    # Stage 9 (R10) camera state, also as class-level defaults so a harness that builds the service
+    # with __new__ sees the same "nothing happened yet" values __init__ sets.
+    _cam = None
+    _warm_until = 0.0
+    _boost_disabled = False
+    _camera_problem: "str | None" = None
+    _probe_why: "str | None" = None
+    _session_locked = None
+
     def __init__(self, cfg: Config, custody=None):
         self.cfg = cfg
         # Stage 8b (F-01 / P-03, act A-2): the data-directory custody verdict. main() heals the
@@ -520,9 +546,37 @@ class FaceService:
         # "abandon": fn()}. One slot: the server is sequential and a newer grant replaces it.
         self._report_slot: dict | None = None
         self._pipe_sa = None            # built once, on the first bind (D-45)
+        # Stage 9 (R10): the warm hold -- a monotonic deadline until which the camera is kept open
+        # although persistent_camera is off (session locked; see _lock_watch). 0.0 = no hold.
+        self._warm_until = 0.0
+        # R10 (F-129): the device did not come back to its exposure settings after a boost; the
+        # boost stays off for it until the service restarts.
+        self._boost_disabled = False
+        # R10: why the camera could not be used at the last attempt ("camera-not-found" |
+        # "camera-busy" | "camera-error"), or None. Shown in status; cleared by a good open.
+        self._camera_problem: "str | None" = None
+        self._probe_why: "str | None" = None
+        self._session_locked = None     # the lock-state probe; set in serve_forever (tests inject)
 
     def _camera_leased_out(self) -> bool:
         return time.monotonic() < self._camera_paused_until
+
+    def _keep_open(self) -> bool:
+        """Whether a capture outlives the request that opened it: persistent_camera, or the warm
+        hold of a locked session (R10)."""
+        return bool(self.cfg.persistent_camera) or time.monotonic() < self._warm_until
+
+    def _done_with(self, cam) -> None:
+        """End of one request's use of ``cam`` (caller holds ``_cam_lock``): kept when the camera
+        is to stay open, closed otherwise -- and never left cached once closed."""
+        if self._keep_open() and self._cam is cam:
+            return
+        if self._cam is cam:
+            self._cam = None
+        try:
+            cam.close()
+        except Exception:
+            log.exception("camera close failed")
 
     def _acquire_camera(self):
         """Open the webcam with a bounded-WAIT retry (Stage 3.4; wait ceiling added in 7b-2).
@@ -542,9 +596,13 @@ class FaceService:
         in bounded time; the DEVICE may still be occupied by the abandoned call for longer, which
         the caller sees as the usual "camera-busy".
         """
-        if self.cfg.persistent_camera and self._cam is not None:
-            return self._cam, False
-        cam = Camera(self.cfg.camera_index, self.cfg.camera_warmup_frames)
+        if self._cam is not None:
+            if getattr(self._cam, "_cap", True) is not None:
+                return self._cam, False
+            self._cam = None        # abandoned by a read that hung (R10): never hand it out again
+        cam = Camera(self.cfg.camera_index, self.cfg.camera_warmup_frames,
+                     name=str(getattr(self.cfg, "camera_name", "") or ""),
+                     read_cap_s=float(self.cfg.camera_open_attempt_cap_s))
         ok = self._opener.open(
             open_fn=cam.open_fast,
             close_fn=cam.close,
@@ -554,8 +612,13 @@ class FaceService:
             cap_s=self.cfg.camera_open_attempt_cap_s,
         )
         if not ok:
-            return None, True
-        if self.cfg.persistent_camera:
+            # Stage 9 (R10): a named camera that is not connected is its own, clear refusal --
+            # there is no fallback to another device. The truthy string keeps `if busy:` working.
+            why = "camera-not-found" if getattr(cam, "not_found", False) else "camera-busy"
+            self._camera_problem = why
+            return None, why
+        self._camera_problem = None
+        if self._keep_open():
             self._cam = cam   # persist ONLY on success -> no stuck half-open handle
         return cam, False
 
@@ -614,10 +677,16 @@ class FaceService:
         not reentrant. Reading ``self._cam`` unlocked is safe here because the pipe server handles
         one request at a time, on this thread.
         """
-        if not self.cfg.persistent_camera or self._cam is None:
+        if self._cam is None:
             return False                      # nothing cached, so nothing to poison
         reason = self._burst_defect(frames_ok, luma_max)
         if reason is None:
+            return False
+        if where.startswith("probe") and reason == "black-burst":
+            # Stage 9 (F-145): a black but streaming capture on the presence path is a covered
+            # lens or a dark room far more often than a wedge -- reopening it every tick only
+            # toggled the LED and cost a cold open (2 730 heals, 0 suppressed). The probe reports
+            # "unknown" instead; the verify path keeps its own heal-and-retry.
             return False
         now = time.monotonic()
         since = now - self._cam_heal_at
@@ -732,6 +801,9 @@ class FaceService:
             return r                          # device held elsewhere: nothing of ours to heal
         if not self._note_camera_health(r.detail.get("frames_ok", 0), r.scene_luma, "verify-burst"):
             return r
+        if not self._room_for_burst(r, UNLOCK_DEADLINE_S):
+            log.info("camera heal retry skipped: not enough of the request budget left (F-138)")
+            return r
         r2 = self._locked_burst()
         # The heal dropped the cache, so the acquire above built a new Camera. If even that could
         # not open, the device is genuinely unavailable -- report the FIRST outcome rather than
@@ -750,15 +822,31 @@ class FaceService:
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
-                log.info("verify skipped: camera busy (held by another process)")
+                log.info("verify skipped: %s", busy)
                 return VerifyOutcome(False, 1.0, False,
-                                     {"verdict": "SKIPPED", "reason": "camera-busy"},
+                                     {"verdict": "SKIPPED", "reason": busy},
                                      camera_busy=True)
             try:
                 return self._analyze_burst(cam)
+            except CameraReadTimeout:
+                # Stage 9 (R10, F-144): the read hung; the capture is already abandoned.
+                self._camera_problem = "camera-error"
+                return VerifyOutcome(False, 1.0, False,
+                                     {"verdict": "SKIPPED", "reason": "camera-error"},
+                                     camera_busy=True)
             finally:
-                if not self.cfg.persistent_camera:
-                    cam.close()
+                self._done_with(cam)
+
+    def _room_for_burst(self, r: "VerifyOutcome", budget_s: float) -> bool:
+        """F-138: whether one more burst like ``r`` still fits in this request's budget (the
+        server deadline, or the client's own when smaller). No request stamp = no deadline."""
+        t0 = getattr(self, "_req_started", None)
+        if t0 is None:
+            return True
+        client = getattr(self, "_client_budget_s", None)
+        limit = budget_s if client is None else min(budget_s, client)
+        need = float(r.detail.get("latency_ms") or 0.0) / 1000.0 + EXTRA_BURST_MARGIN_S
+        return time.monotonic() - t0 + need <= limit
 
     def _analyze_burst(self, cam) -> VerifyOutcome:
         """Run ONE analysis burst over an already-open ``cam``. The caller owns the camera lock and
@@ -884,6 +972,12 @@ class FaceService:
         """
         boost_audit = {"boost_applied": False, "boost_honored": False,
                        "scene_luma_before": round(r_dark.scene_luma, 2)}
+        if self._boost_disabled:
+            # F-129: this device did not return to its exposure settings once; no second try.
+            return r_dark, {**boost_audit, "boost_disabled": True}
+        if not self._room_for_burst(r_dark, UNLOCK_DEADLINE_S):
+            log.info("low-light boost skipped: not enough of the request budget left (F-138)")
+            return r_dark, {**boost_audit, "boost_skipped": "budget"}
         try:
             with self._cam_lock:
                 cam, busy = self._acquire_camera()
@@ -897,9 +991,18 @@ class FaceService:
                         cap, self.cfg.low_light_exposure_step,
                         lambda: self._analyze_burst(cam),
                     )
-                finally:
-                    if not self.cfg.persistent_camera:
+                    if not out.restored:
+                        # F-129: EXPOSURE / AUTO_EXPOSURE did not read back as before. Drop the
+                        # capture (the next open starts from the driver's defaults) and keep the
+                        # boost off for this device until the service restarts.
+                        self._boost_disabled = True
+                        if self._cam is cam:
+                            self._cam = None
                         cam.close()
+                        log.error("low-light boost: the camera did not return to its exposure "
+                                  "settings -- capture dropped, boost off until restart")
+                finally:
+                    self._done_with(cam)
         except Exception as e:   # pragma: no cover - defensive; boost must never break unlock
             log.warning("low-light boost skipped: %s", e)
             return r_dark, boost_audit
@@ -1036,7 +1139,7 @@ class FaceService:
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
-                return {"ok": False, "reason": "camera-busy"}
+                return {"ok": False, "reason": _camera_reason({"reason": busy})}
             try:
                 for _ in range(2):
                     cam.read()
@@ -1095,9 +1198,11 @@ class FaceService:
                         if best_emb is None or a.distance <= distance_best:
                             best_emb = a.embedding
                     seq.feed(a.landmark, a.pose)
+            except CameraReadTimeout:
+                self._camera_problem = "camera-error"      # R10 (F-144): the read hung
+                return {"ok": False, "reason": "camera-error"}
             finally:
-                if not self.cfg.persistent_camera:
-                    cam.close()
+                self._done_with(cam)
 
         self._note_camera_health(frames_ok, luma_max, "gesture")
         if frames_ok == 0 or self._burst_defect(frames_ok, luma_max) is not None:
@@ -1204,7 +1309,8 @@ class FaceService:
     def _presence_probe(self) -> tuple[str, bool]:
         """(state, real) — semantics depend on config.presence_mode.
 
-        ``state`` is one of ``"present"`` / ``"uncertain"`` / ``"absent"`` (7c-6). ``uncertain``
+        ``state`` is one of ``"present"`` / ``"uncertain"`` / ``"absent"`` (7c-6), ``"unknown"``
+        (Stage 9) or ``"error"``. ``uncertain``
         means something face-shaped and close was seen but anti-screen flagged it: it is NOT a
         sighting and NOT an absence, and on its own it must never lock. Only the recognition mode
         can produce it -- detection has no distance and no anti-screen, so it stays two-valued.
@@ -1213,17 +1319,23 @@ class FaceService:
         detection:   ``present`` = *any* face detected by YuNet. ``real`` is
                      reported as True (anti-spoofing not evaluated).
 
-        Every benign skip below reports ``present``: the camera being unavailable is not evidence
-        that the user left, and that is exactly what these paths meant before 7c-6 too.
+        Stage 9 (act 9b R10, F-143): every "cannot see" case -- leased to the wizard, busy, not
+        connected, a read that hung, zero or black frames -- is ``"unknown"`` with the cause in
+        ``self._probe_why``. It used to be reported as ``present``, which Status then showed as a
+        sighting; the monitor now takes it as no decision at all, neither presence nor absence.
         """
+        self._probe_why = None
         if self._camera_leased_out():
             log.info("presence probe skipped: camera leased out to enrollment")
-            # Report present so the monitor doesn't rack up strikes
-            # while the user is enrolling their face.
-            return "present", True
+            return self._unknown("leased")
         if self.cfg.presence_mode == "detection":
             return self._presence_probe_detection()
         return self._presence_probe_recognition()
+
+    def _unknown(self, why: str) -> tuple:
+        """A probe that could not see: no decision, with the cause for Status (R10)."""
+        self._probe_why = why
+        return "unknown", False
 
     def _note_probe_errors(self, errors: list) -> None:
         """Stage 8b (F-22): log the FIRST engine exception of an error episode with its traceback,
@@ -1257,8 +1369,8 @@ class FaceService:
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
-                log.info("presence probe skipped: camera busy (held by another process)")
-                return "present", True   # like leased: no strikes when we cannot see
+                log.info("presence probe skipped: %s", busy)
+                return self._unknown("not-found" if busy == "camera-not-found" else "busy")
             try:
                 for _ in range(2):
                     cam.read()
@@ -1286,9 +1398,11 @@ class FaceService:
                     if ok:
                         result = (True, real)
                         break
+            except CameraReadTimeout:
+                self._camera_problem = "camera-error"
+                return self._unknown("camera-error")
             finally:
-                if not self.cfg.persistent_camera:
-                    cam.close()
+                self._done_with(cam)
         # No retry on this path: the probe runs on a timer, so the next tick already gets the
         # fresh camera, and absence-strike policy stays entirely the caller's business.
         self._note_camera_health(frames_ok, luma_max, "probe-recog")
@@ -1300,9 +1414,9 @@ class FaceService:
             # -- present, so the monitor does not spend an absence strike (and eventually a lock)
             # on a camera fault. The self-heal above has already dropped the cache, so the next
             # probe opens a fresh one.
-            log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> camera-error, not absence",
+            log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> unknown, not absence",
                      defect, frames_ok, "n/a" if luma_max is None else "%.2f" % luma_max)
-            return "present", True
+            return self._unknown("zero-frames" if defect == "zero-frames" else "black")
         # Reaching here means the camera-error gate above did NOT fire, so anything short of a
         # sighting is about the USER, not the device. ``result`` above is the strong-match early
         # exit and still gates the camera-error branch byte-for-byte; the tri-state verdict is
@@ -1346,11 +1460,13 @@ class FaceService:
         frames_ok = 0
         luma_max: "float | None" = None
         result = (False, True)
+        judged = 0
+        errors: list = []        # Stage 9 (F-133): detector exceptions this burst
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
-                log.info("presence probe skipped: camera busy (held by another process)")
-                return "present", True   # like leased: no strikes when we cannot see
+                log.info("presence probe skipped: %s", busy)
+                return self._unknown("not-found" if busy == "camera-not-found" else "busy")
             try:
                 for _ in range(2):
                     cam.read()
@@ -1365,22 +1481,31 @@ class FaceService:
                     except Exception as e:
                         log.warning("scene luma failed on a probe frame: %r", e)
                     try:
-                        if self.detector.has_face(frame):
-                            result = (True, True)
-                            break
+                        found = self.detector.has_face(frame)
                     except Exception as e:
-                        log.warning("detector error: %s", e)
+                        errors.append(e)
                         continue
+                    judged += 1
+                    if found:
+                        result = (True, True)
+                        break
+            except CameraReadTimeout:
+                self._camera_problem = "camera-error"
+                return self._unknown("camera-error")
             finally:
-                if not self.cfg.persistent_camera:
-                    cam.close()
+                self._done_with(cam)
         self._note_camera_health(frames_ok, luma_max, "probe-detect")
+        self._note_probe_errors(errors)
         defect = self._burst_defect(frames_ok, luma_max)
         if not result[0] and defect is not None:
             # Same reasoning as the recognition probe above: a blind camera is a camera fault.
-            log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> camera-error, not absence",
+            log.info("presence probe: %s (frames_ok=%d luma_max=%s) -> unknown, not absence",
                      defect, frames_ok, "n/a" if luma_max is None else "%.2f" % luma_max)
-            return "present", True
+            return self._unknown("zero-frames" if defect == "zero-frames" else "black")
+        if not result[0] and errors and judged == 0:
+            # Stage 9 (F-133): the detector could not judge a single frame (YuNet missing or
+            # unreadable) -- an error, exactly like the recognition probe's all-error burst.
+            return "error", False
         # Symmetric to the recognition probe. YuNet only answers yes/no, so there are no distances
         # to report: an absent verdict here means has_face said no on every frame that arrived.
         state = "present" if result[0] else "absent"
@@ -1417,6 +1542,11 @@ class FaceService:
             **({"why": state["why"]} if "why" in state else {}),
             "password_rejected": password_rejected(),
             "protocol": PROTOCOL_VERSION,
+            # Stage 9 (R10), additive: the camera as the service last saw it.
+            "camera": {"problem": self._camera_problem,
+                       "open": getattr(self, "_cam", None) is not None,
+                       "warm": time.monotonic() < self._warm_until,
+                       "boost_disabled": self._boost_disabled},
         }
 
     def _refusal(self) -> "str | None":
@@ -1452,6 +1582,7 @@ class FaceService:
             return {"ok": False, "reason": f"invalid-config: {_scrub(e)}"}
         old = self.cfg
         old_index = self.cfg.camera_index
+        old_name = getattr(self.cfg, "camera_name", "")
         old_persistent = self.cfg.persistent_camera
         # Stage 8b (F-15). Defect: self.cfg was swapped FIRST and the lockout / audit were
         # reconfigured after it, so a failure there left a half-applied reload (new cfg, old
@@ -1485,7 +1616,10 @@ class FaceService:
         # Reset camera if camera-affecting settings changed. The new cfg is already
         # applied above, so a failure here must not abort the reload and strand the
         # OLD camera open under the NEW settings -- log it and carry on.
-        if new_cfg.camera_index != old_index or new_cfg.persistent_camera != old_persistent:
+        # (Stage 9, R10: switching auto_lock off releases the camera too.)
+        if (new_cfg.camera_index != old_index or new_cfg.camera_name != old_name
+                or new_cfg.persistent_camera != old_persistent
+                or (old.auto_lock and not new_cfg.auto_lock)):
             try:
                 with self._cam_lock:
                     self._release_camera()
@@ -1638,6 +1772,11 @@ class FaceService:
             # probes in the tray and the Status window read it, and an older monitor that knows
             # nothing about ``state`` still sees uncertain as not-present (i.e. the pre-7c-6
             # behaviour) rather than something it cannot interpret.
+            if state == "unknown":
+                # Stage 9 (R10): the camera could not see -- no decision, with the cause.
+                return {"ok": True, "present": False, "real": False,
+                        "mode": self.cfg.presence_mode, "state": "unknown",
+                        "why": self._probe_why or "camera-error"}
             return {"ok": True, "present": state == "present", "real": real,
                     "mode": self.cfg.presence_mode, "state": state}
 
@@ -1692,8 +1831,9 @@ class FaceService:
         # Stage 3.4 busy camera: the webcam is held by ANOTHER process (or leased to the wizard).
         # Refuse cleanly with reason "camera-busy" -- LOCKOUT-NEUTRAL (act 9b R5).
         if r.camera_busy:
-            self._audit.write("unlock", {**r.detail, "outcome": "camera-busy"})
-            return {"ok": False, "reason": "camera-busy"}
+            why = _camera_reason(r.detail)
+            self._audit.write("unlock", {**r.detail, "outcome": why})
+            return {"ok": False, "reason": why}
         # Stage 8b (F-18) / Stage 9 (R5): a burst in which no frame arrived, in which the engine
         # could not judge enough frames, or in which no face appeared at all is not a failed
         # attempt -- an honest reason, lockout-neutral.
@@ -2393,7 +2533,7 @@ class FaceService:
             with self._cam_lock:
                 cam, busy = self._acquire_camera()
                 if busy:
-                    log.info("camera warmup skipped: camera busy (held by another process)")
+                    log.info("camera warmup skipped: %s", busy)
                 else:
                     # close in a finally: a raising read() must not skip it, or the
                     # non-persistent path leaks the handle for the process lifetime.
@@ -2407,10 +2547,52 @@ class FaceService:
                             log.info("camera warmup ok (persistent=%s)",
                                      self.cfg.persistent_camera)
                     finally:
-                        if not self.cfg.persistent_camera:
-                            cam.close()
+                        self._done_with(cam)
         except Exception as e:
             log.warning("camera warmup failed: %s", e)
+
+    # ---------- warm camera on lock (Stage 9, act 9b R10) ----------
+
+    def _lock_watch_step(self, locked: "bool | None", was_locked: bool) -> bool:
+        """One poll of the lock watcher; returns the new ``was_locked``. On the lock edge the camera
+        is opened and held warm (at most CAMERA_WARM_HOLD_S); on the unlock edge -- or when the
+        hold runs out -- it is released unless persistent_camera keeps it anyway. ``locked=None``
+        (the probe has no opinion) changes nothing."""
+        if locked is None:
+            return was_locked
+        now = time.monotonic()
+        if locked and not was_locked:
+            if (self._refusal() is None and not self._camera_leased_out()
+                    and not self.cfg.persistent_camera):
+                self._warm_until = now + CAMERA_WARM_HOLD_S
+                if self._cam_lock.acquire(timeout=0.5):
+                    try:
+                        cam, busy = self._acquire_camera()
+                        log.info("session locked: camera %s", "kept warm" if not busy
+                                 else f"not warmed ({busy})")
+                    except Exception:
+                        log.exception("warming the camera failed")
+                    finally:
+                        self._cam_lock.release()
+            return True
+        if self._warm_until and (not locked or now >= self._warm_until):
+            self._warm_until = 0.0
+            if not self.cfg.persistent_camera:
+                with self._cam_lock:
+                    if self._cam is not None:
+                        self._release_camera()
+                        log.info("camera released (%s)", "session unlocked" if not locked
+                                 else "warm hold expired")
+        return bool(locked)
+
+    def _lock_watch(self) -> None:
+        was = False
+        while not self._stop.wait(CAMERA_WARM_POLL_S):
+            try:
+                probe = self._session_locked
+                was = self._lock_watch_step(probe() if probe else None, was)
+            except Exception:
+                log.exception("lock watch step failed")
 
     def serve_forever(self) -> None:
         # Single-instance guard: if another FaceService is already serving
@@ -2455,6 +2637,11 @@ class FaceService:
                 log.warning("enrollment load at start: %s", e)
             if self.cfg.warmup_on_start:
                 self._warmup()
+        if bound:
+            from .session_state import session_locked_wts
+            if self._session_locked is None:
+                self._session_locked = session_locked_wts
+            threading.Thread(target=self._lock_watch, name="lock-watch", daemon=True).start()
 
         while not self._stop.is_set():
             try:
