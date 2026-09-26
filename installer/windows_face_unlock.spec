@@ -472,6 +472,14 @@ watchdog_exe = EXE(
     version=_version_info("Windows Face Unlock watchdog", "face_unlock_watchdog"),
 )
 
+# 9c-BUILD: PyInstaller's OWN hooks (hook-onnxruntime, hook-cv2) collect these libraries as well, so
+# filtering only the BINARIES list above let the TensorRT provider, the CUDA provider (CPU variant)
+# and the FFmpeg plugin through -- the build gate caught it. The filter therefore runs on every
+# Analysis' final binaries and datas, right before they are collected (F-51, F-219, D-151).
+for _analysis in (service_analysis, tray_analysis, watchdog_analysis):
+    _analysis.binaries = [b for b in _analysis.binaries if _keep_binary(b)]
+    _analysis.datas = [d for d in _analysis.datas if _keep_binary(d)]
+
 coll = COLLECT(
     service_exe,
     service_analysis.binaries,

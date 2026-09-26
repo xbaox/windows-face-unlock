@@ -202,6 +202,10 @@ def test_build():
     check("NVIDIA files only in the GPU variant", 'if VARIANT == "gpu":' in spec and "raise SystemExit" in spec)
     check("no FFmpeg, no TensorRT provider", "opencv_videoio_ffmpeg" in spec and "providers_tensorrt" in spec)
     check("no sample media", 'excludes=["data/images/**", "gui/**"]' in spec and '"skimage", excludes=["data/**"]' in spec)
+    check("the binary filter runs on every Analysis' final TOCs, not only on BINARIES (9c-BUILD)",
+          "_analysis.binaries = [b for b in _analysis.binaries if _keep_binary(b)]" in spec
+          and "_analysis.datas = [d for d in _analysis.datas if _keep_binary(d)]" in spec
+          and spec.index("for _analysis in") < spec.index("coll = COLLECT("))
     check("pystray collected as .py (LGPL, F-261)", 'COLLECTION_MODE = {"pystray": "py"}' in spec
           and spec.count("module_collection_mode=COLLECTION_MODE") == 3)
     check("unused packages excluded (F-51)", all(f'"{m}"' in spec for m in ("pandas", "sympy", "pip", "setuptools")))
