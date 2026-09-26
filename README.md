@@ -35,7 +35,12 @@ What it does have:
 - a passive anti-screen check that flags a display being held up to the camera
 - a hardened local IPC channel, and credential release gated to `SYSTEM`
 
-What that buys you: a flat photo, a phone screen and a recorded video all fail.
+What that buys you: a photo, a phone screen or a recorded video of your face
+is harder to use than with a plain face match, especially in `paranoid` mode,
+where a gesture is always required. It is **not** a guarantee: an RGB camera
+cannot measure depth, and in the default `fast` mode such an attempt can
+occasionally pass. If that matters to you, set **Liveness mode** to `paranoid`
+in Settings.
 What it does not buy you: resistance to a 3-D mask, to a determined attacker
 with your unlocked machine, or to malware already running as you.
 
