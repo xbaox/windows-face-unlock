@@ -1,44 +1,48 @@
-"""Store the Windows password used by the Credential Provider.
+"""Store the Windows password used by the sign-in tile -- console form, for scripted developer use.
 
-Encrypted with DPAPI (user scope). Must be run as the same user that will log in.
+The tray's "Windows password…" opens the dialog (presence_monitor.password_gui) in every layout; this
+tool is the same save path without Tk (Stage 9, R20 / B7-11): an empty password is refused, the
+password is checked ONCE with an interactive logon before anything is stored (a rejected password is
+never saved), and the stored record is read back. Encrypted with DPAPI for the current Windows
+account -- run it as the account that signs in.
 
 Usage:
-  python -m tools.set_password
+  python -m tools.set_password            # prompts twice; exit 0 saved, 1 not saved
   python -m tools.set_password --clear
 """
 from __future__ import annotations
+
 import argparse
 import getpass
-import os
+import sys
 
-from face_service.credentials import clear_password, load_password, save_password
+from face_service.credentials import clear_password
+from presence_monitor.password_gui import account_identity, store_password_checked
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--clear", action="store_true")
-    ap.add_argument("--user", default=os.environ.get("USERNAME", ""))
-    ap.add_argument("--domain", default=os.environ.get("USERDOMAIN", "."))
-    args = ap.parse_args()
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m tools.set_password")
+    ap.add_argument("--clear", action="store_true", help="remove the stored password")
+    args = ap.parse_args(argv)
 
     if args.clear:
         clear_password()
-        print("Cleared stored credentials.")
-        return
+        print("Cleared the stored password.")
+        return 0
 
-    print(f"User:   {args.user}")
-    print(f"Domain: {args.domain}")
+    user, domain, kind = account_identity()
+    print(f"Account: {domain + chr(92) if domain else ''}{user}  ({kind})")
     pw = getpass.getpass("Windows password: ")
-    pw2 = getpass.getpass("Confirm:          ")
-    if pw != pw2:
-        raise SystemExit("Passwords do not match.")
-    save_password(args.user, pw, args.domain)
-
-    # sanity check
-    check = load_password()
-    assert check and check["u"] == args.user
-    print("Saved. DPAPI test: OK")
+    if not pw:
+        print("Not saved: the password is empty.", file=sys.stderr)
+        return 1
+    if getpass.getpass("Confirm:          ") != pw:
+        print("Not saved: the passwords do not match.", file=sys.stderr)
+        return 1
+    level, text = store_password_checked(user, pw, domain)
+    print(text, file=sys.stderr if level == "err" else sys.stdout)
+    return 1 if level == "err" else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

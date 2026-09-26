@@ -61,7 +61,9 @@ bundle under a GPU name.
 1. CMake -> `build-cp\Release\FaceCredentialProvider.dll`.
 2. Sign the CP DLL (Azure Trusted Signing) -- **loudly skipped** without credentials.
 3. PyInstaller (`FU_VARIANT=<variant>`) -> `dist\WindowsFaceUnlock\` (three exes, one runtime
-   folder); the CP DLL, the docs and pystray's license texts are staged.
+   folder); the CP DLL, the docs (README, INSTALL, SECURITY, THIRD_PARTY_NOTICES, LICENSE) and
+   every third-party license text are staged -- `licenses\<package>\` + `licenses\INDEX.txt`,
+   copied by `installer/notices.py` from the build interpreter (F-260).
 4. GPU only: every NVIDIA DLL is checked with Authenticode. The cuDNN DLLs are signed by NVIDIA;
    the CUDA runtime / cuBLAS / cuFFT / NVRTC wheels ship unsigned DLLs. They are never modified or
    re-signed (their EULA); the catalog (`.cat`) signature that would cover them needs our signing
@@ -71,8 +73,8 @@ bundle under a GPU name.
 6. **The gate** on the (signed) bundle: `tools\verify_frozen_entrypoints.py` (PE content compared
    without the certificate table), `tools\packaging_selftest.py`, the frozen custody self-check,
    no model in the bundle, the variant's shape (CPU: no CUDA provider, no NVIDIA file; GPU: exactly
-   the allowlist; no FFmpeg, no TensorRT provider; pystray as replaceable `.py` files), then
-   `dist\WindowsFaceUnlock.gate.json`.
+   the allowlist; no FFmpeg, no TensorRT provider; pystray as replaceable `.py` files), every
+   expected license folder present and non-empty (F-260), then `dist\WindowsFaceUnlock.gate.json`.
 7. ISCC with the version, the variant and the model pins as `/D` defines (plus SignTool /
    SignedUninstaller when signing is configured). The artefact is exactly
    `WindowsFaceUnlock-Setup-<ver>-<variant>.exe`; the bundle is re-hashed after ISCC and must still
@@ -117,5 +119,5 @@ a different recorded owner in a silent install needs `/FORCEOWNER`.
 - `lang\en.isl`, `lang\ru.isl` -- the installer's own texts, English and Russian.
 - `windows_face_unlock.spec` -- PyInstaller (variants, NVIDIA allowlist, exclusions, version
   resources, the tray's PerMonitorV2 manifest).
-- `build.py` -- the pipeline above. `requirements-build.txt` -- PyInstaller and its dependencies,
-  hashed.
+- `build.py` -- the pipeline above. `notices.py` -- stages and checks the third-party license
+  texts. `requirements-build.txt` -- PyInstaller and its dependencies, hashed.

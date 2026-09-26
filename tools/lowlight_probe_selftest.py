@@ -15,6 +15,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_lowlight_probe_")
 
 try:
     from tools.lowlight_probe import ProbeRow, summarize_bins, boost_comparison

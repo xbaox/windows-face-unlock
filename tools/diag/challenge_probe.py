@@ -10,9 +10,9 @@ face.
 Reuses the Stage-1 CUDA fix. Read-only webcam probe -- does not touch service/recognizer/config.
 
 Run from repo root:
-    python tools\\challenge_probe.py
-    python tools\\challenge_probe.py --blink-only   # only blink challenges
-    python tools\\challenge_probe.py --camera 1
+    python tools\\diag\\challenge_probe.py
+    python tools\\diag\\challenge_probe.py --blink-only   # only blink challenges
+    python tools\\diag\\challenge_probe.py --camera 1
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import time
 import argparse
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import cv2
 import numpy as np

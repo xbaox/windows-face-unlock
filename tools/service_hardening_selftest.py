@@ -26,18 +26,17 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-_ROOT = Path(tempfile.mkdtemp(prefix="faceunlock_svchard_"))
-os.environ["FACE_UNLOCK_HOME"] = str(_ROOT / "home")
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+_ROOT = testhome.own_root("faceunlock_svchard_")
+from tools.testkit import patch, run_restoring  # noqa: E402  (D-142)
 
 import numpy as np
 import pywintypes    # type: ignore
@@ -146,6 +145,7 @@ def test_screen_in_round():
         L.GestureSequence.feed, L.ROUND_CAP_S = orig, orig_cap
     check("no screen-flagged frame reached the task", fed == [], len(fed))
     check("identity_frames counts none of them", r.get("identity_frames") == 0, r)
+    check("and the round did not pass (D-140)", r.get("passed") is not True, r)
 
 
 # --- [2] F-15 -----------------------------------------------------------------------------------
@@ -295,7 +295,7 @@ def _client(name, payload: bytes, *, read=True, timeout=5.0):
 def test_deadline_and_delivery():
     print("[5] F-19 deadlines and delivery-gated grants; [9] F-42 / F-43 on the real _serve_one")
     released = []
-    S.load_password = lambda: released.append(1) or {"u": "admin", "p": "pw", "d": "."}
+    patch(S, "load_password", lambda: released.append(1) or {"u": "admin", "p": "pw", "d": "."})
     orig_name = S.PIPE_NAME
     try:
         # (a) past the deadline: nothing released, nothing recorded
@@ -412,6 +412,9 @@ def test_perimeter_clients():
 
     name = r"\\.\pipe\FaceUnlockSelftest-" + uuid.uuid4().hex
     got = []
+    # D-139 (B14-06): the silent server holds the connection until the test releases it -- not a
+    # fixed sleep -- so "returned at the client's budget" cannot be confused with "the server hung up".
+    release = threading.Event()
 
     def server(reply: bool):
         h = win32pipe.CreateNamedPipe(name, win32pipe.PIPE_ACCESS_DUPLEX,
@@ -425,7 +428,7 @@ def test_perimeter_clients():
                 if reply:
                     win32file.WriteFile(h, b'{"ok": true, "pong": true}')
                 else:
-                    time.sleep(2.0)
+                    release.wait(10.0)
             except pywintypes.error:
                 pass
         finally:
@@ -449,9 +452,12 @@ def test_perimeter_clients():
     t0 = time.monotonic()
     resp, why = P.exchange({"cmd": "ping"}, 0.8, pipe_name=name)
     dt = time.monotonic() - t0
+    still_holding = th.is_alive()
+    release.set()
     th.join(3)
     check("SELF server that never answers -> reply-timeout", why == "reply-timeout", why)
-    check("... within the budget (< 1.5 s)", dt < 1.5, round(dt, 2))
+    check("... at the client's own budget, while the server still held on",
+          still_holding and dt < 5.0, (still_holding, round(dt, 2)))
 
 
 # --- [7] F-21, [8] F-32 -------------------------------------------------------------------------
@@ -529,15 +535,17 @@ def test_atomic_and_cache():
 
 def main() -> int:
     try:
-        test_screen_in_round()
-        test_validation()
-        test_pause_camera()
-        test_fault_neutral()
-        test_deadline_and_delivery()
-        test_perimeter_clients()
-        test_small()
-        test_scene_luma()
-        test_atomic_and_cache()
+        run_restoring(
+            test_screen_in_round,
+            test_validation,
+            test_pause_camera,
+            test_fault_neutral,
+            test_deadline_and_delivery,
+            test_perimeter_clients,
+            test_small,
+            test_scene_luma,
+            test_atomic_and_cache,
+        )
     finally:
         subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", str(_ROOT)], capture_output=True)
     if FAILS:

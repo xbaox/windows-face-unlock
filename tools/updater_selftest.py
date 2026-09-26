@@ -17,15 +17,14 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import sys
 import tempfile
 import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-if not os.environ.get("FACE_UNLOCK_HOME"):
-    os.environ["FACE_UNLOCK_HOME"] = tempfile.mkdtemp(prefix="faceunlock_upd_")
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_upd_")
 
 from presence_monitor import updater as U
 

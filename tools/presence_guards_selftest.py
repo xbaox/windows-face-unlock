@@ -48,6 +48,8 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_presence_guards_")
 
 import numpy as np
 
@@ -365,11 +367,8 @@ def main(argv=None) -> int:
     finally:
         I.set_language(saved_lang)
     en, ru = I.TRANSLATIONS["en"], I.TRANSLATIONS["ru"]
-    # 208 -> 224 in 7d-E (16 pwd.* keys for the password dialog) -> 226 in 7d-G (two update.*
-    # keys: a mandatory-checksum refusal and the source-checkout notice) -> 228 in 7h (label
-    # and .desc for the debug_dump_frames diagnostics knob) -> 229 in 7l (enroll.status.connecting,
-    # the wizard's wait-for-service line; added to all twelve locales).
-    # Stage 9 (R16): EN and RU are the product languages, rebuilt key-for-key in 9c-4.
+    # Stage 9 (R16): EN and RU are the product languages, rebuilt key-for-key in 9c-4 (the old
+    # twelve-locale history ended at 237 keys); the count is now a floor, parity is exact.
     t.ok(len(en) == len(ru) >= 300, f"_EN / _RU have the same, full key count (got {len(en)} / {len(ru)})")
     t.ok(set(en) == set(ru), "_EN and _RU are still key-for-key equal")
     # Key parity alone never caught a translation that drops or renames a {placeholder}: t()

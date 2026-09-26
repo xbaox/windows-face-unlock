@@ -15,6 +15,8 @@ import random
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_liveness_")
 
 import numpy as np
 
@@ -70,13 +72,18 @@ class FakeClock:
         self.t += dt
 
 
+FAILED: list[str] = []
+
+
 def check(name, cond):
+    """Stage 9 (D-147, B14-14): a failure is counted and the run goes on, so every group reports;
+    main() returns 1 at the end instead of stopping at the first failure with a traceback."""
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
     if not cond:
-        raise AssertionError(name)
+        FAILED.append(name)
 
 
-def main():
+def main() -> int:
     print("EAR sanity:")
     check("open EAR reproduces target", abs(compute_ear(OPEN) - OPEN_EAR) < 1e-3)
     check("closed EAR reproduces target", abs(compute_ear(CLOSED) - CLOSED_EAR) < 1e-3)
@@ -270,8 +277,12 @@ def main():
     check("the clocks start at the first frame (F-140): nothing expires before it",
           not seq.started and seq.tick() == ChallengeState.AWAITING)
 
+    if FAILED:
+        print(f"\nLIVENESS SELFTEST FAILED: {len(FAILED)} check(s): " + "; ".join(FAILED))
+        return 1
     print("\nAll liveness self-tests passed.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

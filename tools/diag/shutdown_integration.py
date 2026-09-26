@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/shutdown_integration.py -- Stage 3 / Step 5 graceful-shutdown integration test.
+"""tools/diag/shutdown_integration.py -- Stage 3 / Step 5 graceful-shutdown integration test.
 
 Autonomous, no-human proof of the shutdown fixes against a REAL service process. It launches the
 service in an isolated FACE_UNLOCK_HOME with warmup DISABLED (so it needs no camera / no engine and
@@ -11,12 +11,14 @@ comes up in ~1s), then:
     ConnectNamedPipe). This leg needs a console, so it self-skips (inconclusive) where one isn't
     available rather than failing.
 
-Graceful skip (exit 0) when pywin32 is unavailable or the service can't be launched/pinged. This is
-a diagnostic artifact (like camera_busy_integration), NOT part of the acceptance set.
+Stage 9 (R20, B13-03): a service that cannot be launched or never answers is a FAILURE (exit 1), not
+a skip -- a wrong working directory used to turn the whole proof into a silent pass. Exit 2 means the
+proof could not run at all (no pywin32, or the real service is up). This is a diagnostic artifact
+(like camera_busy_integration), NOT part of the acceptance set.
 
 Run from the repo root, with the real service STOPPED (the global single-instance mutex is shared):
-    python -m tools.shutdown_integration
-Exit 0 = proof passed OR cleanly skipped; 1 = a real failure.
+    python -m tools.diag.shutdown_integration
+Exit 0 = proof passed; 1 = a real failure; 2 = could not run (not a pass).
 """
 from __future__ import annotations
 
@@ -30,9 +32,9 @@ import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-REPO_ROOT = str(Path(__file__).resolve().parents[1])
-PIPE_NAME = r"\\.\pipe\FaceUnlock"
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+REPO_ROOT = str(Path(__file__).resolve().parents[2])
+from face_service.config import PIPE_NAME  # noqa: E402  (after the sys.path line)
 
 
 def _send(req: dict, connect_timeout_s: float = 6.0):
@@ -94,7 +96,7 @@ def _launch(home: str, new_group: bool):
 
 def _tail_log(home: str, n: int = 8) -> str:
     try:
-        lines = (Path(home) / "service.log").read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = (Path(home) / "logs" / "service.log").read_text(encoding="utf-8", errors="replace").splitlines()
         return "\n    ".join(lines[-n:])
     except Exception:
         return "(no service.log)"
@@ -105,8 +107,11 @@ def main(argv=None) -> int:
         import pywintypes  # noqa: F401
         import win32file   # noqa: F401
     except Exception as e:
-        print(f"[shutdown] SKIP: pywin32 unavailable ({e!r}).")
-        return 0
+        print(f"[shutdown] CANNOT RUN: pywin32 unavailable ({e!r}).")
+        return 2
+    if not (Path(REPO_ROOT) / "face_service" / "__main__.py").is_file():
+        print(f"[shutdown] FAIL: {REPO_ROOT} is not the repo root (no face_service package).")
+        return 1
 
     fails: list[str] = []
     home = tempfile.mkdtemp(prefix="faceunlock_shutdown_")
@@ -116,9 +121,9 @@ def main(argv=None) -> int:
     # If the real service is up (shared mutex), we can't run this cleanly -> skip.
     resp, _ = _send({"cmd": "ping"})
     if resp and resp.get("pong"):
-        print("[shutdown] SKIP: a FaceUnlock service is already running (stop it first).")
+        print("[shutdown] CANNOT RUN: a FaceUnlock service is already running (stop it first).")
         shutil.rmtree(home, ignore_errors=True)
-        return 0
+        return 2
 
     proc = None
     proc2 = None
@@ -127,9 +132,9 @@ def main(argv=None) -> int:
         print("[shutdown] launching service (warmup off) for the shutdown test...")
         proc = _launch(home, new_group=False)
         if not _wait_pingable(40.0):
-            print("[shutdown] SKIP: service never became pingable. service.log tail:")
+            print("[shutdown] FAIL: service never became pingable. service.log tail:")
             print("    " + _tail_log(home))
-            return 0
+            return 1
         print("[shutdown] pingable; sending shutdown...")
         resp, err = _send({"cmd": "shutdown"})
         if err == 233:
@@ -154,7 +159,8 @@ def main(argv=None) -> int:
         print("[shutdown] launching service in a new process group for the Ctrl+C test...")
         proc2 = _launch(home, new_group=True)
         if not _wait_pingable(40.0):
-            print("[shutdown] SKIP (Ctrl+C leg): service never became pingable.")
+            print("[shutdown] FAIL (Ctrl+C leg): service never became pingable.")
+            fails.append("ctrl-c-not-pingable")
         else:
             print("[shutdown] pingable; sending CTRL_BREAK_EVENT...")
             try:
@@ -175,8 +181,8 @@ def main(argv=None) -> int:
                     p.wait(timeout=5)
                 except Exception:
                     pass
-        # best-effort: leave nothing running, clean the temp home
-        _send({"cmd": "shutdown"})
+        # Only our own processes are stopped (terminate above). No blind "shutdown" on the shared
+        # pipe name: a real service started meanwhile (watchdog restart) would get it (B13-03).
         shutil.rmtree(home, ignore_errors=True)
 
     if fails:

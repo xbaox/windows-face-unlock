@@ -3,7 +3,7 @@
     Remove Face Unlock from this machine, and prove what is left.
 
 .DESCRIPTION
-    MASTER-TZ section 7 asks for an uninstaller that removes the CP registration,
+    docs/internal/face-unlock-MASTER-TZ.md section 7 asks for an uninstaller that removes the CP registration,
     the tasks, .venv and the config "without a trace". Before Stage 7d-I there was
     no uninstall entry point for the dev layout at all: setup.ps1 had no
     counterpart, and INSTALL.md section 9 was a block of commands to type by hand.
@@ -174,7 +174,7 @@ $fuTemplateStems = @('embeddings.npz', 'adaptive.npz')
 # Directories under the data directory whose entire contents are enrollment imagery,
 # classified BY LOCATION rather than by name: everything below them, at any depth.
 # The wizard writes full frames as enroll_<ms>.jpg (presence_monitor/enroll_gui.py:698)
-# and the QC probe writes aligned face crops into enroll\_qc_crops (tools/
+# and the QC probe writes aligned face crops into enroll\_qc_crops (tools/diag/
 # enroll_qc_probe.py:66,102). A raw frame is MORE disclosing than a template -- it is
 # the original, not a derived vector -- so a rule that only knew file names would be
 # protecting the lesser artifact while ignoring the greater.
@@ -428,7 +428,7 @@ function Invoke-Inventory {
         # while the report still claimed to name everything. A single enumeration plus a
         # single classifier means a file cannot be counted by one list and missed by
         # another; the arithmetic printed at the end of this block proves it each run.
-        $fuRoot = $fuDataDir.TrimEnd('\')
+        $fuRoot = [IO.Path]::GetFullPath($fuDataDir).TrimEnd('\')
         $fuAll = @(Get-ChildItem -LiteralPath $fuDataDir -File -Force -Recurse -ErrorAction SilentlyContinue |
                    ForEach-Object {
                        $fuRel = $_.FullName
@@ -502,15 +502,28 @@ function Invoke-Inventory {
                 Write-Host ("       - {0}  ({1})" -f $fuU.Rel, (Format-Size $fuU.Bytes)) -ForegroundColor Magenta
             }
         }
-        # The arithmetic, printed every run. Each file lands in exactly one bucket by
-        # construction, so this line is the claim "nothing under the data directory fell
-        # out of the inventory" in a form that can be checked at a glance rather than
-        # trusted. A mismatch against the directory total is itself the finding.
-        $fuAccounted = $fuSecret.Count + $fuTemplate.Count + $fuImage.Count + $fuUnknown.Count
-        Write-Host ("     accounted: {0} secret + {1} template + {2} image + {3} known + {4} unmanaged = {5} of {6} file(s)" `
-                    -f $fuSecret.Count, $fuTemplate.Count, $fuImage.Count,
-                       ($fuAll.Count - $fuAccounted), $fuUnknown.Count, $fuAll.Count, $fuSz.Files) `
-                   -ForegroundColor DarkGray
+        # The arithmetic, printed every run. Stage 9 (D-119): every bucket is counted on its
+        # OWN predicate -- "known" is no longer the remainder -- and the sum is compared with
+        # the independent directory count from Get-DirSize. A file that no bucket claims, or
+        # one that two buckets claim, makes the sums differ and is reported, so the line can
+        # now fail instead of being true by construction.
+        $fuKnown = @($fuAll | Where-Object {
+                         $fuN = $_.Name
+                         (-not $_.Class) -and
+                         (($_.Sub -eq '') -or ($_.Sub -eq $fuLogDir)) -and
+                         (($fuKnownData -contains $fuN) -or
+                          [bool]($fuKnownPatterns | Where-Object { $fuN -match $_ }))
+                     })
+        $fuAccounted = $fuSecret.Count + $fuTemplate.Count + $fuImage.Count + $fuKnown.Count + $fuUnknown.Count
+        $fuBalanced = ($fuAccounted -eq $fuAll.Count) -and ($fuAll.Count -eq $fuSz.Files)
+        Write-Host ("     accounted: {0} secret + {1} template + {2} image + {3} known + {4} unmanaged = {5}; enumerated {6}; directory {7} file(s)" `
+                    -f $fuSecret.Count, $fuTemplate.Count, $fuImage.Count, $fuKnown.Count,
+                       $fuUnknown.Count, $fuAccounted, $fuAll.Count, $fuSz.Files) `
+                   -ForegroundColor $(if ($fuBalanced) { 'DarkGray' } else { 'Red' })
+        if (-not $fuBalanced) {
+            Write-Host '     INVENTORY MISMATCH: some file is in no bucket or in two -- the report above is incomplete.' `
+                       -ForegroundColor Red
+        }
     }
     }
 

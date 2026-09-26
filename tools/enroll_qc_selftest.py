@@ -12,9 +12,12 @@ Run from the repo root:
 from __future__ import annotations
 
 import sys
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_enroll_qc_")
 
 import numpy as np
 
@@ -39,7 +42,7 @@ BBOX = [20, 20, 180, 180]
 
 def _make(kind):
     import cv2
-    rng = np.random.default_rng(abs(hash(kind)) % (2 ** 32))
+    rng = np.random.default_rng(zlib.crc32(kind.encode()))   # stable across runs (D-145)
     if kind == "sharp":
         img = rng.integers(40, 215, (200, 200, 3), dtype=np.uint8)   # texture, mid exposure
         return img, _Face(0.88, BBOX)
@@ -112,8 +115,10 @@ def main(argv=None) -> int:
     print("\n[G6] keypoint path of aligned_crop (norm_crop), not just the bbox fallback")
     try:
         from insightface.utils import face_align as _fa  # noqa: F401
-    except Exception as e:   # pragma: no cover - insightface not installed in this context
-        print(f"  skip  insightface unavailable ({e.__class__.__name__}); G6 skipped")
+    except ImportError as e:   # pragma: no cover - insightface not installed in this context
+        from tools.testkit import skip_is_failure
+        if skip_is_failure("insightface (G6)", e):
+            failures += 1
     else:
         class _FaceKps:
             def __init__(self, det, bbox, kps):
@@ -156,12 +161,14 @@ def main(argv=None) -> int:
             return [_FakeFace(0.88, [20, 20, 180, 180], e)]
 
     def _write_img(path, kind):
-        rng = np.random.default_rng(abs(hash((kind, path.name))) % (2 ** 32))
+        rng = np.random.default_rng(zlib.crc32(f"{kind}/{path.name}".encode()))
         if kind == "good":
             im = rng.integers(40, 215, (200, 200, 3), dtype=np.uint8)   # sharp + mid exposure
         else:  # dark
             im = np.full((200, 200, 3), 10, np.uint8)                   # luma ~10 -> dropped
-        cv2.imwrite(str(path), im)
+        ok, buf = cv2.imencode(".png" if path.suffix.lower() == ".png" else ".jpg", im)
+        assert ok, f"could not encode {path.name}"
+        buf.tofile(str(path))   # non-ASCII-safe, unlike cv2.imwrite (D-145)
 
     orig_embed = _RC.EMBED_PATH
     with tempfile.TemporaryDirectory() as td:

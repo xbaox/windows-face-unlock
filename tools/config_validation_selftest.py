@@ -37,6 +37,8 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_config_validation_")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SENTINEL = "@@RESULT@@"

@@ -14,8 +14,8 @@ Features (per face crop, 128x128 gray, Hann-windowed):
 Reuses the Stage-1 CUDA fix. Read-only webcam probe. Touches nothing in the service.
 
 Run from repo root:
-    python tools\\screen_probe.py
-    python tools\\screen_probe.py --camera 1
+    python tools\\diag\\screen_probe.py
+    python tools\\diag\\screen_probe.py --camera 1
 
 Keys:
   l : toggle recording as LIVE   (hold a real face in frame)
@@ -29,7 +29,7 @@ import sys
 import argparse
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import cv2
 import numpy as np

@@ -28,6 +28,8 @@ import tomllib
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_config_example_")
 
 from face_service.config import Config
 from face_service.i18n import LANG_CODES

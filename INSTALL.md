@@ -1,415 +1,237 @@
-# Face Unlock — Fresh Install Guide
+# Installing and using Windows Face Unlock
 
-This captures every lesson learned during the original setup so the next
-install on a fresh machine is painless. Read top-to-bottom.
+This guide is for people who install the program. Building from source is in
+[CONTRIBUTING.md](CONTRIBUTING.md). Security and privacy: [SECURITY.md](SECURITY.md).
 
-## 0. Prerequisites
+## 1. Before you start
 
-| Requirement | Tested version | Install command |
-|---|---|---|
-| Windows 10/11 x64 | 11 Pro 26200 | — |
-| Python 3.11 or 3.12 | 3.12.10 | `winget install Python.Python.3.12` |
-| Git | any | `winget install Git.Git` |
-| CMake | 4.3 | `winget install Kitware.CMake` |
-| VS Build Tools 2022 (C++ workload + Win11 SDK) | 17.14 | see §3 |
-| GitHub CLI (optional, for push) | 2.89 | `winget install GitHub.cli` |
-
-An NVIDIA GPU is optional. Recognition runs on the CUDA execution provider when
-one is present and falls back to CPU with a warning in `service.log` when it is
-not.
-
-## 1. Clone + Python setup
-
-```powershell
-git clone <this-repo> C:\Users\<you>\Documents\Projects\face-unlock
-cd C:\Users\<you>\Documents\Projects\face-unlock
-.\setup.ps1               # creates .venv, installs deps, registers the scheduled tasks
-```
-
-`requirements.txt` pulls the recognition engine — `onnxruntime-gpu` (pinned),
-`insightface`, `onnx`, `opencv-python`, `numpy` — plus `pywin32`, `psutil`,
-`pystray`, `Pillow`, `tomli-w`, and `tomli` on Python 3.10 only.
-
-Active liveness (blink, head-pose gesture, anti-screen) is built on the
-InsightFace landmark models, so it needs no extra ML dependency.
-
-### Recognition models
-
-The engine is InsightFace `buffalo_l`. It is **not** in this repo and not
-downloaded by `setup.ps1`: insightface fetches it into
-`%USERPROFILE%\.insightface\models\buffalo_l\` the first time the service warms
-up. Budget for that on a fresh machine, and make sure the first warmup happens
-while you are online.
-
-Sizes, because the usual "~290 MB" is only half the story:
-
-| what | size |
+| You need | Notes |
 |---|---|
-| download (`buffalo_l.zip`) | ~275 MiB |
-| the five `.onnx` files, unpacked — what is actually used | ~325 MiB |
-| left on disk after the automatic download | **~600 MiB** |
-
-The download is ~600 MiB on disk rather than ~325 because insightface extracts
-the archive and then keeps it (the `os.remove` in its `utils/storage.py` is
-commented out). Deleting `%USERPROFILE%\.insightface\models\buffalo_l.zip` after
-the first successful warmup is safe and reclaims ~275 MiB.
-
-Since Stage 7d the **installer ships the unpacked pack**, so an installed machine
-needs no download and works offline. Only the dev/source layout fetches at first
-run. If the pack is missing or incomplete the service now says so explicitly in
-`service.log` instead of retrying a download on every camera frame.
-
-The YuNet detector used by `presence_mode = "detection"` **is** bundled, at
-`models/face_detection_yunet_2023mar.onnx`.
-
-## 2. Enrollment + password
-
-```powershell
-.\.venv\Scripts\python -m tools.enroll capture --count 15    # look at camera, move head slightly
-.\.venv\Scripts\python -m tools.set_password                 # enter Windows password (DPAPI encrypt)
-```
-
-Enrollment only keeps frames that pass the quality gates (detector confidence,
-sharpness, exposure); with 15 captures expect roughly 9 to survive. Re-run
-`enroll capture --count 20` if fewer than 6 make it.
-
-`set_password` stores `{user, password, domain}` in
-`%USERPROFILE%\.face-unlock\credentials.bin` encrypted with DPAPI (user scope).
-The password never leaves your user profile.
-
-## 3. Install Visual Studio Build Tools (only for the Credential Provider)
-
-Skip this section if you only want presence auto-lock without real lock-screen
-unlock.
-
-```powershell
-winget install Microsoft.VisualStudio.2022.BuildTools --silent --override `
-  "--wait --quiet --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"
-```
-
-About 6–8 GB. Takes 10–20 minutes depending on bandwidth.
-
-## 4. Build + register the Credential Provider DLL
-
-Build from the repo root. The output tree `build-cp\` is the one the registered
-CLSID points at, so this is where LogonUI loads the DLL from — build here and
-nowhere else, and never delete the directory.
-
-```powershell
-cmake -S credential_provider -B build-cp -A x64 -G "Visual Studio 17 2022"
-cmake --build build-cp --config Release
-
-# Then, from an Administrator PowerShell:
-.\credential_provider\register.ps1 -Action register
-```
-
-`register.ps1` requires elevation, finds the DLL itself, and verifies the result
-against the registry before reporting success. Remove it any time with
-`.\credential_provider\register.ps1 -Action unregister`.
-
-**Test the fallback before you rely on face sign-in:** stop the service task,
-lock the workstation, and confirm PIN or password still gets you in.
-
-### Gotchas encountered while building
-
-These are already fixed in the source; listed only for troubleshooting.
-
-1. **`FIELD_STATE_PAIR` undefined** — it's in the Microsoft sample set, not the
-   public SDK. `helpers.h` defines it locally.
-2. **`CPFG_CREDENTIAL_PROVIDER_LOGO` undefined** — same reason. We use
-   `GUID_NULL` instead; the tile uses the default logo.
-3. **`__ImageBase` undefined in `GetModuleFileNameW`** — because we call it
-   directly from `DllRegisterServer`, not via a helper. Leave the
-   `EXTERN_C IMAGE_DOS_HEADER __ImageBase;` at end of `dll.cpp`.
-4. **`__try/__except` + C++ objects** — MSVC rejects it; use `try/catch`
-   instead (already done).
-5. **"Parameter is incorrect" from LogonUI** — two separate bugs:
-   - `UNICODE_STRING.Buffer` inside the serialization must be an **offset** (in
-     bytes from the start of the buffer), NOT an absolute pointer. LSA does the
-     fixup across process boundaries.
-   - Authentication package: use `"Negotiate"` (NEGOSSP_NAME_A), not
-     `"Kerberos"`. Negotiate auto-picks Kerberos vs NTLM and works for local
-     accounts. Do NOT fall through to `pkgId = 0` on lookup failure — return
-     `HRESULT_FROM_NT(status)`.
-6. **GUID must be unique** — replace `CLSID_FaceCredentialProvider` in `guid.h`
-   with a freshly generated one (`uuidgen`) before distributing. It is also
-   hardcoded in `register.ps1`; keep the two in sync.
-
-## 5. Runtime behaviour
-
-### Configuration
-
-There is no config file after install, and none is needed — the service runs on
-the defaults compiled into `face_service/config.py`.
-
-**[`config.example.toml`](config.example.toml) is the single reference for every
-setting**: it lists all 54 keys with their real defaults and a comment on each.
-It is not a template you must copy and it is not allowed to drift — a self-test
-(`tools/config_example_selftest.py`) fails the moment a key or a value there
-stops matching the code.
-
-To customise, copy it to `%USERPROFILE%\.face-unlock\config.toml` and delete
-everything you do not want to change. Missing keys keep their defaults; unknown
-keys are ignored.
-
-Three settings are worth understanding before you touch anything else:
-
-- **`liveness_mode`** — `fast` asks for a live challenge (a blink or a head
-  gesture) only when the match is in doubt, so a confident unlock is
-  sub-second. `paranoid` demands the gesture every single time: slower, and the
-  strongest defence against a replayed video.
-- **`auto_lock`** — turn it off to run presence detection in observe-only mode.
-  Absences are still counted and visible in Status, but the workstation is never
-  locked. Face sign-in works either way. Use this while tuning the presence
-  settings so a false absence cannot lock you out mid-sentence.
-- **`persistent_camera`** — on, the camera handle stays open between requests:
-  verification is roughly three times faster, but the webcam LED stays lit. Off,
-  the device is opened per request: the LED only lights while verifying, at the
-  cost of a slower unlock.
-
-After editing, restart both processes:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\clean_restart.ps1
-```
-
-### Scheduled tasks
-
-`setup.ps1` registers **three** logon tasks. They are declared in
-`tools\tasks.psd1` and created by `tools\register_tasks.ps1`, which is the only
-script that knows about them:
-
-- **FaceUnlock-Service** — the Python pipe server (`\\.\pipe\FaceUnlock`)
-- **FaceUnlock-Presence** — the tray app and the presence probe
-- **FaceUnlock-Watchdog** — pings the service and restarts it if it hangs
-
-To re-register them all after changing the venv or moving the repo:
-
-```powershell
-.\tools\register_tasks.ps1 -Action Register
-```
-
-### The dev checkout and the installed product cannot coexist
-
-This is an invariant, not a preference, and it follows from the fact that both
-layouts are the *same application* pointed at different files. They share every
-singleton it owns:
-
-- the same three task names, `FaceUnlock-Service` / `-Presence` / `-Watchdog`
-  (`tools\tasks.psd1` is the only declaration, used by both `-Mode Dev` and
-  `-Mode Installed`), and `Register-ScheduledTask -Force` overwrites in place —
-  so whichever layout registered last owns all three;
-- the same named pipe `\\.\pipe\FaceUnlock`, opened with `FIRST_PIPE_INSTANCE`;
-- the same single-instance mutex `Local\FaceUnlockService`, so a second service
-  does not race the first — it exits immediately as a mutex-loser;
-- the same data directory `%USERPROFILE%\.face-unlock` — one enrollment, one
-  DPAPI credential blob, one set of logs.
-
-The practical consequence: **stop the dev stack before installing the product,
-and unregister the product before going back to dev.** Running `setup.ps1` on a
-machine that has the installed product does not give you two systems, it gives
-you one system whose tasks now point at the checkout, with the installed
-executables still on disk and nothing running them.
-
-To check which layout owns the tasks right now, without changing anything:
-
-```powershell
-.\tools\register_tasks.ps1 -Action Unregister -DryRun
-```
-
-It prints every declared task, whether it is present, and every matching process
-with its PID — and, being a dry run, stops before the first mutating call.
-
-### Upgrading is a supported path, not a reinstall
-
-Installing a newer setup **over** an existing installation is the intended
-upgrade route, and it is what `presence_monitor\updater.py` does unattended —
-it launches the downloaded installer with `/SILENT`. Two properties make that
-safe as of Stage 7g:
-
-- Setup stops the running stack itself, before it overwrites anything. Its
-  `PrepareToInstall` runs the installed `register_tasks.ps1 -Action Unregister`,
-  which is the same teardown the uninstaller performs. Previously this was left
-  to the Restart Manager, which cannot close a windowless process such as the
-  watchdog: the upgrade stopped at "Some applications could not be shut down",
-  and under `/SILENT` that prompt was answered by nobody.
-- Enrollment data is kept. Only an interactive uninstall asks about removing
-  `%USERPROFILE%\.face-unlock`, and a silent one never deletes it — see
-  `WantsDataRemoved` in `installer\installer.iss`.
-
-If an upgrade still reports that files are in use, the honest check is:
-
-```powershell
-.\tools\register_tasks.ps1 -Mode Installed -Action Unregister
-```
-
-It now exits non-zero and prints the surviving PIDs when the stack does not go
-down, instead of reporting "All tasks removed" unconditionally.
-
-### First sign-in after a reboot uses your PIN
-
-This is by design, not a fault. All three tasks are **logon** tasks, so the
-service does not exist until you have already signed in once. The very first
-sign-in after any reboot — and after any sign-out — is therefore PIN or
-password. Face sign-in is available from the next lock onward.
-
-### Lock-screen behaviour
-
-The face tile is the default tile, but it does **not** start scanning by itself.
-`FaceCredential::SetSelected` returns `pbAutoLogon = FALSE`, so selecting the
-tile does nothing until you press the submit arrow; and
-`FaceCredentialProvider::GetCredentialCount` only sets
-`pbAutoLogonWithDefault = TRUE` when a verification result is already waiting.
-An idle lock screen never wakes the camera on its own.
-
-Safety: `GetSerialization` never blocks. The scan runs on a worker thread whose
-pipe calls are bounded — 12 s for the face check, 15 s for the gesture round,
-connect wait included — and on any failure the tile shows a fixed message while the
-PIN and password tiles stay available. If Windows rejects the stored password
-(for example after a password change), the tile stops scanning until the next
-lock-screen session; save the new password from the tray (Stage 8b).
-
-### What auto-lock does NOT do (accepted, Stage 8)
-
-- **A dark or covered camera counts as "present".** When the camera delivers no
-  frame, or only black frames, the presence probe reports a camera fault, not an
-  absence, so it never spends an absence strike on it. The price: in the dark, or
-  with the lens covered, walk-away auto-lock does not fire. This is deliberate
-  (fail-safe: a device fault must not lock you out of your session or burn the
-  face lockout). Keep the Windows screen-lock timeout (Settings → Accounts →
-  Sign-in options / Power) as the backstop. (8a F-17, KNOWN_ISSUES §6.)
-- **The adaptive gallery does not adapt in paranoid mode.** Adaptation happens
-  only on a passive (no-gesture) PASS, and in `paranoid` every unlock goes through
-  the gesture round, so `adaptive_gallery = true` is a silent no-op there. Re-enroll
-  (Replace) if your appearance changed. (8a F-47, decision after the project is done.)
-
-### Data directory permissions (Stage 8b)
-
-The service re-secures `%USERPROFILE%\.face-unlock` on every start: the folder
-gets a protected ACL for you, SYSTEM and Administrators only, every file below it
-inherits that, and `credentials.bin` / `pipe_entropy.bin` are locked to you and
-SYSTEM. One line in `service.log` reports it (`data dir custody healed: ...`).
-If it cannot (for example a junction inside the folder), face sign-in answers
-`insecure-data-dir` — shown as "service unavailable" on the tile — and PIN still
-works; the ERROR line in `service.log` names the problem.
-
-### Environment variables
-
-`face_service/__main__.py` caps the native thread pool so the runtime does not
-spawn workers that compete with the pipe server thread:
-
-```
-OMP_NUM_THREADS=1
-```
-
-It is set with `setdefault`, so an explicit value in your environment wins.
-onnxruntime's own thread counts are session options, not environment variables,
-and are left at their defaults.
-
-**`CUDA_VISIBLE_DEVICES` is deliberately NOT set.** Setting it to `-1` hides
-every GPU and the engine silently falls back to CPU. An earlier version of this
-project set it; removing it was the fix that made GPU inference work. If you
-have it in your environment, unset it.
-
-### Remote-session exclusion
-
-`presence_monitor/remote_session.py` skips auto-lock when:
-
-- an RDP session is active (`GetSystemMetrics(SM_REMOTESESSION)`)
-- a known remote-control process holds an ESTABLISHED external TCP connection
-  (UltraViewer, AnyDesk, RustDesk, Parsec, Chrome Remote Desktop, Splashtop)
-- a process name matches one of the tools that only run during active sessions
-  (TeamViewer_Desktop.exe, Quick Assist, MSRA)
-
-Tune the list in that file if your remote tool is missing.
-
-## 6. If you also have `facewinunlock-tauri` installed
-
-Uninstall it from **Settings > Apps > Installed apps**.
-
-**Do not run `tools\disable_tauri.ps1`.** Earlier versions of this guide
-recommended it, but besides the facewinunlock-tauri provider it also removed
-the registration of Microsoft's **Windows Hello Face** credential provider
-(`{8AF662BF-65A0-4D0A-A540-A338A999D36F}`). The script is now disabled.
-
-If you ran it before, restore Windows Hello Face from the backup it made.
-In an elevated PowerShell:
-
-~~~powershell
-Get-ChildItem "$env:USERPROFILE\face-unlock-backup\cp-8AF662BF-65A0-4D0A-A540-A338A999D36F-*.reg" |
-    Sort-Object Name | Select-Object -Last 1 | ForEach-Object { reg import $_.FullName }
-~~~
-
-Then restart the PC.
-
-## 7. Troubleshooting
-
-| Symptom | Fix |
+| Windows 11 24H2 or 25H2, 64-bit (x64) | Supported. Windows 10 22H2 and Windows 11 23H2 install and should work, but are untested ("best effort"). Older Windows and ARM64 PCs are refused by the installer. |
+| Administrator rights | To install and to uninstall. |
+| An ordinary webcam | Built-in or USB. Put it at eye level, facing you. No infrared camera is needed or used. |
+| A Windows **password** you know | Face sign-in submits your saved password to Windows. Accounts that sign in without any password cannot use it. |
+| Internet during installation, once | To download the face-recognition models (about 275 MiB) -- or a copy of `buffalo_l.zip` on disk (see [5](#5-installing-without-internet-or-silently)). |
+| Disk space | About 1 GB for the CPU variant; several GB for the GPU variant. |
+| Smart App Control **off** | Until a signed release exists. With Smart App Control on, the unsigned programs are blocked and the lock-screen tile does not load. |
+
+**Which installer?** `WindowsFaceUnlock-Setup-0.2.0-cpu.exe` works on every x64 PC and is the one
+to pick if unsure. `...-gpu.exe` adds NVIDIA's CUDA libraries and uses an NVIDIA graphics card for
+recognition; it is much larger. Each installer has a `.sha256` file next to it -- you can compare it
+with `Get-FileHash <file> -Algorithm SHA256` in PowerShell.
+
+**One Windows user per PC.** Face Unlock belongs to one account: the user signed in at the
+computer's screen when you run Setup (not the administrator account you may type in the UAC
+prompt). Setup shows who that is before it installs. Other accounts on the PC sign in exactly as
+before and never see the face tile.
+
+## 2. Installing
+
+1. Sign in to Windows as the person who will use face sign-in.
+2. Run the installer and approve the administrator prompt. Setup installs into
+   `C:\Program Files\WindowsFaceUnlock` (the location is fixed).
+3. **Face-recognition models.** The recognition models are made by InsightFace and are licensed
+   *for non-commercial research purposes only*. They are not part of this program. Setup shows
+   those terms and asks you to accept them; then it downloads the official `buffalo_l.zip` from
+   InsightFace's own release page, checks its size and SHA-256 fingerprint, and unpacks the five
+   model files into the program folder. You can instead choose a `buffalo_l.zip` you already have
+   (the same check applies). If you do not accept, Setup cannot continue. When you upgrade and valid
+   models are already installed, this page is skipped.
+4. **"Sign in to Windows with your face"** is ticked by default. It registers the
+   lock-screen tile. Your PIN and password tiles stay; untick it if you only want walk-away lock.
+5. Setup registers three background tasks for you (service, tray, watchdog) and starts them.
+6. On the last page, keep both boxes ticked:
+   - **Save your Windows password** -- type it once; Windows checks it before it is saved (see
+     [3.1](#31-your-windows-password)).
+   - **Set up your face** -- the wizard (see [3.2](#32-setting-up-your-face)).
+
+If you are upgrading, Setup stops the running copy first, keeps your face profile, password and
+settings, and starts the new version. If you cancel an upgrade half-way, the old version is started
+again.
+
+## 3. First-time setup
+
+A tray icon (a face) appears in the notification area. Everything below is also in its menu.
+
+### 3.1 Your Windows password
+
+Tray → **Windows password…**. Enter your normal Windows sign-in password -- for a Microsoft account,
+the password of that account, not your PIN.
+
+- Before saving, the dialog tries a real Windows sign-in with it. A wrong password is **not
+  saved** (a wrong saved password would cost you a failed sign-in every time you unlock).
+- If Windows cannot give a clear answer (this happens with some Microsoft accounts and when a domain
+  controller is not reachable), the password is saved with a yellow warning. If it turns out to be
+  wrong, the lock-screen tile will say "Windows rejected the saved password" -- save it again.
+- If Windows is set to "passwordless" (Settings → Accounts → Sign-in options → *For improved
+  security, only allow Windows Hello sign-in*), face sign-in cannot work; the dialog explains how to
+  turn that off.
+- **After you change your Windows password, save the new one here too.**
+
+The password is encrypted with Windows DPAPI for your account only and kept in your profile folder.
+
+### 3.2 Setting up your face
+
+Tray → **Set up face…**.
+
+1. Pick your camera from the list (it is remembered by name).
+2. Sit about an arm's length from the camera, face it, in normal light.
+3. Press **Start** when the preview shows you. The wizard takes a series of photos by itself; move
+   your head slightly between them.
+4. Only photos that are sharp, well lit and clearly of the same person are kept. If too few pass, the
+   wizard tells you why -- fix the light and try again.
+5. **Calibration**: turn your head to the left when asked. This teaches Face Unlock which way "left"
+   is for your camera (some cameras show a mirrored picture).
+6. At the end the wizard checks that everything is ready: password saved and accepted, face profile
+   loaded by the service, data folder secured. Each problem has a button to fix it.
+
+To start over later, open the wizard again in **Replace** mode (the old profile is kept until the new
+one is complete), **Add** more photos to the current profile, or **Delete face profile**. The
+calibration can be repeated with **Calibrate head turn**.
+
+## 4. Everyday use
+
+### 4.1 Unlocking
+
+Lock the PC (Windows+L or walk away). On the lock screen:
+
+1. Select the **Face Unlock** tile and press the arrow.
+2. Look at the camera. The tile says what to do, for example **"Turn your head left, then nod."**
+   Keep your head still until the instruction appears, then do the two movements in that order.
+3. Windows signs you in.
+
+If it does not work, the tile says why, and the PIN and password tiles are always there:
+
+| The tile says | What to do |
 |---|---|
-| `Cannot open camera index 0` | Close other camera apps; Teams/Zoom/UltraViewer can hold the device. Try a different `camera_index`. |
-| Enrollment says "No face found" on all images | Lighting too dim, or you weren't centred. Re-run `enroll capture --count 20`. |
-| Unlock refused with "too dark" | The low-light gate fired. Add light; the exposure boost only rescues borderline scenes. |
-| Verify is slow on the first call | Models didn't pre-warm. Check `service.log` for the warmup line, and confirm `warmup_on_start` is on. |
-| Verify is slow on *every* call | The CUDA provider fell back to CPU. `service.log` logs the effective providers at startup. Check `CUDA_VISIBLE_DEVICES` is unset. |
-| Two `python.exe` processes for one service | Normal — the venv launcher spawns the real interpreter. Only the inner one runs our code. |
-| `Parameter is incorrect` on lock screen | You're running an old DLL. Rebuild into `build-cp` (§4) and lock/unlock once to reload. |
-| Lock screen hangs for ~12 s | FaceService is down. `Start-ScheduledTask FaceUnlock-Service`. |
-| User stuck, can't reach password | Click "Sign-in options" on the lock screen → pick the Password tile. Or boot into Safe Mode; third-party CPs are disabled there. |
+| Face not recognised. Try again or use PIN or password. | Try again facing the camera; if it keeps happening, set up your face again. |
+| Face sign-in is locked for N s. | 5 failed attempts in a row lock face sign-in for 5 minutes. Use your PIN. |
+| No Windows password is saved in Face Unlock. | Sign in with your PIN and save it (3.1). |
+| Windows rejected the saved password. | Your password changed or was saved wrong. Sign in with your PIN and save it again. |
+| No face is set up yet. | Run the setup wizard (3.2). |
+| The camera is busy or not responding. | Close apps using the camera (Teams, Zoom, Camera) or reconnect it. |
+| Too dark to recognise your face. | Add light. |
+| Face Unlock service is not running. | See 6.1. |
+| Face Unlock components do not match. Update Face Unlock. | Run the latest installer again. |
+| Face Unlock needs attention. | Sign in with your PIN and open the tray icon: Status shows the reason. |
 
-## 8. Logs
+**After a restart or sign-out, the first sign-in is always PIN or password.** Face Unlock runs in
+your Windows session, so it starts only after you sign in. From the next lock on, the face tile is
+there. (A restart from the Start menu with "Use my sign-in info to automatically finish setting up
+after an update or restart" enabled signs you in automatically and locks; face sign-in then works
+right away.)
 
-- `%USERPROFILE%\.face-unlock\service.log` — FaceService
-- `%USERPROFILE%\.face-unlock\presence.log` — PresenceMonitor
-- `%USERPROFILE%\.face-unlock\audit.jsonl` — one record per verify / unlock /
-  challenge, when `audit_log` is on
-- Event Viewer → Applications and Services Logs → Microsoft → Windows → User
-  Profile Service / Authentication — for LogonUI and LSA errors when debugging
-  Credential Provider issues
+Face sign-in is available only on the lock screen and the sign-in screen of the owner's session:
+not in UAC or other credential prompts, and not inside a Remote Desktop session.
 
-## 9. Uninstall completely
+### 4.2 Walk-away lock (optional)
 
-Use `tools\uninstall.ps1`. It runs in two phases: without `-Force` it only
-INVENTORIES what is on the machine and changes nothing, so you always see the
-list before anything is removed.
+Off by default. Turn it on in **Settings → Basic → Walk-away lock**. The tray then checks the camera
+every 60 seconds and locks the PC after your face has been missing on two checks in a row (both
+numbers are in Settings → Basic).
 
-```powershell
-# Admin PowerShell, from the repo root — show what is here, change nothing
-.\tools\uninstall.ps1
+- Settings → Advanced → presence: **Your face** (default) locks when *your* face is not there;
+  **Any face** only asks whether *a* face is there.
+- If the camera cannot give an answer -- busy in another app, unplugged, covered, too dark to see
+  anything -- the result is **unknown**: it neither locks nor counts as present. Status shows why.
+- A very dim room can be taken as "nobody there". Keep Windows' own screen-lock timeout as a
+  backstop.
+- It never locks while the session is controlled remotely (Remote Desktop, TeamViewer, Chrome Remote
+  Desktop, Quick Assist, Windows Remote Assistance).
+- **Pause presence checks** in the tray stops it until you resume (kept across restarts).
 
-# then actually remove it
-.\tools\uninstall.ps1 -Force
-```
+### 4.3 The tray menu
 
-Your enrollment data is **kept** by default: the face embeddings and the
-DPAPI-encrypted Windows password are yours, and a reinstall can reuse them. Add
-the switches for a full wipe:
+- **Status…** -- whether the service is running and serving, face profile, password, camera,
+  presence, watchdog, recent events and messages.
+- **Settings…** -- *Basic*: language, walk-away lock and its interval and strike count, the face
+  sign-in check (4.4), camera, notifications, update check. *Advanced* (collapsed): the match
+  threshold, the screen check, attempts before the face lockout and its length, presence details,
+  low-light brightening. Changes apply when you press Save.
+- **Check presence now**, **Pause / Resume presence checks**.
+- **Set up face…**, **Windows password…**.
+- **Open log folder** -- opens only the `logs` folder (not your face photos or password).
+- **Language** -- English or Русский.
+- **Check for updates…** -- asks GitHub for the newest release and tells you. Nothing is downloaded
+  or installed automatically; the automatic check runs at most once a day and can be turned off in
+  Settings.
+- **Help…**, **Quit Face Unlock** (asks first).
 
-```powershell
-.\tools\uninstall.ps1 -Force -RemoveData -IncludeModels
-```
+**Quit** stops the tray and the service. The walk-away lock stays off until you sign in again; the
+watchdog brings the service back after 5 minutes so the lock-screen tile keeps working.
 
-| switch | what it adds |
+Notifications (update found, face sign-in locked, service stopped) appear as Windows notifications
+from "Windows Face Unlock", and also in Status → recent events.
+
+### 4.4 Liveness modes
+
+Settings → Basic → **Face sign-in check**:
+
+- **Head movements every time (safer)** -- the default for new installations: every unlock needs
+  the face match *and* two random head movements.
+- **Head movements only when in doubt (faster)** -- the movements are asked for only when the match
+  is not clearly strong or a screen is suspected. Quicker, but a good photo or video of you is
+  easier to use against it. See [SECURITY.md](SECURITY.md).
+
+## 5. Installing without internet, or silently
+
+- **Offline:** get `buffalo_l.zip` from InsightFace's release
+  (`https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip`, 288,621,354
+  bytes, SHA-256 `80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f`) and choose it on
+  the models page.
+- **Silent / scripted** (administrators):
+
+  ```
+  WindowsFaceUnlock-Setup-0.2.0-cpu.exe /VERYSILENT /ACCEPTMODELLICENSE [/MODELZIP=C:\path\buffalo_l.zip] [/OWNER=DOMAIN\user] [/FORCEOWNER] [/MERGETASKS="cp"]
+  ```
+
+  `/ACCEPTMODELLICENSE` means you accept the InsightFace model terms on behalf of the user; without
+  it a silent installation that needs the models stops. `/OWNER=` names the face-sign-in user
+  (otherwise: the user at the console); replacing a different recorded owner needs `/FORCEOWNER`.
+  Exit codes besides Inno Setup's usual ones: **21** the background tasks could not be registered,
+  **22** the lock-screen tile could not be registered, **23** the models could not be installed.
+  Password and face still have to be set up by the user.
+
+## 6. Troubleshooting
+
+### 6.1 "Face Unlock service is not running"
+
+- Right after you sign in, the service needs a few seconds to start. Try again.
+- Open the tray icon → Status. If the tray is gone, sign out and in again.
+- The watchdog restarts a service that stopped answering, with growing pauses if it keeps failing.
+
+### 6.2 Status says "Face sign-in is off: …"
+
+| Reason | Meaning / fix |
 |---|---|
-| `-RemoveData` | `%USERPROFILE%\.face-unlock` — config, embeddings, `credentials.bin`, audit log, enrollment images |
-| `-IncludeModels` | `%USERPROFILE%\.insightface` — the ~600 MiB model cache, **shared** with any other InsightFace app |
-| `-Mode Installed` | clean a Program Files install instead of this checkout (`-InstallDir` is read from the registry if omitted) |
+| the data folder could not be secured | Your `%USERPROFILE%\.face-unlock` folder has permissions or an owner Face Unlock cannot repair (another account or program changed them). Restart the PC. If it persists, delete the folder (then set up face and password again), or restore its permissions to only you and SYSTEM. The service log names the file. |
+| Face Unlock belongs to another Windows account on this PC | You are not the owner recorded at installation. Reinstall while signed in as the right person. |
+| the face recognition models are missing or damaged | Run the installer again. |
+| the sign-in attempt counter cannot be saved | The disk or folder refuses writes; free space or fix permissions, then restart. |
 
-The script unregisters the Credential Provider *and* deletes both of its registry
-keys directly afterwards, which matters because `register.ps1` refuses to run
-when the DLL is already gone. It ends by re-reading the machine and reporting
-anything that survived, and exits non-zero if something did — a locked file
-usually means a process is still running, so reboot and re-run.
+### 6.3 Other problems
 
-It delegates task removal to `register_tasks.ps1 -Action Unregister`, which walks
-the same `tasks.psd1` used to create them, so all three go including the
-watchdog, and the service is asked to stop over the pipe before anything is
-killed.
+- **The movement is not recognised** -- face the camera straight, do the movements clearly (about a
+  quarter turn, a clear nod), and stay still until the instruction appears. If "left" and "right"
+  seem swapped, run the setup wizard again: its calibration step fixes it for your camera.
+- **The wrong camera is used** -- Settings → Basic → Camera, or the wizard's camera list.
+- **Settings window too tall** -- it scrolls; Save and Cancel stay at the bottom.
+- **Logs** -- Tray → Open log folder. When you ask for help, send only the `*.log` files from that
+  folder. Never send the rest of `%USERPROFILE%\.face-unlock`: it holds your face photos and your
+  encrypted password.
 
-`build-cp\` is deliberately left alone — it is repo build output and goes with
-the repo. Unregister before deleting the checkout, or the lock screen keeps a
-registration pointing at a DLL that no longer exists; running this script first
-does that for you.
+## 7. Uninstalling
 
-If you installed from the packaged installer, use **Programs and Features**
-instead; add `/REMOVEDATA` to the uninstaller command line for an unattended
-wipe.
+Settings → Apps → Installed apps → **Windows Face Unlock** → Uninstall (administrator).
+
+The uninstaller stops Face Unlock, removes its background tasks, unregisters the lock-screen tile
+and deletes the program folder (files still in use are removed at the next restart). It then asks
+whether to also delete the owner's data folder `%USERPROFILE%\.face-unlock` (face photos, face
+templates, the encrypted password, settings, logs). A silent uninstall keeps that folder unless it
+is run with `/REMOVEDATA`.
+
+What can remain after an uninstall: the data folder if you kept it (and a
+`%TEMP%\windows-face-unlock-update` folder if an older version downloaded an update there); Windows'
+own records (Task Scheduler history, event logs). The downloaded model archive lives only in
+Setup's temporary folder and is deleted when Setup ends. Nothing is stored in Windows Credential Manager, and no firewall rules are
+created.

@@ -19,7 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Stage 8b: a private home, so nothing below can reach a real ~/.face-unlock (see [5]).
-os.environ["FACE_UNLOCK_HOME"] = tempfile.mkdtemp(prefix="faceunlock_wdself_")
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_wdself_")
 
 from face_service import watchdog as W
 

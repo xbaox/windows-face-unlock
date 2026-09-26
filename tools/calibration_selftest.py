@@ -14,15 +14,14 @@ Exit 0 = all pass; 1 = a failure.
 """
 from __future__ import annotations
 import json
-import os
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.setdefault("FACE_UNLOCK_HOME", tempfile.mkdtemp(prefix="faceunlock_calib_"))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_calib_")
 
 import numpy as np
 

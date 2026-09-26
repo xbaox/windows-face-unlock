@@ -29,7 +29,9 @@
 #include <windows.h>
 #include <sddl.h>
 #include <cstdio>
+#include <cstring>
 #include <functional>
+#include <new>
 #include <string>
 #include <thread>
 
@@ -425,6 +427,32 @@ static void TransportShapes() {
     }
     TestSetPipeName(L"");
     TestSetOwnerOverride(L"");
+}
+
+// B14 N-07 (Stage 9, 9c-6): the reply's password copy is wiped by UnlockReply's destructor. The
+// object lives in storage this test owns and the password is short enough for the small-string
+// buffer, so after the destructor the bytes are still ours to read (a heap copy takes the same
+// SecureZeroMemory path before it is freed, which a test cannot read back without UB).
+static void SecretWipeTests() {
+    using namespace FaceUnlock;
+    alignas(UnlockReply) unsigned char storage[sizeof(UnlockReply)];
+    std::memset(storage, 0, sizeof storage);
+    const wchar_t sentinel[] = L"Pw9#xQ";                 // 6 UTF-16 units: inside the SSO buffer
+    UnlockReply* r = new (storage) UnlockReply();
+    r->password = sentinel;
+    const bool inline_ = reinterpret_cast<const unsigned char*>(r->password.data()) >= storage &&
+                         reinterpret_cast<const unsigned char*>(r->password.data()) < storage + sizeof storage;
+    auto has = [&](const unsigned char* buf, size_t n) {
+        const size_t k = sizeof(sentinel) - sizeof(wchar_t);
+        for (size_t i = 0; i + k <= n; ++i)
+            if (std::memcmp(buf + i, sentinel, k) == 0) return true;
+        return false;
+    };
+    const bool before = has(storage, sizeof storage);
+    r->~UnlockReply();
+    const bool after = has(storage, sizeof storage);
+    Check("wipe: the password sits in the reply's own storage (SSO) before destruction", inline_ && before);
+    Check("wipe: no byte of the password remains after ~UnlockReply (N-07)", !after);
 }
 
 static void KerbPackTests() {
@@ -965,6 +993,7 @@ int main() {
     TransportTests();
     TransportShapes();
     KerbPackTests();
+    SecretWipeTests();
 
     const int total9 = g_pass + g_fail - pre9Count;
     std::printf("-----------------------------\n");

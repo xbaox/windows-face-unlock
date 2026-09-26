@@ -1,4 +1,4 @@
-"""tools/enroll_qc_probe.py -- Stage 3 / Step 1 (read-only).
+"""tools/diag/enroll_qc_probe.py -- Stage 3 / Step 1 (read-only).
 
 Measure enrollment-frame quality on the CURRENT enroll photos and show which
 frames the live QC gates would keep or drop. The gates come from config
@@ -10,9 +10,9 @@ Uses the same engine and largest-face selection as enroll_from_dir, so det_score
 matches. Read-only: never touches embeddings.npz, config, or the running service.
 
 Run from the repo root:
-    python -m tools.enroll_qc_probe
-    python -m tools.enroll_qc_probe --dir "C:\\path\\to\\photos"
-    python -m tools.enroll_qc_probe --save-crops     # dump aligned crops to eyeball
+    python -m tools.diag.enroll_qc_probe
+    python -m tools.diag.enroll_qc_probe --dir "C:\\path\\to\\photos"
+    python -m tools.diag.enroll_qc_probe --save-crops     # dump aligned crops to eyeball
 """
 from __future__ import annotations
 

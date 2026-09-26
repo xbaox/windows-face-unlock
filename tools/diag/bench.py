@@ -1,8 +1,8 @@
-"""tools/bench.py - Stage 1 acceptance benchmark for the InsightFace engine.
+"""tools/diag/bench.py - Stage 1 acceptance benchmark for the InsightFace engine.
 
 Measures the real Recognizer.verify_frame path (liveness + embed + cosine),
 warmup time, self-distance distribution, and effective ORT provider.
-Usage: python -m tools.bench [N]   (default N=10)
+Usage: python -m tools.diag.bench [N]   (default N=10)
 """
 from __future__ import annotations
 import sys
@@ -37,7 +37,7 @@ def main():
 
     rec = Recognizer(cfg)
     if not rec.load():
-        print("ERROR: no valid enrollment (run: python -m tools.enroll capture --count 15)")
+        print("ERROR: no valid enrollment (set up your face first: tray menu -> Set up face)")
         return
 
     t0 = time.perf_counter()

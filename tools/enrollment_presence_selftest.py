@@ -21,19 +21,15 @@ Run:  python -m tools.enrollment_presence_selftest
 Exit 0 = all pass; 1 = a failure.
 """
 from __future__ import annotations
-import json
 import logging
-import os
 import subprocess
 import sys
-import tempfile
-import threading
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-_ROOT = Path(tempfile.mkdtemp(prefix="faceunlock_enrollpres_"))
-os.environ["FACE_UNLOCK_HOME"] = str(_ROOT / "home")
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+_ROOT = testhome.own_root("faceunlock_enrollpres_")
 
 import numpy as np
 

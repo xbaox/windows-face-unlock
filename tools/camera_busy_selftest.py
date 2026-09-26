@@ -30,6 +30,8 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_camera_busy_")
 
 from face_service.camera_open import BoundedOpener, open_with_retry
 from face_service.config import Config
@@ -113,8 +115,10 @@ def main(argv=None) -> int:
     try:
         import face_service.service as SVC
         from face_service.service import FaceService, VerifyOutcome  # noqa: F401
-    except Exception as e:   # pragma: no cover - pywin32 absent in this context
-        print(f"\n  skip  service import unavailable ({e.__class__.__name__}); [2]-[5] skipped")
+    except ImportError as e:   # pragma: no cover - pywin32 absent in this context
+        from tools.testkit import skip_is_failure
+        if skip_is_failure("service import ([2]-[5])", e):
+            t.ok(False, "service-level sections [2]-[5] ran")
     else:
         class FakeCamera:
             """Stand-in for face_service.camera.Camera. open_fast() returns FakeCamera.next_open;
@@ -179,12 +183,9 @@ def main(argv=None) -> int:
         def _cfg():
             c = Config()
             c.camera_open_retries = 0   # single fast attempt -> no real sleeps in the tests
-            # This harness calls _handle({"cmd":"unlock"}) with NO pipe handle, so the
-            # Stage-5 SID gate resolves the client SID to None and refuses with
-            # "not-authorized" before the camera-busy branch is ever reached. The gate
-            # is not what these cases exercise -- same reason and same shape as
-            # tools/pipe_hardening_selftest.py:155.
-            pass   # Stage 9: no config switch for the SYSTEM gate; the service stands in via _caller_sid
+            # The SYSTEM gate on unlock is not what these cases exercise: the service is made to
+            # see the lock screen as its caller (tools.testkit.as_lock_screen / _caller_sid). The
+            # gate's own coverage: pipe_hardening_selftest.test_gates (D-144).
             return c
 
         orig_camera = SVC.Camera
@@ -289,9 +290,10 @@ def main(argv=None) -> int:
         """Scripted open_fn/close_fn pair. Records every call, and can sleep so that an attempt
         outlives the cap -- which is the whole point being tested. No camera, no cv2."""
 
-        def __init__(self, results, sleep_s=0.0):
+        def __init__(self, results, sleep_s=0.0, gate=None):
             self.results = list(results)
             self.sleep_s = sleep_s
+            self.gate = gate            # threading.Event: the attempt blocks until the test sets it
             self.calls = 0
             self.deadlines = []
             self.closes = 0
@@ -299,7 +301,9 @@ def main(argv=None) -> int:
         def open_fn(self, deadline):
             self.calls += 1
             self.deadlines.append(deadline)
-            if self.sleep_s:
+            if self.gate is not None:
+                self.gate.wait(30.0)
+            elif self.sleep_s:
                 time.sleep(self.sleep_s)
             return self.results.pop(0) if self.results else False
 
@@ -333,26 +337,33 @@ def main(argv=None) -> int:
     # wedged attempt now takes 1.5 s and the bound is 0.75 s: 12x the measured base, 2x the loaded
     # outlier, and still half of the attempt, so "returned at the cap" and "waited for the
     # attempt" cannot be confused. The code under test is unchanged.
-    wedged = FakeOpen([True], sleep_s=1.5)
+    # Stage 9 (D-137, B14-04): the wedged attempt no longer SLEEPS a fixed 1.5 s -- it blocks on an
+    # Event the test releases only after the "second open refused" check, so a stall under load can
+    # no longer let the worker finish early; and the worker is JOINED instead of a fixed
+    # sleep(0.1) before the "next open works" check. Only the "returned at the cap" bound is still
+    # wall-clock, and it is generous: the attempt cannot end before the release.
+    release = threading.Event()
+    wedged = FakeOpen([True], gate=release)
     t0 = time.monotonic()
     got = op.open(open_fn=wedged.open_fn, close_fn=wedged.close_fn, retries=3, pause_s=0.0,
                   timeout_s=9e9, cap_s=0.05)
     waited = time.monotonic() - t0
     t.ok(got is False and wedged.calls == 1,
          f"attempt outliving the cap -> False and NO retry ({wedged.calls} call, retries=3)")
-    t.ok(waited < 0.75,
-         f"returns at the ceiling, not when the wedged attempt finishes ({waited:.2f}s of 1.5s)")
+    t.ok(waited < 3.0 and wedged.closes == 0,
+         f"returns at the ceiling while the wedged attempt is still blocked ({waited:.2f}s)")
 
     blocked = FakeOpen([True])
     t.ok(op.open(open_fn=blocked.open_fn, close_fn=blocked.close_fn, retries=0, pause_s=0.0,
                  timeout_s=9e9, cap_s=1.0) is False and blocked.calls == 0,
          "a second open while that worker is still in flight -> False, its open_fn NOT called")
 
-    # Let the abandoned attempt finish and run its own cleanup (polled, bounded: it takes 1.5 s).
-    t_end = time.monotonic() + 5.0
-    while wedged.closes == 0 and time.monotonic() < t_end:
-        time.sleep(0.05)
-    time.sleep(0.1)   # and let its worker thread leave the opener's in-flight slot
+    # Let the abandoned attempt finish and run its own cleanup, then wait for its thread to leave.
+    worker = op._worker
+    release.set()
+    if worker is not None:
+        worker.join(10.0)
+    t.ok(worker is not None and not worker.is_alive(), "the abandoned worker thread has exited")
     t.ok(wedged.closes == 1,
          "the abandoned attempt closed its capture exactly once, from its own thread")
 

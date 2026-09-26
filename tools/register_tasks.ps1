@@ -614,7 +614,7 @@ function Invoke-GracefulServiceShutdown {
     # risk. Fix: $fuGraceClientMs = 10 s. Measured in the 8b dist smoke (frozen tray exe,
     # --pipe-shutdown, cold start + exchange): 1.13 s and 1.01 s, x2 = 2.3 s. The bound stays at
     # 10 s by the architect's decision (8b-2): the first run after an install goes under an AV scan
-    # of the freshly written exe, which the smoke did not measure. See audit-notes, section "Stage 8" (D-120: this file stays ASCII-only).
+    # of the freshly written exe, which the smoke did not measure. See docs/internal/audit-notes.md, section "Stage 8" (D-120: this file stays ASCII-only).
     $fuGraceClientMs = 10000
     if (-not $fuClient.WaitForExit($fuGraceClientMs)) {
         Write-Warning ("pipe client did not return within {0}s; killing the client and falling back to hard kill" -f `

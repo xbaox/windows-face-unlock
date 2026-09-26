@@ -53,39 +53,41 @@ tile should appear.
    automatically; the user presses the submit arrow, which triggers
    `GetSerialization`.
 3. `GetSerialization` starts a worker thread and returns at once; the worker opens
-   `\\.\pipe\FaceUnlock` (checking that the server runs as the user or SYSTEM,
-   identification-level only), sends `{"cmd":"unlock"}`, and is bounded by 12 s
-   (15 s for the gesture round), the connect wait included.
+   `\\.\pipe\FaceUnlock` at identification level, and talks to it only if BOTH the server
+   process and the pipe object belong to the owner recorded at installation
+   (`HKLM\SOFTWARE\WindowsFaceUnlock\OriginalUserSid`, Stage 9 R1). It sends
+   `{"cmd":"unlock","v":2,"budget_ms":...}` and is bounded by 12 s (18 s for the two-movement
+   round), the connect wait included; every wait also watches a cancel event, so leaving the tile
+   ends the call at once.
 4. `FaceService` performs the camera capture, the InsightFace recognition
    check and liveness, decrypts the DPAPI password blob, and returns
-   `{"ok":true,"username":"...","password":"...","domain":"..."}`. When
-   liveness wants an active gesture it answers `needs-gesture` with a
-   single-use token instead, and the tile completes the round with
-   `unlock_gesture` before any credential is released.
+   `{"ok":true,"username":"...","password":"...","domain":"...","grant_id":"..."}`. When
+   liveness wants the movement round it answers `needs-gesture` with a single-use token and a
+   prompt instead, and the tile completes the round with `unlock_gesture` before any credential
+   is released.
 5. The CP packs those into a `KERB_INTERACTIVE_UNLOCK_LOGON` and returns
-   `CPGSR_RETURN_CREDENTIAL_FINISHED`. LogonUI performs the actual logon.
+   `CPGSR_RETURN_CREDENTIAL_FINISHED`. LogonUI performs the actual logon; `ReportResult` then
+   sends `report_result {grant_id, ok}` so the service counts only an accepted sign-in (protocol
+   v2). A verified result is kept for at most 10 s, used once, and wiped.
 
 ## Important caveats
 
 - **The DLL runs inside `LogonUI.exe` under the `SYSTEM` account.** Because
   the DPAPI blob is encrypted with the *user* key, the Python service (which
   runs in the user session) is the one that decrypts it and passes plaintext
-  over the pipe — the CP itself never touches DPAPI. The pipe is local-only
-  and carries an explicit security descriptor: `SELF` and `SYSTEM` only, no
-  `Everyone` ACE, plus a medium integrity label. On top of that the `unlock`
-  command is refused unless the caller's token SID is `SYSTEM` (`S-1-5-18`),
-  which is what LogonUI loads this DLL as. Understand that the plaintext
-  password still crosses the pipe before deploying widely.
-- This is a **skeleton**: no custom tile bitmap, no localisation, no progress
-  UI while the service captures frames, and only the single "unlock /
-  interactive logon" scenario is implemented. The Microsoft
-  [SampleCredentialProvider](https://github.com/microsoft/Windows-classic-samples/tree/main/Samples/CredentialProvider)
-  is a good reference for polishing.
+  over the pipe — the CP itself never touches DPAPI. The pipe rejects remote clients, denies
+  NETWORK first, and otherwise admits only `SELF` and `SYSTEM`; the unlock commands are refused
+  unless the caller's token SID is `SYSTEM` (`S-1-5-18`), which is what LogonUI loads this DLL as.
+  The plaintext password still crosses this local pipe; see SECURITY.md.
+- The tile is offered only to the owner, only in the lock (`CPUS_UNLOCK_WORKSTATION`) and sign-in
+  (`CPUS_LOGON`, only while the owner's service is running) scenarios -- never in CredUI (UAC) or a
+  remote session. Texts are English or Russian (the service's `lang`, else the system UI language).
+  Built with `/guard:cf` and `/CETCOMPAT`, x64 only.
 - The `CLSID_FaceCredentialProvider` GUID in `guid.h` is this fork's own
   (`{8414D7B6-…}`, generated in Stage 0). A fork of this repository must generate
   its own (`uuidgen.exe`) before publishing builds.
-- A failed scan never blocks LogonUI: the tile shows one of four fixed messages
-  (not recognised / temporarily locked / service unavailable / stored password
-  rejected) and the PIN and password tiles stay available. After Windows rejects
-  the stored password, the tile stops scanning for the rest of that lock-screen
-  session (Stage 8b, F-04) — re-save the password in Face Unlock.
+- A failed scan never blocks LogonUI: the tile shows a fixed message per cause (not recognised,
+  locked for N s, no password saved, no face set up, camera busy, too dark, service not running,
+  saved password rejected, components do not match, needs attention) and the PIN and password
+  tiles stay available. After Windows rejects the stored password, the service keeps a "password
+  rejected" flag until a new password is saved, and the tile says so.

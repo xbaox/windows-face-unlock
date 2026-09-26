@@ -28,6 +28,8 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_adaptive_")
 
 import numpy as np
 
@@ -330,8 +332,10 @@ def main(argv=None) -> int:
     print("\n[12] service _maybe_adapt_gallery integration")
     try:
         from face_service.service import FaceService, VerifyOutcome
-    except Exception as e:   # pragma: no cover - pywin32 not present in this context
-        print(f"  skip  service import unavailable ({e.__class__.__name__}); G5 skipped")
+    except ImportError as e:   # pragma: no cover - pywin32 not present in this context
+        from tools.testkit import skip_is_failure
+        if skip_is_failure("service import (G5)", e):
+            t.ok(False, "G5 section ran")
     else:
         class _AuditStub:
             def __init__(self):

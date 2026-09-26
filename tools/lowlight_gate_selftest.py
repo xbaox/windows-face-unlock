@@ -21,6 +21,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_lowlight_gate_")
 
 from face_service import lowlight as LL
 from face_service.config import Config
@@ -100,8 +102,10 @@ def main(argv=None) -> int:
     print("\n[3] lockout-neutrality: too-dark unlock never touches Lockout.record")
     try:
         from face_service.service import FaceService, VerifyOutcome
-    except Exception as e:   # pragma: no cover - pywin32 absent in this context
-        print(f"  skip  service import unavailable ({e.__class__.__name__}); lockout proof skipped")
+    except ImportError as e:   # pragma: no cover - pywin32 absent in this context
+        from tools.testkit import skip_is_failure
+        if skip_is_failure("service import (lockout proof)", e):
+            t.ok(False, "lockout proof section ran")
     else:
         class _LockoutSpy:
             def __init__(self):
@@ -129,29 +133,19 @@ def main(argv=None) -> int:
             s._audit = _AuditStub()
             s._camera_paused_until = 0.0            # _camera_leased_out() -> False
             s._capture_and_verify = lambda: outcome
-            # Neutralise the Step-3.3 boost the same way lowlight_boost_selftest.py:197 does.
-            # A dark scene sends the unlock path through _maybe_boost (service.py:805), and
-            # THIS fake has no _cam_lock, so the real one would raise AttributeError at
-            # service.py:477 -- swallowed by the defensive handler at :492, but it would then
-            # be one added attribute away from calling _acquire_camera() against a real
-            # device in a harness that never patches SVC.Camera. Returning the outcome
-            # unchanged with an empty audit dict is exactly what the swallow produced, so
-            # every assertion below is unaffected (service.py:806 merges {} harmlessly).
+            # Neutralise the low-light boost the same way lowlight_boost_selftest does. A dark
+            # scene sends the unlock path through FaceService._maybe_boost, and THIS fake has no
+            # camera lock -- one added attribute away from FaceService._acquire_camera() against
+            # a real device in a harness that never patches SVC.Camera. Returning the outcome
+            # unchanged with an empty audit dict keeps every assertion below as it was.
             s._maybe_boost = lambda r: (r, {})
             return s
 
         def _svc_cfg():
             c = Config()
-            # This harness calls _handle({"cmd": "unlock", "v": 2}) with NO pipe handle, so the
-            # Stage-5 SID gate resolves the client SID to None and refuses with
-            # "not-authorized" before the low-light path is ever reached. The gate is not
-            # what these cases exercise -- same reason and same shape as
-            # tools/camera_busy_selftest.py:173 (block6-A-fix, bc4e25b). The gate keeps its
-            # own dedicated coverage in tools/pipe_hardening_selftest.py:148-160, which
-            # asserts both that it REFUSES a non-SYSTEM caller when on (:148-153) and that
-            # it allows one through when off (:155-160). Test scaffold only: production
-            # behaviour and the Stage-4/5 perimeter are untouched.
-            pass   # Stage 9: no config switch for the SYSTEM gate; the service stands in via _caller_sid
+            # The SYSTEM gate on unlock is not what these cases exercise: the service is made to
+            # see the lock screen as its caller (tools.testkit.as_lock_screen / _caller_sid). The
+            # gate's own coverage: pipe_hardening_selftest.test_gates (D-144).
             return c
 
         cfg = _svc_cfg()  # low_light_luma_min = 45.0
@@ -199,8 +193,10 @@ def main(argv=None) -> int:
     try:
         import cv2
         import numpy as np
-    except Exception as e:   # pragma: no cover - cv2 absent in this context
-        print(f"  skip  cv2/numpy unavailable ({e.__class__.__name__}); numeric-identity check skipped")
+    except ImportError as e:   # pragma: no cover - cv2 absent in this context
+        from tools.testkit import skip_is_failure
+        if skip_is_failure("cv2/numpy (numeric-identity check)", e):
+            t.ok(False, "numeric-identity section ran")
     else:
         rng = np.random.default_rng(7)
         img = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)

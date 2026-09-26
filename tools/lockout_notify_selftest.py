@@ -18,6 +18,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_lockout_notify_")
+from tools.testkit import patch, run_restoring  # noqa: E402  (D-142)
 
 from face_service.config import Config
 from presence_monitor import monitor as M
@@ -50,16 +53,16 @@ class Harness:
         self.session_locked_calls = 0
 
         self.mon._notify = lambda gate, message: self.notifications.append((gate, message))
-        M.pipe_call = lambda req, timeout_s=30.0: {
+        patch(M, "pipe_call", lambda req, timeout_s=30.0: {
             "ok": True,
             "lockout": {"locked": self.locked, "remaining_s": self.remaining_s},
-        }
+        })
         # 7c-7: the toast gate now asks _is_session_locked (the authoritative WTS detector with the
         # desktop predicate only as a fallback). Both names are patched to the same stub -- without
         # the first one the real detector answers about the developer's own machine and the
         # desktop_locked knob below stops meaning anything.
-        M._is_session_locked = self._session_locked
-        M.session_locked = self._session_locked
+        patch(M, "_is_session_locked", self._session_locked)
+        patch(M, "session_locked", self._session_locked)
 
     def _session_locked(self) -> bool:
         self.session_locked_calls += 1
@@ -159,7 +162,7 @@ def test_service_state_notification_untouched() -> None:
     check("baseline tick raises no service-state toast", gates_before, [])
 
     # Service goes away while the screen is locked -> that transition still notifies.
-    M.pipe_call = lambda req, timeout_s=30.0: None
+    patch(M, "pipe_call", lambda req, timeout_s=30.0: None)
     h.tick()
     check("service-down toast still fires while locked",
           [g for g, _ in h.notifications], ["notify_service_state"])
@@ -167,9 +170,11 @@ def test_service_state_notification_untouched() -> None:
 
 def main() -> int:
     print("=== Block-7 A3: lock-screen-aware lockout toast ===")
-    test_deferred_while_locked_then_replayed()
-    test_probe_is_not_called_when_already_notified()
-    test_service_state_notification_untouched()
+    run_restoring(
+        test_deferred_while_locked_then_replayed,
+        test_probe_is_not_called_when_already_notified,
+        test_service_state_notification_untouched,
+    )
     print()
     if _fails:
         print(f"LOCKOUT-NOTIFY SELFTEST FAILED: {len(_fails)} check(s): {', '.join(_fails)}")

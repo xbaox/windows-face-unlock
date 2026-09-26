@@ -1,7 +1,7 @@
 """tools/pose_coach_selftest.py -- Stage 8b package J proof: the enrollment pose warning (D-17).
 
-Calibration data are LITERALS copied from C:\\dev\\d-series\\7l\\c\\gallery-diag.txt (pitch, yaw per
-enrolled frame, degrees) -- numbers only, no image is read. Expectations are literals too, never
+Calibration data are LITERALS from the stage-7l gallery diagnostics (head pitch and yaw per
+enrolled frame, degrees, measured on real enrollments) -- numbers only, no image is read. Expectations are literals too, never
 derived from the thresholds under test (lesson of 7-i).
   [1] every July frame (2026-07-19 and 2026-07-20, 30 frames) -> no warning.
   [2] every September frame (2026-09-23, 15 frames) -> warning.
@@ -15,15 +15,14 @@ Run:  python -m tools.pose_coach_selftest
 Exit 0 = all pass; 1 = a failure.
 """
 from __future__ import annotations
-import os
 import statistics
 import sys
-import tempfile
 import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ["FACE_UNLOCK_HOME"] = tempfile.mkdtemp(prefix="faceunlock_pose_")
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_pose_")
 
 from presence_monitor.enroll_gui import pose_warning
 from face_service.config import Config

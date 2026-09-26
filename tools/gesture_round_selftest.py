@@ -26,15 +26,15 @@ Run:  python -m tools.gesture_round_selftest
 Exit 0 = all pass; 1 = a failure.
 """
 from __future__ import annotations
-import os
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.setdefault("FACE_UNLOCK_HOME", tempfile.mkdtemp(prefix="faceunlock_gesture_"))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_gesture_")
+from tools.testkit import patch, run_restoring  # noqa: E402  (D-142)
 
 import numpy as np
 
@@ -159,7 +159,7 @@ def test_phase1():
           xx._prompt_for("turn_right,turn_left") == "Turn your head right, then turn your head left",
           xx._prompt_for("turn_right,turn_left"))
 
-    svc.load_password = lambda: {"u": "admin", "p": "pw", "d": "."}
+    patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
     p = _svc()
     p._capture_and_verify = lambda: _outcome("PASS", match=True, distance=0.05)
     rp = p._handle({"cmd": "unlock", "v": 2}, None)
@@ -182,7 +182,7 @@ def test_phase1():
 
 def test_token_slot():
     print("[2] one-shot token slot")
-    svc.load_password = lambda: {"u": "admin", "p": "pw", "d": "."}
+    patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
     s = _needs_gesture_svc()
     tok = s._handle({"cmd": "unlock", "v": 2}, None)["token"]
     s._run_challenge = _round_result()
@@ -424,7 +424,7 @@ def _armed(runner, cfg=None):
 
 def test_strikes():
     print("[5] R5 strike rules")
-    svc.load_password = lambda: {"u": "admin", "p": "pw", "d": "."}
+    patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
     cases = (
         ("failed round on face frames", _round_result(passed=False, identity_frames=5), "gesture-failed", [False]),
         ("too few identity frames", _round_result(passed=True, identity_frames=1), "gesture-failed", [False]),
@@ -489,7 +489,7 @@ def test_strikes():
 
 def test_audit_and_adaptation():
     print("[7] audit records and phase-2 adaptation (F-47)")
-    svc.load_password = lambda: {"u": "admin", "p": "pw", "d": "."}
+    patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
     s, tok = _armed(_round_result())
     ev, rec = s._audit.records[-1]
     check("phase-1 audit: outcome needs-gesture, the sequence, never the token",
@@ -522,12 +522,14 @@ def test_audit_and_adaptation():
 
 
 def main() -> int:
-    test_phase1()
-    test_token_slot()
-    test_gate_order()
-    test_round()
-    test_strikes()
-    test_audit_and_adaptation()
+    run_restoring(
+        test_phase1,
+        test_token_slot,
+        test_gate_order,
+        test_round,
+        test_strikes,
+        test_audit_and_adaptation,
+    )
     if FAILS:
         print(f"\nGESTURE-ROUND SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")
         return 1

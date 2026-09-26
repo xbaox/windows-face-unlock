@@ -4,7 +4,7 @@ Pure, engine-agnostic helpers. Given an already-detected InsightFace ``face`` an
 the source BGR image, compute per-frame quality metrics and decide whether the
 frame is good enough to contribute an embedding. Kept separate from Recognizer so
 the gates are unit-testable without a camera or the GPU engine (see
-``tools.enroll_qc_selftest``), and so ``tools.enroll_qc_probe`` and
+``tools.enroll_qc_selftest``), and so ``tools.diag.enroll_qc_probe`` and
 ``Recognizer.enroll_from_dir`` share ONE source of truth for the thresholds.
 
 All metrics are computed on the canonical 112x112 aligned crop that ArcFace

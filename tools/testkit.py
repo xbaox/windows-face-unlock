@@ -29,3 +29,42 @@ def deliver_and_report(svc, ok: bool = True) -> dict:
         return {}
     return svc._handle({"cmd": "report_result", "v": 2, "grant_id": slot["grant_id"], "ok": ok},
                        None)
+
+
+def skip_is_failure(what: str, e: BaseException) -> bool:
+    """Stage 9 (D-141, B14-08): a section that cannot run is a FAILURE unless the run was started
+    with ``--allow-skip`` -- a regression that breaks an import must not vanish as "skip" under an
+    OK result. Prints the line; returns True when the caller must count a failure."""
+    import sys
+    allowed = "--allow-skip" in sys.argv
+    print(f"  {'skip' if allowed else 'FAIL'}  {what} unavailable ({e.__class__.__name__}: {e})"
+          + ("" if allowed else " -- run with --allow-skip to accept a partial run"))
+    return not allowed
+
+
+# Stage 9 (D-142, B14-09): module globals replaced by a test are put back after every test function,
+# so tests that share a process (stage4, a runner) never see another test's fake password store or
+# fake pipe.
+_PATCHES: list = []
+
+
+def patch(obj, name: str, value):
+    """``setattr(obj, name, value)``, remembering the original for restore_all()."""
+    _PATCHES.append((obj, name, getattr(obj, name)))
+    setattr(obj, name, value)
+    return value
+
+
+def restore_all() -> None:
+    while _PATCHES:
+        obj, name, orig = _PATCHES.pop()
+        setattr(obj, name, orig)
+
+
+def run_restoring(*tests) -> None:
+    """Run each test function, restoring every patch() after each one (even when it raises)."""
+    for fn in tests:
+        try:
+            fn()
+        finally:
+            restore_all()

@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_liveness_verdict_")
 
 try:  # repo layout on the target machine
     from face_service.liveness import verdict, Verdict

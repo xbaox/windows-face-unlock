@@ -16,7 +16,10 @@
 
       1. GATE. Find the `exit` inside `if (-not $Force) { ... }` and assert it sits
          at script top level, so reaching it ends the process rather than a nested
-         scope. Its line number is the gate line.
+         scope. The `exit` must be a DIRECT statement of that if body -- an exit
+         nested in a further conditional (`if ($DryRun) { exit 0 }`) could fall
+         through into phase B and does not count (Stage 9, D-130). Its line number
+         is the gate line.
 
       2. REACHABILITY. Starting from every top-level statement at or above the gate
          line, follow function calls transitively. The result is the set of code
@@ -26,9 +29,11 @@
 
       3. MUTATION SCAN. Walk every CommandAst in the file and classify it against a
          deny-list of state-changing cmdlets, their aliases, and known external
-         mutators; separately walk every method call for mutating members
-         ([IO.File]::Delete and friends). Any hit inside the reachable set fails the
-         proof.
+         mutators (incl. Invoke-Expression, jobs, CIM/WMI methods, child shells,
+         sc.exe / net / msiexec); separately walk every method call for mutating
+         members ([IO.File]::Delete, COM DeleteTask / RegisterTaskDefinition and
+         friends); and every file redirection (`> file`, `>> file`). Any hit inside
+         the reachable set fails the proof.
 
       4. INDIRECTION. `& $something` can invoke code this file does not contain, so
          every ampersand invocation is treated as mutating BY DEFAULT. One pattern
@@ -77,7 +82,14 @@ $fuMutatingCommands = @(
     'Stop-Process', 'kill', 'spps', 'Start-Process', 'saps',
     'Set-Acl', 'New-PSDrive', 'Remove-PSDrive', 'Write-EventLog',
     'regsvr32', 'regsvr32.exe', 'reg', 'reg.exe', 'schtasks', 'schtasks.exe',
-    'taskkill', 'taskkill.exe', 'icacls', 'cacls', 'attrib', 'cmd', 'cmd.exe'
+    'taskkill', 'taskkill.exe', 'icacls', 'cacls', 'attrib', 'cmd', 'cmd.exe',
+    # Stage 9 (D-130): code runners, jobs, CIM/WMI writers, child shells, service/installer tools
+    'Invoke-Expression', 'iex', 'Invoke-Command', 'icm', 'Start-Job', 'sajb', 'Start-ThreadJob',
+    'Invoke-CimMethod', 'Remove-CimInstance', 'Set-CimInstance', 'New-CimInstance',
+    'Invoke-WmiMethod', 'Remove-WmiObject', 'Set-WmiInstance',
+    'sc.exe', 'net', 'net.exe', 'net1', 'net1.exe', 'msiexec', 'msiexec.exe',
+    'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe', 'rundll32', 'rundll32.exe',
+    'Tee-Object', 'tee', 'Invoke-WebRequest', 'iwr', 'Invoke-RestMethod', 'irm', 'Start-BitsTransfer'
 )
 # Mutating .NET members, matched on the member name alone (the type is not always
 # statically knowable, so this errs toward reporting).
@@ -85,7 +97,12 @@ $fuMutatingMembers = @(
     'Delete', 'DeleteSubKey', 'DeleteSubKeyTree', 'DeleteValue',
     'Create', 'CreateDirectory', 'CreateSubKey',
     'WriteAllText', 'WriteAllBytes', 'WriteAllLines', 'AppendAllText', 'AppendAllLines',
-    'Move', 'MoveTo', 'Replace', 'SetAccessControl', 'SetValue', 'Kill'
+    'Move', 'MoveTo', 'Replace', 'SetAccessControl', 'SetValue', 'Kill',
+    # Stage 9 (D-130): COM / WMI / shell members (Task Scheduler, WMI, Shell.Application, FSO)
+    'DeleteTask', 'RegisterTaskDefinition', 'RegisterTask', 'DeleteFolder', 'CreateFolder',
+    'Run', 'RunEx', 'StopTask', 'Terminate', 'InvokeMethod', 'ExecMethod_', 'Put_', 'Delete_',
+    'DeleteFile', 'CopyFile', 'MoveFile', 'CopyHere', 'MoveHere', 'ShellExecute', 'SetInfo',
+    'Encrypt', 'Decrypt', 'SetAttributes', 'Copy', 'CopyTo'
 )
 
 $fuTokens = $null
@@ -114,9 +131,9 @@ function Get-FuEnclosingFunction {
     return ''
 }
 
-$fuCommands  = Get-FuAll ([System.Management.Automation.Language.CommandAst])
-$fuFunctions = Get-FuAll ([System.Management.Automation.Language.FunctionDefinitionAst])
-$fuMembers   = Get-FuAll ([System.Management.Automation.Language.InvokeMemberExpressionAst])
+$fuCommands  = @(Get-FuAll ([System.Management.Automation.Language.CommandAst]))
+$fuFunctions = @(Get-FuAll ([System.Management.Automation.Language.FunctionDefinitionAst]))
+$fuMembers   = @(Get-FuAll ([System.Management.Automation.Language.InvokeMemberExpressionAst]))
 
 Write-Host ''
 Write-Host "AST dry-run proof -- $fuTarget" -ForegroundColor White
@@ -128,8 +145,10 @@ $fuGateText = ''
 foreach ($fuIf in (Get-FuAll ([System.Management.Automation.Language.IfStatementAst]))) {
     $fuCond = $fuIf.Clauses[0].Item1.Extent.Text
     if ($fuCond -notmatch '-not\s+\$Force') { continue }
-    $fuExits = @($fuIf.Clauses[0].Item2.FindAll(
-        { param($fuN) $fuN -is [System.Management.Automation.Language.ExitStatementAst] }, $true))
+    # A DIRECT statement of the if body only (D-130): an exit nested in another conditional
+    # could be skipped and let the script fall through into phase B.
+    $fuExits = @($fuIf.Clauses[0].Item2.Statements | Where-Object {
+        $_ -is [System.Management.Automation.Language.ExitStatementAst] })
     if (-not $fuExits.Count) { continue }
     if ((Get-FuEnclosingFunction $fuIf) -ne '') { continue }   # must end the SCRIPT
     $fuGateLine = $fuExits[0].Extent.StartLineNumber
@@ -137,7 +156,7 @@ foreach ($fuIf in (Get-FuAll ([System.Management.Automation.Language.IfStatement
     break
 }
 if (-not $fuGateLine) {
-    Write-Host 'PROOF FAILED: no top-level `exit` inside an `if (-not $Force)` block.' -ForegroundColor Red
+    Write-Host 'PROOF FAILED: no top-level `if (-not $Force)` block whose body has an `exit` as a direct statement.' -ForegroundColor Red
     Write-Host '              Without that gate a run without -Force is not bounded at all.' -ForegroundColor Red
     exit 1
 }
@@ -265,6 +284,20 @@ foreach ($fuM in $fuMembers) {
         What = $fuWhat
     }
     if (Test-FuPreGate $fuM) { $fuFindings += $fuRow } else { $fuBelow += $fuRow }
+}
+
+# File redirections (`> file`, `>> file`, `2> file`) write files without any command name (D-130).
+# Redirection to $null is a discard, not a write.
+foreach ($fuRd in (Get-FuAll ([System.Management.Automation.Language.FileRedirectionAst]))) {
+    $fuTargetText = $fuRd.Location.Extent.Text
+    if ($fuTargetText -eq '$null') { continue }
+    $fuRow = [pscustomobject]@{
+        Line = $fuRd.Extent.StartLineNumber
+        Kind = 'REDIRECT'
+        In   = $(if ((Get-FuEnclosingFunction $fuRd) -eq '') { '<top level>' } else { (Get-FuEnclosingFunction $fuRd) + '()' })
+        What = $fuRd.Extent.Text
+    }
+    if (Test-FuPreGate $fuRd) { $fuFindings += $fuRow } else { $fuBelow += $fuRow }
 }
 
 Write-Host ''

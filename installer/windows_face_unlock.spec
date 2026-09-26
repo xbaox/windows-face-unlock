@@ -81,14 +81,14 @@ HIDDEN += collect_submodules("skimage.transform")
 # internals -- so it is dropped silently and warn-*.txt shows nothing. Without it
 # scipy's import guard raises "seems to be broken" at the first touch of
 # skimage.transform inside FaceAnalysis.get(), so every probe answers none while
-# the detector is healthy. KNOWN_ISSUES #5, 7j; evidence C:\dev\d-series\7j-diag.
+# the detector is healthy. KNOWN_ISSUES #5 (docs/internal), 7j.
 HIDDEN += ["scipy._cyutility"]
 
 # Mine 2. scipy vendors array_api_compat under scipy._external and imports its submodules by
 # COMPUTED name at first use -- numpy/__init__.py runs __import__(__package__ + ".fft")
 # -- modulegraph never sees them, so the frozen build died on the first FaceAnalysis.get()
 # with: No module named 'scipy._external.array_api_compat.numpy.fft'. Collect the whole tree;
-# it is pure .py, no binaries. KNOWN_ISSUES #5 mine 2, 7j; evidence C:\dev\d-series\7j-fix.
+# it is pure .py, no binaries. KNOWN_ISSUES #5 mine 2 (docs/internal), 7j.
 HIDDEN += collect_submodules("scipy._external")
 
 HIDDEN += [

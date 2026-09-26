@@ -1,7 +1,7 @@
 # Live smoke protocol
 
 How a live smoke of the service, presence and verify is run and judged. Written in
-Stage 8b (D-10) from rules learned the hard way in 7k and 7l (`audit-notes.md`,
+Stage 8b (D-10) from rules learned the hard way in 7k and 7l (`docs/internal/audit-notes.md`,
 7k А–Г and 7l Е/Ж/З). A smoke that does not follow these rules is not evidence.
 
 ## 1. Which copy is under test
@@ -50,7 +50,7 @@ which writes a sibling and renames it (F-45) — with synthetic INPUTS only: noi
 (no face), a stub engine returning random L2-normalised 512-D vectors, QC told every
 frame passes. The file is the exact on-disk format (`embeddings`, `engine`, `dim`) and
 holds no biometric data: nothing derived from a face, nothing copied from a real
-gallery. Reference implementation: `C:\dev\d-series\8b2\smoke\gen_synthetic_gallery.py`.
+gallery. (The generator used in 8b is kept with the private smoke evidence, not in this repo.)
 With it, `presence` on a real person answers `ok:true state=absent` (no vector matches)
 — the point is that the engine ran, not the verdict. Never put a synthetic gallery into
 a real `.face-unlock`.
@@ -85,7 +85,7 @@ camera; `engine-error` is the engine. Name the class in the verdict.
 ## 5. Verdict files
 
 - Every live probe goes to a file under the window's evidence folder
-  (`C:\dev\d-series\<window>\...`) together with the service's reply and the
+  (`<evidence root>\<window>\...`) together with the service's reply and the
   matching log lines. The report cites the file, never memory (7k В).
 - The window's outcome goes to `<window>-verdict.txt`: `GREEN` or `RED` plus the
   reason, written before the report.
@@ -125,6 +125,6 @@ camera; `engine-error` is the engine. Name the class in the verdict.
   `reload_config` keeps the old config. Set `adaptive_gallery = false` for the run.
 - `reload_config` does not reload the gallery: adaptive samples stay in matching until the next start.
 - The gesture round only feeds frames with d ≤ `threshold` (identity binding). Measure d in the gesture poses
-  too, or a head turn may never register at a thin threshold (KNOWN_ISSUES §9).
+  too, or a head turn may never register at a thin threshold (docs/internal/KNOWN_ISSUES.md §9).
 - Keep a byte backup of `config.toml` outside the data directory and restore it at any outcome; the SHA must
   match the reference afterwards.

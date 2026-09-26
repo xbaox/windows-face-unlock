@@ -31,8 +31,8 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if not os.environ.get("FACE_UNLOCK_HOME"):
-    os.environ["FACE_UNLOCK_HOME"] = tempfile.mkdtemp(prefix="faceunlock_inst_")
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_inst_")
 
 REPO = Path(__file__).resolve().parents[1]
 FAILS: list = []
@@ -284,12 +284,71 @@ def test_misc():
     check("installed mode is the exe's business", "managed by its own executable" in reg)
 
 
+def test_notices_and_docs():
+    print("[6] third-party notices (F-260) and the end-user docs (9c-6)")
+    import re
+    import shutil
+    import tempfile
+    sys.path.insert(0, str(REPO / "installer"))
+    import notices
+    root = Path(tempfile.mkdtemp(prefix="faceunlock_notices_"))
+    try:
+        problems = notices.stage(root, "cpu", None)
+        # without ISCC only Inno Setup's text can be missing
+        check("stage(): every runtime package, Python, YuNet get their texts (cpu)",
+              [p_ for p_ in problems if "Inno" not in p_ and "inno-setup" not in p_] == [], problems)
+        lic = root / "licenses"
+        check("pystray's LGPL + GPL texts are staged", (lic / "pystray" / "COPYING.LGPL").is_file()
+              and (lic / "pystray" / "COPYING").is_file())
+        check("the CPython license (OpenSSL, MSVC runtime conditions) is staged",
+              (lic / "python" / "LICENSE.txt").is_file())
+        check("packages without a license file get a stated text (insightface, flatbuffers)",
+              (lic / "insightface" / "LICENSE.txt").is_file() and (lic / "flatbuffers" / "LICENSE.txt").is_file())
+        check("no NVIDIA text in the CPU variant", not (lic / "nvidia").exists())
+        shutil.rmtree(lic / "numpy")
+        check("check(): an emptied package folder fails the gate",
+              any("numpy" in p_ for p_ in notices.check(root, "cpu", notices_doc=False)))
+        check("check(): the GPU variant insists on the NVIDIA texts",
+              any("nvidia" in p_ for p_ in notices.check(root, "gpu", notices_doc=False)))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    build = read("installer/build.py")
+    check("build.py stages the texts after PyInstaller and gates on them",
+          "notices.stage(DIST_ROOT, variant, iscc)" in build and "notices.check(dist_root, variant)" in build)
+    for doc in ("README.md", "INSTALL.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "CONTRIBUTING.md"):
+        text = read(doc).replace("Русский", "")   # the language menu entry is named in its own script
+        check(f"{doc}: English only, no internal references",
+              not re.search("[\u0400-\u04FF]", text) and "KNOWN_ISSUES" not in text
+              and "d-series" not in text and "docs/internal/" not in text or doc == "CONTRIBUTING.md")
+    check("build.py ships SECURITY.md and THIRD_PARTY_NOTICES.md",
+          '"SECURITY.md", "THIRD_PARTY_NOTICES.md"' in build)
+    lic_text = read("LICENSE")
+    check("LICENSE keeps the upstream line and adds the fork's (D-157)",
+          "Copyright (c) 2026 Cao Chí Tâm" in lic_text and "Copyright (c) 2026 xbaox" in lic_text)
+    check("README credits the upstream project", "caochitam/windows-face-unlock" in read("README.md"))
+    for gone in ("KNOWN_ISSUES.md", "audit-notes.md", "face-unlock-MASTER-TZ.md", "stage-7-TZ.md",
+                 "stage-7i-TZ.md", "stage1-benchmark.md"):
+        check(f"internal {gone} lives in docs/internal/ (D-158)",
+              not (REPO / gone).exists() and (REPO / "docs" / "internal" / gone).is_file())
+    sec = read("SECURITY.md")
+    check("SECURITY: the password-in-memory decision (D-43) and the print limitation (F-123)",
+          "immutable" in sec and "Printed photo" in sec)
+    check("SECURITY: fast mode signs in with no movement on a confident match (F-114)",
+          "with\nno movement at all" in sec or "with no movement at all" in sec)
+    check("SECURITY: privacy -- ORT telemetry off, the update request named",
+          "switches it off" in sec and "api.github.com/repos/xbaox/windows-face-unlock" in sec)
+    check("README: screen readers are a stated limitation (F-171)", "screen-reader" in read("README.md"))
+    check("CONTRIBUTING: the R19 dev-tree restriction", "R19" in read("CONTRIBUTING.md")
+          and "refuses" in read("CONTRIBUTING.md"))
+
+
 def main() -> int:
     test_taskreg()
     test_iss()
     test_build()
     test_locks_ci()
     test_misc()
+    test_notices_and_docs()
     print()
     if FAILS:
         print(f"INSTALLER SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")

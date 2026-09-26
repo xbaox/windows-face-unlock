@@ -51,13 +51,20 @@ jobs:
         run: |
           python -m pip install --require-hashes -r requirements.lock
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Selftests (each in its own FACE_UNLOCK_HOME)
+          # the frozen-gate tests (verifier, frozen_custody) read PyInstaller's archive format
+          python -m pip install --require-hashes -r installer/requirements-build.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Selftests (each with its own TEMP and a FACE_UNLOCK_HOME inside it)
         shell: pwsh
         run: |
+          # R20: a selftest refuses a home outside the temporary directory, so TEMP comes first.
           $fail = @()
-          foreach ($t in Get-ChildItem tools -Filter '*selftest*.py') {
-            $home_ = Join-Path $env:RUNNER_TEMP ("home-" + $t.BaseName)
-            $env:FACE_UNLOCK_HOME = $home_
+          foreach ($t in Get-ChildItem tools -Filter '*_selftest.py') {
+            $tmp_ = Join-Path $env:RUNNER_TEMP ("t-" + $t.BaseName)
+            New-Item -ItemType Directory -Force -Path $tmp_ | Out-Null
+            $env:TEMP = $tmp_
+            $env:TMP = $tmp_
+            $env:FACE_UNLOCK_HOME = Join-Path $tmp_ "home"
             python -m ("tools." + $t.BaseName)
             if ($LASTEXITCODE) { $fail += $t.BaseName }
           }

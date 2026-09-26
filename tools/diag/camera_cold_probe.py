@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""tools/camera_cold_probe.py -- Stage 6 / block6-B: COLD open -> first-frame latency.
+"""tools/diag/camera_cold_probe.py -- Stage 6 / block6-B: COLD open -> first-frame latency.
 
 Measures how long the webcam actually takes to hand over its first usable frame,
 split into the three segments the service pays on every on-demand acquisition.
 It exists because the ~0.9s / ~3s figures in ``field.persistent_camera.desc``
 (face_service/i18n.py:179 EN, :1060 RU) are undocumented -- ``git log -L`` shows
 they arrived whole in the bulk GUI/i18n merge dcaa766, not from a measurement --
-and because ``tools.camera_busy_integration`` only ever reports a WARM re-open
+and because ``tools.diag.camera_busy_integration`` only ever reports a WARM re-open
 (~0.6s after releasing its own holder, in a process where cv2 and the backend
 are already hot).
 
@@ -35,8 +35,8 @@ process just released, so they are reported separately as warm.
 Run with the service STOPPED -- otherwise it holds the device and every cycle
 measures contention instead of open latency.
 
-    .venv\\Scripts\\python.exe -m tools.camera_cold_probe
-    .venv\\Scripts\\python.exe -m tools.camera_cold_probe --runs 8 --backend dshow
+    .venv\\Scripts\\python.exe -m tools.diag.camera_cold_probe
+    .venv\\Scripts\\python.exe -m tools.diag.camera_cold_probe --runs 8 --backend dshow
 
 Read-only: touches no config, writes no files, prints to stdout. The capture is
 released in a finally on every cycle so the probe cannot leave the webcam held.

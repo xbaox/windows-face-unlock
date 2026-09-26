@@ -25,14 +25,13 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if not os.environ.get("FACE_UNLOCK_HOME"):
-    os.environ["FACE_UNLOCK_HOME"] = tempfile.mkdtemp(prefix="faceunlock_campol_")
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_campol_")
 
 import numpy as np
 

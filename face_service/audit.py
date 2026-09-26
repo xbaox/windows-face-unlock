@@ -1,8 +1,11 @@
 """Structured audit trail for face-auth attempts (Stage 2, Step 7).
 
-One JSON object per line (JSONL) appended to a file in APP_DIR: verify / unlock / challenge
-attempts with the verdict, distance, liveness signals, mode and latency. Never contains the
-password -- only the outcome. Size-based rotation keeps ``audit.jsonl`` plus a few numbered
+One JSON object per line (JSONL) appended to a file in APP_DIR. Events (Stage 9, D-85: the list
+the service actually writes): ``unlock`` (phase 1, with its outcome), ``unlock_gesture``
+(phase 2), ``gesture_telemetry``, ``verify`` (the diagnostic command), ``adapt`` (an adaptive-
+gallery decision), ``enroll_build`` (add / replace), ``clear_enrollment`` and ``calibrate_turn``
+-- with the verdict, distance, liveness signals, mode and latency. Never contains the password,
+a token or an image -- only the outcome. Size-based rotation keeps ``audit.jsonl`` plus a few numbered
 backups so the file can't grow without bound. Thread-safe; clock injectable for tests.
 """
 from __future__ import annotations

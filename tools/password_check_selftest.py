@@ -22,6 +22,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_password_check_")
 
 from face_service.i18n import set_language, t
 from presence_monitor import password_gui as G

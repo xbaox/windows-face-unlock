@@ -8,7 +8,8 @@ Steps, in this order (the signing order is R18's):
      variant is cleaned (F-220, F-221: fail in seconds, not after the whole build)
   1. build the Credential Provider DLL (CMake, Release x64)
   2. sign the CP DLL                                   -- Azure Trusted Signing, or LOUDLY SKIPPED
-  3. PyInstaller (FU_VARIANT=<variant>), then stage the CP DLL, the docs and the LGPL texts
+  3. PyInstaller (FU_VARIANT=<variant>), then stage the CP DLL, the docs and every third-party
+     license text (the licenses folder + INDEX.txt, installer/notices.py, F-260)
   4. GPU only: every shipped NVIDIA DLL is checked with Authenticode (signed by NVIDIA Corporation)
      and never modified; unsigned ones need a catalog signature (.cat) under our identity --
      LOUDLY SKIPPED without signing credentials, recorded in the stamp
@@ -17,7 +18,7 @@ Steps, in this order (the signing order is R18's):
   6. THE GATE on the (signed) bundle: verify_frozen_entrypoints (PE content compared WITHOUT the
      certificate table and checksum), packaging_selftest, the frozen custody self-check, no model
      in the bundle, the variant's shape (CPU: no CUDA provider and no NVIDIA file; GPU: exactly the
-     allowlist), the CP DLL; then the stamp
+     allowlist), the third-party license texts (F-260), the CP DLL; then the stamp
   7. ISCC (version, variant and the model pins as /D defines; SignTool + SignedUninstaller only
      with credentials); the EXACT file ISCC was told to write is the artefact (F-220); the bundle
      is re-hashed after ISCC and must still match the stamp (F-225)
@@ -258,7 +259,7 @@ def step_sign_cp(dll: "Path | None") -> dict:
 
 
 # ---------------------------------------------------------------------------------------- 3
-def step_pyinstaller(variant: str, cp_dll: "Path | None") -> Path:
+def step_pyinstaller(variant: str, cp_dll: "Path | None", iscc: "str | None" = None) -> Path:
     step(3, f"PyInstaller ({variant}) + staging")
     for d in (DIST_DIR, BUILD_DIR):
         if d.exists():
@@ -283,17 +284,14 @@ def step_pyinstaller(variant: str, cp_dll: "Path | None") -> Path:
         p = REPO_ROOT / doc
         if p.exists():
             shutil.copy2(p, DIST_ROOT / doc)
-    # §2.9 (F-261): pystray's license texts beside its replaceable sources.
-    try:
-        from importlib import metadata
-        dist = metadata.distribution("pystray")
-        lic_dir = DIST_ROOT / "licenses" / "pystray"
-        lic_dir.mkdir(parents=True, exist_ok=True)
-        for f in dist.files or []:
-            if Path(str(f)).name.upper().startswith(("COPYING", "LICENSE")):
-                shutil.copy2(Path(dist.locate_file(f)), lic_dir / Path(str(f)).name)
-    except Exception as e:
-        raise BuildAbort(f"cannot stage the pystray license texts: {e!r}") from e
+    # F-260 / §2.9: every third-party license text (pystray's LGPL/GPL texts included, beside its
+    # replaceable sources -- F-261), from the build interpreter, into licenses\ + INDEX.txt.
+    sys.path.insert(0, str(INSTALLER_DIR))
+    import notices
+    problems = notices.stage(DIST_ROOT, variant, iscc)
+    if problems:
+        raise BuildAbort("cannot stage the third-party license texts: " + "; ".join(problems))
+    log(f"licenses staged: {sum(1 for q in (DIST_ROOT / 'licenses').rglob('*') if q.is_file())} files")
     return DIST_ROOT
 
 
@@ -484,6 +482,11 @@ def step_gate(variant: str, dist_root: Path, signing: dict) -> dict:
     custody = gate_frozen_custody(dist_root)
     gate_no_models(dist_root)
     gate_variant(variant, dist_root)
+    sys.path.insert(0, str(INSTALLER_DIR))
+    import notices
+    lic_problems = notices.check(dist_root, variant)
+    if lic_problems:
+        raise BuildAbort("GATE FAILED: third-party notices (F-260): " + "; ".join(lic_problems))
     staged = dist_root / "credential_provider" / CP_DLL_NAME
     cp = {"sha256": sha256_file(staged) if staged.is_file() else None}
     if not cp_skipped() and not staged.is_file():
@@ -602,7 +605,7 @@ def _run(args) -> int:
         return 0
     cp_dll = step_build_cp()
     signing = {"cp": step_sign_cp(cp_dll)}
-    dist_root = step_pyinstaller(variant, cp_dll)
+    dist_root = step_pyinstaller(variant, cp_dll, tools["iscc"])
     signing["nvidia"] = step_nvidia(variant, dist_root)
     signing["bundle"] = step_sign_bundle(dist_root)
     step_gate(variant, dist_root, signing)

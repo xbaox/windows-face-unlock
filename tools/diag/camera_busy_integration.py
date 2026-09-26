@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/camera_busy_integration.py -- Stage 3 / Step 4 REAL busy-camera integration test.
+"""tools/diag/camera_busy_integration.py -- Stage 3 / Step 4 REAL busy-camera integration test.
 
 Autonomous, no-human proof that the shipped busy handling works against a REAL cv2.VideoCapture,
 complementing the fake-camera unit test (tools.camera_busy_selftest). It does NOT touch the running
@@ -21,8 +21,8 @@ OpenCV missing / the device is already held (e.g. the service is still running -
 / or the webcam allows concurrent opens on this machine (then "busy" cannot be reproduced here).
 
 Run from the repo root (camera FREE -- stop the face-unlock service first):
-    python -m tools.camera_busy_integration
-    python -m tools.camera_busy_integration --index 1 --hold-seconds 15
+    python -m tools.diag.camera_busy_integration
+    python -m tools.diag.camera_busy_integration --index 1 --hold-seconds 15
 Exit 0 = proof passed OR cleanly skipped; 1 = a real failure.
 """
 from __future__ import annotations
@@ -35,8 +35,8 @@ import threading
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-REPO_ROOT = str(Path(__file__).resolve().parents[1])
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+REPO_ROOT = str(Path(__file__).resolve().parents[2])
 
 # Mirrors face_service.service.CAMERA_OPEN_PAUSE_S so the probe matches _acquire_camera exactly.
 PAUSE_S = 0.3
@@ -130,7 +130,7 @@ def _run_integration(index: int, hold_seconds: float) -> int:
     print(f"[integ] index={index} retries={retries} timeout_s={timeout_s} pause_s={PAUSE_S}")
 
     holder = subprocess.Popen(
-        [sys.executable, "-m", "tools.camera_busy_integration", "--hold",
+        [sys.executable, "-m", "tools.diag.camera_busy_integration", "--hold",
          "--index", str(index), "--hold-seconds", str(hold_seconds)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=REPO_ROOT,
     )

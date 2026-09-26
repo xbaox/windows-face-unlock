@@ -17,7 +17,8 @@ exists because Stage-7 blocks shipped unrunnable builds that every check of the
 day called green (7c/7d: relative import in an entry script; 7g: numpy by-name
 import from C; 7j/7k: the three "blind bundle" mines of KNOWN_ISSUES #5).
 
-Six passes, each answering a question the others cannot:
+Seven passes, each answering a question the others cannot (Stage 9, D-123: the count now
+includes pass 7; tools/verifier_selftest.py runs passes 1-6 on fixtures, D-125):
 
   1 SOURCE  -- AST over the three scripts the spec names as Analysis targets: is
                there a relative import anywhere, including inside a function body?
@@ -71,12 +72,16 @@ Six passes, each answering a question the others cannot:
                    adds such a branch therefore stops the build instead of
                    shipping a blind bundle.
 
-The lesson passes 4-6 encode: verifying a bundle by reading its PYZ proves what
+  7 LAZY    -- pywin32's native side imports some Python modules by name, lazily
+               (win32timezone: the 8b RED); each must be in EVERY EXE's PYZ, and the
+               claim is re-checked against the bundled DLL bytes.
+
+The lesson passes 4-7 encode: verifying a bundle by reading its PYZ proves what
 was collected, never that the result runs. Native extensions and frozen-aware
 vendor code fail on their own terms.
 
 --passes selects a subset (comma-separated: source,frozen,pyz,native,mines,class,lazy);
-the default is all six. A subset run is a diagnostic, never a gate result.
+the default is all seven. A subset run is a diagnostic, never a gate result.
 """
 from __future__ import annotations
 

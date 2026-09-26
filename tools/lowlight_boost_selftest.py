@@ -22,6 +22,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_lowlight_boost_")
 
 from tools.testkit import deliver_and_report  # noqa: E402  (Stage 9: v2 report)
 from face_service import camera_boost as CB
@@ -128,7 +130,7 @@ def main(argv=None) -> int:
 
     # --- 4) Config.validate: boost fields ---------------------------------------------------
     print("\n[4] Config.validate low_light_boost / low_light_exposure_step")
-    t.ok(Config().low_light_boost is True, "default low_light_boost True (TODO: confirm w/ Bao)")
+    t.ok(Config().low_light_boost is True, "default low_light_boost True (confirmed on the live smoke, see Config.low_light_boost)")
     t.ok(Config().low_light_exposure_step == 2.0, "default low_light_exposure_step == 2.0")
 
     def _cfg(**over):
@@ -157,8 +159,10 @@ def main(argv=None) -> int:
     try:
         import face_service.service as SVC
         from face_service.service import FaceService, VerifyOutcome
-    except Exception as e:   # pragma: no cover - pywin32 absent in this context
-        print(f"  skip  service import unavailable ({e.__class__.__name__}); unlock wiring skipped")
+    except ImportError as e:   # pragma: no cover - pywin32 absent in this context
+        from tools.testkit import skip_is_failure
+        if skip_is_failure("service import (unlock wiring)", e):
+            t.ok(False, "unlock wiring section ran")
     else:
         class _LockoutSpy:
             def __init__(self):
@@ -202,16 +206,9 @@ def main(argv=None) -> int:
 
         def _svc_cfg():
             c = Config()
-            # This harness calls _handle({"cmd": "unlock", "v": 2}) with NO pipe handle, so the
-            # Stage-5 SID gate resolves the client SID to None and refuses with
-            # "not-authorized" before the low-light path is ever reached. The gate is not
-            # what these cases exercise -- same reason and same shape as
-            # tools/camera_busy_selftest.py:173 (block6-A-fix, bc4e25b). The gate keeps its
-            # own dedicated coverage in tools/pipe_hardening_selftest.py:148-160, which
-            # asserts both that it REFUSES a non-SYSTEM caller when on (:148-153) and that
-            # it allows one through when off (:155-160). Test scaffold only: production
-            # behaviour and the Stage-4/5 perimeter are untouched.
-            pass   # Stage 9: no config switch for the SYSTEM gate; the service stands in via _caller_sid
+            # The SYSTEM gate on unlock is not what these cases exercise: the service is made to
+            # see the lock screen as its caller (tools.testkit.as_lock_screen / _caller_sid). The
+            # gate's own coverage: pipe_hardening_selftest.test_gates (D-144).
             return c
 
         cfg = _svc_cfg()  # low_light_luma_min 45, low_light_boost True, step 2

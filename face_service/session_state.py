@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 #
 # remote_session.session_locked infers the answer from the INPUT DESKTOP: ACCESS_DENIED on
 # OpenInputDesktop, or a desktop name other than "Default", means locked. On this hardware it does
-# not work -- tools/session_lock_probe.log holds 609 samples reading desktop='Default' and NOT ONE
+# not work -- %USERPROFILE%\.face-unlock\session_lock_probe.log (written by tools.diag.session_lock_probe) holds 609 samples reading desktop='Default' and NOT ONE
 # reading 'Winlogon', with a single one-sample True that is flanked by False two seconds either
 # side (a blip, not a lock). The live consequence is in presence.log: after the 17:32:47 lock the
 # probe kept running at 17:33:47 while the machine was on the lock screen, earned a strike, and

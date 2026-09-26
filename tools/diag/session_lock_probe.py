@@ -13,9 +13,9 @@ Read-only in the strict sense: it opens no camera, sends no pipe command, and to
 no service or scheduled task. The only thing it writes is its own log file.
 
 Run:
-  python -m tools.session_lock_probe
-  python -m tools.session_lock_probe --watch            (Ctrl-C to stop)
-  python -m tools.session_lock_probe --watch --interval 1.0
+  python -m tools.diag.session_lock_probe
+  python -m tools.diag.session_lock_probe --watch            (Ctrl-C to stop)
+  python -m tools.diag.session_lock_probe --watch --interval 1.0
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import sys
 import time
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from face_service.config import APP_DIR
 from presence_monitor.remote_session import UNLOCKED_DESKTOP, session_locked

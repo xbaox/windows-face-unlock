@@ -14,13 +14,13 @@ Run:  python -m tools.nonascii_path_selftest
 Exit 0 = all pass; 1 = a failure.
 """
 from __future__ import annotations
-import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.setdefault("FACE_UNLOCK_HOME", tempfile.mkdtemp(prefix="faceunlock_nonascii_"))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_nonascii_")
 
 import cv2
 import numpy as np

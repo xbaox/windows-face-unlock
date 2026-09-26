@@ -28,13 +28,13 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-_ROOT = Path(tempfile.mkdtemp(prefix="faceunlock_datadir_"))
-os.environ["FACE_UNLOCK_HOME"] = str(_ROOT / "home")
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+_ROOT = testhome.own_root("faceunlock_datadir_")
+from tools.testkit import patch, run_restoring  # noqa: E402  (D-142)
 
 import win32security  # type: ignore
 
@@ -173,7 +173,7 @@ def test_fail_closed():
           any("cannot re-secure" in p for p in rep.problems), rep.problems[:2])
 
     released = []
-    svc.load_password = lambda: released.append(1) or {"u": "admin", "p": "pw", "d": "."}
+    patch(svc, "load_password", lambda: released.append(1) or {"u": "admin", "p": "pw", "d": "."})
 
     s = _svc(insecure=True)
     r = s._handle({"cmd": "unlock", "v": 2}, None)
@@ -384,12 +384,14 @@ def test_ctypes_facts():
 
 def main() -> int:
     try:
-        test_heal()
-        test_fail_closed()
-        test_reparse()
-        test_purge()
-        test_remove_tree()
-        test_ctypes_facts()
+        run_restoring(
+            test_heal,
+            test_fail_closed,
+            test_reparse,
+            test_purge,
+            test_remove_tree,
+            test_ctypes_facts,
+        )
     finally:
         subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", str(_ROOT)], capture_output=True)
     if FAILS:

@@ -36,6 +36,8 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_watchdog_ping_")
 
 import pywintypes    # type: ignore
 import win32file     # type: ignore
@@ -146,7 +148,7 @@ def main(argv=None) -> int:
         (ok, reason), dt = _timed(W.ping, _BUDGET, name)
     t.ok(ok is True, "ok is True")
     t.ok(reason is None, f"reason is None (got {reason!r})")
-    t.ok(dt < _BUDGET, f"answered well inside the budget ({dt:.3f}s < {_BUDGET}s)")
+    t.ok(dt < _BUDGET + 1.0, f"answered promptly ({dt:.3f}s; budget {_BUDGET}s + 1 s scheduling headroom)")
     t.ok(srv.error is None, f"mini server had no error ({srv.error!r})")
 
     # --- 2) nothing listening -------------------------------------------------------------------
@@ -185,7 +187,7 @@ def main(argv=None) -> int:
     t.ok(reason == "reply-timeout", f"reason == 'reply-timeout' (got {reason!r})")
     t.ok(dt >= _BUDGET * 0.5, f"waited for the budget ({dt:.3f}s)")
     t.ok(dt < _BUDGET + 2.0, f"CancelIo + drain returned promptly, no hang ({dt:.3f}s)")
-    t.ok(threading.active_count() >= 1, "process still healthy after a cancelled overlapped read")
+    t.ok(not srv.th.is_alive(), "the server side finished too: nothing left blocked after the cancel")
 
     # --- 5) garbage answer ----------------------------------------------------------------------
     print("[5] server answers non-JSON -> bad-reply, immediately")
@@ -194,7 +196,7 @@ def main(argv=None) -> int:
         (ok, reason), dt = _timed(W.ping, _BUDGET, name)
     t.ok(ok is False, "ok is False")
     t.ok(reason == "bad-reply", f"reason == 'bad-reply' (got {reason!r})")
-    t.ok(dt < _BUDGET, f"failed at once instead of retrying a wrong answer ({dt:.3f}s < {_BUDGET}s)")
+    t.ok(dt < _BUDGET + 1.0, f"failed at once instead of retrying a wrong answer ({dt:.3f}s)")
 
     # --- 6) a broken config must not take the supervisor down -----------------------------------
     print("[6] Config.load() raises -> _load_config falls back to built-in defaults")

@@ -31,14 +31,15 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.setdefault("FACE_UNLOCK_HOME", tempfile.mkdtemp(prefix="faceunlock_pipehard_"))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_pipehard_")
+from tools.testkit import patch, run_restoring  # noqa: E402  (D-142)
 
 import pywintypes     # type: ignore
 import win32con       # type: ignore
@@ -224,29 +225,40 @@ def test_sid_helpers():
     me = P.self_sid_string()
     check("policy allows SELF", P.server_sid_allowed(me, me))
     check("policy rejects SYSTEM as a server (R1)", not P.server_sid_allowed("S-1-5-18", me))
-    check("policy rejects a foreign SID", not P.server_sid_allowed("S-1-5-21-1-2-3-4444", me))
+    # The Python clients' rule (pipe_io). The Credential Provider has its own server check
+    # (PipeClient.cpp), tested in credential_provider/tests (test_parser) -- D-143.
+    check("Python pipe_io policy rejects a foreign SID",
+          not P.server_sid_allowed("S-1-5-21-1-2-3-4444", me))
     check("policy rejects an empty SID", not P.server_sid_allowed("", me))
 
     name = _private("sid")
     res = {}
+    # D-139 (B14-06): the steps are ordered by events, not by sleeps -- the client connects only
+    # once the pipe exists and closes only once the server has read its SID.
+    created, sid_read, client_closed = threading.Event(), threading.Event(), threading.Event()
 
     def _server():
         try:
             sh = win32pipe.CreateNamedPipe(name, win32pipe.PIPE_ACCESS_DUPLEX,
                                            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_WAIT, 1,
                                            4096, 4096, 0, svc._build_pipe_sa())
+            created.set()
             win32pipe.ConnectNamedPipe(sh, None)
             win32file.ReadFile(sh, 64)
             res["client_sid"] = _pipe_client_sid_string(sh)
-            time.sleep(0.2)
+            sid_read.set()
+            client_closed.wait(5.0)
             win32pipe.DisconnectNamedPipe(sh)
             win32file.CloseHandle(sh)
         except Exception as e:
             res["server_err"] = repr(e)
+        finally:
+            created.set()
+            sid_read.set()
 
     th = threading.Thread(target=_server, daemon=True)
     th.start()
-    time.sleep(0.3)
+    created.wait(5.0)
     # B14 N-09: the client offers IDENTIFICATION only (as the CP and pipe_io do) and the service
     # still reads its SID.
     ch = win32file.CreateFile(name, win32con.GENERIC_READ | win32con.GENERIC_WRITE, 0, None,
@@ -255,8 +267,9 @@ def test_sid_helpers():
     res["server_sid"] = P.server_sid_string(ch)
     res["pipe_owner"] = P.pipe_owner_sid_string(ch)
     win32file.WriteFile(ch, b"selftest")
-    time.sleep(0.1)
+    sid_read.wait(5.0)
     win32file.CloseHandle(ch)
+    client_closed.set()
     th.join(5)
     check("server SID on a live connection == SELF", res.get("server_sid") == me, res)
     check("pipe OBJECT owner == SELF (F-64)", res.get("pipe_owner") == me, res)
@@ -296,7 +309,7 @@ def test_sid_helpers():
 
 def test_gates():
     print("[5] gates: SYSTEM + v2 for the credential commands, SELF for verify")
-    svc.load_password = lambda: {"u": "admin", "p": "pw", "d": "."}
+    patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
     calls = {"verify": 0}
 
     def forced():
@@ -436,14 +449,16 @@ def test_internal_error_and_scrub():
 
 
 def main() -> int:
-    test_descriptor()
-    test_instances()
-    test_always_listening()
-    test_sid_helpers()
-    test_gates()
-    test_old_keys()
-    test_owner()
-    test_internal_error_and_scrub()
+    run_restoring(
+        test_descriptor,
+        test_instances,
+        test_always_listening,
+        test_sid_helpers,
+        test_gates,
+        test_old_keys,
+        test_owner,
+        test_internal_error_and_scrub,
+    )
     if FAILS:
         print(f"\nPIPE-HARDENING SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")
         return 1

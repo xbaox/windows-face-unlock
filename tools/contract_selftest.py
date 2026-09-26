@@ -17,6 +17,11 @@ Exit 0 = all pass; 1 = a failure.
 from __future__ import annotations
 import re
 from pathlib import Path
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
+testhome.isolate("faceunlock_contract_")
 
 REPO = Path(__file__).resolve().parents[1]
 FAILS: list[str] = []
