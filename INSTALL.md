@@ -325,16 +325,22 @@ Tune the list in that file if your remote tool is missing.
 
 ## 6. If you also have `facewinunlock-tauri` installed
 
-Run the disable script once (as Administrator) to turn off its autostart, kill
-its processes, and remove its Credential Provider registrations (backed up
-first):
+Uninstall it from **Settings > Apps > Installed apps**.
 
-```powershell
-tools\disable_tauri.ps1
-```
+**Do not run `tools\disable_tauri.ps1`.** Earlier versions of this guide
+recommended it, but besides the facewinunlock-tauri provider it also removed
+the registration of Microsoft's **Windows Hello Face** credential provider
+(`{8AF662BF-65A0-4D0A-A540-A338A999D36F}`). The script is now disabled.
 
-Backup lives at `%USERPROFILE%\face-unlock-backup\` — `reg import` those files
-to restore if needed.
+If you ran it before, restore Windows Hello Face from the backup it made.
+In an elevated PowerShell:
+
+~~~powershell
+Get-ChildItem "$env:USERPROFILE\face-unlock-backup\cp-8AF662BF-65A0-4D0A-A540-A338A999D36F-*.reg" |
+    Sort-Object Name | Select-Object -Last 1 | ForEach-Object { reg import $_.FullName }
+~~~
+
+Then restart the PC.
 
 ## 7. Troubleshooting
 
