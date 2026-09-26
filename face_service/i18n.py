@@ -339,6 +339,8 @@ _EN: dict[str, str] = {
     "gesture.prompt.turn_left": "Turn your head left",
     "gesture.prompt.turn_right": "Turn your head right",
     "gesture.prompt.nod": "Nod your head",
+    "gesture.then": ", then ",
+    "enroll.coach.detector_unavailable": "The face detector could not start (see the log). Reinstalling Face Unlock restores a missing or damaged model.",
 
     # ---- Password dialog (presence_monitor/password_gui.py) ----
     "pwd.title": "Face Unlock — Windows password",
@@ -1262,6 +1264,8 @@ _RU: dict[str, str] = {
     "gesture.prompt.turn_left": "Поверни голову влево",
     "gesture.prompt.turn_right": "Поверни голову вправо",
     "gesture.prompt.nod": "Кивни головой",
+    "gesture.then": ", затем ",
+    "enroll.coach.detector_unavailable": "Детектор лиц не запустился (подробности в журнале). Переустановка Face Unlock восстановит отсутствующую или повреждённую модель.",
 
     # ---- Password dialog (presence_monitor/password_gui.py) ----
     "pwd.title": "Face Unlock — пароль Windows",

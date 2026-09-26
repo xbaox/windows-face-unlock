@@ -2,8 +2,13 @@
 
 Blink detection (2d106) + head-pose gesture challenges (1k3d68 face.pose) + an anti-screen
 check on the face crop (frequency + texture). Everything here consumes what the recognizer
-already produces per frame; no InsightFace import and no extra detections. Enabling the
-landmark modules in the recognizer's allowed_modules happens at integration (Step 5).
+already produces per frame; no InsightFace import and no extra detections. (Stage 9, D-78: the
+landmark modules have been enabled in the recognizer since Stage 5.)
+
+Stage 9 (act 9b R4): the lock screen's phase 2 is a GestureSequence -- two DIFFERENT head
+movements from {turn_left, turn_right, nod} in a random order, performed in that order, after a
+still start. A blink is no longer a phase-2 gesture (any video of the owner contains blinks); the
+passive blink still counts in phase 1.
 
 Numbers (measured on this webcam)
 ---------------------------------
@@ -15,7 +20,8 @@ as screen features do (live hf 0.198->0.189 across sessions; live lap std 28->52
 collapsed to 0.24 in dim light). Absolute thresholds therefore trade FP vs detection poorly.
 Kept as a WEAK doubt trigger only: hf-only, conservative threshold (<1% live FP on the worst
 session), escalates to a gesture rather than hard-rejecting. The gesture is the real replay
-defense (behavioral, lighting-independent). lap/peak -> audit telemetry, not in the gate.
+defense (behavioral, lighting-independent). lap/peak are reported per attempt as telemetry
+(Stage 9, R6) and are not in the gate.
 """
 from __future__ import annotations
 
@@ -58,6 +64,14 @@ LEFT_IS_NEGATIVE_YAW = False  # Live lock-screen calibration 2026-07-27 on the p
 BLINK_TIMEOUT_S = 4.0
 GESTURE_TIMEOUT_S = 5.0
 
+# --- Stage 9 (act 9b R4): the phase-2 sequence ------------------------------------------------
+# New constants only; every value above is unchanged. To be revisited with the 9e measurements.
+GESTURE_SEQUENCE_LEN = 2      # two different movements from GESTURE_KINDS, in a random order
+STILLNESS_WINDOW_S = 0.4      # the first frames of phase 2 must be still...
+STILLNESS_MAX_DEG = 4.0       # ...frame-to-frame |d yaw| and |d pitch| at most this many degrees
+# The whole round: the still start, each step with its own GESTURE_TIMEOUT_S, and 2 s of slack.
+ROUND_CAP_S = STILLNESS_WINDOW_S + GESTURE_SEQUENCE_LEN * GESTURE_TIMEOUT_S + 2.0
+
 # --- Anti-screen (frequency + texture on the face crop) ----------------------------------
 
 SCREEN_CROP = 128
@@ -69,8 +83,8 @@ SCREEN_CROP = 128
 # hard reject in fast mode. The robust replay defense is the gesture challenge. lap/peak are
 # logged to the audit trail as telemetry but are NOT in the gate.
 HF_THRESH = 0.150     # gate: screen-like when hf < this (drift-robust, live FP <1% all sessions)
-LAP_AUDIT = 260.0     # telemetry only (moire energy reference; unreliable across lighting)
-PEAK_AUDIT = 8.8      # telemetry only (weakest separator)
+# (Stage 9, D-79: the unused LAP_AUDIT / PEAK_AUDIT reference numbers are gone; lap and peak are
+# reported raw in the per-attempt telemetry.)
 
 
 def _ear_one(lm: np.ndarray, idx: list[int]) -> float:
@@ -200,10 +214,29 @@ class _BlinkTask:
         return self._win.feed(landmark)
 
 
+def default_left_sign() -> float:
+    """+1 when a turn to the user's own left raises yaw (LEFT_IS_NEGATIVE_YAW False), else -1."""
+    return -1.0 if LEFT_IS_NEGATIVE_YAW else 1.0
+
+
+def kind_met(kind: Challenge, baseline: tuple[float, float], pitch: float, yaw: float,
+             left_sign: float) -> bool:
+    """Has (pitch, yaw) moved far enough from ``baseline`` for ``kind``? ``left_sign`` is the
+    per-camera calibration (Stage 9, R6), or default_left_sign() without one."""
+    bpitch, byaw = baseline
+    if kind == Challenge.TURN_LEFT:
+        return (yaw - byaw) * left_sign > YAW_DELTA
+    if kind == Challenge.TURN_RIGHT:
+        return (yaw - byaw) * -left_sign > YAW_DELTA
+    if kind == Challenge.NOD:
+        return (bpitch - pitch) > PITCH_DOWN_DELTA
+    return False
+
+
 class _PoseTask:
     """Reach a yaw/pitch deviation from a captured baseline before timeout."""
 
-    def __init__(self, kind: Challenge, timeout_s: float, clock):
+    def __init__(self, kind: Challenge, timeout_s: float, clock, left_sign: float | None = None):
         self.kind = kind
         self._clock = clock
         self._deadline = clock() + timeout_s
@@ -211,17 +244,14 @@ class _PoseTask:
         self._baseline: tuple[float, float] | None = None
         self._resolved = False
         self._passed = False
+        self._left_sign = default_left_sign() if left_sign is None else float(left_sign)
+
+    @property
+    def baseline(self) -> "tuple[float, float] | None":
+        return self._baseline
 
     def _target_met(self, pitch: float, yaw: float) -> bool:
-        bpitch, byaw = self._baseline  # type: ignore[misc]
-        left_sign = -1.0 if LEFT_IS_NEGATIVE_YAW else 1.0
-        if self.kind == Challenge.TURN_LEFT:
-            return (yaw - byaw) * left_sign > YAW_DELTA
-        if self.kind == Challenge.TURN_RIGHT:
-            return (yaw - byaw) * -left_sign > YAW_DELTA
-        if self.kind == Challenge.NOD:
-            return (bpitch - pitch) > PITCH_DOWN_DELTA
-        return False
+        return kind_met(self.kind, self._baseline, pitch, yaw, self._left_sign)  # type: ignore[arg-type]
 
     def feed(self, landmark, pose) -> tuple[bool, bool]:
         if self._resolved:
@@ -289,6 +319,117 @@ class LivenessChallenge:
     @property
     def passed(self) -> bool:
         return self.state == ChallengeState.PASSED
+
+
+class GestureSequence:
+    """Stage 9 (act 9b R4): the lock screen's phase 2.
+
+    ``kinds`` is GESTURE_SEQUENCE_LEN DIFFERENT movements from GESTURE_KINDS, to be performed in
+    that order. Nothing runs until the first frame arrives: the round clock (ROUND_CAP_S), the
+    stillness window and the first step's own GESTURE_TIMEOUT_S all start there, not at issue time
+    -- a cold camera no longer eats the user's window (F-140). Then:
+      * still start: during the first STILLNESS_WINDOW_S of frames, frame-to-frame |d yaw| and
+        |d pitch| must stay within STILLNESS_MAX_DEG, else the round fails with
+        ``motion-before-prompt`` (a replay that is already moving when the prompt appears);
+      * each step is the existing pose detector with its own baseline and GESTURE_TIMEOUT_S; the
+        next step starts when the previous one passes;
+      * the order is checked: reaching a LATER step's target while an earlier step is still open
+        fails the round with ``gesture-order``;
+      * the whole round ends by ROUND_CAP_S (``round-timeout``).
+    ``reason`` names the failure; ``steps_done`` counts the steps passed. Deterministic with an
+    injected clock.
+    """
+
+    def __init__(self, kinds, *, clock=time.monotonic, left_sign: float | None = None):
+        kinds = tuple(kinds)
+        if (len(kinds) != GESTURE_SEQUENCE_LEN or len(set(kinds)) != len(kinds)
+                or any(k not in GESTURE_KINDS for k in kinds)):
+            raise ValueError(f"a phase-2 sequence is {GESTURE_SEQUENCE_LEN} different head "
+                             f"movements from {[k.name for k in GESTURE_KINDS]}, got {kinds}")
+        self.kinds = kinds
+        self._clock = clock
+        self._left_sign = default_left_sign() if left_sign is None else float(left_sign)
+        self.state = ChallengeState.AWAITING
+        self.reason: str | None = None
+        self.steps_done = 0
+        self._t0: float | None = None
+        self._task: _PoseTask | None = None
+        self._prev: tuple[float, float] | None = None
+
+    @property
+    def started(self) -> bool:
+        return self._t0 is not None
+
+    @property
+    def done(self) -> bool:
+        return self.state in (ChallengeState.PASSED, ChallengeState.FAILED)
+
+    @property
+    def passed(self) -> bool:
+        return self.state == ChallengeState.PASSED
+
+    def _fail(self, reason: str) -> ChallengeState:
+        self.state, self.reason = ChallengeState.FAILED, reason
+        return self.state
+
+    def start(self) -> None:
+        """Start the clocks (the first frame arrived). Idempotent."""
+        if self._t0 is None:
+            self._t0 = self._clock()
+            self._task = _PoseTask(self.kinds[0], GESTURE_TIMEOUT_S, self._clock, self._left_sign)
+
+    def tick(self) -> ChallengeState:
+        """Account for time passing without a usable frame (no face, a dropped frame)."""
+        if self.done or self._t0 is None:
+            return self.state
+        if self._clock() - self._t0 >= ROUND_CAP_S:
+            return self._fail("round-timeout")
+        resolved, passed = self._task.feed(None, None)   # type: ignore[union-attr]
+        if resolved and not passed:
+            return self._fail("gesture-timeout")
+        return self.state
+
+    def feed(self, landmark, pose) -> ChallengeState:
+        if self.done:
+            return self.state
+        self.start()
+        now = self._clock()
+        if now - self._t0 >= ROUND_CAP_S:                          # type: ignore[operator]
+            return self._fail("round-timeout")
+        if pose is not None:
+            p = np.asarray(pose, dtype=np.float32).ravel()
+            pitch, yaw = float(p[POSE_PITCH]), float(p[POSE_YAW])
+            if now - self._t0 <= STILLNESS_WINDOW_S and self._prev is not None:   # type: ignore[operator]
+                if (abs(yaw - self._prev[1]) > STILLNESS_MAX_DEG
+                        or abs(pitch - self._prev[0]) > STILLNESS_MAX_DEG):
+                    return self._fail("motion-before-prompt")
+            self._prev = (pitch, yaw)
+            base = self._task.baseline                              # type: ignore[union-attr]
+            if base is not None:
+                for later in self.kinds[self.steps_done + 1:]:
+                    if kind_met(later, base, pitch, yaw, self._left_sign):
+                        return self._fail("gesture-order")
+        resolved, passed = self._task.feed(landmark, pose)         # type: ignore[union-attr]
+        if not resolved:
+            return self.state
+        if not passed:
+            return self._fail("gesture-timeout")
+        self.steps_done += 1
+        if self.steps_done >= len(self.kinds):
+            self.state = ChallengeState.PASSED
+            return self.state
+        self._task = _PoseTask(self.kinds[self.steps_done], GESTURE_TIMEOUT_S, self._clock,
+                               self._left_sign)
+        return self.state
+
+
+def random_sequence(rng=None) -> tuple:
+    """GESTURE_SEQUENCE_LEN different kinds from GESTURE_KINDS in a random order. ``rng`` must
+    offer sample(); the service passes nothing, which means secrets.SystemRandom, so the order
+    cannot be predicted."""
+    import secrets as _secrets
+    rng = rng or _secrets.SystemRandom()
+    return tuple(rng.sample(list(GESTURE_KINDS), GESTURE_SEQUENCE_LEN))
 
 
 # --- Anti-screen detector ----------------------------------------------------------------
@@ -384,24 +525,21 @@ class Verdict(Enum):
     PASS = auto()           # recognized + live enough -> unlock now
     NOT_LIVE = auto()       # deny: no confirmed live enrolled face (too few matches, or a
                             # static-spoof signature = screen-flagged AND never blinked)
-    NEEDS_GESTURE = auto()  # ambiguous -> escalate to an active gesture (Credential Provider,
-                            # master-Stage 5). At the Stage-2 PASSIVE lockscreen there is no UI
-                            # to run the gesture, so the service maps this to a deny; the
-                            # tri-state exists so the *same* verdict drives the CP gesture loop
-                            # unchanged once Stage 5 lands.
+    NEEDS_GESTURE = auto()  # ambiguous -> the lock screen runs phase 2 (the GestureSequence);
+                            # the Credential Provider has done so since Stage 7-i (D-78).
 
 
 # Decision-layer policy knobs. These are POLICY, not measured spoof constants -- but they are
 # informed by the locked numbers: anti-screen live per-frame FP <1% and screen detection
-# ~40-70% (liveness.py header), and the Stage-1 self distance ~0.07 at threshold 0.45. Re-check
-# them against real impostor/spoof margins in Step 9; conservative is safe until then.
+# ~40-70% (liveness.py header), and a self distance of ~0.07-0.12 at the 0.32 threshold. The
+# 9a-5 spoof measurement ("before") and 9e ("after") are the references for revisiting them.
 SCREEN_DOUBT_FRAC = 0.34   # >= this share of frames screen-flagged -> screen suspicion.
                            # With the default 5-frame burst that is >=2 flagged frames: a live
                            # face (<1% per-frame FP) will not reach it, a screen (~40-70% per
                            # frame) will. Fraction-based so it is robust to the frame count.
 STRONG_MARGIN = 0.10       # threshold - best_distance >= this -> confident recognition (may skip
-                           # the gesture in fast mode). Self margin ~0.38 today (~0.28 after a
-                           # ~0.35 threshold in Step 9); a borderline impostor sits near 0.
+                           # the gesture in fast mode). Self margin ~0.2-0.25 at the 0.32
+                           # threshold; a borderline impostor sits near 0.
 
 
 def verdict(

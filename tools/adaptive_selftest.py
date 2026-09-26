@@ -63,6 +63,7 @@ def cdist(a: np.ndarray, b: np.ndarray) -> float:
 
 def make_cfg(**over) -> Config:
     cfg = Config()
+    cfg.liveness_mode = "fast"          # the cases below are the passive (phase-1) path unless set
     cfg.threshold = 0.32
     cfg.adaptive_gallery = True
     cfg.adaptive_margin = 0.17          # ceiling = 0.15
@@ -266,8 +267,14 @@ def main(argv=None) -> int:
             RC.EMBED_PATH = emb_path
             rec = Recognizer(make_cfg(adaptive_gallery=False))
             rec._adaptive = A.AdaptiveStore(adp_path)
-            t.ok(rec.load() and rec._refs.shape[0] == 1 and rec._adaptive.count == 0,
-                 "toggle OFF: ring NOT loaded, matching set = enrollment only (1 row)")
+            # Stage 9 (D-40): the ring is kept in memory either way; only the matching set follows
+            # the toggle, so switching it on at run time cannot overwrite the stored ring.
+            t.ok(rec.load() and rec._refs.shape[0] == 1 and rec._adaptive.count == 1,
+                 "toggle OFF: ring kept in memory, matching set = enrollment only (1 row)")
+            rec.cfg = make_cfg(adaptive_gallery=True)
+            rec._refresh_refs()
+            t.ok(rec._refs.shape[0] == 2,
+                 "D-40: toggle switched ON at run time -> the kept ring joins at once (2 rows)")
             rec2 = Recognizer(make_cfg(adaptive_gallery=True))
             rec2._adaptive = A.AdaptiveStore(adp_path)
             t.ok(rec2.load() and rec2._refs.shape[0] == 2 and rec2._adaptive.count == 1,
@@ -377,6 +384,23 @@ def main(argv=None) -> int:
             t.ok(last[1]["accept"] is False and last[1]["reason"] == "paranoid-no-gesture"
                  and rec._adaptive.count == 0,
                  "paranoid + passive path -> refused (no gesture)")
+            # d) Stage 9 (F-47): paranoid + a passed phase 2 -> the same gates, accepted
+            rec = _rec(cfgp, "d.npz")
+            svc = _svc(rec, cfgp)
+            svc._maybe_adapt_gallery_embedding(good, 0.10, gesture_passed=True, is_screen=False)
+            last = svc._audit.records[-1]
+            t.ok(last[1]["accept"] is True and rec._adaptive.count == 1,
+                 "F-47: paranoid + passed gesture round -> adapted (same ceiling)")
+            # e) F-126: a NaN distance can no longer slip past the ceiling
+            dec = A.evaluate(float("nan"), 0.32, make_cfg(), liveness_passed=True, is_screen=False,
+                             mode="fast", gesture_passed=False, now=10.0, last_adapt_ts=0.0,
+                             adaptive_count=0)
+            t.ok(dec.accept is False and dec.reason == "distance>ceiling", "F-126: NaN distance refused")
+            # f) F-127: a stored stamp in the future does not block adaptation
+            dec = A.evaluate(0.10, 0.32, make_cfg(), liveness_passed=True, is_screen=False,
+                             mode="fast", gesture_passed=False, now=1000.0,
+                             last_adapt_ts=1000.0 + 86400.0, adaptive_count=1)
+            t.ok(dec.accept is True, "F-127: clock set back since the last add -> cooldown satisfied")
 
     # --- 13) F5: save() failure rolls the in-memory add back (memory == disk, cooldown frozen) (G9) ---
     print("\n[13] maybe_adapt: save() failure -> rollback (F5)")

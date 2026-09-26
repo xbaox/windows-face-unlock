@@ -81,6 +81,7 @@ try:
         "raised": None,
         "defaults": got == want,
         "probe": cfg.presence_interval_s,
+        "values": {k: v for k, v in got.items() if isinstance(v, (bool, int, float, str))},
     }
 except BaseException as e:
     out["lenient"] = {"raised": type(e).__name__, "msg": str(e)}
@@ -102,8 +103,10 @@ print("@@RESULT@@" + json.dumps(out))
 # expect_strict:  "raise" | "ok"
 # needle: substring required in the ERROR message (None = no ERROR expected)
 CASES = [
+    # Stage 9 (F-137): strict (the live reload) treats a missing file as broken -- keep the
+    # running config instead of swapping onto defaults.
     dict(name="no config file at all",
-         content=None, expect_lenient="defaults", expect_strict="ok",
+         content=None, expect_lenient="defaults", expect_strict="raise",
          needle=None, warn=None),
     dict(name="valid config loads and is kept",
          content="presence_interval_s = 61\n",
@@ -123,16 +126,20 @@ CASES = [
          expect_lenient="defaults", expect_strict="raise", needle="threshold", warn=None),
     dict(name="threshold wrong type (string) -> TypeError path",
          content='threshold = "0.5"\n',
-         expect_lenient="defaults", expect_strict="raise", needle="failed validation", warn=None),
-    dict(name="verify_required > verify_frames",
+         expect_lenient="defaults", expect_strict="raise", needle="threshold", warn=None),
+    # Stage 9 (R9, F-102): per key -- verify_frames = 3 is fine on its own and is KEPT; only the
+    # impossible verify_required falls back to its default.
+    dict(name="verify_required > verify_frames: only the bad key falls back",
          content="verify_frames = 3\nverify_required = 5\n",
-         expect_lenient="defaults", expect_strict="raise", needle="verify_required", warn=None),
+         expect_lenient={"verify_frames": 3, "verify_required": 2}, expect_strict="raise",
+         needle="verify_required", warn=None),
     dict(name="verify_frames = 0",
-         content="verify_frames = 0\nverify_required = 0\n",
+         content="verify_frames = 0\n",
          expect_lenient="defaults", expect_strict="raise", needle="verify_frames", warn=None),
-    dict(name="distance_metric not implemented",
+    # Stage 9 (D-70): distance_metric is gone -- an unknown key now, named in a WARNING.
+    dict(name="distance_metric (removed) is an unknown key",
          content='distance_metric = "euclidean"\n',
-         expect_lenient="defaults", expect_strict="raise", needle="not implemented", warn=None),
+         expect_lenient="defaults", expect_strict="ok", needle=None, warn=["distance_metric"]),
     dict(name="camera_index negative",
          content="camera_index = -1\n",
          expect_lenient="defaults", expect_strict="raise", needle="camera_index", warn=None),
@@ -170,6 +177,28 @@ CASES = [
          content="debug_dump_frames = 1\n",
          expect_lenient="defaults", expect_strict="raise",
          needle="debug_dump_frames must be a boolean", warn=None),
+    # --- Stage 9 (B14 N-20): per-key degradation --------------------------------------------
+    dict(name="N-20: one bad key keeps the user's other choices",
+         content='liveness_mode = "paranoid"\nthreshold = 0.30\nauto_lock = true\n'
+                 'lockout_seconds = 99999\n',
+         expect_lenient={"liveness_mode": "paranoid", "threshold": 0.30, "auto_lock": True,
+                         "lockout_seconds": 300},
+         expect_strict="raise", needle="lockout_seconds", warn=None),
+    dict(name="N-20: an integral float in an int field is accepted",
+         content="lockout_seconds = 300.0\npresence_interval_s = 61.0\n",
+         expect_lenient={"lockout_seconds": 300, "presence_interval_s": 61},
+         expect_strict="ok", needle=None, warn=None),
+    dict(name="N-20: an invalid security key gets its SAFE default (paranoid)",
+         content='liveness_mode = "yolo"\npresence_interval_s = 61\n',
+         expect_lenient={"liveness_mode": "paranoid", "presence_interval_s": 61},
+         expect_strict="raise", needle="liveness_mode", warn=None),
+    dict(name="F-105: an upper bound -- max_face_attempts = 1000 falls back",
+         content="max_face_attempts = 1000\n",
+         expect_lenient="defaults", expect_strict="raise", needle="max_face_attempts", warn=None),
+    dict(name="F-110: camera_black_luma must stay under the low-light floor",
+         content="camera_black_luma = 49.0\nlow_light_luma_min = 45.0\n",
+         expect_lenient={"camera_black_luma": 2.0, "low_light_luma_min": 45.0},
+         expect_strict="raise", needle="camera_black_luma", warn=None),
 ]
 
 
@@ -218,6 +247,68 @@ def run_case(case) -> dict:
         return result
 
 
+SAVE_CHILD = r'''
+import json, os, sys
+sys.path.insert(0, __REPO_ROOT__)
+from face_service.config import Config, CONFIG_PATH, ConfigSaveRefused
+out = {}
+home = os.environ["FACE_UNLOCK_HOME"]
+assert os.path.normcase(str(CONFIG_PATH.parent)) == os.path.normcase(home)
+# (a) merge: comments, order and unknown keys survive; only changed keys are written
+CONFIG_PATH.write_text("# my notes\nthreshold = 0.30   # tuned\nzzz = 1\nlockout_seconds = 99999\n",
+                       encoding="utf-8")
+cfg = Config.load()
+cfg.language = "ru"
+cfg.save(keys=["language"])
+out["lang_only"] = CONFIG_PATH.read_text(encoding="utf-8")
+# (b) a Settings save writes the keys that differ -- and nothing pinned at its default
+cfg2 = Config.load()
+cfg2.presence_interval_s = 77
+cfg2.save()
+out["settings"] = CONFIG_PATH.read_text(encoding="utf-8")
+# (c) a file that is not TOML is never overwritten
+CONFIG_PATH.write_text("threshold = = 0.5\n", encoding="utf-8")
+try:
+    Config().save(keys=["language"])
+    out["refused"] = False
+except ConfigSaveRefused as e:
+    out["refused"] = True
+    out["refused_msg"] = str(e)
+out["after_refusal"] = CONFIG_PATH.read_text(encoding="utf-8")
+out["bad_copy"] = (CONFIG_PATH.parent / "config.toml.bad").read_text(encoding="utf-8")
+print("@@RESULT@@" + json.dumps(out))
+'''
+
+
+def save_checks(t) -> None:
+    print("\n[save] Stage 9 (R9, F-111): a merge that never overwrites what it cannot parse")
+    with tempfile.TemporaryDirectory(prefix="fu-cfgsave-") as tmp:
+        env = dict(os.environ)
+        env["FACE_UNLOCK_HOME"] = tmp
+        proc = subprocess.run(
+            [sys.executable, "-c", SAVE_CHILD.replace("__REPO_ROOT__", repr(str(REPO_ROOT)))],
+            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=120)
+        line = next((c[len(SENTINEL):] for c in proc.stdout.splitlines() if c.startswith(SENTINEL)), "")
+        if not line:
+            t.ok(False, f"save child produced no result: {proc.stderr.strip()[:400]}")
+            return
+        r = json.loads(line)
+    lang = r["lang_only"]
+    t.ok(lang.startswith("# my notes\nthreshold = 0.30   # tuned\nzzz = 1\nlockout_seconds = 99999\n")
+         and 'language = "ru"' in lang,
+         "tray language switch: ONLY language written; comments, order, unknown and even an invalid "
+         "value left as they were")
+    st = r["settings"]
+    t.ok("presence_interval_s = 77" in st and "lockout_seconds = 300" in st
+         and "anti_screen" not in st and "# tuned" in st,
+         "Settings save: changed keys written in place, defaults not pinned (the invalid "
+         "lockout_seconds is replaced by the value in force)")
+    t.ok(r["refused"] is True and "NOT overwritten" in r.get("refused_msg", ""),
+         "an unparsable config.toml refuses the save with an explanation")
+    t.ok(r["after_refusal"] == "threshold = = 0.5\n" and r["bad_copy"] == "threshold = = 0.5\n",
+         "... the file is untouched and a .bad copy is kept")
+
+
 def main(argv=None) -> int:
     t = T()
     print(f"[0] harness: {len(CASES)} cases, each in its own subprocess with a temp "
@@ -241,9 +332,14 @@ def main(argv=None) -> int:
              f"Config.load() did not raise (got {lenient.get('raised')!r})")
 
         # 2. lenient mode landed on the right config
-        if case["expect_lenient"] == "defaults":
+        if isinstance(case["expect_lenient"], dict):
+            vals = lenient.get("values", {})
+            want = case["expect_lenient"]
+            t.ok(all(vals.get(k) == v and type(vals.get(k)) is type(v) for k, v in want.items()),
+                 f"per key: {want} (got {({k: vals.get(k) for k in want})})")
+        elif case["expect_lenient"] == "defaults":
             t.ok(lenient.get("defaults") is True,
-                 "fell back to full built-in defaults")
+                 "every key at its built-in default")
         else:
             t.ok(lenient.get("defaults") is False and lenient.get("probe") == 61,
                  f"kept the file's values (presence_interval_s={lenient.get('probe')!r})")
@@ -279,13 +375,17 @@ def main(argv=None) -> int:
         # 6. reading a config never rewrites it
         t.ok(r.get("file_intact") is True, "the config file was not modified by load()")
 
+    save_checks(t)
+
     print()
     if t.fail:
         print(f"CONFIG VALIDATION SELFTEST FAILED: {t.fail} check(s) failed.")
         return 1
-    print("CONFIG VALIDATION SELFTEST OK: Config.load() degrades to defaults with a loud ERROR "
-          "on every broken-file mode, names unknown keys, validates on the load path, and "
-          "Config.load(strict=True) raises instead so reload_config can keep the live config.")
+    print("CONFIG VALIDATION SELFTEST OK: Config.load() degrades PER KEY with a loud ERROR naming "
+          "the key (whole-file defaults only for a file that is not TOML), names unknown keys, "
+          "accepts integral floats for ints, and Config.load(strict=True) raises instead so "
+          "reload_config can keep the live config; save() merges and never overwrites what it "
+          "cannot parse.")
     return 0
 
 

@@ -13,7 +13,7 @@ inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\FaceUnlock";
 // Budgets for the whole call (connect included). The request carries what is left of it
 // ("budget_ms", measured after the connect), and the service stops 500 ms short of that.
 constexpr DWORD kUnlockTimeoutMs  = 12000;   // phase 1: passive burst
-constexpr DWORD kGestureTimeoutMs = 15000;   // phase 2: the user performs the head movements
+constexpr DWORD kGestureTimeoutMs = 18000;   // phase 2: two head movements (R4: 12.4 s round)
 constexpr DWORD kReportTimeoutMs  = 3000;    // report_result after ReportResult
 
 // Outcome of the pipe-server identity check, for callers that want to observe it.
@@ -64,7 +64,7 @@ enum class Text {
     Scanning,
     Verified,         // degraded path: no provider sink, a second click signs in
     PackingFailed,
-    NotRecognised,    // no-match, gesture-failed, motion-before-prompt, screen-suspected
+    NotRecognised,    // no-match, no-face, gesture-failed, motion-before-prompt, screen-suspected
     LockedOut,        // locked-out without a usable retry_after_s
     LockedOutSecs,    // locked-out with seconds: contains one %u
     Unavailable,      // the service really is not reachable (no pipe, untrusted server)

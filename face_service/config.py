@@ -2,7 +2,8 @@ from __future__ import annotations
 import logging
 import math
 import os
-from dataclasses import dataclass, field, asdict, fields
+import re
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 try:
@@ -29,15 +30,18 @@ LOCKOUT_PATH = APP_DIR / "lockout.json"
 AUDIT_PATH = APP_DIR / "audit.jsonl"
 ADAPTIVE_PATH = APP_DIR / "adaptive.npz"   # Stage 3: adaptive gallery (separate from embeddings.npz)
 WATCHDOG_PAUSE_PATH = APP_DIR / "watchdog.pause"   # Stage 3 Step 5: deliberate-stop pause (self-expiring)
+# Stage 9 (act 9b R6): the per-camera turn-sign calibration, and the folder the wizard hands its
+# calibration frames over in (deleted by the service right after measuring them).
+CALIBRATION_PATH = APP_DIR / "calibration.json"
+CALIBRATION_DIR = APP_DIR / "calibration"
 
 PIPE_NAME = r"\\.\pipe\FaceUnlock"
 
 PRESENCE_MODES = ("recognition", "detection")
 LIVENESS_MODES = ("fast", "paranoid")
-# Only cosine is implemented: the recognizer compares L2-normalised ArcFace embeddings and every
-# threshold in this file was measured as a cosine distance. The knob predates the ONNX engine and
-# nothing reads it, so any other value is silently ignored -- validate() rejects it loudly instead.
-DISTANCE_METRICS = ("cosine",)
+# (Stage 9, D-70 / F-69: distance_metric -- validated, read by nothing -- and blink_timeout_s --
+# only ever a term of the gesture round's wall cap, which is a constant since R4 -- are gone. An
+# old config.toml with them loads with an "unknown key" warning.)
 
 log = logging.getLogger(__name__)
 
@@ -58,18 +62,17 @@ def _default_language() -> str:
 
 @dataclass
 class Config:
-    distance_metric: str = "cosine"
-    threshold: float = 0.32          # ArcFace cosine. Set from Stage-9 measurements on this
-                                     # webcam: genuine (self) max ~0.12 over 40 varied frames,
-                                     # impostor min ~0.97 -> huge gap; 0.32 keeps self headroom
-                                     # (~2.6x) while staying far below any impostor.
+    threshold: float = 0.32          # ArcFace cosine. Set from the Stage-1/3 measurements on the
+                                     # reference webcam (D-71): genuine (self) max ~0.12 over 40
+                                     # varied frames, impostor min ~0.97 -> huge gap; 0.32 keeps
+                                     # self headroom (~2.6x) while staying far below any impostor.
     camera_index: int = 0
     camera_warmup_frames: int = 10   # discard N frames after opening for auto-exposure
     persistent_camera: bool = True   # keep VideoCapture open between requests
-    verify_frames: int = 5            # số frame cần đạt ngưỡng
-    verify_required: int = 2          # trong đó cần ≥ N khớp (giảm từ 3 để nhanh hơn)
+    verify_frames: int = 5            # frames in one unlock burst (D-72)
+    verify_required: int = 2          # of those, this many must match the enrolled face
     presence_interval_s: int = 60
-    presence_absent_strikes: int = 2  # vắng mặt liên tiếp trước khi lock
+    presence_absent_strikes: int = 2  # consecutive absent probes before the PC locks
     # Absent strikes required while a FULLSCREEN app or presentation mode owns the screen (a game,
     # a film, slides). The ordinary threshold is tuned for "walked away from the desk"; the same two
     # ticks during a match or a movie is a FALSE lock, and the user is demonstrably at the machine.
@@ -110,10 +113,11 @@ class Config:
     presence_mode: str = "recognition"
     warmup_on_start: bool = True
     # --- Stage 2: liveness (active challenge / anti-screen / rate-limit) ---
-    # fast    = challenge only on doubt (subsecond when confident + clean)
-    # paranoid = require an active gesture on every valid match
-    liveness_mode: str = "fast"
-    blink_timeout_s: float = 4.0       # window to observe a spontaneous blink
+    # fast    = challenge only on doubt (subsecond when confident + clean) -- LESS SECURE: a clean
+    #           replay with a strong margin passes without any head movement (F-114)
+    # paranoid = require the two-movement head gesture on every valid match (Stage 9, R4:
+    #           the default for new installs; an existing config.toml keeps its own value)
+    liveness_mode: str = "paranoid"
     challenge_on_doubt: bool = True    # fast mode: on doubt escalate to a gesture (else deny)
     anti_screen: bool = True           # passive anti-screen (texture/moire) doubt trigger
     max_face_attempts: int = 5         # consecutive face failures before a temporary face lockout
@@ -136,7 +140,9 @@ class Config:
     # augmented set -> no drift-hopping), liveness passed, no screen flag, and (in paranoid) a
     # gesture passed. Measured refs: self <=0.124, replay-of-self ~0.155, impostor ~0.97. Default
     # margin 0.17 -> ceiling 0.15 at threshold 0.32: above self-max, BELOW replay -> spoof/other
-    # cannot inject. Widening the margin lowers the ceiling toward replay distance -- keep it tight.
+    # cannot inject. The ceiling FOLLOWS the threshold (D-80): raising the threshold, or narrowing
+    # the margin, raises the ceiling toward (and past) the replay distance -- at threshold 0.33 it
+    # is already 0.16. Widening the margin moves it away. Keep the pair as it is.
     adaptive_gallery: bool = False      # master toggle (mutates the gallery; opt in explicitly)
     adaptive_margin: float = 0.17       # add only if enroll-distance <= threshold - this
     adaptive_max_size: int = 10         # cap on stored adaptive embeddings (FIFO ring; excludes enroll)
@@ -242,6 +248,53 @@ class Config:
         return cls()
 
     @classmethod
+    def _coerce(cls, values: dict) -> dict:
+        """An integral float in an int field (lockout_seconds = 300.0) is that int (B3-04)."""
+        types = {f.name: f.type for f in fields(cls)}
+        out = {}
+        for k, v in values.items():
+            if (types.get(k) == "int" and isinstance(v, float) and not isinstance(v, bool)
+                    and math.isfinite(v) and v.is_integer()):
+                v = int(v)
+            out[k] = v
+        return out
+
+    @classmethod
+    def from_values(cls, values: dict) -> "tuple[Config, dict]":
+        """Build a valid Config from ``values``, key by key (Stage 9, act 9b R9 / F-102).
+
+        The whole set is tried first. When it does not validate, each key is taken over on its
+        own and kept only if the result still validates; a key that fails keeps its built-in
+        default. Two passes, so a pair that only validates together (verify_frames raised with
+        verify_required) is not lost to the order. Returns (config, {key: reason}) for the keys
+        that fell back. The defaults are the safe values: liveness_mode "paranoid", anti_screen
+        on, the frozen threshold and lockout numbers."""
+        values = cls._coerce(values)
+        try:
+            cfg = cls(**values)
+            cfg.validate()
+            return cfg, {}
+        except (ValueError, TypeError):
+            pass
+        base = cls()
+        accepted: dict = {}
+        pending = dict(values)
+        errors: dict = {}
+        for _ in range(2):
+            for k in list(pending):
+                try:
+                    trial = replace(base, **accepted, **{k: pending[k]})
+                    trial.validate()
+                except (ValueError, TypeError) as e:
+                    errors[k] = str(e)
+                    continue
+                accepted[k] = pending.pop(k)
+                errors.pop(k, None)
+        cfg = replace(base, **accepted)
+        cfg.validate()
+        return cfg, {k: errors.get(k, "invalid") for k in pending}
+
+    @classmethod
     def load(cls, strict: bool = False) -> "Config":
         """Read ``~/.face-unlock/config.toml``, or fall back to built-in defaults.
 
@@ -263,9 +316,23 @@ class Config:
         Unknown keys are dropped in both modes (a knob removed by an upgrade must not break the
         load) but they are now NAMED in a WARNING -- a typo used to be indistinguishable from
         not setting the key at all.
+
+        Stage 9 (act 9b R9 / F-102): an invalid VALUE no longer throws the whole file away. Only
+        that key falls back to its built-in default, with an ERROR naming it (from_values); the
+        user's other choices -- paranoid mode, a lower threshold, auto_lock -- stay in force. A
+        file that is not TOML at all still degrades to the defaults as a whole.
+
+        Stage 9 (F-137): under ``strict`` a MISSING file is a broken file too: the live reload
+        keeps the running config instead of swapping the service onto defaults.
+        Stage 9 (F-107): "never raises" includes a data directory that cannot be created.
         """
         if not CONFIG_PATH.exists():
-            APP_DIR.mkdir(parents=True, exist_ok=True)
+            if strict:
+                raise ValueError(f"{CONFIG_PATH.name} is missing")
+            try:
+                APP_DIR.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                log.error("data directory %s could not be created (%s)", APP_DIR, e)
             return cls()
 
         try:
@@ -286,22 +353,64 @@ class Config:
             log.warning("%s: %d unknown key(s) ignored: %s",
                         CONFIG_PATH, len(unknown), ", ".join(unknown))
 
-        cfg = cls(**{k: v for k, v in data.items() if k in known})
-        try:
-            cfg.validate()
-        except (ValueError, TypeError) as e:
-            return cls._degraded(f"{CONFIG_PATH} failed validation ({e})", strict)
+        values = {k: v for k, v in data.items() if k in known}
+        if strict:
+            try:
+                cfg = cls(**cls._coerce(values))
+                cfg.validate()
+            except (ValueError, TypeError) as e:
+                return cls._degraded(f"{CONFIG_PATH} failed validation ({e})", strict)
+            return cfg
+        cfg, rejected = cls.from_values(values)
+        for k, why in rejected.items():
+            log.error("%s: %s = %r is invalid (%s) -- using the built-in default %r for this key "
+                      "only", CONFIG_PATH.name, k, values.get(k), why, getattr(cfg, k))
         return cfg
 
-    def save(self) -> None:
+    def save(self, keys=None) -> None:
+        """Write this config into config.toml -- as a MERGE (Stage 9, act 9b R9; F-111).
+
+        Only keys that change are written: ``keys`` when given (the tray's language switch passes
+        ["language"]), else every key whose value differs from the file -- or, for a key the file
+        does not have, from the built-in default. Each is replaced on its own line; the user's
+        comments, ordering and unknown keys stay, and defaults are not pinned into the file, so a
+        later release's safer default still reaches the user.
+
+        A file that is not valid TOML is NEVER overwritten: it is copied to config.toml.bad and
+        ConfigSaveRefused explains what to do (B3-04: the tray's language switch used to turn a
+        typo into a file full of defaults).
+        """
         if tomli_w is None:
             raise RuntimeError("tomli-w is required to save config (pip install tomli-w)")
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        # Stage 8b (F-45). Defect: written in place. Consequence: a crash or a full disk mid-write
-        # left a truncated config.toml, which the next start reads as broken and replaces with
-        # DEFAULTS -- silently undoing the user's paranoid mode. Fix: write a sibling, then rename.
+        raw = ""
+        existing: dict = {}
+        if CONFIG_PATH.exists():
+            try:
+                raw = CONFIG_PATH.read_text(encoding="utf-8")
+                existing = tomllib.loads(raw)
+            except Exception as e:
+                bad = CONFIG_PATH.with_name(CONFIG_PATH.name + ".bad")
+                try:
+                    bad.write_bytes(CONFIG_PATH.read_bytes())
+                except OSError:
+                    pass
+                raise ConfigSaveRefused(
+                    f"{CONFIG_PATH.name} could not be read ({e}); it was NOT overwritten. A copy "
+                    f"is in {bad.name}. Fix or delete {CONFIG_PATH.name}, then save again.") from e
+        defaults = type(self)()
+        names = [f.name for f in fields(self)]
+        if keys is None:
+            keys = [k for k in names
+                    if (k in existing and existing[k] != getattr(self, k))
+                    or (k not in existing and getattr(self, k) != getattr(defaults, k))]
+        text = _merge_toml(raw, {k: getattr(self, k) for k in keys if k in names})
+        # Stage 8b (F-45): a sibling, then a rename -- never a half-written config.toml.
         tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
-        tmp.write_text(tomli_w.dumps(asdict(self)), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, CONFIG_PATH)
 
     def _validate_types(self) -> None:
@@ -324,14 +433,19 @@ class Config:
     def validate(self) -> None:
         from .i18n import LANG_CODES
         self._validate_types()
-        # Distance metric: declared since Stage 0, read by nothing. The recognizer is hardwired to
-        # cosine over L2-normalised ArcFace embeddings, so a config asking for anything else gets
-        # cosine regardless -- exactly the silent-wrong-behaviour this pass exists to remove.
-        if self.distance_metric not in DISTANCE_METRICS:
-            raise ValueError(
-                f"distance_metric {self.distance_metric!r} is not implemented "
-                f"(only {DISTANCE_METRICS[0]!r} is; the recognizer compares cosine distance)"
-            )
+        # Stage 9 (F-105): upper bounds for the knobs that had none -- the Settings spinboxes
+        # enforce them, a hand-edited file did not (a huge max_face_attempts turned the face
+        # lockout off). The defaults and the frozen numbers are untouched.
+        for name, hi in (("max_face_attempts", 20), ("lockout_seconds", 3600),
+                         ("verify_frames", 30), ("audit_max_mb", 100.0),
+                         ("presence_interval_s", 3600), ("presence_absent_strikes", 20),
+                         ("presence_fullscreen_strikes", 120), ("presence_uncertain_streak", 60),
+                         ("presence_confirm_delay_s", 30.0), ("presence_input_idle_s", 3600.0),
+                         ("enroll_min_frames", 50), ("enroll_min_sharpness", 5000.0),
+                         ("adaptive_max_size", 100), ("adaptive_cooldown_s", 30 * 86400.0),
+                         ("camera_warmup_frames", 60)):
+            if getattr(self, name) > hi:
+                raise ValueError(f"{name} must be <= {hi}")
         # Camera selection and warmup: non-negative integers (bool rejected, as everywhere else).
         # No upper bound on either -- an exotic multi-camera host is legitimate, and a too-large
         # warmup only costs time on open, it cannot mis-verify anyone.
@@ -404,8 +518,6 @@ class Config:
             raise ValueError(
                 f"liveness_mode must be one of {LIVENESS_MODES}, got {self.liveness_mode!r}"
             )
-        if self.blink_timeout_s <= 0:
-            raise ValueError("blink_timeout_s must be > 0")
         # Warmup / liveness / audit toggles: real booleans, same rationale as the pipe and notify
         # gates below -- a stray int or string silently takes a truthy branch and picks the wrong
         # behaviour. anti_screen in particular gates the primary replay defense.
@@ -468,6 +580,11 @@ class Config:
         # bounded anti-thrash cooldown. Fail loud rather than silently clamp, like the checks above.
         if not (0.0 < self.camera_black_luma <= 50.0):
             raise ValueError("camera_black_luma must be in (0, 50]")
+        # Stage 9 (F-110): the comment always said the black floor sits "well under"
+        # low_light_luma_min; now it is checked whenever the low-light gate is on.
+        if self.low_light_luma_min > 0 and not (self.camera_black_luma < self.low_light_luma_min):
+            raise ValueError("camera_black_luma must be below low_light_luma_min "
+                             "(a dark but working camera would count as black)")
         if not (0.0 < self.camera_reopen_cooldown_s <= 600.0):
             raise ValueError("camera_reopen_cooldown_s must be in (0, 600]")
         # Watchdog bounds (Step 5): positive/bounded timeouts, an integer failure threshold >= 1.
@@ -512,3 +629,37 @@ class Config:
                     f"(got margin={self.adaptive_margin} >= threshold={self.threshold} "
                     "=> ceiling <= 0, no frame could ever adapt)"
                 )
+
+
+class ConfigSaveRefused(RuntimeError):
+    """config.toml could not be parsed, so it was not overwritten (a copy is in .bad)."""
+
+
+_KEY_LINE = r"(?m)^[ \t]*{key}[ \t]*=.*$"
+
+
+def _merge_toml(raw: str, updates: dict) -> str:
+    """Put ``updates`` into the TOML text ``raw``: replace each key's line in place (keeping a
+    trailing comment when the old value was not a string), append keys the file does not have.
+    The config is flat (no tables), which is what makes a line-level merge exact."""
+    text = raw
+    appended = []
+    for k, v in updates.items():
+        line = tomli_w.dumps({k: v}).strip()
+        pat = re.compile(_KEY_LINE.format(key=re.escape(k)))
+        m = pat.search(text)
+        if m is None:
+            appended.append(line)
+            continue
+        old = m.group(0)
+        comment = ""
+        rhs = old.split("=", 1)[1]
+        if '"' not in rhs and "'" not in rhs and "#" in rhs:
+            comment = "   " + rhs[rhs.index("#"):].strip()
+        indent = old[:len(old) - len(old.lstrip())]
+        text = text[:m.start()] + indent + line + comment + text[m.end():]
+    if appended:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += "\n".join(appended) + "\n"
+    return text

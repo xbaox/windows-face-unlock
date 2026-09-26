@@ -85,6 +85,11 @@ def main() -> int:
     s.cfg = Config()
     s._cam_lock = threading.Lock()
 
+    class _Audit:                     # Stage 9 (D-82): every build is audited
+        def write(self, *_a):
+            pass
+    s._audit = _Audit()
+
     class _Recog:
         last_enroll_pose = {"pitch": -18.94, "yaw": 1.64, "n": 15}
 

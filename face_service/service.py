@@ -77,7 +77,10 @@ import secrets
 import threading
 import time
 from dataclasses import asdict
-from typing import Callable, NamedTuple
+from pathlib import Path
+from typing import NamedTuple
+
+import numpy as np
 
 import pywintypes  # type: ignore
 import win32api  # type: ignore
@@ -101,6 +104,7 @@ from .datadir import (DUMP_NAME_RE, heal_data_dir, is_reparse, purge_debug_frame
 from .detector import FaceDetector
 from .audit import AuditLog
 from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
+from . import imio
 from .lockout import Lockout
 from .lowlight import evaluate_low_light, scene_luma
 from .camera_boost import try_exposure_boost
@@ -132,7 +136,11 @@ GESTURE_TOKEN_TTL_S = 15.0
 # reading any more. Fix: past these deadlines the service fails closed WITHOUT releasing anything;
 # each leaves ~1 s for the reply to reach the CP inside its own budget.
 UNLOCK_DEADLINE_S = 11.0
-UNLOCK_GESTURE_DEADLINE_S = 14.0
+# Stage 9 (act 9b R4): the phase-2 round is two movements now -- 0.4 s still start + 2 x 5 s +
+# 2 s = 12.4 s from its first frame (liveness.ROUND_CAP_S). The phase-2 budgets grew with it:
+# the CP waits 18 s (kGestureTimeoutMs) and the service stops at 17 s, keeping the ~1 s for the
+# reply that F-19 established.
+UNLOCK_GESTURE_DEADLINE_S = 17.0
 
 # Stage 8b (F-16 / act A-5): bounds of a pause_camera lease. Not a Config field.
 PAUSE_CAMERA_MIN_S = 5.0
@@ -444,6 +452,7 @@ class FaceService:
         if custody is None:
             custody = heal_data_dir(APP_DIR)
         self._data_dir_insecure = not custody.ok
+        self._custody_problem = (_scrub(custody.problems[0]) if custody.problems else None)
         # Stage 9 (R1): the product is single-user. A service that does not run as the recorded
         # owner keeps the pipe (the watchdog sees it alive) but refuses every face function; ping
         # answers {"state":"refusing","why":"not-owner"}. Fixed for the process lifetime.
@@ -453,6 +462,20 @@ class FaceService:
             log.error("owner check failed: %s -- face functions refused (not-owner)", why)
         self.recog = Recognizer(cfg)
         self.detector = FaceDetector()
+        # Stage 9 (act 9b R7): the model pack is checked ONCE, at start -- exactly the five pinned
+        # files with their pinned SHA-256 (~1-2 s for 340 MB). Anything else and every face
+        # function answers "no-models"; ping says {"state":"refusing","why":"no-models"}.
+        self._models_problem = None
+        if not self._not_owner and custody.ok:
+            from .recognizer import model_problems
+            problems = model_problems(hashes=True)
+            if problems:
+                self._models_problem = "; ".join(problems[:3])
+                log.error("model pack not usable: %s -- face functions refused (no-models). "
+                          "Run the Face Unlock installer again to download it.",
+                          self._models_problem)
+        # Stage 9 (R6): the per-camera turn-sign calibration (calibration.json).
+        self._calibration = self._load_calibration() if custody.ok else {}
         # Persistent consecutive-failure lockout for the face path (PIN stays available).
         self._lockout = Lockout(LOCKOUT_PATH, cfg.max_face_attempts, cfg.lockout_seconds)
         # Structured JSONL audit trail (verify/unlock/challenge; never stores the password).
@@ -638,9 +661,6 @@ class FaceService:
         if not self.cfg.debug_dump_frames:
             return
         try:
-            import cv2
-            import numpy as np
-
             d = APP_DIR / "debug_frames"
             # Stage 8b (F-02): never write or prune THROUGH a reparse point -- a linked directory
             # points outside the tree the heal secured, and the prune below deletes files.
@@ -656,7 +676,7 @@ class FaceService:
             np.save(str(npy), arr)
             png_note = str(png)
             try:
-                if not cv2.imwrite(str(png), frame):
+                if not imio.imwrite(png, frame):      # Stage 9 (R8): Unicode-safe
                     png_note = "%s (imwrite returned False)" % png
             except Exception as e:
                 png_note = "%s (imwrite failed: %r)" % (png, e)
@@ -683,13 +703,12 @@ class FaceService:
         One detect per frame via ``analyze_frame`` -> match/distance + 2d106 landmarks (blink)
         + an anti-screen vote. After the burst ``liveness.verdict`` combines them (mode-aware).
         Returns a ``VerifyOutcome``: the legacy ``(match, distance, real)`` plus a ``detail`` dict
-        for the audit log. Only a ``PASS`` verdict yields ``match=True``; ``NEEDS_GESTURE`` and
-        ``NOT_LIVE`` both map to a deny here (the Stage-2 lockscreen is PASSIVE and cannot run a
-        gesture yet, so anything that needs one falls back to PIN). ``real`` = the passive
-        anti-screen did NOT suspect a screen. Active gesture escalation is exposed separately via
-        the ``challenge`` command for the Stage-5 Credential Provider. Runs the full burst (no
-        early-exit) so every frame gets a chance to flag a screen and to catch a spontaneous
-        blink; that burst is still subsecond.
+        for the audit log. Only a ``PASS`` verdict yields ``match=True``. ``NEEDS_GESTURE`` is
+        answered by unlock with "needs-gesture" and a token: the lock screen then runs phase 2
+        (``unlock_gesture``, the two-movement GestureSequence) -- D-50: the old text still said
+        the lock screen was passive. ``real`` = the passive anti-screen did NOT suspect a screen.
+        Runs the full burst (no early-exit) so every frame gets a chance to flag a screen and to
+        catch a spontaneous blink; that burst is still subsecond.
 
         Camera self-heal (KNOWN_ISSUES #1): when the burst reads nothing, or reads black, the
         cached persistent capture is dropped (``_note_camera_health``) and the WHOLE burst is
@@ -755,6 +774,8 @@ class FaceService:
         scene_luma_max = None   # brightest scene luma seen this burst (Stage 3.2); None if no frame read
         frames_ok = 0           # frames that actually arrived (camera-health telemetry, 7b)
         engine_errors = 0       # frames the engine could not judge (Stage 8b, F-18)
+        faces = 0               # frames with a face at all (Stage 9, R5: "no-face" is no attempt)
+        feats: list = []        # anti-screen features of the face frames (R6 telemetry)
         blink = BlinkDetector()
 
         # drain stale buffered frames
@@ -787,6 +808,9 @@ class FaceService:
                 continue
             if not a.face:
                 continue
+            faces += 1
+            if getattr(a, "screen_features", None) is not None:
+                feats.append(a.screen_features)
             if a.distance < best:
                 best = a.distance
                 best_emb = a.embedding
@@ -836,8 +860,15 @@ class FaceService:
             "frames_ok": frames_ok,
             # Stage 8b (F-18), additive: frames the engine could not judge at all.
             "engine_errors": engine_errors,
+            "faces": faces,
             "mode": self.cfg.liveness_mode,
             "latency_ms": round(latency_ms, 1),
+            # Stage 9 (act 9b R6): per-attempt telemetry -- the anti-screen features (medians over
+            # the face frames) and the burst's frame rate. Numbers only.
+            "hf": round(float(np.median([f.hf for f in feats])), 4) if feats else None,
+            "lap": round(float(np.median([f.lap for f in feats])), 1) if feats else None,
+            "peak": round(float(np.median([f.peak for f in feats])), 2) if feats else None,
+            "fps": round(frames_ok / (latency_ms / 1000.0), 1) if latency_ms > 0 else None,
         }
         return VerifyOutcome(v == Verdict.PASS, best, is_real, detail, best_emb, scene_luma_max)
 
@@ -888,20 +919,28 @@ class FaceService:
         return r_dark, boost_audit
 
     def _maybe_adapt_gallery(self, r: "VerifyOutcome") -> None:
-        """Opt-in adaptive gallery: on a genuine, live, non-screen unlock, offer the
-        verifying embedding to the recognizer, which applies the anti-poisoning gates
-        (distance-to-enrollment ceiling, cooldown, size cap) and persists it separately.
+        """Opt-in adaptive gallery after a phase-1 PASS (see _maybe_adapt_gallery_embedding)."""
+        self._maybe_adapt_gallery_embedding(
+            r.embedding, r.distance, gesture_passed=False,
+            is_screen=r.detail.get("screen_flagged", 0) > 0)
+
+    def _maybe_adapt_gallery_embedding(self, embedding, distance, *, gesture_passed: bool,
+                                       is_screen: bool) -> None:
+        """Opt-in adaptive gallery: on a genuine, live, non-screen grant, offer the verifying
+        embedding to the recognizer, which applies the anti-poisoning gates (distance-to-enrollment
+        ceiling, cooldown, size cap) and persists it separately. Stage 9 (F-47): a grant after a
+        passed phase 2 qualifies too (gesture_passed=True) -- paranoid mode adapted never before.
         Best-effort: never let adaptation break an unlock."""
         if not self.cfg.adaptive_gallery:
             return
         try:
             dec = self.recog.maybe_adapt(
-                r.embedding,
-                liveness_passed=True,                             # r.match == verdict PASS => live for the mode
-                is_screen=r.detail.get("screen_flagged", 0) > 0,  # ANY screen flag blocks adaptation
+                embedding,
+                liveness_passed=True,          # a grant => live for the mode
+                is_screen=bool(is_screen),     # ANY screen flag blocks adaptation
                 mode=self.cfg.liveness_mode,
-                gesture_passed=False,                             # passive unlock path runs no gesture
-                union_distance=r.distance,
+                gesture_passed=gesture_passed,
+                union_distance=distance,
             )
             self._audit.write("adapt", {"accept": dec.accept, "reason": dec.reason,
                                         "ceiling": round(dec.ceiling, 4)})
@@ -930,46 +969,69 @@ class FaceService:
             "domain": creds.get("d", "."),
         }
 
-    def _run_challenge(self, kind_name: str | None = None, *, identity: bool = False) -> dict:
-        """Server-side active-gesture loop.
+    def _left_sign(self) -> "float | None":
+        """The calibrated turn sign for the current camera (Stage 9, R6), or None = the
+        LEFT_IS_NEGATIVE_YAW default."""
+        cal = getattr(self, "_calibration", None) or {}
+        entry = (cal.get("cameras") or {}).get(self._camera_id())
+        if isinstance(entry, dict) and isinstance(entry.get("left_is_negative_yaw"), bool):
+            return -1.0 if entry["left_is_negative_yaw"] else 1.0
+        return None
 
-        Issues one challenge (random, or the requested ``kind``: blink|turn_left|turn_right|nod)
-        and drives it to PASS/FAIL over camera frames using ``analyze_frame`` landmarks/pose.
-        The pipe server is sequential, so this holds the camera for the duration of the gesture.
+    def _camera_id(self) -> str:
+        """What a calibration is bound to: the camera's device name when configured (R10), else
+        its index."""
+        name = str(getattr(self.cfg, "camera_name", "") or "").strip()
+        return f"name:{name}" if name else f"index:{self.cfg.camera_index}"
 
-        ``identity=False`` (the `challenge` command) is the original diagnostic behaviour, byte
-        for byte: every analyzed frame is fed to the task and the reply carries no extra keys.
+    def _run_challenge(self, kind_name: "str | None" = None, *, identity: bool = True) -> dict:
+        """Stage 9 (act 9b R4): the lock screen's phase 2 -- a GestureSequence.
 
-        ``identity=True`` (Stage 7-i `unlock_gesture`) binds the gesture to the RECOGNIZED face:
-        a frame whose embedding does not match is dropped outright -- not fed to the task at all.
-        Without that, the two signals are independent and separable: a photo of the enrolled user
-        supplies the matching frames while a live impostor beside it supplies the motion, and the
-        round passes. Dropping the frame closes the seam, and because the task's deadline runs on
-        wall-clock, non-matching frames still burn the budget -- which IS the binding. Adds
-        ``identity_frames`` (matching frames actually fed) and ``distance_best`` to the reply.
+        ``kind_name`` is the sequence armed in phase 1, e.g. "turn_left,nod". The camera is
+        acquired first; the round's clock starts at the FIRST frame that arrives (F-140), so a
+        cold open no longer eats the user's window. Identity binding (Stage 7-i, 8b F-11): a frame
+        whose face does not match, or that the anti-screen check flagged, is not fed to the
+        sequence -- an impostor's motion never reaches it. The round is also bounded by the
+        request's own deadline, so it cannot outlive what the lock screen can still use.
+
+        Reply (internal; unlock_gesture turns it into the wire reply):
+          {"ok": False, "reason": "camera-busy" | "no-frames" | "no-enrollment" | "engine-error"
+                                  | "deadline-exceeded" | "bad-request"}
+          {"ok": True, "challenge", "prompt", "passed", "state", "reason" (the sequence's failure
+           or None), "identity_frames", "distance_best", "faces", "frames_ok", "screen_flagged",
+           "screen_checked", "scene_luma", "fps", "_embedding" (best identity frame, never sent)}
         """
-        from .liveness import Challenge, GESTURE_TIMEOUT_S, LivenessChallenge
+        from .liveness import Challenge, GestureSequence
+        from .recognizer import EngineError
 
         if self._camera_leased_out():
             return {"ok": False, "reason": "camera-busy"}
+        try:
+            kinds = tuple(Challenge[k.strip().upper()] for k in str(kind_name or "").split(","))
+            # late-bound clock: the round runs on this module's time (a test can drive it)
+            seq = GestureSequence(kinds, clock=lambda: time.monotonic(), left_sign=self._left_sign())
+        except (KeyError, ValueError):
+            # Stage 9 (F-65): the value is never echoed back or into the audit.
+            return {"ok": False, "reason": "bad-request"}
 
-        kind = None
-        if kind_name:
-            try:
-                kind = Challenge[str(kind_name).upper()]
-            except KeyError:
-                # Stage 9 (F-65): the client's value is never echoed back or into the audit.
-                return {"ok": False, "reason": "bad-request"}
+        identity_frames = 0
+        distance_best: float | None = None
+        best_emb = None
+        faces = 0
+        frames_ok = 0
+        screen_flagged = 0
+        screen_checked = 0
+        luma_max: "float | None" = None
+        t_first: "float | None" = None
+        n = 0
 
-        ch = LivenessChallenge()
-        issued = ch.issue(kind)
-        # Wall-clock safety cap: each task also self-times-out on its own deadline when fed, but
-        # if the camera stalls we must not block the pipe forever.
-        wall_deadline = time.monotonic() + self.cfg.blink_timeout_s + GESTURE_TIMEOUT_S + 2.0
-
-        identity_frames = 0            # matching frames actually fed to the task (identity mode)
-        distance_best: float | None = None   # best distance over every frame that HAD a face
-        frames_ok = 0                  # frames that actually arrived (camera-health telemetry, 7b)
+        def request_late() -> bool:
+            t0 = getattr(self, "_req_started", None)
+            if t0 is None:
+                return False
+            client = getattr(self, "_client_budget_s", None)
+            limit = UNLOCK_GESTURE_DEADLINE_S if client is None else min(UNLOCK_GESTURE_DEADLINE_S, client)
+            return time.monotonic() - t0 > limit - 0.3
 
         with self._cam_lock:
             cam, busy = self._acquire_camera()
@@ -978,85 +1040,124 @@ class FaceService:
             try:
                 for _ in range(2):
                     cam.read()
-                while not ch.done and time.monotonic() < wall_deadline:
+                # Frames first: the round cannot start before one arrives, but a camera that never
+                # delivers is bounded by camera_open_attempt_cap_s (the same ceiling as an open).
+                first_deadline = time.monotonic() + float(self.cfg.camera_open_attempt_cap_s)
+                while not seq.done:
+                    if request_late():
+                        return {"ok": False, "reason": "deadline-exceeded"}
                     frame = cam.read()
                     if frame is None:
+                        if t_first is None and time.monotonic() >= first_deadline:
+                            break
+                        seq.tick()
+                        time.sleep(0.01)          # F-131: no busy spin on a dead device
                         continue
                     frames_ok += 1
+                    if t_first is None:
+                        t_first = time.monotonic()
+                        seq.start()
+                    try:
+                        sl = scene_luma(frame)
+                        luma_max = sl if luma_max is None else max(luma_max, sl)
+                    except Exception as e:
+                        log.warning("scene luma failed on a gesture frame: %r", e)
+                    # D-86: the gesture round can be dumped like the burst and the probe.
+                    self._maybe_dump_frame(frame, f"gesture{n}")
+                    n += 1
                     try:
                         a = self.recog.analyze_frame(frame)
-                    except RuntimeError as e:      # e.g. no enrollment
-                        return {"ok": False, "reason": str(e)}
-                    except Exception as e:
-                        log.warning("challenge analyze error: %s", e)
+                    except EngineError as e:
+                        log.warning("gesture round: engine error on a frame: %s", e)
+                        seq.tick()
                         continue
-                    if a.face and (distance_best is None or a.distance < distance_best):
+                    except RuntimeError as e:
+                        # The engine refused the whole round (no enrollment, models gone): a fault,
+                        # not a failed attempt (Stage 9, R5 / F-62).
+                        log.warning("gesture round did not run: %s", e)
+                        return {"ok": False, "reason": "no-enrollment"
+                                if getattr(self.recog, "_refs", None) is None else "engine-error"}
+                    if not a.face:
+                        seq.tick()
+                        continue
+                    faces += 1
+                    if distance_best is None or a.distance < distance_best:
                         distance_best = a.distance
+                    if a.screen is not None:
+                        screen_checked += 1
+                        if a.screen:
+                            screen_flagged += 1
+                    if identity and (not a.is_match or a.screen is True):
+                        seq.tick()
+                        continue
                     if identity:
-                        # Identity binding: a non-matching frame is NOT the enrolled user, so it
-                        # does not exist as far as the gesture task is concerned. Skipping the
-                        # feed (rather than merely not counting it) is the point -- it stops an
-                        # impostor's motion from ever reaching the task.
-                        # Stage 8b (F-11, act A-3). Defect: this round never looked at the
-                        # anti-screen flag. Consequence: a frame the passive check had flagged as a
-                        # screen could still drive the identity-bound gesture. Fix: a screen-flagged
-                        # frame is treated exactly as a non-matching one. No threshold involved.
-                        if not a.is_match or a.screen is True:
-                            continue
                         identity_frames += 1
-                    ch.feed(a.landmark, a.pose)
+                        if best_emb is None or a.distance <= distance_best:
+                            best_emb = a.embedding
+                    seq.feed(a.landmark, a.pose)
             finally:
                 if not self.cfg.persistent_camera:
                     cam.close()
 
-        # Zero-frame check only: no luma, and no retry. A gesture round is fed by whatever the
-        # user does over several seconds, so a dark stretch is normal here and would false-flag a
-        # black burst; and the round is already over -- retrying it would silently re-prompt the
-        # user for a gesture they just performed. Dropping a dead cache still helps the NEXT
-        # request. (The RuntimeError return above bails out before this, on purpose: that is an
-        # engine refusal, e.g. enrollment vanished, not a camera verdict.)
-        self._note_camera_health(frames_ok, None, "challenge")
-
-        log.info("challenge kind=%s passed=%s state=%s%s",
-                 issued.name.lower(), ch.passed, ch.state.name,
-                 (" identity_frames=%d best=%s" %
-                  (identity_frames,
-                   "n/a" if distance_best is None else "%.3f" % distance_best)) if identity else "")
-        resp = {
+        self._note_camera_health(frames_ok, luma_max, "gesture")
+        if frames_ok == 0 or self._burst_defect(frames_ok, luma_max) is not None:
+            # F-131: the camera delivered nothing (or only black) -- a device fault, lockout-neutral.
+            log.info("gesture round: camera delivered %d frame(s), luma=%s -> no-frames",
+                     frames_ok, _fmt_luma(luma_max))
+            return {"ok": False, "reason": "no-frames"}
+        elapsed = (time.monotonic() - t_first) if t_first else 0.0
+        fps = round(frames_ok / elapsed, 1) if elapsed > 0 else None
+        log.info("gesture round %s: passed=%s reason=%s steps=%d identity_frames=%d faces=%d "
+                 "screen=%d/%d sceneL=%s best=%s fps=%s", kind_name, seq.passed, seq.reason,
+                 seq.steps_done, identity_frames, faces, screen_flagged, screen_checked,
+                 _fmt_luma(luma_max), "n/a" if distance_best is None else "%.3f" % distance_best,
+                 fps)
+        return {
             "ok": True,
-            "challenge": issued.name.lower(),
-            "prompt": ch.prompt,
-            "passed": ch.passed,
-            "state": ch.state.name.lower(),
+            "challenge": ",".join(k.name.lower() for k in kinds),
+            "prompt": self._prompt_for(",".join(k.name.lower() for k in kinds)),
+            "passed": seq.passed,
+            "state": seq.state.name.lower(),
+            "reason": seq.reason,
+            "steps_done": seq.steps_done,
+            "identity_frames": identity_frames,
+            "distance_best": None if distance_best is None else round(distance_best, 4),
+            "faces": faces,
+            "frames_ok": frames_ok,
+            "screen_flagged": screen_flagged,
+            "screen_checked": screen_checked,
+            "scene_luma": None if luma_max is None else round(luma_max, 2),
+            "fps": fps,
+            "_embedding": best_emb,
         }
-        if identity:
-            # Extra keys ONLY in identity mode, so the `challenge` command's reply is unchanged.
-            resp["identity_frames"] = identity_frames
-            resp["distance_best"] = (None if distance_best is None else round(distance_best, 4))
-        return resp
 
     def _prompt_for(self, kind_name: str) -> str:
-        """Localized gesture prompt for the CURRENT cfg.language.
-
-        Mirrors i18n.t()'s fallback chain (language -> English -> raw key) but resolves the
-        language from cfg on every call instead of i18n's process-global _current_lang: this
-        service never calls set_language (only the tray process does), and reload_config can
-        change cfg.language at runtime, so anything cached at startup would go stale.
-        """
+        """Localized instruction for the armed sequence, in the CURRENT cfg.language: each step's
+        prompt, the later ones lower-cased, joined by the language's "then" -- e.g. "Turn your
+        head left, then nod your head". Resolved from cfg on every call (reload can change the
+        language; this process never calls set_language)."""
         from .i18n import DEFAULT_LANG, TRANSLATIONS
-        key = f"gesture.prompt.{kind_name}"
         table = TRANSLATIONS.get(self.cfg.language) or TRANSLATIONS[DEFAULT_LANG]
-        return table.get(key) or TRANSLATIONS[DEFAULT_LANG].get(key, key)
+        en = TRANSLATIONS[DEFAULT_LANG]
+
+        def tr(key):
+            return table.get(key) or en.get(key, key)
+
+        parts = [tr(f"gesture.prompt.{k.strip()}") for k in str(kind_name).split(",") if k.strip()]
+        if not parts:
+            return ""
+        out = parts[0]
+        for p in parts[1:]:
+            out += tr("gesture.then") + (p[:1].lower() + p[1:])
+        return out
 
     def _issue_gesture_token(self) -> tuple[str, str, str]:
-        """Pick a random gesture, arm the one-shot token slot, return (kind, prompt, token).
-
-        The kind is drawn with `secrets` (not `random`) so an observer cannot predict which
-        gesture the next lockscreen attempt will demand. Overwrites any previous slot: the newest
-        phase-1 reply is the only one that can be answered.
-        """
-        from .liveness import ALL_KINDS
-        kind = secrets.choice(ALL_KINDS).name.lower()
+        """Pick a random two-movement sequence, arm the one-shot token slot, return
+        (sequence, prompt, token). The order is drawn with the system CSPRNG so an observer
+        cannot predict what the next lock screen will ask for. Overwrites any previous slot: the
+        newest phase-1 reply is the only one that can be answered."""
+        from .liveness import random_sequence
+        kind = ",".join(k.name.lower() for k in random_sequence())
         token = secrets.token_hex(16)          # 32 hex chars
         self._gesture_slot = {"token": token, "kind": kind,
                               "expires": time.monotonic() + GESTURE_TOKEN_TTL_S}
@@ -1208,7 +1309,13 @@ class FaceService:
         # derived from the frame classes, which also see the weak and suspect frames that
         # ``result`` cannot represent.
         threshold, soft = self.cfg.threshold, self.cfg.presence_soft_margin
-        if seen and all(ok is None for ok, _d, _r in seen):
+        # Stage 9 (F-134): an engine error in the burst with no sighting at all is an error too --
+        # a fault must not be read as an absence.
+        sighting = any(_probe_frame_class(ok, d, r, self.cfg.threshold,
+                                          self.cfg.presence_soft_margin) in ("strong", "weak")
+                       for ok, d, r in seen)
+        if seen and (all(ok is None for ok, _d, _r in seen)
+                     or (errors and not sighting)):
             # Stage 8b (F-22). Defect: an all-error burst fell through _probe_verdict to "absent".
             # Consequence: no enrollment, a model or a CUDA failure earned an absence strike every
             # idle tick and ended in LockWorkStation. Fix: an engine that could not judge a single
@@ -1301,6 +1408,9 @@ class FaceService:
             "audit": self._audit.status(),
             # Stage 8b, additive: False while unlock is refused for custody.
             "data_dir_secure": not getattr(self, "_data_dir_insecure", False),
+            # Stage 9 (F-101): the first custody / model problem, for the tray's Status row.
+            "custody_problem": getattr(self, "_custody_problem", None),
+            "models_problem": getattr(self, "_models_problem", None),
             # Stage 9, additive: serving | refusing (+why), and the lock screen's verdict on the
             # stored password (§2.1: set by report_result ok=false, cleared by a new password).
             "state": state["state"],
@@ -1316,6 +1426,13 @@ class FaceService:
             return "not-owner"
         if getattr(self, "_data_dir_insecure", False):
             return "custody"
+        if getattr(self, "_models_problem", None):
+            return "no-models"
+        # R9 (F-112): a lockout state that cannot be saved refuses face unlock -- retried on
+        # every check, so the refusal ends as soon as the disk takes the state again.
+        lk = getattr(self, "_lockout", None)
+        if lk is not None and not getattr(lk, "store_ok", True) and not lk.retry_save():
+            return "lockout-store-error"
         return None
 
     def _service_state(self) -> dict:
@@ -1354,6 +1471,17 @@ class FaceService:
             return {"ok": False, "reason": f"reload-failed: {_scrub(e)}"}
         self.cfg = new_cfg
         self.recog.cfg = new_cfg
+        # Stage 9 (D-40): the adaptive toggle takes effect at once, both ways.
+        try:
+            self.recog._refresh_refs()
+        except Exception:
+            log.exception("reload_config: refreshing the matching set failed")
+        # Stage 9 (F-136): switching the frame dump off removes what it wrote.
+        if old.debug_dump_frames and not new_cfg.debug_dump_frames:
+            try:
+                purge_debug_frames(APP_DIR)
+            except Exception:
+                log.exception("reload_config: purging debug frames failed")
         # Reset camera if camera-affecting settings changed. The new cfg is already
         # applied above, so a failure here must not abort the reload and strand the
         # OLD camera open under the NEW settings -- log it and carry on.
@@ -1465,7 +1593,7 @@ class FaceService:
             log.info("camera lease cleared (%.1fs still remained)", remaining)
             return {"ok": True}
 
-        if cmd in ("build_enrollment", "clear_enrollment", "verify", "presence"):
+        if cmd in ("build_enrollment", "clear_enrollment", "verify", "presence", "calibrate_turn"):
             # Stage 9 (R1): a refusing service runs no face function at all.
             why = self._refusal()
             if why is not None:
@@ -1473,17 +1601,18 @@ class FaceService:
 
         if cmd == "build_enrollment":
             try:
-                from .config import ENROLL_DIR
                 if req.get("replace") is True:
                     return self._with_pose(self._build_replace())
-                n = self.recog.enroll_from_dir(ENROLL_DIR)
-                return self._with_pose({"ok": True, "count": n})
+                return self._with_pose(self._build_add())
             except Exception as e:
                 log.exception("build_enrollment failed")
                 return {"ok": False, "reason": _scrub(e)}
 
         if cmd == "clear_enrollment":
             return self._clear_enrollment()
+
+        if cmd == "calibrate_turn":
+            return self._calibrate_turn(req, handle)
 
         if cmd == "verify":
             # §2.3: a diagnostic for the owner's own tools -- SELF only, no strike, no secret.
@@ -1560,14 +1689,14 @@ class FaceService:
         if refused is not None:
             return refused
         r = self._capture_and_verify()
-        # Stage 3.4 busy camera: the webcam is held by ANOTHER process (not our enrollment
-        # lease). Refuse cleanly with reason "camera-busy" -- LOCKOUT-NEUTRAL (a busy device is
-        # environment, not a failed match).
+        # Stage 3.4 busy camera: the webcam is held by ANOTHER process (or leased to the wizard).
+        # Refuse cleanly with reason "camera-busy" -- LOCKOUT-NEUTRAL (act 9b R5).
         if r.camera_busy:
             self._audit.write("unlock", {**r.detail, "outcome": "camera-busy"})
             return {"ok": False, "reason": "camera-busy"}
-        # Stage 8b (F-18, act A-4): a burst in which no frame arrived, or in which the engine could
-        # not judge a single frame, returns an honest reason, lockout-neutral.
+        # Stage 8b (F-18) / Stage 9 (R5): a burst in which no frame arrived, in which the engine
+        # could not judge enough frames, or in which no face appeared at all is not a failed
+        # attempt -- an honest reason, lockout-neutral.
         fault = self._burst_fault(r)
         if fault is not None:
             self._audit.write("unlock", {**r.detail, "outcome": fault})
@@ -1577,10 +1706,22 @@ class FaceService:
         # normally-lit face is never blown out; transient (exposure always restored inside
         # _maybe_boost); lockout-neutral (a still-dark result stays too-dark below, adding no
         # strike). Boost telemetry is merged into r.detail so every unlock audit below carries it.
+        # (Stage 9, D-83: the "not leased" conjunct here was dead -- a lease already answered
+        # camera-busy above.)
         boost_audit: dict = {}
         if (r.scene_luma is not None and r.scene_luma < self.cfg.low_light_luma_min
-                and self.cfg.low_light_boost and not self._camera_leased_out()):
+                and self.cfg.low_light_boost):
+            r_dark = r
             r, boost_audit = self._maybe_boost(r)
+            # Stage 9 (F-130): the fault gate applies to the boosted re-capture too. A re-capture
+            # that delivered nothing, or that the engine could not judge, is not a face verdict:
+            # keep the dark burst (and its lockout-neutral too-dark answer) instead of turning a
+            # device fault in a dim room into a strike.
+            if r is not r_dark and self._burst_fault(r) is not None:
+                log.info("low-light boost re-capture was faulty (%s); keeping the dark burst",
+                         self._burst_fault(r))
+                boost_audit = {**boost_audit, "boost_recapture_fault": self._burst_fault(r)}
+                r = r_dark
             r = r._replace(detail={**r.detail, **boost_audit})
         # Stage 3.2 low-light gate: below the floor refuse honestly ("too-dark"), LOCKOUT-NEUTRAL.
         too_dark = False
@@ -1594,11 +1735,17 @@ class FaceService:
         # gesture". .get() is deliberate: a detail dict WITHOUT a verdict falls through to the old
         # no-match path -- fail closed, never into the gesture path.
         needs_gesture = r.detail.get("verdict") == "NEEDS_GESTURE"
-        # A gesture escalation is not an attempt -- phase 2 records its own outcome. A MATCH is
-        # not recorded here either: its reset is part of the grant (settled by report_result).
-        if not self._camera_leased_out() and not needs_gesture and not r.match:
+        # R5: a no-match on frames that HAD a face is a strike (the fault gate above already took
+        # the bursts with no face at all). A gesture escalation is not an attempt -- phase 2
+        # records its own outcome. A MATCH is not recorded here either: its reset is part of the
+        # grant (settled by report_result).
+        if not needs_gesture and not r.match:
             self._lockout.record(False)
         if needs_gesture:
+            if self._past_deadline(UNLOCK_DEADLINE_S):
+                # D-62: the CP has already left -- arm no token for nobody.
+                self._audit.write("unlock", {**r.detail, "outcome": "deadline-exceeded"})
+                return {"ok": False, "reason": "deadline-exceeded"}
             kind, prompt, token = self._issue_gesture_token()
             # Audit records the gesture but NEVER the token.
             self._audit.write("unlock", {**r.detail, "outcome": "needs-gesture",
@@ -1645,46 +1792,69 @@ class FaceService:
             return {"ok": False, "reason": "gesture-token-invalid"}
         resp = self._run_challenge(slot["kind"], identity=True)
         if not resp.get("ok"):
-            # The round never ran. "camera-busy" stays itself and stays lockout-NEUTRAL, like
-            # everywhere else (a busy device is environment, not a failed match). Anything
-            # else here is an engine-level refusal (e.g. enrollment vanished mid-session);
-            # it is reported as a plain gesture-failed with the real reason kept in the log and
-            # audit. (Stage 9, 9c-2 / R5 makes this lockout-neutral with an honest reason.)
-            raw = resp.get("reason") or "gesture-failed"
-            if raw == "camera-busy":
-                self._audit_gesture(challenge=slot["kind"], reason="camera-busy")
-                return {"ok": False, "reason": "camera-busy"}
-            log.warning("unlock_gesture round did not run: %s", raw)
-            self._lockout.record(False)
+            # The round never ran, or the device / engine / deadline cut it off: camera-busy,
+            # no-frames, no-enrollment, engine-error, deadline-exceeded -- every one of them is
+            # LOCKOUT-NEUTRAL (act 9b R5; F-62, F-131), each with its honest reason.
+            raw = resp.get("reason") or "engine-error"
             self._audit_gesture(challenge=slot["kind"], reason=raw)
-            return {"ok": False, "reason": "gesture-failed", "challenge": slot["kind"],
-                    "state": "failed", "identity_frames": 0}
+            return {"ok": False, "reason": raw}
         frames = int(resp.get("identity_frames") or 0)
         best = resp.get("distance_best")
-        # Two conditions, no new numbers: the task itself passed AND enough MATCHING frames
-        # were fed (cfg.verify_required, the same bar the passive burst uses).
+        faces = int(resp.get("faces") or 0)
+
+        # R6 telemetry for every round that ran (numbers only, no image data)
+        self._audit.write("gesture_telemetry", {
+            "faces": faces, "frames_ok": resp.get("frames_ok"), "fps": resp.get("fps"),
+            "screen_flagged": resp.get("screen_flagged"),
+            "screen_checked": resp.get("screen_checked"), "scene_luma": resp.get("scene_luma"),
+            "steps_done": resp.get("steps_done"), "sequence_reason": resp.get("reason")})
+
+        def _audit_round(reason, passed=None):
+            self._audit_gesture(challenge=resp.get("challenge"), passed=passed,
+                                identity_frames=frames, distance_best=best, reason=reason)
+
+        if faces == 0:
+            # R5: nobody in front of the camera for the whole round -- no attempt was made.
+            _audit_round("no-face", passed=False)
+            return {"ok": False, "reason": "no-face"}
+        # R4 additional layer: too many screen-like frames among the frames with a face fails the
+        # round, whatever the head did -- only with anti-screen on and in enough light for the
+        # signal to mean something (the same floor as the too-dark gate).
+        checked = int(resp.get("screen_checked") or 0)
+        flagged = int(resp.get("screen_flagged") or 0)
+        luma = resp.get("scene_luma")
+        if (self.cfg.anti_screen and checked > 0 and flagged / checked >= SCREEN_DOUBT_FRAC
+                and luma is not None and luma >= self.cfg.low_light_luma_min):
+            self._lockout.record(False)
+            _audit_round("screen-suspected", passed=False)
+            return {"ok": False, "reason": "screen-suspected", "challenge": resp.get("challenge"),
+                    "identity_frames": frames}
+        if resp.get("reason") == "motion-before-prompt":
+            # R4: moving before the prompt could be read is what a replay does -- a strike.
+            self._lockout.record(False)
+            _audit_round("motion-before-prompt", passed=False)
+            return {"ok": False, "reason": "motion-before-prompt",
+                    "challenge": resp.get("challenge"), "identity_frames": frames}
+        # Two conditions, no new numbers: the sequence passed AND enough MATCHING frames were fed
+        # (cfg.verify_required, the same bar the passive burst uses).
         passed = bool(resp.get("passed")) and frames >= self.cfg.verify_required
         if not passed:
-            self._lockout.record(False)
-            self._audit_gesture(challenge=resp.get("challenge"), passed=resp.get("passed"),
-                                identity_frames=frames, distance_best=best,
-                                reason="gesture-failed")
+            self._lockout.record(False)          # R5: gesture-failed on frames with a face
+            _audit_round("gesture-failed", passed=resp.get("passed"))
             return {"ok": False, "reason": "gesture-failed",
                     "challenge": resp.get("challenge"), "state": resp.get("state"),
                     "identity_frames": frames}
         if self._past_deadline(UNLOCK_GESTURE_DEADLINE_S):
             # F-19: the round ran past what phase 2 can still deliver -- release nothing.
-            self._audit_gesture(challenge=resp.get("challenge"), passed=True,
-                                identity_frames=frames, distance_best=best,
-                                reason="deadline-exceeded")
+            _audit_round("deadline-exceeded", passed=True)
             return {"ok": False, "reason": "deadline-exceeded"}
         granted = self._release_credentials()
         if granted is None:
             self._lockout.record(True)     # the round passed: same reset as before 8b
-            self._audit_gesture(challenge=resp.get("challenge"), passed=True,
-                                identity_frames=frames, distance_best=best,
-                                reason="no-credentials")
+            _audit_round("no-credentials", passed=True)
             return {"ok": False, "reason": "no-credentials"}
+
+        emb = resp.get("_embedding")
 
         def _audit(outcome: str) -> None:
             self._audit_gesture(challenge=resp.get("challenge"), passed=True,
@@ -1693,6 +1863,11 @@ class FaceService:
         def _commit() -> None:
             self._lockout.record(True)
             _audit("granted")
+            # Stage 9 (act 9b R6, F-47 / D-40): a grant after a passed phase 2 may adapt the
+            # gallery too -- the same gates and ceiling (threshold - adaptive_margin) as before;
+            # never when any frame of the round was screen-flagged.
+            self._maybe_adapt_gallery_embedding(emb, best, gesture_passed=True,
+                                                is_screen=flagged > 0)
         return self._arm_grant(granted, _audit, _commit)
 
     # ---- grant settlement (§2.1 protocol v2: F-60, F-93) ----
@@ -1788,8 +1963,16 @@ class FaceService:
         frames_ok = int(frames_ok)
         if frames_ok == 0:
             return "no-frames"
-        if int(r.detail.get("engine_errors", 0) or 0) >= frames_ok:
+        errors = int(r.detail.get("engine_errors", 0) or 0)
+        if errors >= frames_ok:
             return "no-enrollment" if getattr(self.recog, "_refs", None) is None else "engine-error"
+        # Stage 9 (F-134): with engine faults in the burst and too few JUDGED frames left to reach
+        # verify_required, the verdict is the fault's, not the face's -- neutral too.
+        if errors > 0 and (frames_ok - errors) < int(self.cfg.verify_required) and not r.match:
+            return "engine-error"
+        # Stage 9 (act 9b R5): no face in any frame -- nobody tried; no strike.
+        if "faces" in r.detail and int(r.detail.get("faces") or 0) == 0:
+            return "no-face"
         return None
 
     def _with_pose(self, resp: dict) -> dict:
@@ -1801,39 +1984,100 @@ class FaceService:
                             for k, v in pose.items()}
         return resp
 
-    def _build_replace(self) -> dict:
-        """``build_enrollment`` with ``replace``: build the gallery from the PENDING session only,
-        and only after that succeeded delete the old images and promote the new ones.
+    def _build_add(self) -> dict:
+        """``build_enrollment`` without ``replace`` (the wizard's "Add"): rebuild the gallery from
+        every image in ENROLL_DIR. Stage 9 (D-82): audited, success or not."""
+        from .config import ENROLL_DIR
+        try:
+            n = self.recog.enroll_from_dir(ENROLL_DIR)
+        except Exception as e:
+            self._audit.write("enroll_build", {"mode": "add", "ok": False,
+                                               "reason": _scrub(e)[:200]})
+            raise
+        self._audit.write("enroll_build", {"mode": "add", "ok": True, "accepted": n,
+                                           **self._enroll_telemetry()})
+        return {"ok": True, "count": n}
 
-        Stage 8b (F-12). Defect: every session appended to ENROLL_DIR and the build used them all
-        (45 images from 3 sessions on the live machine), with no way to replace an enrollment
-        short of deleting it first. Consequence: a re-enroll either mixed old and new faces or
-        left the user with no gallery at all while the new one was being captured. Fix: the
-        wizard's Replace mode captures into ENROLL_PENDING_DIR; a failed build here leaves the old
-        gallery and images exactly as they were."""
+    def _enroll_telemetry(self) -> dict:
+        info = dict(getattr(self.recog, "last_enroll_info", {}) or {})
+        return {k: info.get(k) for k in ("rejected", "other_person", "ear_open_median")}
+
+    def _build_replace(self) -> dict:
+        """``build_enrollment`` with ``replace``: the new session replaces the gallery ATOMICALLY.
+
+        Stage 9 (act 9b R6, F-132). Before, the pending build already overwrote embeddings.npz and
+        the in-memory refs, and only then were the old images deleted and the new ones moved --
+        an OSError in those loops (an old JPG held by AV or a viewer) left the NEW gallery live,
+        a mix of old and new images on disk, and a wizard reporting failure. Now:
+          1. the gallery is COMPUTED from ENROLL_PENDING_DIR only -- nothing live changes;
+          2. the old images are moved into a retired folder and the new ones into ENROLL_DIR --
+             any failure moves everything back and the old gallery stays in force;
+          3. embeddings.npz is replaced atomically and the service switches to it (the commit);
+          4. the retired images are deleted (best effort: problems are reported, not raised);
+          5. an audit record is written in every case.
+        """
         from .config import ENROLL_DIR, ENROLL_PENDING_DIR
         for d in (ENROLL_DIR, ENROLL_PENDING_DIR):
             if is_reparse(d):
                 return {"ok": False, "reason": f"{d.name} is a reparse point (not followed)"}
-        n = self.recog.enroll_from_dir(ENROLL_PENDING_DIR)   # raises on a bad session: old kept
+        try:
+            embeds, _rep = self.recog.build_gallery(ENROLL_PENDING_DIR)   # raises: old kept
+        except Exception as e:
+            self._audit.write("enroll_build", {"mode": "replace", "ok": False,
+                                               "reason": _scrub(e)[:200]})
+            raise
         images = {".jpg", ".jpeg", ".png"}
-        removed = moved = 0
-        for p in list(ENROLL_DIR.iterdir()):
-            if p.suffix.lower() in images and p.is_file() and not is_reparse(p):
-                p.unlink()
-                removed += 1
-        for p in list(ENROLL_PENDING_DIR.iterdir()):
-            if p.suffix.lower() in images and p.is_file() and not is_reparse(p):
-                os.replace(p, ENROLL_DIR / p.name)
-                moved += 1
-        _n, problems = remove_tree_no_follow(ENROLL_PENDING_DIR)
+        retired = ENROLL_DIR / ".retired"
+        moved_old: list = []
+        moved_new: list = []
+        try:
+            retired.mkdir(parents=True, exist_ok=True)
+            if is_reparse(retired):
+                raise OSError(f"{retired.name} is a reparse point")
+            for p in list(ENROLL_DIR.iterdir()):
+                if p.suffix.lower() in images and p.is_file() and not is_reparse(p):
+                    os.replace(p, retired / p.name)
+                    moved_old.append(p.name)
+            for p in list(ENROLL_PENDING_DIR.iterdir()):
+                if p.suffix.lower() in images and p.is_file() and not is_reparse(p):
+                    os.replace(p, ENROLL_DIR / p.name)
+                    moved_new.append(p.name)
+            self.recog.commit_gallery(embeds)                     # the commit point
+        except Exception as e:
+            # Roll the files back; the gallery on disk and in memory is still the old one.
+            for name in moved_new:
+                try:
+                    os.replace(ENROLL_DIR / name, ENROLL_PENDING_DIR / name)
+                except OSError:
+                    pass
+            for name in moved_old:
+                try:
+                    os.replace(retired / name, ENROLL_DIR / name)
+                except OSError:
+                    pass
+            log.exception("build_enrollment(replace): staging failed; the old gallery is kept")
+            self._audit.write("enroll_build", {"mode": "replace", "ok": False,
+                                               "reason": "staging-failed: " + _scrub(e)[:160]})
+            return {"ok": False, "reason": "staging-failed"}
+        problems: list = []
+        _n, more = remove_tree_no_follow(retired)
+        problems.extend(more)
+        _n, more = remove_tree_no_follow(ENROLL_PENDING_DIR)
+        problems.extend(more)
         if problems:
-            log.warning("build_enrollment(replace): pending cleanup left %s", problems[:3])
-        log.info("build_enrollment(replace): %d accepted; %d old image(s) removed, %d promoted",
-                 n, removed, moved)
-        self._audit.write("enroll_replace", {"accepted": n, "old_removed": removed,
-                                             "promoted": moved})
-        return {"ok": True, "count": n, "replaced": True}
+            log.warning("build_enrollment(replace): cleanup left %s", problems[:3])
+        n = int(embeds.shape[0])
+        log.info("build_enrollment(replace): %d accepted; %d old image(s) retired, %d promoted",
+                 n, len(moved_old), len(moved_new))
+        self._audit.write("enroll_build", {"mode": "replace", "ok": True, "accepted": n,
+                                           "old_removed": len(moved_old),
+                                           "promoted": len(moved_new),
+                                           "cleanup_problems": len(problems),
+                                           **self._enroll_telemetry()})
+        resp = {"ok": True, "count": n, "replaced": True}
+        if problems:
+            resp["partial"] = True
+        return resp
 
     def _clear_enrollment(self) -> dict:
         """Stage 8b (F-06). Defect: the wizard's "Delete enrollment" unlinked files on disk while
@@ -1841,21 +2085,31 @@ class FaceService:
         matching until the next service restart, although the confirmation promised deletion.
         Fix: the service itself forgets the gallery (refs + adaptive ring), deletes
         embeddings.npz and the whole enroll tree without following reparse points, drops any
-        pending gesture token, and writes an audit record."""
-        from .config import EMBED_PATH, ENROLL_DIR
-        self.recog.clear_enrollment()
+        pending gesture token, and writes an audit record.
+        Stage 9 (F-136): the frame dumps and the *.npz.tmp leftovers are face data too -- they go
+        as well; (F-121) the in-memory forget no longer depends on the ring file being deletable."""
+        from .config import ADAPTIVE_PATH, EMBED_PATH, ENROLL_DIR
+        problems: list = []
+        ring_problem = self.recog.clear_enrollment()
+        if ring_problem:
+            problems.append(ring_problem)
         self._gesture_slot = None
         removed = 0
-        problems: list = []
-        try:
-            if EMBED_PATH.exists():
-                EMBED_PATH.unlink()
-                removed += 1
-        except OSError as e:
-            problems.append(f"{EMBED_PATH.name}: {e}")
+        for path in (EMBED_PATH, EMBED_PATH.with_name(EMBED_PATH.name + ".tmp"),
+                     ADAPTIVE_PATH.with_name(ADAPTIVE_PATH.name + ".tmp")):
+            try:
+                if path.exists():
+                    path.unlink()
+                    removed += 1
+            except OSError as e:
+                problems.append(f"{path.name}: {e}")
         n, more = remove_tree_no_follow(ENROLL_DIR)
         removed += n
         problems.extend(more)
+        try:
+            removed += purge_debug_frames(APP_DIR)
+        except Exception as e:
+            problems.append(f"debug_frames: {e!r}")
         self._audit.write("clear_enrollment", {"removed": removed, "problems": len(problems)})
         if problems:
             log.error("clear_enrollment: %d item(s) could not be removed: %s",
@@ -1863,6 +2117,83 @@ class FaceService:
             return {"ok": False, "reason": "partial", "removed": removed}
         log.info("clear_enrollment: gallery forgotten, %d item(s) removed", removed)
         return {"ok": True, "removed": removed}
+
+    # ---- turn-sign calibration (Stage 9, act 9b R6 / F-117) ----
+
+    def _load_calibration(self) -> dict:
+        from .config import CALIBRATION_PATH
+        try:
+            data = json.loads(CALIBRATION_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            log.warning("calibration.json unreadable (%r); using the default turn sign", e)
+            return {}
+
+    def _calibrate_turn(self, req: dict, handle) -> dict:
+        """``calibrate_turn``: learn which way yaw moves when THIS user on THIS camera turns to
+        their own left. SELF only, and only while the wizard holds the camera lease.
+
+        The wizard saves a few frames of a frontal face and of a turn to the user's left into
+        ``<data>\\calibration\\`` and names them in the request ("frontal", "left": file names). The
+        service measures the head pose with the SAME estimator the lock screen uses (1k3d68),
+        takes the medians, and stores the sign in calibration.json bound to the camera; the
+        frames are deleted either way. A turn smaller than the gesture's own YAW_DELTA is refused
+        ("turn-too-small") -- such a turn would not pass the lock screen either. Without a
+        calibration the LEFT_IS_NEGATIVE_YAW default applies (unchanged)."""
+        from .config import CALIBRATION_DIR, CALIBRATION_PATH
+        from .liveness import YAW_DELTA
+        denied = self._require_caller(handle, current_user_sid(), "calibrate_turn")
+        if denied is not None:
+            return denied
+        if not self._camera_leased_out():
+            return {"ok": False, "reason": "not-leased"}
+        names = {}
+        for key in ("frontal", "left"):
+            v = req.get(key)
+            if (not isinstance(v, list) or not (1 <= len(v) <= 30)
+                    or not all(isinstance(x, str) and x and "/" not in x and "\\" not in x
+                               and ".." not in x for x in v)):
+                return {"ok": False, "reason": "bad-request"}
+            names[key] = v
+        poses: dict = {"frontal": [], "left": []}
+        try:
+            if is_reparse(CALIBRATION_DIR):
+                return {"ok": False, "reason": "bad-request"}
+            for key, files in names.items():
+                for name in files:
+                    img = imio.imread(CALIBRATION_DIR / name)
+                    pose = self.recog.pose_of(img) if img is not None else None
+                    if pose is not None:
+                        poses[key].append(pose)
+        finally:
+            _n, _p = remove_tree_no_follow(CALIBRATION_DIR)   # face frames: never kept
+        if len(poses["frontal"]) < 1 or len(poses["left"]) < 1:
+            return {"ok": False, "reason": "no-face"}
+        yaw_front = float(np.median([y for _p, y in poses["frontal"]]))
+        yaw_left = float(np.median([y for _p, y in poses["left"]]))
+        delta = yaw_left - yaw_front
+        if abs(delta) <= YAW_DELTA:
+            self._audit.write("calibrate_turn", {"ok": False, "delta_deg": round(delta, 1)})
+            return {"ok": False, "reason": "turn-too-small", "delta_deg": round(delta, 1)}
+        cal = self._load_calibration()
+        cams = cal.get("cameras") if isinstance(cal.get("cameras"), dict) else {}
+        cams[self._camera_id()] = {"left_is_negative_yaw": delta < 0,
+                                   "delta_deg": round(delta, 1),
+                                   "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        cal = {"version": 1, "cameras": cams}
+        tmp = CALIBRATION_PATH.with_name(CALIBRATION_PATH.name + ".tmp")
+        tmp.write_text(json.dumps(cal, indent=1), encoding="utf-8")
+        os.replace(tmp, CALIBRATION_PATH)
+        self._calibration = cal
+        self._audit.write("calibrate_turn", {"ok": True, "delta_deg": round(delta, 1),
+                                             "left_is_negative_yaw": delta < 0,
+                                             "camera": self._camera_id()})
+        log.info("turn calibration for %s: left turn moves yaw by %+.1f deg", self._camera_id(),
+                 delta)
+        return {"ok": True, "left_is_negative_yaw": delta < 0, "delta_deg": round(delta, 1),
+                "camera": self._camera_id()}
 
     def _create_instance(self, first: bool):
         """One pipe instance. ``first`` claims the NAME (FILE_FLAG_FIRST_PIPE_INSTANCE): if anyone
@@ -2032,7 +2363,6 @@ class FaceService:
 
     def _warmup(self) -> None:
         """Load enrollment, preload heavy models so the first real call is fast."""
-        import numpy as np
         try:
             self.recog.load()
             log.info("enrollment loaded: %s", self.recog._refs is not None)
@@ -2045,10 +2375,9 @@ class FaceService:
         # Using one of our enrolled photos guarantees a face is present.
         try:
             from .config import ENROLL_DIR
-            import cv2
             enroll_imgs = list(ENROLL_DIR.glob("*.jpg")) + list(ENROLL_DIR.glob("*.png"))
             if enroll_imgs:
-                img = cv2.imread(str(enroll_imgs[0]))
+                img = imio.imread(enroll_imgs[0])     # Stage 9 (R8): Unicode-safe
                 if img is not None:
                     t0 = time.time()
                     self.recog.verify_frame(img)
@@ -2116,8 +2445,16 @@ class FaceService:
         # Stage 9 (F-54): claim the name BEFORE the warmup -- model and camera loading take seconds,
         # and the old order left the name free for all of them. A client that connects meanwhile
         # simply waits for the first answer.
-        if self._bind() and self.cfg.warmup_on_start and self._refusal() is None:
-            self._warmup()
+        bound = self._bind()
+        if bound and self._refusal() is None:
+            # Stage 9 (R6, D-40): the gallery -- and with it the adaptive ring -- loads at start
+            # whatever warmup_on_start says; only the model/camera warmup stays optional.
+            try:
+                self.recog.load()
+            except Exception as e:
+                log.warning("enrollment load at start: %s", e)
+            if self.cfg.warmup_on_start:
+                self._warmup()
 
         while not self._stop.is_set():
             try:
@@ -2202,16 +2539,37 @@ def _setup_logging() -> None:
     setup_logging(LOG_PATH)
 
 
+def _boot_config(custody) -> Config:
+    """The config the service starts on: the file when custody holds, else the built-in defaults
+    (Stage 9, act 9b R9 / F-99 -- a directory that could not be secured is not read)."""
+    if not custody.ok:
+        log.error("data directory custody failed -- config.toml is NOT read; built-in defaults "
+                  "apply and face functions are refused")
+        return Config()
+    return Config.load()
+
+
 def main() -> None:
-    _setup_logging()
+    # Stage 9 (F-107): the log file lives in the data directory, which is not healed yet. A data
+    # directory that is a reparse point is never written through -- the log goes to %TEMP% then.
+    if is_reparse(APP_DIR):
+        from .logging_setup import setup_logging
+        import tempfile
+        setup_logging(Path(tempfile.gettempdir()) / "face-unlock-service.log")
+        log.error("data directory %s is a reparse point -- logging to %%TEMP%%", APP_DIR)
+    else:
+        _setup_logging()
     # Stage 8b (F-01 / F-23): secure the data directory BEFORE anything in it is read -- the
     # config below included -- and before the pipe exists. Never raises; a failure is logged at
-    # ERROR and turns into the insecure-data-dir refusal inside FaceService.
+    # ERROR and turns into the custody refusal inside FaceService.
     custody = heal_data_dir(APP_DIR)
-    cfg = Config.load()
+    # Stage 9 (act 9b R9, F-99): a data directory that could not be secured is not READ either --
+    # the built-in defaults apply (a planted config could not weaken anything, and no dump is
+    # written into it); every face function refuses anyway.
+    cfg = _boot_config(custody)
     # Stage 8b (F-12): with the dump knob off, frames left over from an earlier diagnosis are
     # biometric data with no purpose -- remove them (dump-named files only, no reparse points).
-    if not cfg.debug_dump_frames:
+    if not cfg.debug_dump_frames and custody.ok:
         purge_debug_frames(APP_DIR)
     svc = FaceService(cfg, custody=custody)
     try:

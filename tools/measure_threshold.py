@@ -99,14 +99,14 @@ def _save_accum(data: dict[str, list[float]]) -> None:
 # ---------- sampling (needs InsightFace / camera; imported lazily) ----------
 
 def _distances_from_dir(recog, folder: Path) -> tuple[list[float], int]:
-    import cv2
+    from face_service import imio
     dists: list[float] = []
     no_face = 0
     imgs = sorted(p for p in folder.iterdir() if p.suffix.lower() in IMG_EXT)
     if not imgs:
         raise SystemExit(f"no images in {folder}")
     for p in imgs:
-        img = cv2.imread(str(p))
+        img = imio.imread(p)   # Stage 9 (R8): Unicode-safe
         if img is None:
             print(f"  skip {p.name}: unreadable")
             continue

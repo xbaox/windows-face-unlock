@@ -104,8 +104,7 @@ def qc_reasons(q: FrameQuality, cfg) -> list[str]:
     return reasons
 
 
-def passes(q: FrameQuality, cfg) -> bool:
-    return not qc_reasons(q, cfg)
+# (Stage 9, D-79: passes() had no caller; "not qc_reasons(q, cfg)" says the same.)
 
 
 def summarize_rejections(rejected) -> str:

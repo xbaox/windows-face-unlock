@@ -149,12 +149,14 @@ def main(argv=None) -> int:
     t.ok("tools" in spec and "watchdog" in spec,
          "the spec references the watchdog entry point")
 
-    print("\n[6] the models the recognizer requires are the ones the spec ships")
+    print("\n[6] the recognition models are NOT bundled (decision 9-02, act 9b R7)")
     from face_service.recognizer import MODEL_FILES
-    pack_block = spec[spec.find("_PACK_FILES = ("):spec.find("_pack_missing")]
-    missing = [n for n in MODEL_FILES if f'"{n}"' not in pack_block]
-    t.ok(not missing,
-         f"spec ships every recognizer.MODEL_FILES entry (missing: {missing or 'none'})")
+    shipped = [n for n in MODEL_FILES if f'"{n}"' in spec]
+    t.ok(not shipped and "insightface_home" not in spec.split("# The buffalo_l recognition pack is NOT", 1)[-1],
+         f"the spec ships no buffalo_l file (found: {shipped or 'none'})")
+    build = _read(REPO_ROOT / "installer" / "build.py")
+    t.ok("def gate_no_models" in build and "gate_no_models(dist_root)" in build,
+         "build.py fails the build when a model reaches dist")
 
     print("\n[7] the updater points at this repository")
     up = _read(REPO_ROOT / "presence_monitor" / "updater.py")
@@ -200,8 +202,8 @@ def main(argv=None) -> int:
         return 1
     print("PACKAGING SELFTEST OK: version literals agree, every declared InstalledExe is an EXE "
           "the spec builds, the watchdog matches the service exe by the same name, the frozen-only "
-          "hidden imports are present, all three entry points are declared, the shipped model "
-          "set equals recognizer.MODEL_FILES, and the installer invariants of Stage 8b hold.")
+          "hidden imports are present, all three entry points are declared, no recognition model "
+          "is bundled, and the installer invariants hold.")
     return 0
 
 

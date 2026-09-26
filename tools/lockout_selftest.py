@@ -124,6 +124,32 @@ def test_reset_and_reconfigure() -> None:
         check("new cooldown ~60", round(lo.remaining()), 60)
 
 
+def test_store_and_clock() -> None:
+    print("Stage 9: a lockout that cannot be saved (F-112) and a clock set back (F-135)")
+    with tempfile.TemporaryDirectory() as d:
+        clk = FakeClock()
+        path = Path(d) / "lockout.json"
+        lo = Lockout(path, max_attempts=2, lockout_seconds=300, clock=clk)
+        check("store_ok at start", lo.store_ok, True)
+        blocker = Path(d) / "blocked"
+        blocker.mkdir()
+        (blocker / "sub").write_text("a file where the directory should be")
+        lo.path = blocker / "sub" / "lockout.json"
+        lo.record(False)
+        check("a failed save -> store_ok False", lo.store_ok, False)
+        check("retry_save keeps failing while the disk refuses", lo.retry_save(), False)
+        lo.path = path
+        check("retry_save succeeds once the state can be written", lo.retry_save(), True)
+        check("... and store_ok is back", lo.store_ok, True)
+        check("status reports store_ok", lo.status()["store_ok"], True)
+        # F-135: a persisted lockout far in the future (clock set back) is capped at one lockout
+        path.write_text('{"fails": 0, "locked_until": %f}' % (clk.t + 86400.0), encoding="utf-8")
+        lo2 = Lockout(path, max_attempts=2, lockout_seconds=300, clock=clk)
+        check("loaded lockout capped at lockout_seconds", round(lo2.remaining()), 300)
+        lo2._locked_until = clk.t + 5000.0
+        check("remaining() never exceeds lockout_seconds", round(lo2.remaining()), 300)
+
+
 def main() -> int:
     for t in (
         test_lock_after_max,
@@ -131,6 +157,7 @@ def main() -> int:
         test_cooldown_expires,
         test_persistence,
         test_reset_and_reconfigure,
+        test_store_and_clock,
     ):
         t()
         print()

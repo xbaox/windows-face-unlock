@@ -16,7 +16,6 @@ Exit 0 = all pass; 1 = a failure.
 """
 from __future__ import annotations
 import re
-import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -65,8 +64,10 @@ def main() -> int:
     print("[1] every wire reason is mapped on the tile")
     reasons = service_reasons(svc)
     explicit = cp_explicit(cpp)
-    # Not unlock / unlock_gesture replies: an audit-detail tag and the clear_enrollment reply.
-    wire_only = {"grant-unknown", "camera-leased", "partial"}
+    # Not unlock / unlock_gesture replies: an audit-detail tag, clear_enrollment, build_enrollment
+    # and calibrate_turn replies.
+    wire_only = {"grant-unknown", "camera-leased", "partial", "not-leased", "staging-failed",
+                 "turn-too-small"}
     for r in sorted(reasons - wire_only):
         check(f"reason '{r}' has a tile text", r in explicit or r in GENERIC,
               "unmapped -- add it to FailureClass or to GENERIC with a reason")

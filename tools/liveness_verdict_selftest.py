@@ -123,8 +123,8 @@ def test_verdict_unknown_mode() -> None:
 def test_config_stage2() -> None:
     print("config.py -- Stage 2 fields + validate()")
     c = Config()
-    check("default liveness_mode", c.liveness_mode, "fast")
-    check("default blink_timeout_s", c.blink_timeout_s, 4.0)
+    check("default liveness_mode (Stage 9, R4: paranoid for new installs)", c.liveness_mode, "paranoid")
+    check("blink_timeout_s is gone (Stage 9, F-69)", hasattr(c, "blink_timeout_s"), False)
     check("default challenge_on_doubt", c.challenge_on_doubt, True)
     check("default anti_screen", c.anti_screen, True)
     check("default max_face_attempts", c.max_face_attempts, 5)
@@ -138,7 +138,7 @@ def test_config_stage2() -> None:
 
     bad_cases = {
         "liveness_mode=turbo": dict(liveness_mode="turbo"),
-        "blink_timeout_s=0": dict(blink_timeout_s=0.0),
+        "max_face_attempts=21 (F-105 bound)": dict(max_face_attempts=21),
         "max_face_attempts=0": dict(max_face_attempts=0),
         "lockout_seconds=-1": dict(lockout_seconds=-1),
     }

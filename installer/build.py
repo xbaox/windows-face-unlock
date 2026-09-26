@@ -71,23 +71,14 @@ GATE_STAMP_SCHEMA = 1
 
 TOTAL_STEPS = 7
 
-# buffalo_l, as shipped by 0.1.0 (installed copy and this build machine's pack are
-# byte-identical, 8b). Unverified models were the F-38 gap: a substituted model is a
-# wrong-party unlock, and nothing between the download and the installer looked.
-# Source: insightface's BASE_REPO_URL .../releases/download/v0.7/buffalo_l.zip.
-MODEL_SHA256 = {
-    "det_10g.onnx":   "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
-    "w600k_r50.onnx": "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43",
-    "2d106det.onnx":  "f001b856447c413801ef5c42091ed0cd516fcd21f2d6b79635b1e733a7109dbf",
-    "1k3d68.onnx":    "df5c06b8a0c12e422b2ed8947b8869faa4105387f199c477af038aa01f9a45cc",
-    "genderage.onnx": "4fde69b1c810857b88c64a335084f1c3fe8f01246c9a191b48c7bb756d6652fb",
-}
-# The archive insightface downloads (288,621,354 bytes). Checked only when it is still
-# on disk -- it is not shipped, but a mismatching archive next to the pack means the
-# pack's provenance is unknown.
-BUFFALO_ZIP_SHA256 = "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f"
+# Stage 9 (act 9b R7): the pins live in face_service/model_pins.py -- the ONE source that build.py,
+# the installer generator and the service all read (F-38: a substituted model is a wrong-party
+# unlock). This file keeps no SHA literal of its own.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from face_service.model_pins import BUFFALO_FILES, BUFFALO_ZIP_SHA256  # noqa: E402
+
+MODEL_SHA256 = {name: digest for name, (_size, digest) in BUFFALO_FILES.items()}
 MODELS_PACK = Path.home() / ".insightface" / "models" / "buffalo_l"
-BUNDLED_PACK_REL = Path("_internal") / "insightface_home" / "models" / "buffalo_l"
 
 
 class BuildAbort(RuntimeError):
@@ -109,6 +100,25 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> Non
 
 def python_exe() -> str:
     return sys.executable
+
+
+def gate_no_models(dist_root: Path) -> None:
+    """Stage 9 (act 9b R7, F-259): buffalo_l is not redistributed -- the installer downloads it.
+    Fail the build if ANY file of the pack (by name, or by size + SHA-256 under any name) or any
+    directory named buffalo_l / insightface_home is inside the bundle."""
+    names = set(MODEL_SHA256)
+    sizes = {size for size, _d in BUFFALO_FILES.values()}
+    found = []
+    for p in dist_root.rglob("*"):
+        if p.is_dir() and p.name.lower() in ("buffalo_l", "insightface_home"):
+            found.append(str(p.relative_to(dist_root)))
+        elif p.is_file() and (p.name in names or (p.stat().st_size in sizes
+                                                   and sha256_file(p) in MODEL_SHA256.values())):
+            found.append(str(p.relative_to(dist_root)))
+    if found:
+        raise BuildAbort("GATE FAILED: recognition models are inside the bundle ("
+                         + ", ".join(found[:5]) + ") -> decision 9-02: the installer downloads "
+                         "them; nothing may redistribute them -> refusing.")
 
 
 def sha256_file(path: Path) -> str:
@@ -139,7 +149,7 @@ def verify_model_pack(pack: Path, where: str) -> None:
             f"buffalo_l in {pack} ({where}) does not match the pinned SHA-256 -> the installer "
             "would ship recognition models nobody reviewed (a substituted model can match the "
             "wrong face) -> refusing. Mismatches:\n  " + "\n  ".join(bad) + "\n"
-            "Fix: restore the pack from the pinned source; bump MODEL_SHA256 in installer/build.py "
+            "Fix: restore the pack from the pinned source; the pins are in face_service/model_pins.py "
             "only as a deliberate, reviewed model change."
         )
 
@@ -518,9 +528,9 @@ def step_gate(dist_root: Path, cp_dll: Path | None, policy: dict) -> dict:
     _gate_run("tools/packaging_selftest.py", [python_exe(), "-m", "tools.packaging_selftest"])
     custody = gate_frozen_custody(dist_root)
 
-    log("gate: bundled recognition models against the pinned SHA-256")
-    verify_model_pack(dist_root / BUNDLED_PACK_REL, "bundle")
-    log("bundled buffalo_l matches the pins")
+    log("gate: no recognition model in the bundle (decision 9-02, act 9b R7)")
+    gate_no_models(dist_root)
+    log("no buffalo_l file anywhere in the bundle")
 
     staged = dist_root / "credential_provider" / CP_DLL_NAME
     cp = {"mode": policy["mode"], "thumbprint": policy["thumbprint"], "sha256": None}

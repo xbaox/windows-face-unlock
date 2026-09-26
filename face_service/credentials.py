@@ -7,10 +7,17 @@ Credential Manager entry.
 
 Stage 4 Step 6 (custody): new blobs are encrypted with a per-install random secret stored in
 ``pipe_entropy.bin`` (a file locked to SELF+SYSTEM via a protected DACL) used as the DPAPI *entropy*,
-instead of the old public hardcoded constant. Pre-Stage-4 (v1) blobs are auto-migrated to v2 on the
-first read. DPAPI stays user-scope (that already excludes other users); this only raises the bar for
-same-user code from "copy a constant off GitHub" to "read a local file at runtime" -- a speed-bump,
-not the real fix (which is SYSTEM-side custody, a later stage).
+instead of the old public hardcoded constant. DPAPI stays user-scope (that already excludes other
+users); this only raises the bar for same-user code from "copy a constant off GitHub" to "read a
+local file at runtime" -- a speed-bump, not the real fix (which is SYSTEM-side custody).
+
+Stage 9 (act 9b R9 / §2.5, D-69): support for v1 blobs (DPAPI entropy = a public constant) is
+gone. There were no public installs with v1 blobs, and keeping the read path meant keeping the
+public constant forever. A v1 blob now reads as "no credentials": save the password again.
+
+Accepted residue (act 9b §2.2, D-43): the plaintext password passes through immutable Python str
+objects on its way to the pipe and cannot be wiped in CPython; zeroing copies there would be
+theatre. Same-user code can read this process anyway (DPAPI user scope).
 """
 from __future__ import annotations
 import json
@@ -27,13 +34,8 @@ from .config import CREDS_PATH
 
 log = logging.getLogger(__name__)
 
-# LEGACY entropy for v1 blobs. Public (shipped in source) -> no real secrecy; kept ONLY to read /
-# migrate pre-Stage-4 blobs. NEW encryptions use the per-install secret below, never this constant.
-ENTROPY = b"face-unlock:v1"
-
-# Per-install DPAPI entropy secret + the version marker distinguishing v1 (legacy) from v2 blobs.
-# A v1 DPAPI blob begins with the DPAPI provider magic (01 00 00 00 ...), never with this prefix,
-# so prefix-detection is unambiguous.
+# Per-install DPAPI entropy secret + the version marker of a v2 blob. (A legacy v1 blob begins with
+# the DPAPI provider magic 01 00 00 00, never with this prefix; it is no longer read, D-69.)
 ENTROPY_PATH = CREDS_PATH.parent / "pipe_entropy.bin"
 _V2_PREFIX = b"v2:"
 
@@ -146,7 +148,7 @@ def load_password() -> "dict | None":
     """Decrypt the stored credential blob, or None if absent / undecryptable. NEVER raises: a failure
     returns None exactly like an absent blob, so the unlock path degrades to the password tile
     instead of crashing (lockout risk 0 -- the lockout counter is already settled before this call).
-    A legacy v1 blob is transparently migrated to v2 in place on first read."""
+    A legacy v1 blob is not read (Stage 9, D-69)."""
     if not CREDS_PATH.exists():
         return None
     try:
@@ -158,17 +160,9 @@ def load_password() -> "dict | None":
                 return None
             _, data = win32crypt.CryptUnprotectData(enc[len(_V2_PREFIX):], secret, None, None, 0)
             return json.loads(data.decode("utf-8"))
-        # v1 legacy blob (no marker): decrypt with the old public entropy, then migrate to v2.
-        _, data = win32crypt.CryptUnprotectData(enc, ENTROPY, None, None, 0)
-        try:
-            secret = _ensure_entropy_secret()   # generates the per-install secret if not present yet
-            new_blob = _V2_PREFIX + win32crypt.CryptProtectData(
-                data, "face-unlock", secret, None, None, 0)
-            _atomic_write_bytes(CREDS_PATH, new_blob)
-            log.info("migrated credential blob v1 -> v2 (per-install entropy)")
-        except Exception as e:   # migration is best-effort -- still return the plaintext we recovered
-            log.warning("credential v1->v2 migration skipped: %s", e)
-        return json.loads(data.decode("utf-8"))
+        log.warning("credentials.bin is a legacy v1 blob, which is no longer read (Stage 9); "
+                    "save the Windows password again in Face Unlock")
+        return None
     except Exception as e:
         log.warning("load_password failed (%s); treating as no-credentials", e)
         return None

@@ -190,8 +190,18 @@ def test_clear_enrollment():
     s.recog._adaptive.save()
     check("adaptive ring on disk before", C.ADAPTIVE_PATH.exists())
 
+    # Stage 9 (F-136): the leftovers are face data too
+    C.EMBED_PATH.with_name(C.EMBED_PATH.name + ".tmp").write_bytes(b"t")
+    C.ADAPTIVE_PATH.with_name(C.ADAPTIVE_PATH.name + ".tmp").write_bytes(b"t")
+    dumps = C.APP_DIR / "debug_frames"
+    dumps.mkdir(exist_ok=True)
+    (dumps / "20260101-000000-000_verify0.npy").write_bytes(b"x")
     r = s._handle({"cmd": "clear_enrollment"}, None)
     check("reply ok", r.get("ok") is True and r.get("removed", 0) >= 4, r)
+    check("F-136: *.npz.tmp leftovers and frame dumps deleted too",
+          not C.EMBED_PATH.with_name(C.EMBED_PATH.name + ".tmp").exists()
+          and not C.ADAPTIVE_PATH.with_name(C.ADAPTIVE_PATH.name + ".tmp").exists()
+          and not (dumps / "20260101-000000-000_verify0.npy").exists())
     check("refs forgotten in memory", s.recog._refs is None and s.recog._enroll_refs is None)
     check("adaptive ring gone (memory + disk)",
           s.recog._adaptive.count == 0 and not C.ADAPTIVE_PATH.exists())
@@ -211,35 +221,71 @@ def test_clear_enrollment():
 # --- [4] F-12 -------------------------------------------------------------------------------------
 
 def test_replace():
-    print("[4] build_enrollment replace")
+    print("[4] build_enrollment replace -- atomic (Stage 9, R6 / F-132) and audited (D-82)")
     C.ENROLL_DIR.mkdir(parents=True, exist_ok=True)
     for n in ("old1.jpg", "old2.jpg"):
         (C.ENROLL_DIR / n).write_bytes(b"o")
     C.ENROLL_PENDING_DIR.mkdir(parents=True, exist_ok=True)
-    (C.ENROLL_PENDING_DIR / "new1.jpg").write_bytes(b"n")
+    for n in ("new1.jpg", "new2.jpg"):
+        (C.ENROLL_PENDING_DIR / n).write_bytes(b"n")
     s = _svc_with_real_recognizer()
     built: list = []
+    committed: list = []
 
     def fail(d):
         built.append(Path(d))
         raise RuntimeError("enrollment rejected: only 1 of 1 image(s) passed quality control")
 
-    s.recog.enroll_from_dir = fail
+    s.recog.build_gallery = fail
+    s.recog.commit_gallery = lambda e: committed.append(e.shape)
     r = s._handle({"cmd": "build_enrollment", "replace": True}, None)
     check("failed build -> ok:false", r.get("ok") is False, r)
-    check("built from the pending session only", built == [C.ENROLL_PENDING_DIR], built)
-    check("old images untouched on failure",
-          sorted(p.name for p in C.ENROLL_DIR.glob("*.jpg")) == ["old1.jpg", "old2.jpg"])
-    check("pending kept for another try", (C.ENROLL_PENDING_DIR / "new1.jpg").exists())
+    check("built from the pending session only", built[-1] == C.ENROLL_PENDING_DIR, built)
+    check("nothing committed, old images untouched, pending kept",
+          committed == [] and sorted(p.name for p in C.ENROLL_DIR.glob("*.jpg")) == ["old1.jpg", "old2.jpg"]
+          and (C.ENROLL_PENDING_DIR / "new1.jpg").exists())
+    check("the failed build is audited (D-82)",
+          s._audit.records[-1][0] == "enroll_build" and s._audit.records[-1][1]["ok"] is False,
+          s._audit.records[-1:])
+
+    # staging fails half way (a locked file): everything is rolled back, nothing committed
+    s.recog.build_gallery = lambda d: (np.ones((2, 512), np.float32), None)
+    real_replace = S.os.replace
+
+    def flaky(src, dst):
+        if Path(dst).name == "new2.jpg" and Path(dst).parent == C.ENROLL_DIR:
+            raise PermissionError(13, "locked", str(dst))
+        return real_replace(src, dst)
+
+    S.os.replace = flaky
+    try:
+        r = s._handle({"cmd": "build_enrollment", "replace": True}, None)
+    finally:
+        S.os.replace = real_replace
+    check("staging failure -> ok:false staging-failed", r == {"ok": False, "reason": "staging-failed"}, r)
+    check("... old images back in place, new ones back in pending, nothing committed",
+          sorted(p.name for p in C.ENROLL_DIR.glob("*.jpg")) == ["old1.jpg", "old2.jpg"]
+          and sorted(p.name for p in C.ENROLL_PENDING_DIR.glob("*.jpg")) == ["new1.jpg", "new2.jpg"]
+          and committed == [], (list(C.ENROLL_DIR.glob("*.jpg")), committed))
+
+    r = s._handle({"cmd": "build_enrollment", "replace": True}, None)
+    check("successful build -> replaced", r.get("ok") is True and r.get("replaced") is True
+          and r.get("count") == 2, r)
+    check("the new gallery was committed once", committed == [(2, 512)], committed)
+    check("old images removed, new promoted",
+          sorted(p.name for p in C.ENROLL_DIR.glob("*.jpg")) == ["new1.jpg", "new2.jpg"])
+    check("pending and retired folders removed",
+          not C.ENROLL_PENDING_DIR.exists() and not (C.ENROLL_DIR / ".retired").exists())
+    ev, rec = s._audit.records[-1]
+    check("audited: enroll_build replace ok", ev == "enroll_build" and rec.get("mode") == "replace"
+          and rec.get("ok") is True and rec.get("promoted") == 2, (ev, rec))
 
     s.recog.enroll_from_dir = lambda d: 1
-    r = s._handle({"cmd": "build_enrollment", "replace": True}, None)
-    check("successful build -> replaced", r.get("ok") is True and r.get("replaced") is True, r)
-    check("old images removed, new promoted",
-          sorted(p.name for p in C.ENROLL_DIR.glob("*.jpg")) == ["new1.jpg"])
-    check("pending directory removed", not C.ENROLL_PENDING_DIR.exists())
     r = s._handle({"cmd": "build_enrollment", "replace": "yes"}, None)
     check("replace must be literally true (else the ordinary build)", r.get("replaced") is None, r)
+    check("the ordinary build is audited too (D-82)",
+          s._audit.records[-1][0] == "enroll_build" and s._audit.records[-1][1]["mode"] == "add",
+          s._audit.records[-1:])
 
 
 # --- [5] F-31 -------------------------------------------------------------------------------------

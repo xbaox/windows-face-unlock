@@ -553,8 +553,8 @@ std::wstring TileText(Text id, const std::string& lang) {
 }
 
 Text FailureClass(const std::string& r) {
-    if (r == "no-match" || r == "gesture-failed" || r == "motion-before-prompt" ||
-        r == "screen-suspected")
+    if (r == "no-match" || r == "no-face" || r == "gesture-failed" ||
+        r == "motion-before-prompt" || r == "screen-suspected")
         return Text::NotRecognised;
     if (r == "locked-out") return Text::LockedOut;
     if (r == "pipe-unavailable" || r == "server-untrusted") return Text::Unavailable;

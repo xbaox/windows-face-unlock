@@ -201,7 +201,9 @@ def _save_language(code: str) -> None:
         cfg = Config.load()
         cfg.language = code
         cfg.validate()
-        cfg.save()
+        # Stage 9 (R9, B3-04): ONLY the language key is written -- the rest of the file (and a
+        # file with a bad value somewhere) is left exactly as it is; an unparsable file is refused.
+        cfg.save(keys=["language"])
     except Exception:
         log.exception("failed to persist language=%s", code)
 

@@ -206,6 +206,70 @@ def main():
     check("screen_features returns finite hf/peak/lap",
           all(np.isfinite(v) for v in f))
 
+    print("\nStage 9 (R4) GestureSequence: two movements, still start, checked order:")
+    from face_service.liveness import (GestureSequence, STILLNESS_WINDOW_S, STILLNESS_MAX_DEG,
+                                       ROUND_CAP_S, GESTURE_SEQUENCE_LEN, random_sequence,
+                                       GESTURE_KINDS)
+    check("ROUND_CAP_S = 0.4 + 2 x 5 + 2 = 12.4",
+          abs(ROUND_CAP_S - 12.4) < 1e-9 and GESTURE_SEQUENCE_LEN == 2
+          and STILLNESS_WINDOW_S == 0.4 and STILLNESS_MAX_DEG == 4.0)
+    for bad in ((Challenge.BLINK, Challenge.NOD), (Challenge.NOD, Challenge.NOD), (Challenge.NOD,)):
+        try:
+            GestureSequence(bad)
+            check(f"sequence {[k.name for k in bad]} refused", False)
+        except ValueError:
+            check(f"sequence {[k.name for k in bad]} refused", True)
+    draws = {random_sequence() for _ in range(60)}
+    check("random_sequence: two different kinds, never blink, all six orders appear",
+          all(len(d) == 2 and d[0] != d[1] and set(d) <= set(GESTURE_KINDS) for d in draws)
+          and len(draws) == 6)
+
+    def run_seq(kinds, poses, step=0.1, left_sign=None):
+        clk = FakeClock()
+        seq = GestureSequence(kinds, clock=clk, left_sign=left_sign)
+        for p in poses:
+            seq.feed(OPEN, p)
+            clk.tick(step)
+            if seq.done:
+                break
+        for _ in range(200):
+            if seq.done:
+                break
+            seq.tick()
+            clk.tick(step)
+        return seq
+
+    still = [pose()] * 6
+    ok = run_seq((Challenge.TURN_LEFT, Challenge.NOD),
+                 still + [pose(yaw=left_yaw)] * 4 + [pose(yaw=left_yaw, pitch=down_pitch)] * 4)
+    check("left then nod, in order -> PASSED", ok.passed and ok.steps_done == 2)
+    one = run_seq((Challenge.TURN_LEFT, Challenge.NOD), still + [pose(yaw=left_yaw)] * 4)
+    check("only the first movement -> FAILED on the second step's timeout",
+          not one.passed and one.steps_done == 1 and one.reason in ("gesture-timeout", "round-timeout"))
+    rev = run_seq((Challenge.TURN_LEFT, Challenge.NOD), still + [pose(pitch=down_pitch)] * 4)
+    check("the second movement first -> gesture-order", rev.reason == "gesture-order")
+    mv = run_seq((Challenge.NOD, Challenge.TURN_RIGHT),
+                 [pose(), pose(yaw=NEUTRAL[POSE_YAW] + STILLNESS_MAX_DEG + 1.0)] + still)
+    check("moving inside the first 0.4 s -> motion-before-prompt", mv.reason == "motion-before-prompt")
+    late = run_seq((Challenge.NOD, Challenge.TURN_RIGHT),
+                   still + [pose(yaw=NEUTRAL[POSE_YAW] + STILLNESS_MAX_DEG + 1.0)] * 2
+                   + [pose(pitch=down_pitch)] * 4 + [pose(pitch=down_pitch, yaw=right_yaw)] * 4)
+    check("small drift AFTER the still window is fine", late.passed)
+    slow = run_seq((Challenge.TURN_LEFT, Challenge.NOD), still + [pose()] * 200, step=0.1)
+    check("nothing happens -> FAILED by a timeout", not slow.passed and slow.reason in
+          ("gesture-timeout", "round-timeout"))
+    mirror_yaw = NEUTRAL[POSE_YAW] - (YAW_DELTA + 10)
+    mirror = still + [pose(yaw=mirror_yaw)] * 4 + [pose(yaw=mirror_yaw, pitch=down_pitch)] * 4
+    check("mirrored camera: a left turn read as negative yaw fails without calibration",
+          not run_seq((Challenge.TURN_LEFT, Challenge.NOD), mirror).passed)
+    check("... and passes with the calibrated sign (R6, B14 N-14)",
+          run_seq((Challenge.TURN_LEFT, Challenge.NOD), mirror, left_sign=-1.0).passed)
+    clk = FakeClock()
+    seq = GestureSequence((Challenge.TURN_LEFT, Challenge.NOD), clock=clk)
+    clk.tick(30.0)                      # a slow camera: nothing started yet
+    check("the clocks start at the first frame (F-140): nothing expires before it",
+          not seq.started and seq.tick() == ChallengeState.AWAITING)
+
     print("\nAll liveness self-tests passed.")
 
 

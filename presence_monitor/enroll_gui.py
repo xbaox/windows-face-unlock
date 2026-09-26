@@ -37,6 +37,7 @@ from PIL import Image, ImageTk
 from face_service.config import (ENROLL_DIR, ENROLL_PENDING_DIR, EMBED_PATH,
                                  WATCHDOG_PAUSE_PATH, Config)
 from face_service.detector import FaceDetector
+from face_service import imio
 from face_service.enroll_qc import frame_quality, qc_reasons
 from face_service.i18n import set_language, t
 
@@ -685,6 +686,11 @@ class EnrollWindow:
         drawing in _annotate crosses into preview space.
         """
         if not rows:
+            # Stage 9 (F-191): a detector that could not start is not "no face" -- say so, once
+            # logged at ERROR by the detector itself, instead of asking the user to look at the
+            # camera forever.
+            if getattr(self.detector, "unavailable", None):
+                return CoachState("enroll.coach.detector_unavailable", False, "err")
             return CoachState("enroll.status.waiting", False, "err")
 
         row = self._largest_row(rows)
@@ -826,7 +832,11 @@ class EnrollWindow:
         try:
             self._capture_dir.mkdir(parents=True, exist_ok=True)
             path = self._capture_dir / f"enroll_{int(now * 1000)}.jpg"
-            cv2.imwrite(str(path), frame)
+            # Stage 9 (R8, F-116): Unicode-safe, and the result is CHECKED -- cv2.imwrite used to
+            # return False on any non-ASCII profile path and the frame was counted anyway.
+            if not imio.imwrite(path, frame):
+                log.error("enroll: could not save %s -- the frame is not counted", path.name)
+                return
             self._captured += 1
             self._last_capture_ts = now
             log.info("enroll: saved %s (%d/%d)", path.name, self._captured, self._target)

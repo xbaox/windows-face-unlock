@@ -2,7 +2,7 @@
 
 Isolated FACE_UNLOCK_HOME so the real ~/.face-unlock is never touched.
   [f] fresh save -> v2 blob + pipe_entropy.bin locked to SELF+SYSTEM (no Everyone) + round-trip
-  [g] legacy v1 blob -> load migrates to v2 once (plaintext correct; second load reads v2 directly)
+  [g] legacy v1 blob -> no longer read (Stage 9, D-69); [g2] the password-rejected flag (§2.1)
   [h] corrupt / missing blob -> load_password returns None (never raises) -> unlock degrades cleanly
   [i] pipe_entropy.bin descriptor grants only SELF + SYSTEM
   [j] Stage 8b (F-23): "locked" now means PROTECTED (the P flag) and no BUILTIN\\Users ACE -- also
@@ -87,18 +87,30 @@ def main() -> int:
     check("entropy DACL = SELF+SYSTEM only", _dacl_self_system_only(sddl_f, ss), sddl_f)
     check("round-trips", C.load_password() == {"u": "admin", "p": "secretpw", "d": "."})
 
-    print("[g] legacy v1 -> migrate to v2 once")
+    print("[g] legacy v1 is no longer read (Stage 9, act 9b §2.5 / D-69)")
     _reset()
     plain = json.dumps({"u": "u1", "p": "p1", "d": "."}).encode("utf-8")
-    v1 = win32crypt.CryptProtectData(plain, "face-unlock", C.ENTROPY, None, None, 0)
+    v1 = win32crypt.CryptProtectData(plain, "face-unlock", b"face-unlock:v1", None, None, 0)
     C.CREDS_PATH.parent.mkdir(parents=True, exist_ok=True)
     C.CREDS_PATH.write_bytes(v1)
     check("crafted blob is v1 (no marker)", not C.CREDS_PATH.read_bytes().startswith(b"v2:"))
-    first = C.load_password()
-    check("v1 load returns correct plaintext", first == {"u": "u1", "p": "p1", "d": "."}, first)
-    check("blob migrated to v2 on disk", C.CREDS_PATH.read_bytes().startswith(b"v2:"))
-    check("entropy secret generated during migration", C.ENTROPY_PATH.exists())
-    check("second load reads v2 directly (same value)", C.load_password() == first)
+    check("v1 blob -> None (no-credentials), never decrypted", C.load_password() is None)
+    check("the v1 blob is left as it was (not rewritten)", C.CREDS_PATH.read_bytes() == v1)
+    check("the public v1 constant is gone from the module", not hasattr(C, "ENTROPY"))
+    C.save_password("u2", "p2", ".")
+    check("saving again writes a v2 blob that reads back",
+          C.CREDS_PATH.read_bytes().startswith(b"v2:") and C.load_password()["u"] == "u2")
+
+    print("[g2] the lock screen's password-rejected flag (Stage 9, §2.1)")
+    _reset()
+    C.save_password("u", "p", ".")
+    C.mark_password_rejected()
+    check("flag set", C.password_rejected())
+    C.save_password("u", "p-new", ".")
+    check("saving a new password clears the flag", not C.password_rejected())
+    C.mark_password_rejected()
+    C.clear_password()
+    check("clearing the password clears the flag too", not C.password_rejected())
 
     print("[h] corrupt / missing -> None (no crash)")
     _reset()
@@ -140,7 +152,7 @@ def main() -> int:
     if FAILS:
         print(f"\nCREDENTIALS SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")
         return 1
-    print("\nCREDENTIALS SELFTEST OK: v2 per-install entropy; one-time v1->v2 migration; corrupt/"
+    print("\nCREDENTIALS SELFTEST OK: v2 per-install entropy; v1 no longer read; rejected-password flag; corrupt/"
           "missing degrade to None; the entropy file and the blob are locked to SELF+SYSTEM "
           "(protected, no BUILTIN\\Users), including over files that already existed.")
     return 0

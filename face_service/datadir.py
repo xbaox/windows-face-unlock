@@ -221,6 +221,37 @@ def _foreign_aces(dacl, allowed) -> int:
     return n
 
 
+# Stage 9 (F-100): an entry another process deleted or renamed between the listing and the open is
+# not a custody problem -- it is simply gone (the tray rolls presence.log over, the watchdog drops
+# an expired pause file, a Settings save replaces config.toml while the service starts).
+_VANISHED = (2, 3)      # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+
+
+def _take_ownership(path: str, t: "_Targets", rep: CustodyReport) -> None:
+    """Stage 9 (F-99): an object owned by another account (e.g. created by it under a 0.1.0-era
+    Users:Modify directory) is taken over by SELF -- the DACL written just before grants SELF
+    WRITE_OWNER, and setting the owner to one's own SID needs no privilege. If that is refused the
+    verification walk still reports the foreign owner and custody fails closed."""
+    try:
+        h = _open_no_follow(path, win32con.READ_CONTROL | win32con.WRITE_OWNER)
+    except pywintypes.error:
+        return
+    try:
+        sd = win32security.GetKernelObjectSecurity(h, _OWNER)
+        owner = win32security.ConvertSidToStringSid(sd.GetSecurityDescriptorOwner())
+        if owner in t.allowed:
+            return
+        new = win32security.SECURITY_DESCRIPTOR()
+        new.SetSecurityDescriptorOwner(win32security.ConvertStringSidToSid(t.self_sid), False)
+        win32security.SetKernelObjectSecurity(h, _OWNER, new)
+        rep.rewritten += 1
+        log.info("custody: took ownership of %s from %s", path, owner)
+    except pywintypes.error as e:
+        log.warning("custody: could not take ownership of %s (winerror=%d)", path, e.winerror)
+    finally:
+        win32file.CloseHandle(h)
+
+
 def _heal_one(path: str, kind: str, t: _Targets, rep: CustodyReport) -> "bool | None":
     """Re-secure one object through a no-follow handle. Returns True for a directory the walk may
     descend into, False for a file, None for an object that must not be touched (reparse point,
@@ -229,6 +260,8 @@ def _heal_one(path: str, kind: str, t: _Targets, rep: CustodyReport) -> "bool | 
     try:
         h = _open_no_follow(path, win32con.READ_CONTROL | win32con.WRITE_DAC)
     except pywintypes.error as e:
+        if kind != "root" and e.winerror in _VANISHED:
+            return None                                  # F-100: gone since the listing
         rep.problems.append("cannot open %s (winerror=%d)" % (path, e.winerror))
         return None
     try:
@@ -255,6 +288,7 @@ def _heal_one(path: str, kind: str, t: _Targets, rep: CustodyReport) -> "bool | 
             rep.rewritten += 1
             if target is t.secret:
                 rep.relocked += 1
+        _take_ownership(path, t, rep)
         return is_dir
     except pywintypes.error as e:
         rep.problems.append("cannot re-secure %s (winerror=%d)" % (path, e.winerror))
@@ -290,6 +324,8 @@ def verify_data_dir(app_dir, self_sid: "str | None" = None) -> list:
         try:
             h = _open_no_follow(path, win32con.READ_CONTROL)
         except pywintypes.error as e:
+            if kind != "root" and e.winerror in _VANISHED:
+                return None                              # F-100: gone since the listing
             problems.append("cannot open %s (winerror=%d)" % (path, e.winerror))
             return None
         try:
@@ -342,11 +378,21 @@ def verify_data_dir(app_dir, self_sid: "str | None" = None) -> list:
     return problems
 
 
-def heal_data_dir(app_dir) -> CustodyReport:
+def heal_data_dir(app_dir, _retry: bool = True) -> CustodyReport:
     """Heal, then verify, the custody of ``app_dir``. Never raises; the report says what happened.
 
     Logs ONE INFO line with the outcome on success and ONE ERROR line on failure; the caller turns
-    ``ok=False`` into the ``custody`` refusal (Stage 9, R9; the wire token was insecure-data-dir)."""
+    ``ok=False`` into the ``custody`` refusal (Stage 9, R9; the wire token was insecure-data-dir).
+    Stage 9 (F-100): a failed heal is retried ONCE after a short pause -- a file caught mid-delete
+    (ACCESS_DENIED while delete-pending) no longer costs a whole session of "custody"."""
+    if _retry:
+        first = heal_data_dir(app_dir, _retry=False)
+        if first.ok:
+            return first
+        import time as _time
+        _time.sleep(0.5)
+        log.info("data dir custody: retrying the heal once")
+        return heal_data_dir(app_dir, _retry=False)
     rep = CustodyReport()
     root = str(app_dir)
     try:

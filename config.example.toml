@@ -21,7 +21,6 @@
 # the enrollment wizard's live preview.
 # Neither is selectable from config -- there is no model/backend knob.
 
-distance_metric = "cosine"       # embedding distance function
 threshold = 0.32                 # cosine distance cutoff; LOWER = stricter.
                                  # Measured on the reference webcam: genuine
                                  # self <= ~0.12, impostor >= ~0.97. Do not
@@ -65,14 +64,16 @@ warmup_on_start = true           # preload models when the service starts, so
                                  # the first unlock is not the slow one
 
 # --- Liveness ----------------------------------------------------------------
-# Active challenge (blink / head gesture) built on InsightFace landmarks.
+# Active challenge: two head movements (turn left / turn right / nod) in a random
+# order, built on InsightFace landmarks. A blink is only a passive signal.
 
-liveness_mode = "fast"           # "fast"     = challenge only when the match is
-                                 #              in doubt
-                                 # "paranoid" = challenge on every unlock
+liveness_mode = "paranoid"       # "paranoid" = the head movements on every unlock
+                                 #              (default, and the safer choice)
+                                 # "fast"     = only when the match is in doubt --
+                                 #              LESS SECURE: a clean replay with a
+                                 #              strong match passes without them
 challenge_on_doubt = true        # fast mode: on doubt, escalate to a gesture
                                  # instead of denying outright
-blink_timeout_s = 4.0            # window for observing a spontaneous blink
 anti_screen = true               # passive replay check (moire / glare of a
                                  # display held up to the camera)
 

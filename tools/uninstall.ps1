@@ -151,7 +151,7 @@ $fuBuildCp  = Join-Path $fuRepoRoot 'build-cp'
 #
 # STEMS, not exact names. The field turned up credentials.bin.bak and
 # credentials.bin.pre-stage4 next to the live blob (pre-Stage-4 v1 copies, decryptable
-# with the constant printed in face_service/credentials.py:33) and embeddings.npz.bak
+# with a public constant that face_service/credentials.py carried until Stage 9) and embeddings.npz.bak
 # next to the live template. Nothing in this repo writes any of them, which is exactly
 # why an exact-name list cannot work: it can only chase spellings someone has already
 # seen, and the next one is missed the same way. Anything called <stem>* IS the thing

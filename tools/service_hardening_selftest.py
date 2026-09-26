@@ -120,7 +120,7 @@ def test_screen_in_round():
             if self.n <= 0:
                 return None
             self.n -= 1
-            return np.zeros((4, 4, 3), np.uint8)
+            return np.full((4, 4, 3), 100, np.uint8)   # lit, not black (a black round is no-frames)
 
         def close(self):
             pass
@@ -136,15 +136,14 @@ def test_screen_in_round():
     cam = _Cam(12)
     s._acquire_camera = lambda: (cam, False)
     s._note_camera_health = lambda *a: False
-    real_feed = S.__dict__.get("LivenessChallenge")
     from face_service import liveness as L
-    orig = L.LivenessChallenge.feed
-    L.LivenessChallenge.feed = lambda self, lm, pose: fed.append(1)
-    clock = [time.monotonic()]
+    orig, orig_cap = L.GestureSequence.feed, L.ROUND_CAP_S
+    L.GestureSequence.feed = lambda self, lm, pose: fed.append(1)
+    L.ROUND_CAP_S = 0.5            # keep the (real-clock) round short in this test
     try:
-        r = s._run_challenge("blink", identity=True)
+        r = s._run_challenge("turn_left,nod", identity=True)
     finally:
-        L.LivenessChallenge.feed = orig
+        L.GestureSequence.feed, L.ROUND_CAP_S = orig, orig_cap
     check("no screen-flagged frame reached the task", fed == [], len(fed))
     check("identity_frames counts none of them", r.get("identity_frames") == 0, r)
 
@@ -155,7 +154,7 @@ LIVE_8A_CONFIG = dict(   # the value types of the live config.toml as dumped in 
     threshold=0.32, camera_index=0, camera_warmup_frames=10, verify_frames=5, verify_required=2,
     presence_interval_s=60, presence_absent_strikes=2, presence_fullscreen_strikes=10,
     presence_soft_margin=0.05, presence_uncertain_streak=3, presence_confirm_delay_s=2.0,
-    liveness_mode="paranoid", blink_timeout_s=4.0, max_face_attempts=5, lockout_seconds=300,
+    liveness_mode="paranoid", max_face_attempts=5, lockout_seconds=300,
     audit_max_mb=5.0, enroll_min_det_score=0.65, enroll_min_sharpness=80.0, enroll_luma_min=55.0,
     enroll_luma_max=210.0, enroll_min_frames=3, adaptive_gallery=True, adaptive_margin=0.17,
     adaptive_max_size=10, adaptive_cooldown_s=1800.0, low_light_luma_min=45.0,
@@ -180,7 +179,7 @@ def test_validation():
         check("the live 8a config values still validate", True)
     except Exception as e:
         check("the live 8a config values still validate", False, repr(e))
-    for name, bad in (("blink_timeout_s", math.nan), ("presence_confirm_delay_s", math.inf),
+    for name, bad in (("low_light_exposure_step", math.nan), ("presence_confirm_delay_s", math.inf),
                       ("presence_input_idle_s", math.nan), ("adaptive_cooldown_s", -math.inf),
                       ("audit_max_mb", "5"), ("threshold", True)):
         check(f"{name}={bad!r} rejected", _rejects(**{name: bad}))
@@ -309,17 +308,25 @@ def test_deadline_and_delivery():
         check("nothing released", released == [], released)
         check("no reset, no strike", s._lockout.records == [], s._lockout.records)
         g = _svc()
-        g._gesture_slot = {"token": "a" * 32, "kind": "blink", "expires": 1e18}
+        g._gesture_slot = {"token": "a" * 32, "kind": "turn_left,nod", "expires": 1e18}
         g._run_challenge = lambda k, *, identity=False: {
             "ok": True, "challenge": k, "prompt": "x", "passed": True, "state": "passed",
-            "identity_frames": 5, "distance_best": 0.05}
+            "identity_frames": 5, "distance_best": 0.05, "faces": 5, "screen_checked": 5,
+            "screen_flagged": 0, "scene_luma": 90.0}
         g._req_started = time.monotonic() - (S.UNLOCK_GESTURE_DEADLINE_S + 0.5)
         r = g._handle({"cmd": "unlock_gesture", "v": 2, "token": "a" * 32}, None)
-        check("unlock_gesture past 14 s -> deadline-exceeded",
+        check("unlock_gesture past its deadline -> deadline-exceeded",
               r.get("reason") == "deadline-exceeded" and released == [] and g._lockout.records == [],
               (r, g._lockout.records))
-        check("constants are 11.0 / 14.0 (below the CP's 12 / 15 s)",
-              (S.UNLOCK_DEADLINE_S, S.UNLOCK_GESTURE_DEADLINE_S) == (11.0, 14.0))
+        check("constants are 11.0 / 17.0 (below the CP's 12 / 18 s; Stage 9 R4 round 12.4 s)",
+              (S.UNLOCK_DEADLINE_S, S.UNLOCK_GESTURE_DEADLINE_S) == (11.0, 17.0))
+        # Stage 9 (F-61): the client's own budget caps the deadline too
+        c = _svc()
+        c._capture_and_verify = lambda: VerifyOutcome(True, 0.05, True, {"verdict": "PASS"})
+        c._req_started = time.monotonic() - 3.0
+        r = c._handle({"cmd": "unlock", "v": 2, "budget_ms": 3000}, None)
+        check("budget_ms 3000 read 3 s ago -> deadline-exceeded (min(11 s, 3 - 0.5 s))",
+              r.get("reason") == "deadline-exceeded", r)
 
         # (b) delivered grant through the real serve loop
         name = r"\\.\pipe\FaceUnlockSelftest-" + uuid.uuid4().hex
