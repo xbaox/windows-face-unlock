@@ -1,72 +1,72 @@
 """Named pipe server exposing face verification + credential retrieval.
 
-Protocol: line-delimited JSON.  Client sends {"cmd": "...", ...}, server replies
-with a single JSON line and closes the connection.
+Protocol: one JSON object per message, both ways. The client sends {"cmd": "...", ...}; the server
+answers with ONE JSON object and the client closes. Every reply carries "v" (the protocol version,
+2) and "lang" (the UI language the lock-screen tile should use: "en" or "ru"). Transport-level
+replies to any request: {"ok":false,"reason":"bad-request"} (not UTF-8 / not JSON / not an object),
+{"ok":false,"reason":"unknown-command"}, {"ok":false,"reason":"internal-error"} (a handler fault;
+the details go to the log only).
 
-Commands:
+Who may call (Stage 9): the pipe admits the owner (SELF) and SYSTEM only, never a network client.
+unlock, unlock_gesture and report_result additionally require a SYSTEM caller (the lock-screen
+Credential Provider inside LogonUI) and protocol v2; verify requires SELF. No config key changes
+any of this. A service that does not run as the recorded owner, or cannot secure its data
+directory, is "refusing": ping says so and every face function answers the refusal reason.
+
+Refusal reasons shared by the face functions: "not-owner" (R1) | "custody" (R9, was
+"insecure-data-dir").
+
   {"cmd":"ping"}
-      -> {"ok":true,"pong":true}
-  {"cmd":"verify"}
-      -> {"ok":true,"match":bool,"distance":float,"real":bool,"verdict":str}
-                               # "verdict" is the liveness verdict name: PASS | NEEDS_GESTURE |
-                               # NOT_LIVE (from the burst), or SKIPPED (camera leased / busy).
-                               # It exists because match:false alone is ambiguous -- in paranoid
-                               # EVERY recognized face verdicts NEEDS_GESTURE, so a genuine user
-                               # and a stranger both report match:false. Diagnostic/telemetry
-                               # only: it grants nothing and gates nothing.
-  {"cmd":"unlock"}             # verify + return credentials on success
-                               # UNCHANGED by the verify addition above: unlock keeps its own,
-                               # older discriminator (reason "needs-gesture" + gesture/prompt/
-                               # token below), and no verdict field was added to any reply here.
-      -> {"ok":true,"username":"...","password":"...","domain":"..."}  (on match)
-      -> {"ok":false,"reason":"needs-gesture","gesture":"blink|turn_left|turn_right|nod",
-          "prompt":str,"token":"<32 hex>","ttl_s":float,"distance":float,"real":bool}
-                               # Stage 7-i phase 1: recognized, but liveness wants an ACTIVE
-                               # gesture -> answer with `unlock_gesture` carrying the token.
-      -> {"ok":false,"reason":"..."}   # "no-match" | "no-credentials" | "locked-out" (+retry_after_s)
-                                       # | "not-authorized" | "camera-busy" | "too-dark"
-                                       # | "insecure-data-dir" (Stage 8b: the data directory could
-                                       #   not be secured at start-up; see face_service/datadir.py)
-  {"cmd":"unlock_gesture","token":"<32 hex>"}   # Stage 7-i phase 2: run the gesture phase 1
-                               # asked for; credentials only if it is performed BY THE FACE
-                               # THAT MATCHED (non-matching frames are dropped, not fed).
-      -> {"ok":true,"username":"...","password":"...","domain":"..."}
-      -> {"ok":false,"reason":"gesture-failed","challenge":str,"state":str,"identity_frames":int}
-      -> {"ok":false,"reason":"gesture-token-invalid"}   # absent / wrong / expired / already used
-      -> {"ok":false,"reason":"..."}   # "not-authorized" | "locked-out" (+retry_after_s)
-                                       # | "camera-busy" | "no-credentials" | "insecure-data-dir"
-  (reset_lockout was REMOVED in Stage 8b, F-21: an ungated, unaudited way for any same-user
-   process to clear the face lockout, with no caller anywhere in the repo.)
-  {"cmd":"presence"}           # single-frame presence probe
-      -> {"ok":true,"present":bool,"real":bool,"mode":"recognition|detection"}
-  {"cmd":"challenge","kind":"blink|turn_left|turn_right|nod"}   # active-gesture probe
-                               # ("kind" optional -> random). Dev/diagnostic only: NOT wired to
-                               # unlock and NOT identity-bound -- the authenticating gesture
-                               # round is `unlock_gesture` above.
-      -> {"ok":true,"challenge":str,"prompt":str,"passed":bool,"state":str}
-  {"cmd":"status"}             # service metadata for GUI
-      -> {"ok":true,"uptime_s":float,"config":{...},"enrollment":bool,
-          "lockout":{...},"audit":{...}}
-  {"cmd":"reload_config"}      # re-read config.toml from disk
-      -> {"ok":true,"config":{...}}
-  {"cmd":"pause_camera","seconds":120}   # release webcam for N seconds so
-                                          # the enrollment GUI can own it
-      -> {"ok":true,"paused_until":float}  # time.monotonic() deadline: PROCESS-LOCAL, counted
-                                           # from boot, NOT an epoch. Compare it only against
-                                           # this service's own clock; never format it as a date.
-  {"cmd":"resume_camera"}                 # clear the camera lease early
-      -> {"ok":true}
-  {"cmd":"build_enrollment"}              # (re)compute embeddings from ENROLL_DIR
-      -> {"ok":true,"count":int} | {"ok":false,"reason":str}
-  {"cmd":"build_enrollment","replace":true}   # Stage 8b: build from ENROLL_PENDING_DIR; only on
-      -> {"ok":true,"count":int,"replaced":true}  # success are the old images removed and the new
-                                              # session promoted (an interrupted re-enroll keeps
-                                              # the old gallery)
-  {"cmd":"clear_enrollment"}              # Stage 8b: forget the gallery now (refs + adaptive ring),
-      -> {"ok":true,"removed":int} | {"ok":false,"reason":str}   # delete embeddings.npz and the
-                                              # enroll tree (reparse-safe), audit it
-  {"cmd":"shutdown"}           # stop the service cleanly (tray Quit uses this)
+      -> {"ok":true,"pong":true,"state":"serving"}
+      -> {"ok":true,"pong":true,"state":"refusing","why":"not-owner|custody"}
+  {"cmd":"status"}
+      -> {"ok":true,"uptime_s":float,"config":{...},"enrollment":bool,"lockout":{...},
+          "audit":{...},"data_dir_secure":bool,"state":str[,"why":str],
+          "password_rejected":bool,"protocol":2}
+  {"cmd":"reload_config"}
+      -> {"ok":true,"config":{...}} | {"ok":false,"reason":"invalid-config: ...|reload-failed: ..."}
+  {"cmd":"shutdown"}
       -> {"ok":true,"shutting_down":true}
+  {"cmd":"pause_camera","seconds":120}   # release the webcam to the enrollment wizard
+      -> {"ok":true,"paused_until":float}  # time.monotonic() deadline: PROCESS-LOCAL
+      -> {"ok":false,"reason":"bad-request"}   # not a finite number (clamped to [5, 600] s)
+  {"cmd":"resume_camera"}
+      -> {"ok":true}
+  {"cmd":"build_enrollment"[,"replace":true]}
+      -> {"ok":true,"count":int[,"replaced":true][,"pose":{...}]} | {"ok":false,"reason":str}
+  {"cmd":"clear_enrollment"}
+      -> {"ok":true,"removed":int} | {"ok":false,"reason":"partial","removed":int}
+  {"cmd":"verify"}             # SELF only; diagnostic: grants nothing, no strike, no secret
+      -> {"ok":true,"match":bool,"distance":float,"real":bool,"verdict":str}
+                               # verdict: PASS | NEEDS_GESTURE | NOT_LIVE | SKIPPED
+  {"cmd":"presence"}           # single-burst presence probe
+      -> {"ok":true,"present":bool,"real":bool,"mode":"recognition|detection",
+          "state":"present|uncertain|absent"}
+      -> {"ok":false,"reason":"engine-error","present":false,"real":false,"mode":str,"state":"error"}
+
+  {"cmd":"unlock","v":2,"budget_ms":int}          # SYSTEM only. Phase 1 (passive burst).
+      -> {"ok":true,"username":str,"password":str,"domain":str,"grant_id":"<32 hex>"}
+      -> {"ok":false,"reason":"needs-gesture","gesture":str,"prompt":str,"token":"<32 hex>",
+          "ttl_s":float,"distance":float,"real":bool}
+      -> {"ok":false,"reason":"locked-out","retry_after_s":float}
+      -> {"ok":false,"reason":"no-match"|"too-dark","distance":float,"real":bool}
+      -> {"ok":false,"reason":"not-authorized"|"version-mismatch"|"bad-request"|"not-owner"
+          |"custody"|"password-rejected"|"camera-busy"|"no-frames"|"no-enrollment"
+          |"engine-error"|"deadline-exceeded"|"no-credentials"}
+  {"cmd":"unlock_gesture","v":2,"token":"<32 hex>","budget_ms":int}   # SYSTEM only. Phase 2.
+      -> {"ok":true,"username":str,"password":str,"domain":str,"grant_id":"<32 hex>"}
+      -> {"ok":false,"reason":"gesture-failed","challenge":str,"state":str,"identity_frames":int}
+      -> {"ok":false,"reason":"gesture-token-invalid"|"locked-out"(+retry_after_s)|...as unlock}
+  {"cmd":"report_result","v":2,"grant_id":"<32 hex>","ok":bool}   # SYSTEM only.
+      -> {"ok":true} | {"ok":false,"reason":"grant-unknown"}
+         ok=true: the grant is committed (lockout reset, audit "granted", gallery adaptation).
+         ok=false: Windows rejected the stored password -> a persistent flag; unlock answers
+         "password-rejected" until a new password is saved. No report within 30 s: the grant is
+         abandoned and nothing is committed.
+
+Deadlines: the service counts from the moment it READ the request and fails closed after
+min(11 s / 14 s, budget_ms - 500 ms) for unlock / unlock_gesture.
+(reset_lockout was removed in Stage 8b, F-21; the dev-only challenge command in Stage 9, F-67.)
 """
 from __future__ import annotations
 import json
@@ -94,7 +94,8 @@ def win32api_get_last_error() -> int:
 
 from .camera import Camera
 from .config import Config, APP_DIR, LOG_PATH, LOCKOUT_PATH, AUDIT_PATH, PIPE_NAME
-from .credentials import load_password
+from .credentials import load_password, mark_password_rejected, password_rejected
+from .identity import SYSTEM_SID, current_user_sid, owner_check
 from .datadir import (DUMP_NAME_RE, heal_data_dir, is_reparse, purge_debug_frames,
                       remove_tree_no_follow)
 from .detector import FaceDetector
@@ -141,7 +142,7 @@ PAUSE_CAMERA_MAX_S = 600.0
 LOG_CMD_MAX = 64
 
 # Well-known SID for the lockscreen Credential Provider: LogonUI loads the CP DLL as SYSTEM.
-SYSTEM_SID_STRING = "S-1-5-18"
+SYSTEM_SID_STRING = SYSTEM_SID
 
 # How many files the debug_frames ring keeps (7h). Files, not frames: each dump writes a .npy and
 # a .png, so this is ~20 frames. Deliberately NOT a config knob -- cfg.debug_dump_frames already
@@ -152,43 +153,29 @@ DEBUG_DUMP_RING_MAX = 40
 # CreateNamedPipe openMode flag (anti-squatting, Stage 4 Step 4): CreateNamedPipe fails if an
 # instance of the name already exists. pywin32 312 does not export it, so define the literal.
 FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+# Stage 9 (R2, F-55): pipe-mode flag -- the pipe refuses clients that connect over the network (an
+# SMB client with the user's password or hash). Not exported by pywin32 either.
+PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+# Stage 9 (R2, F-54 / F-56): two instances at most -- the one serving a client and the next one,
+# created BEFORE the served one is closed, so the name is never free between two connections. The
+# old PIPE_UNLIMITED_INSTANCES let any SELF process add parallel instances at will.
+PIPE_MAX_INSTANCES = 2
 
-# The two config keys that ARE the Stage-4 channel perimeter. Both are booleans where True is
-# the hardened value, and both are subject to the reload ratchet in _apply_posture_ratchet.
-#
-# Why a ratchet exists at all (Stage 7e-2): config.toml lives in the profile of the very user
-# whose password is at stake, and `reload_config` is deliberately NOT SID-gated -- only `unlock`
-# and `unlock_gesture` are, every other command being scoped by the pipe DACL instead. Those two
-# facts compose into a way AROUND the SYSTEM gate that needs no SYSTEM at all: write
-# pipe_unlock_require_system = false, send {"cmd":"reload_config"} as SELF, then send
-# {"cmd":"unlock"} as SELF. Same trick disarms the pipe descriptor via pipe_hardened_sd.
-#
-# So reload may only ever TIGHTEN these two. True -> False is refused (loudly, and only for the
-# key concerned); False -> True is applied like any other key. Everything else reloads exactly
-# as it did before.
-#
-# UNCONDITIONAL BY DESIGN -- there is no config flag to disable the ratchet, because such a flag
-# would live in the same file the ratchet exists to distrust.
-#
-# Stage 8b (F-20, act A-2): pipe_first_instance joins them. Defect: it was the one perimeter toggle
-# outside the ratchet, and it also gates the clients' server-SID check. Consequence: a same-user
-# reload could switch the anti-squatting flag off at runtime. Fix: the same one-way rule.
-POSTURE_KEYS = ("pipe_unlock_require_system", "pipe_hardened_sd", "pipe_first_instance")
+# Stage 9 (§2.1): the service <-> Credential Provider contract version. unlock, unlock_gesture and
+# report_result must carry "v": 2; every reply carries "v" and "lang". A mismatch is refused with
+# "version-mismatch" and the tile asks the user to update Face Unlock -- nothing is packed.
+PROTOCOL_VERSION = 2
+# The CP sends its remaining budget as "budget_ms"; the service keeps this much of it for the reply
+# to travel back, i.e. it uses min(own deadline, budget_ms - 500 ms).
+CLIENT_BUDGET_RESERVE_S = 0.5
+CLIENT_BUDGET_MAX_MS = 120_000
+# A delivered grant waits this long for the CP's report_result. Without it the grant counts as
+# abandoned: no lockout reset, no gallery adaptation (F-60 / F-93).
+GRANT_REPORT_TTL_S = 30.0
 
-
-def _current_user_sid_string() -> str:
-    """String SID (S-1-5-21-...) of the account this process runs as (SELF).
-
-    OpenProcessToken(current, TOKEN_QUERY) -> GetTokenInformation(TokenUser) -> ConvertSidToStringSid.
-    Raises on failure so a missing/broken SID fails loud at pipe creation rather than silently
-    dropping back to an unusable descriptor.
-    """
-    th = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
-    try:
-        sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
-    finally:
-        win32api.CloseHandle(th)
-    return win32security.ConvertSidToStringSid(sid)
+# Commands polled on a timer (watchdog, monitor, tray); logged at DEBUG so the log is not a ping
+# counter (D-45).
+ROUTINE_COMMANDS = ("ping", "status")
 
 
 def _pipe_client_sid_string(handle) -> "str | None":
@@ -200,8 +187,8 @@ def _pipe_client_sid_string(handle) -> "str | None":
     as a Limited user, and OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) on a SYSTEM client (the
     lockscreen CP inside LogonUI) is denied -- the old GetNamedPipeClientProcessId->OpenProcess chain
     therefore resolved a genuine SYSTEM caller to None and wrongly failed the SID-gate. Reading the
-    SID needs no privilege (SecurityIdentification suffices; the CP opens the pipe without
-    SECURITY_SQOS_PRESENT, so the default SecurityImpersonation is offered). The unlock handler has
+    SID needs no privilege: SecurityIdentification suffices, and that is all the CP offers -- it opens
+    the pipe with SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION (8b F-26; D-49). The unlock handler has
     already read the request off this handle before the gate runs, so the impersonation precondition
     (a message must have been read) is met, and impersonation happens on that same serve thread.
 
@@ -317,40 +304,24 @@ def _pipe_client_diag(handle) -> str:
     return f"pid={pid} image={image} integrity={integrity} session={session} openable={openable}"
 
 
-def _build_sa_everyone_legacy() -> win32security.SECURITY_ATTRIBUTES:
-    """LEGACY (rollback path, cfg.pipe_hardened_sd=False): NULL DACL = allow ALL (Everyone).
+def _build_pipe_sa() -> win32security.SECURITY_ATTRIBUTES:
+    """Security attributes for the named pipe -- always hardened (Stage 9, R2: the legacy NULL-DACL
+    rollback and its pipe_hardened_sd toggle are gone, F-68).
 
-    Kept verbatim so the hardened default in _build_pipe_sa can be turned off without a code change.
-    """
-    sd = win32security.SECURITY_DESCRIPTOR()
-    sd.SetSecurityDescriptorDacl(1, None, 0)  # NULL DACL = allow all (OK for named pipe on localhost)
-    sa = win32security.SECURITY_ATTRIBUTES()
-    sa.SECURITY_DESCRIPTOR = sd
-    sa.bInheritHandle = 0
-    return sa
-
-
-def _build_pipe_sa(cfg: Config) -> win32security.SECURITY_ATTRIBUTES:
-    """Security attributes for the named pipe.
-
-    cfg.pipe_hardened_sd=False -> legacy NULL DACL (Everyone), for rollback.
-    True (default) -> an explicit descriptor built from an SDDL string:
-      * DACL: SELF (this user) = GENERIC_ALL -- owner/server; GA is needed so the per-connection
-              re-create of the pipe instance works under the SELF token (FILE_CREATE_PIPE_INSTANCE).
-              SYSTEM = GENERIC_READ|GENERIC_WRITE -- the lockscreen CP (LogonUI) connects as SYSTEM
-              (not bare GR: a duplex client needs read+write+SYNCHRONIZE, which GRGW maps in).
-              NO Everyone ACE -> every OTHER non-admin user is denied by the implicit deny.
+      * Owner: SELF, explicitly, so a client can check the pipe OBJECT's owner (F-64) and get the
+              same answer whether or not the service token is elevated.
+      * DACL: NETWORK denied first (F-55) -- a network logon of the owner's own account matches
+              SELF, so without this ACE an SMB client holding the password could drive the pipe.
+              SELF = GENERIC_ALL (the server itself: re-creating the instance needs
+              FILE_CREATE_PIPE_INSTANCE). SYSTEM = GENERIC_READ|GENERIC_WRITE -- the lock-screen
+              CP inside LogonUI. No Everyone ACE: every other account hits the implicit deny.
       * SACL: a Medium mandatory label with NoReadUp+NoWriteUp -> a same-user LOW-integrity process
-              cannot read/write the pipe; SYSTEM and our Medium clients sit at/above Medium so they
-              pass. ME (Medium) is deliberate -- labelling LW (Low) would defeat the point.
-    SetEntriesInAcl is not exported by pywin32, so the descriptor is assembled from SDDL via
-    ConvertStringSecurityDescriptorToSecurityDescriptor (present in pywin32 312).
-    """
-    if not cfg.pipe_hardened_sd:
-        return _build_sa_everyone_legacy()
-    self_sid = _current_user_sid_string()
+              cannot read or write the pipe.
+    Built once per process (D-45): nothing in it can change while the process runs."""
+    self_sid = current_user_sid()
     sddl = (
-        f"D:(A;;GA;;;{self_sid})(A;;GRGW;;;{SYSTEM_SID_STRING})"
+        f"O:{self_sid}"
+        f"D:(D;;GA;;;NU)(A;;GA;;;{self_sid})(A;;GRGW;;;{SYSTEM_SID_STRING})"
         "S:(ML;;NRNW;;;ME)"
     )
     sd = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
@@ -359,6 +330,16 @@ def _build_pipe_sa(cfg: Config) -> win32security.SECURITY_ATTRIBUTES:
     sa.SECURITY_DESCRIPTOR = sd
     sa.bInheritHandle = 0
     return sa
+
+
+def _scrub(text: str) -> str:
+    """F-113: strip profile paths (they carry the account name) from text that leaves over the
+    pipe. The data directory becomes "<data>", the profile "~"."""
+    text = str(text)
+    for path, token in ((str(APP_DIR), "<data>"), (os.path.expanduser("~"), "~")):
+        if path and path != "~":
+            text = text.replace(path, token)
+    return text
 
 
 # ---- presence-probe frame classes and verdict (7c-6). PROBE-ONLY: unlock never reaches here. ----
@@ -463,17 +444,22 @@ class FaceService:
         if custody is None:
             custody = heal_data_dir(APP_DIR)
         self._data_dir_insecure = not custody.ok
+        # Stage 9 (R1): the product is single-user. A service that does not run as the recorded
+        # owner keeps the pipe (the watchdog sees it alive) but refuses every face function; ping
+        # answers {"state":"refusing","why":"not-owner"}. Fixed for the process lifetime.
+        why = owner_check()
+        self._not_owner = why is not None
+        if self._not_owner:
+            log.error("owner check failed: %s -- face functions refused (not-owner)", why)
         self.recog = Recognizer(cfg)
         self.detector = FaceDetector()
         # Persistent consecutive-failure lockout for the face path (PIN stays available).
         self._lockout = Lockout(LOCKOUT_PATH, cfg.max_face_attempts, cfg.lockout_seconds)
         # Structured JSONL audit trail (verify/unlock/challenge; never stores the password).
         self._audit = AuditLog(AUDIT_PATH, cfg.audit_max_mb, enabled=cfg.audit_log)
+        # The serve loop is driven by _stop; ConnectNamedPipe is unblocked by the self-connect in
+        # stop(). (Stage 9, D-44: the parallel win32 _stop_event nobody ever waited on is gone.)
         self._stop = threading.Event()
-        # win32-level stop signal (parity with _stop); set alongside it so a future win32 wait can
-        # observe the stop too. The loop itself is driven by _stop; ConnectNamedPipe is unblocked by
-        # the self-connect in stop().
-        self._stop_event = win32event.CreateEvent(None, True, False, None)
         self._ctrl_handler = None   # keep a ref so SetConsoleCtrlHandler's callback isn't GC'd
         self._cam_lock = threading.Lock()
         self._cam: Camera | None = None  # kept open when persistent_camera=True
@@ -499,16 +485,18 @@ class FaceService:
         # ``_cam_heal_at`` above, 0.0 keeps working as "no lease" because monotonic counts from
         # boot and is therefore always positive.
         self._camera_paused_until: float = 0.0
-        # Stage 7e-2 posture ratchet: the boot value of each perimeter key, which is the floor a
-        # later reload can never go under. Captured here, before any request can be served, so the
-        # floor reflects the config this process actually started on rather than whatever the file
-        # says by the time the first reload arrives. Raised (never lowered) by a tightening reload.
-        self._posture_floor = {k: bool(getattr(cfg, k)) for k in POSTURE_KEYS}
+        # (Stage 9, R2 / F-104: the 7e-2 posture ratchet is gone together with the three pipe keys
+        # it guarded -- the perimeter has no knobs left to weaken.)
         # Stage 7-i gesture round: the single outstanding phase-1 token, or None. ONE slot is
         # enough because the pipe server is strictly sequential (_serve_one handles one request
         # at a time), so two unlocks can never be in flight together; a newer unlock simply
         # replaces the older token. Shape: {"token": str, "kind": str, "expires": monotonic}.
         self._gesture_slot: dict | None = None
+        # Stage 9 (§2.1): the delivered grant waiting for the CP's report_result, or None.
+        # Shape: {"grant_id": str, "expires": monotonic, "commit": fn(), "reject": fn(),
+        # "abandon": fn()}. One slot: the server is sequential and a newer grant replaces it.
+        self._report_slot: dict | None = None
+        self._pipe_sa = None            # built once, on the first bind (D-45)
 
     def _camera_leased_out(self) -> bool:
         return time.monotonic() < self._camera_paused_until
@@ -970,7 +958,8 @@ class FaceService:
             try:
                 kind = Challenge[str(kind_name).upper()]
             except KeyError:
-                return {"ok": False, "reason": f"unknown-kind: {kind_name}"}
+                # Stage 9 (F-65): the client's value is never echoed back or into the audit.
+                return {"ok": False, "reason": "bad-request"}
 
         ch = LivenessChallenge()
         issued = ch.issue(kind)
@@ -1302,6 +1291,7 @@ class FaceService:
 
     def _status(self) -> dict:
         from .config import EMBED_PATH
+        state = self._service_state()
         return {
             "ok": True,
             "uptime_s": time.time() - self._started_at,
@@ -1309,41 +1299,28 @@ class FaceService:
             "enrollment": EMBED_PATH.exists(),
             "lockout": self._lockout.status(),
             "audit": self._audit.status(),
-            # Stage 8b, additive: False while unlock answers "insecure-data-dir".
+            # Stage 8b, additive: False while unlock is refused for custody.
             "data_dir_secure": not getattr(self, "_data_dir_insecure", False),
+            # Stage 9, additive: serving | refusing (+why), and the lock screen's verdict on the
+            # stored password (§2.1: set by report_result ok=false, cleared by a new password).
+            "state": state["state"],
+            **({"why": state["why"]} if "why" in state else {}),
+            "password_rejected": password_rejected(),
+            "protocol": PROTOCOL_VERSION,
         }
 
-    def _apply_posture_ratchet(self, new_cfg: Config) -> None:
-        """Refuse any RUNTIME weakening of the Stage-4 perimeter keys (see POSTURE_KEYS).
+    def _refusal(self) -> "str | None":
+        """Stage 9 (R1 / R11): why this process refuses face functions, or None when it serves.
+        One token per cause, in a fixed order; later stages add their causes here."""
+        if getattr(self, "_not_owner", False):
+            return "not-owner"
+        if getattr(self, "_data_dir_insecure", False):
+            return "custody"
+        return None
 
-        Mutates ``new_cfg`` IN PLACE so the caller can go on applying it wholesale: the ratchet
-        corrects the two keys it owns and touches nothing else, which is what keeps a poisoned
-        posture value from also becoming a way to block legitimate reloads of everything else.
-
-        The floor is the strongest value seen so far -- the boot value, raised by any tightening
-        reload -- so once a key is True it is True for the lifetime of this process. Comparing
-        against a remembered floor rather than against ``self.cfg`` alone means a key cannot be
-        walked down in two steps, and cannot be lowered by anything that edits ``self.cfg``
-        directly either.
-
-        Refusals are logged at WARNING, one line per key, naming the key: a downgrade attempt is
-        the observable half of the same-user path this closes, and it must not pass silently.
-        """
-        floor = getattr(self, "_posture_floor", None)
-        if floor is None:
-            # Selftests build the service with FaceService.__new__ (project convention: no camera,
-            # no model load), so __init__ never ran. Until the first reload the live config IS the
-            # boot config, so seeding from it here yields exactly the floor __init__ would have set.
-            floor = {k: bool(getattr(self.cfg, k)) for k in POSTURE_KEYS}
-            self._posture_floor = floor
-        for key in POSTURE_KEYS:
-            hardened = floor.get(key, False) or bool(getattr(self.cfg, key))
-            incoming = bool(getattr(new_cfg, key))
-            if hardened and not incoming:
-                setattr(new_cfg, key, True)
-                log.warning("posture downgrade refused: %s stays True", key)
-                incoming = True
-            floor[key] = hardened or incoming
+    def _service_state(self) -> dict:
+        why = self._refusal()
+        return {"state": "serving"} if why is None else {"state": "refusing", "why": why}
 
     def _reload_config(self) -> dict:
         # strict=True: a good config is already in effect, so a broken file must be REJECTED and
@@ -1355,11 +1332,7 @@ class FaceService:
         try:
             new_cfg = Config.load(strict=True)
         except (ValueError, TypeError) as e:
-            return {"ok": False, "reason": f"invalid-config: {e}"}
-        # Stage 7e-2: correct any attempted weakening of the perimeter keys BEFORE the swap, so
-        # self.cfg is never once assigned a downgraded posture -- not even for the length of this
-        # method -- and so the {"config": ...} reply below reports what actually took effect.
-        self._apply_posture_ratchet(new_cfg)
+            return {"ok": False, "reason": f"invalid-config: {_scrub(e)}"}
         old = self.cfg
         old_index = self.cfg.camera_index
         old_persistent = self.cfg.persistent_camera
@@ -1378,7 +1351,7 @@ class FaceService:
                 self._audit.reconfigure(old.audit_log, old.audit_max_mb)
             except Exception:
                 log.exception("reload_config: rollback failed")
-            return {"ok": False, "reason": f"reload-failed: {e}"}
+            return {"ok": False, "reason": f"reload-failed: {_scrub(e)}"}
         self.cfg = new_cfg
         self.recog.cfg = new_cfg
         # Reset camera if camera-affecting settings changed. The new cfg is already
@@ -1392,10 +1365,50 @@ class FaceService:
                 log.exception("reload_config: releasing the webcam failed")
         return {"ok": True, "config": asdict(new_cfg)}
 
+    # ---- caller identity (Stage 9: no config can switch these gates off, R2) ----
+
+    def _caller_sid(self, handle) -> "str | None":
+        """SID of the client on ``handle`` (None when unreadable). A method so the selftests can
+        stand in for the lock screen without a real SYSTEM process."""
+        return _pipe_client_sid_string(handle)
+
+    def _require_caller(self, handle, want: str, cmd: str) -> "dict | None":
+        """None when the caller's SID is ``want``; else the not-authorized reply (logged with the
+        client diagnostics -- resolved only here, on a rejection, D-45)."""
+        sid = self._caller_sid(handle)
+        if sid == want:
+            return None
+        log.warning("%s rejected: caller sid=%s is not %s (%s)", cmd, sid, want,
+                    _pipe_client_diag(handle) if handle is not None else "no handle")
+        return {"ok": False, "reason": "not-authorized"}
+
+    def _v2_gate(self, req: dict, cmd: str) -> "dict | None":
+        """§2.1: unlock / unlock_gesture / report_result speak protocol v2 only. A CP of another
+        version gets version-mismatch -- the tile then says "update Face Unlock" and packs nothing."""
+        v = req.get("v")
+        if isinstance(v, bool) or v != PROTOCOL_VERSION:
+            log.warning("%s refused: protocol version %r, this service speaks %d", cmd, v,
+                        PROTOCOL_VERSION)
+            return {"ok": False, "reason": "version-mismatch"}
+        return None
+
+    def _take_budget(self, req: dict) -> bool:
+        """§2.1 (F-61): read the CP's remaining budget. False on a malformed value. Absent means
+        "no client budget": the server deadlines alone apply."""
+        self._client_budget_s = None
+        raw = req.get("budget_ms")
+        if raw is None:
+            return True
+        if isinstance(raw, bool) or not isinstance(raw, int) or not (0 < raw <= CLIENT_BUDGET_MAX_MS):
+            return False
+        self._client_budget_s = raw / 1000.0 - CLIENT_BUDGET_RESERVE_S
+        return True
+
     def _handle(self, req: dict, handle=None) -> dict:
         cmd = req.get("cmd")
         if cmd == "ping":
-            return {"ok": True, "pong": True}
+            # Stage 9 (R11): the ping carries the service state; a refusing service is ALIVE.
+            return {"ok": True, "pong": True, **self._service_state()}
 
         if cmd == "status":
             return self._status()
@@ -1415,10 +1428,6 @@ class FaceService:
             except Exception as e:
                 log.warning("watchdog pause write skipped: %s", e)
             self._stop.set()
-            try:
-                win32event.SetEvent(self._stop_event)
-            except Exception:
-                pass
             # No self-connect needed here: this shutdown request itself unblocked ConnectNamedPipe,
             # so after this _serve_one() finishes the loop re-checks _stop and exits.
             return {"ok": True, "shutting_down": True}
@@ -1456,6 +1465,12 @@ class FaceService:
             log.info("camera lease cleared (%.1fs still remained)", remaining)
             return {"ok": True}
 
+        if cmd in ("build_enrollment", "clear_enrollment", "verify", "presence"):
+            # Stage 9 (R1): a refusing service runs no face function at all.
+            why = self._refusal()
+            if why is not None:
+                return {"ok": False, "reason": why}
+
         if cmd == "build_enrollment":
             try:
                 from .config import ENROLL_DIR
@@ -1465,20 +1480,22 @@ class FaceService:
                 return self._with_pose({"ok": True, "count": n})
             except Exception as e:
                 log.exception("build_enrollment failed")
-                return {"ok": False, "reason": str(e)}
+                return {"ok": False, "reason": _scrub(e)}
 
         if cmd == "clear_enrollment":
             return self._clear_enrollment()
 
         if cmd == "verify":
+            # §2.3: a diagnostic for the owner's own tools -- SELF only, no strike, no secret.
+            denied = self._require_caller(handle, current_user_sid(), "verify")
+            if denied is not None:
+                return denied
             r = self._capture_and_verify()
             self._audit.write("verify", r.detail)
             # "verdict" is additive: the four legacy keys keep their names, types and values, so
             # an older client that ignores unknown keys is unaffected. The value is read from the
             # burst detail (which already carries it) with .get(), so a detail dict that somehow
-            # lacks one yields null rather than raising out of the handler. `unlock` is NOT given
-            # the same field -- its needs-gesture reply already distinguishes the cases, and its
-            # shape is part of the Credential Provider contract.
+            # lacks one yields null rather than raising out of the handler.
             return {"ok": True, "match": r.match, "distance": r.distance, "real": r.real,
                     "verdict": r.detail.get("verdict")}
 
@@ -1495,231 +1512,264 @@ class FaceService:
             return {"ok": True, "present": state == "present", "real": real,
                     "mode": self.cfg.presence_mode, "state": state}
 
-        if cmd == "challenge":
-            # Active-gesture stub for the Stage-5 Credential Provider (not wired to unlock).
-            resp = self._run_challenge(req.get("kind"))
-            self._audit.write("challenge", {k: resp.get(k)
-                              for k in ("challenge", "passed", "state", "reason") if k in resp})
-            return resp
-
-        if cmd == "unlock":
-            # Stage 4 Step 5 SID-gate (default ON since Stage 5): when enabled, only a SYSTEM caller -- the
-            # lockscreen Credential Provider -- may invoke unlock. Runs BEFORE lockout/verify/
-            # load_password so no password is ever returned to a non-SYSTEM caller. unlock and
-            # unlock_gesture are gated (the only two that can release credentials); every other
-            # command is scoped by the Batch-1 pipe DACL.
-            if self.cfg.pipe_unlock_require_system:
-                sid = _pipe_client_sid_string(handle)
-                if sid != SYSTEM_SID_STRING:
-                    log.warning("unlock rejected: caller not SYSTEM (sid=%s %s)",
-                                sid, _pipe_client_diag(handle))
-                    return {"ok": False, "reason": "not-authorized"}
-            rem = self._lockout.remaining()
-            if rem > 0:
-                self._audit.write("unlock", {"verdict": "LOCKED_OUT", "match": False,
-                                             "retry_after_s": round(rem, 1)})
-                return {"ok": False, "reason": "locked-out", "retry_after_s": round(rem, 1)}
-            r = self._capture_and_verify()
-            # Stage 3.4 busy camera: the webcam is held by ANOTHER process (not our enrollment
-            # lease). Refuse cleanly with reason "camera-busy" -- LOCKOUT-NEUTRAL (a busy device is
-            # environment, not a failed match) -- instead of the old multi-second RuntimeError that
-            # bubbled up as reason "exception: Cannot open camera...". Returns before the lockout
-            # counter is touched, before boost, and before the too-dark gate.
-            if r.camera_busy:
-                self._audit.write("unlock", {**r.detail, "outcome": "camera-busy"})
-                return {"ok": False, "reason": "camera-busy"}
-            # Stage 8b (F-01 / P-03, act A-2): additive fail-closed gate AFTER the existing ones
-            # (SYSTEM -> lockout -> camera above are unchanged). Defect: the service released the
-            # password from a data directory other accounts could write to. Consequence: a gallery
-            # or config it trusts could have been planted. Fix: when the start-up heal could not
-            # secure the directory, refuse -- lockout-neutral (returns before the counter), which
-            # the Credential Provider shows as an ordinary failure, so PIN stays the way in.
-            if getattr(self, "_data_dir_insecure", False):
-                self._audit.write("unlock", {**r.detail, "outcome": "insecure-data-dir"})
-                return {"ok": False, "reason": "insecure-data-dir"}
-            # Stage 8b (F-18, act A-4). Defect: a burst in which no frame arrived, or in which the
-            # engine could not judge a single frame (no enrollment, models not loaded), was scored
-            # as a failed face and recorded a lockout strike, answering "no-match". Consequence: a
-            # camera or engine fault could lock the face path out for 5 minutes and told the user
-            # their face was wrong. Fix: those bursts return an honest reason, lockout-neutral.
-            fault = self._burst_fault(r)
-            if fault is not None:
-                self._audit.write("unlock", {**r.detail, "outcome": fault})
-                return {"ok": False, "reason": fault}
-            # Stage 3.3 gated exposure boost: if the burst came back below the floor, try to raise
-            # EXPOSURE and re-capture BEFORE the too-dark fallback. Gated (only below the floor) so a
-            # normally-lit face is never blown out; transient (exposure always restored inside
-            # _maybe_boost); lockout-neutral (a still-dark result stays too-dark below, adding no
-            # strike). Boost telemetry is merged into r.detail so every unlock audit below carries
-            # it unchanged. low_light_boost=False (or scene >= floor / camera leased) -> no camera
-            # touch and the path is identical to Step 3.2.
-            boost_audit: dict = {}
-            if (r.scene_luma is not None and r.scene_luma < self.cfg.low_light_luma_min
-                    and self.cfg.low_light_boost and not self._camera_leased_out()):
-                r, boost_audit = self._maybe_boost(r)
-                r = r._replace(detail={**r.detail, **boost_audit})
-            # Stage 3.2 low-light gate. If even the brightest frame of the burst is below the
-            # floor, refuse honestly ("too-dark") and stay LOCKOUT-NEUTRAL: darkness is an
-            # environment problem, not a failed match, so it must NOT add a lockout strike (nor
-            # reset the counter) -- otherwise a user in a dim room would rack up strikes and get
-            # face-locked for 300s just for being in the dark (a soft DoS). Above the floor -- or
-            # when the gate is disabled (floor 0) or no scene was measured (camera leased / no
-            # frame) -- behaviour is byte-for-byte unchanged. (Step 3.3 will insert an exposure
-            # boost + re-capture BEFORE this gate; the gate itself does not change.)
-            too_dark = False
-            if r.scene_luma is not None:
-                _grant, ll_reason, too_dark = evaluate_low_light(
-                    r.scene_luma, self.cfg.low_light_luma_min, r.match)
-            if too_dark:
-                self._audit.write("unlock", {**r.detail, "outcome": "too-dark"})
-                return {"ok": False, "reason": ll_reason, "distance": r.distance, "real": r.real}
-            # Stage 7-i phase 1. NEEDS_GESTURE means "recognized, but liveness wants an active
-            # gesture" -- until now indistinguishable from a real no-match on the wire. The
-            # verdict name is read straight from the burst detail, which already carries it
-            # (_analyze_burst), so VerifyOutcome keeps its shape and the verify/audit records are
-            # untouched. .get() is deliberate: a detail dict WITHOUT a verdict (the camera-lease
-            # skip writes "SKIPPED", a future path might write nothing) falls through to the old
-            # no-match path -- fail closed, never into the gesture path.
-            needs_gesture = r.detail.get("verdict") == "NEEDS_GESTURE"
-            # Don't count an enrollment-lease skip as a real failed attempt. A gesture escalation
-            # is not an attempt either -- it is a question we just asked, and phase 2 records its
-            # own outcome; counting it here would burn the whole strike budget on paranoid, where
-            # EVERY recognized face escalates.
-            # Stage 8b (F-19): a MATCH is no longer recorded here. The reset it causes is part of
-            # the grant, so it happens only once the reply has actually been delivered (see
-            # _commit_grant); a failed match is still a strike, recorded right here as before.
-            if not self._camera_leased_out() and not needs_gesture and not r.match:
-                self._lockout.record(False)
-            if needs_gesture:
-                kind, prompt, token = self._issue_gesture_token()
-                # Audit records the gesture but NEVER the token.
-                self._audit.write("unlock", {**r.detail, "outcome": "needs-gesture",
-                                             "gesture": kind})
-                return {"ok": False, "reason": "needs-gesture", "gesture": kind,
-                        "prompt": prompt, "token": token, "ttl_s": GESTURE_TOKEN_TTL_S,
-                        "distance": r.distance, "real": r.real}
-            if not r.match:
-                self._audit.write("unlock", {**r.detail, "outcome": "no-match"})
-                return {"ok": False, "reason": "no-match", "distance": r.distance, "real": r.real}
-            if self._past_deadline(UNLOCK_DEADLINE_S):
-                # F-19: too late for the CP to use it -- release nothing, reset nothing.
-                self._audit.write("unlock", {**r.detail, "outcome": "deadline-exceeded"})
-                return {"ok": False, "reason": "deadline-exceeded"}
-            granted = self._release_credentials()
-            if granted is None:
-                self._lockout.record(True)     # the face matched: same reset as before 8b
-                self._audit.write("unlock", {**r.detail, "outcome": "no-credentials"})
-                return {"ok": False, "reason": "no-credentials"}
-
-            def _commit(delivered: bool) -> None:
-                if not delivered:
-                    self._audit.write("unlock", {**r.detail, "outcome": "grant-undelivered"})
-                    return
-                self._lockout.record(True)
-                self._audit.write("unlock", {**r.detail, "outcome": "granted"})
-                self._maybe_adapt_gallery(r)
-            self._pending_grant = _commit
-            return granted
-
-        if cmd == "unlock_gesture":
-            # Stage 7-i phase 2: answer the gesture phase 1 asked for. The gate ORDER is a clone
-            # of unlock's, using the SAME helpers, so this command sits behind exactly the same
-            # perimeter and cannot become a way around the SYSTEM gate: identity check first,
-            # then lockout, then the one-shot token, and only then the camera. _release_credentials
-            # is unreachable until all four have passed.
-            if self.cfg.pipe_unlock_require_system:
-                sid = _pipe_client_sid_string(handle)
-                if sid != SYSTEM_SID_STRING:
-                    log.warning("unlock_gesture rejected: caller not SYSTEM (sid=%s %s)",
-                                sid, _pipe_client_diag(handle))
-                    return {"ok": False, "reason": "not-authorized"}
-            rem = self._lockout.remaining()
-            if rem > 0:
-                self._audit_gesture(reason="locked-out")
-                return {"ok": False, "reason": "locked-out", "retry_after_s": round(rem, 1)}
-            slot = self._take_gesture_token(req.get("token"))
-            if slot is None:
-                # Absent / wrong / expired / already-burnt token. NOT a strike: this is a protocol
-                # state, not a failed face attempt -- the camera never even opened.
-                self._audit_gesture(reason="gesture-token-invalid")
-                return {"ok": False, "reason": "gesture-token-invalid"}
-            resp = self._run_challenge(slot["kind"], identity=True)
-            if not resp.get("ok"):
-                # The round never ran. "camera-busy" stays itself and stays lockout-NEUTRAL, like
-                # everywhere else (a busy device is environment, not a failed match). Anything
-                # else here is an engine-level refusal (e.g. enrollment vanished mid-session);
-                # it is reported as a plain gesture-failed -- the wire deliberately does not
-                # distinguish failure causes -- with the real reason kept in the log and audit.
-                raw = resp.get("reason") or "gesture-failed"
-                if raw == "camera-busy":
-                    self._audit_gesture(challenge=slot["kind"], reason="camera-busy")
-                    return {"ok": False, "reason": "camera-busy"}
-                log.warning("unlock_gesture round did not run: %s", raw)
-                self._lockout.record(False)
-                self._audit_gesture(challenge=slot["kind"], reason=raw)
-                return {"ok": False, "reason": "gesture-failed", "challenge": slot["kind"],
-                        "state": "failed", "identity_frames": 0}
-            # Stage 8b (act A-2): the same additive custody gate as unlock, after SYSTEM ->
-            # lockout -> token -> camera. Phase 1 already refuses before issuing a token, so this
-            # is defence in depth; lockout-neutral like there.
-            if getattr(self, "_data_dir_insecure", False):
-                self._audit_gesture(challenge=resp.get("challenge"), reason="insecure-data-dir")
-                return {"ok": False, "reason": "insecure-data-dir"}
-            frames = int(resp.get("identity_frames") or 0)
-            best = resp.get("distance_best")
-            # Two conditions, no new numbers: the task itself passed AND enough MATCHING frames
-            # were fed (cfg.verify_required, the same bar the passive burst uses).
-            passed = bool(resp.get("passed")) and frames >= self.cfg.verify_required
-            if not passed:
-                self._lockout.record(False)
-                self._audit_gesture(challenge=resp.get("challenge"), passed=resp.get("passed"),
-                                    identity_frames=frames, distance_best=best,
-                                    reason="gesture-failed")
-                return {"ok": False, "reason": "gesture-failed",
-                        "challenge": resp.get("challenge"), "state": resp.get("state"),
-                        "identity_frames": frames}
-            if self._past_deadline(UNLOCK_GESTURE_DEADLINE_S):
-                # F-19: the round ran past what phase 2 can still deliver -- release nothing.
-                self._audit_gesture(challenge=resp.get("challenge"), passed=True,
-                                    identity_frames=frames, distance_best=best,
-                                    reason="deadline-exceeded")
-                return {"ok": False, "reason": "deadline-exceeded"}
-            granted = self._release_credentials()
-            if granted is None:
-                self._lockout.record(True)     # the round passed: same reset as before 8b
-                self._audit_gesture(challenge=resp.get("challenge"), passed=True,
-                                    identity_frames=frames, distance_best=best,
-                                    reason="no-credentials")
-                return {"ok": False, "reason": "no-credentials"}
-
-            def _commit(delivered: bool) -> None:
-                if delivered:
-                    self._lockout.record(True)
-                self._audit_gesture(challenge=resp.get("challenge"), passed=True,
-                                    identity_frames=frames, distance_best=best,
-                                    reason="granted" if delivered else "grant-undelivered")
-            self._pending_grant = _commit
-            return granted
+        if cmd in ("unlock", "unlock_gesture", "report_result"):
+            # SYSTEM gate FIRST, unconditionally (Stage 9, R2: no config key can lift it): only the
+            # lock-screen Credential Provider -- LogonUI runs as SYSTEM -- may release or settle a
+            # credential. Then the protocol version, before anything else is looked at.
+            denied = self._require_caller(handle, SYSTEM_SID_STRING, cmd)
+            if denied is not None:
+                return denied
+            bad = self._v2_gate(req, cmd)
+            if bad is not None:
+                return bad
+            if cmd == "report_result":
+                return self._report_result(req)
+            if not self._take_budget(req):
+                return {"ok": False, "reason": "bad-request"}
+            if cmd == "unlock":
+                return self._unlock()
+            return self._unlock_gesture(req)
 
         return {"ok": False, "reason": "unknown-command"}
 
+    def _unlock_preflight(self, audit) -> "dict | None":
+        """The lockout-neutral refusals both unlock phases share, BEFORE the camera opens:
+        a refusing service (R1 / R9), then the stored password the lock screen already saw
+        rejected (§2.1, F-92), then the face lockout."""
+        why = self._refusal()
+        if why is not None:
+            audit(why)
+            return {"ok": False, "reason": why}
+        if password_rejected():
+            audit("password-rejected")
+            return {"ok": False, "reason": "password-rejected"}
+        rem = self._lockout.remaining()
+        if rem > 0:
+            audit("locked-out", rem)
+            return {"ok": False, "reason": "locked-out", "retry_after_s": round(rem, 1)}
+        return None
+
+    def _unlock(self) -> dict:
+        def _pre_audit(outcome, rem=None):
+            if outcome == "locked-out":
+                self._audit.write("unlock", {"verdict": "LOCKED_OUT", "match": False,
+                                             "retry_after_s": round(rem, 1)})
+            else:
+                self._audit.write("unlock", {"outcome": outcome})
+        refused = self._unlock_preflight(_pre_audit)
+        if refused is not None:
+            return refused
+        r = self._capture_and_verify()
+        # Stage 3.4 busy camera: the webcam is held by ANOTHER process (not our enrollment
+        # lease). Refuse cleanly with reason "camera-busy" -- LOCKOUT-NEUTRAL (a busy device is
+        # environment, not a failed match).
+        if r.camera_busy:
+            self._audit.write("unlock", {**r.detail, "outcome": "camera-busy"})
+            return {"ok": False, "reason": "camera-busy"}
+        # Stage 8b (F-18, act A-4): a burst in which no frame arrived, or in which the engine could
+        # not judge a single frame, returns an honest reason, lockout-neutral.
+        fault = self._burst_fault(r)
+        if fault is not None:
+            self._audit.write("unlock", {**r.detail, "outcome": fault})
+            return {"ok": False, "reason": fault}
+        # Stage 3.3 gated exposure boost: if the burst came back below the floor, try to raise
+        # EXPOSURE and re-capture BEFORE the too-dark fallback. Gated (only below the floor) so a
+        # normally-lit face is never blown out; transient (exposure always restored inside
+        # _maybe_boost); lockout-neutral (a still-dark result stays too-dark below, adding no
+        # strike). Boost telemetry is merged into r.detail so every unlock audit below carries it.
+        boost_audit: dict = {}
+        if (r.scene_luma is not None and r.scene_luma < self.cfg.low_light_luma_min
+                and self.cfg.low_light_boost and not self._camera_leased_out()):
+            r, boost_audit = self._maybe_boost(r)
+            r = r._replace(detail={**r.detail, **boost_audit})
+        # Stage 3.2 low-light gate: below the floor refuse honestly ("too-dark"), LOCKOUT-NEUTRAL.
+        too_dark = False
+        if r.scene_luma is not None:
+            _grant, ll_reason, too_dark = evaluate_low_light(
+                r.scene_luma, self.cfg.low_light_luma_min, r.match)
+        if too_dark:
+            self._audit.write("unlock", {**r.detail, "outcome": "too-dark"})
+            return {"ok": False, "reason": ll_reason, "distance": r.distance, "real": r.real}
+        # Stage 7-i phase 1. NEEDS_GESTURE means "recognized, but liveness wants an active
+        # gesture". .get() is deliberate: a detail dict WITHOUT a verdict falls through to the old
+        # no-match path -- fail closed, never into the gesture path.
+        needs_gesture = r.detail.get("verdict") == "NEEDS_GESTURE"
+        # A gesture escalation is not an attempt -- phase 2 records its own outcome. A MATCH is
+        # not recorded here either: its reset is part of the grant (settled by report_result).
+        if not self._camera_leased_out() and not needs_gesture and not r.match:
+            self._lockout.record(False)
+        if needs_gesture:
+            kind, prompt, token = self._issue_gesture_token()
+            # Audit records the gesture but NEVER the token.
+            self._audit.write("unlock", {**r.detail, "outcome": "needs-gesture",
+                                         "gesture": kind})
+            return {"ok": False, "reason": "needs-gesture", "gesture": kind,
+                    "prompt": prompt, "token": token, "ttl_s": GESTURE_TOKEN_TTL_S,
+                    "distance": r.distance, "real": r.real}
+        if not r.match:
+            self._audit.write("unlock", {**r.detail, "outcome": "no-match"})
+            return {"ok": False, "reason": "no-match", "distance": r.distance, "real": r.real}
+        if self._past_deadline(UNLOCK_DEADLINE_S):
+            # F-19: too late for the CP to use it -- release nothing, reset nothing.
+            self._audit.write("unlock", {**r.detail, "outcome": "deadline-exceeded"})
+            return {"ok": False, "reason": "deadline-exceeded"}
+        granted = self._release_credentials()
+        if granted is None:
+            self._lockout.record(True)     # the face matched: same reset as before 8b
+            self._audit.write("unlock", {**r.detail, "outcome": "no-credentials"})
+            return {"ok": False, "reason": "no-credentials"}
+
+        def _audit(outcome: str) -> None:
+            self._audit.write("unlock", {**r.detail, "outcome": outcome})
+
+        def _commit() -> None:
+            self._lockout.record(True)
+            _audit("granted")
+            self._maybe_adapt_gallery(r)
+        return self._arm_grant(granted, _audit, _commit)
+
+    def _unlock_gesture(self, req: dict) -> dict:
+        # Stage 7-i phase 2: answer the gesture phase 1 asked for. Same perimeter as unlock (SYSTEM
+        # and version checked by _handle), then the shared preflight, then the one-shot token, and
+        # only then the camera. _release_credentials is unreachable until all of them passed.
+        def _pre_audit(outcome, rem=None):
+            self._audit_gesture(reason=outcome)
+        refused = self._unlock_preflight(_pre_audit)
+        if refused is not None:
+            return refused
+        slot = self._take_gesture_token(req.get("token"))
+        if slot is None:
+            # Absent / wrong / expired / already-burnt token. NOT a strike: this is a protocol
+            # state, not a failed face attempt -- the camera never even opened.
+            self._audit_gesture(reason="gesture-token-invalid")
+            return {"ok": False, "reason": "gesture-token-invalid"}
+        resp = self._run_challenge(slot["kind"], identity=True)
+        if not resp.get("ok"):
+            # The round never ran. "camera-busy" stays itself and stays lockout-NEUTRAL, like
+            # everywhere else (a busy device is environment, not a failed match). Anything
+            # else here is an engine-level refusal (e.g. enrollment vanished mid-session);
+            # it is reported as a plain gesture-failed with the real reason kept in the log and
+            # audit. (Stage 9, 9c-2 / R5 makes this lockout-neutral with an honest reason.)
+            raw = resp.get("reason") or "gesture-failed"
+            if raw == "camera-busy":
+                self._audit_gesture(challenge=slot["kind"], reason="camera-busy")
+                return {"ok": False, "reason": "camera-busy"}
+            log.warning("unlock_gesture round did not run: %s", raw)
+            self._lockout.record(False)
+            self._audit_gesture(challenge=slot["kind"], reason=raw)
+            return {"ok": False, "reason": "gesture-failed", "challenge": slot["kind"],
+                    "state": "failed", "identity_frames": 0}
+        frames = int(resp.get("identity_frames") or 0)
+        best = resp.get("distance_best")
+        # Two conditions, no new numbers: the task itself passed AND enough MATCHING frames
+        # were fed (cfg.verify_required, the same bar the passive burst uses).
+        passed = bool(resp.get("passed")) and frames >= self.cfg.verify_required
+        if not passed:
+            self._lockout.record(False)
+            self._audit_gesture(challenge=resp.get("challenge"), passed=resp.get("passed"),
+                                identity_frames=frames, distance_best=best,
+                                reason="gesture-failed")
+            return {"ok": False, "reason": "gesture-failed",
+                    "challenge": resp.get("challenge"), "state": resp.get("state"),
+                    "identity_frames": frames}
+        if self._past_deadline(UNLOCK_GESTURE_DEADLINE_S):
+            # F-19: the round ran past what phase 2 can still deliver -- release nothing.
+            self._audit_gesture(challenge=resp.get("challenge"), passed=True,
+                                identity_frames=frames, distance_best=best,
+                                reason="deadline-exceeded")
+            return {"ok": False, "reason": "deadline-exceeded"}
+        granted = self._release_credentials()
+        if granted is None:
+            self._lockout.record(True)     # the round passed: same reset as before 8b
+            self._audit_gesture(challenge=resp.get("challenge"), passed=True,
+                                identity_frames=frames, distance_best=best,
+                                reason="no-credentials")
+            return {"ok": False, "reason": "no-credentials"}
+
+        def _audit(outcome: str) -> None:
+            self._audit_gesture(challenge=resp.get("challenge"), passed=True,
+                                identity_frames=frames, distance_best=best, reason=outcome)
+
+        def _commit() -> None:
+            self._lockout.record(True)
+            _audit("granted")
+        return self._arm_grant(granted, _audit, _commit)
+
+    # ---- grant settlement (§2.1 protocol v2: F-60, F-93) ----
+
+    def _arm_grant(self, granted: dict, audit, commit) -> dict:
+        """Attach a one-shot grant_id and arm the settlement: nothing is committed now. Once the
+        reply is written the grant waits for report_result (GRANT_REPORT_TTL_S); ok=true commits
+        (lockout reset, audit "granted", gallery adaptation), ok=false marks the stored password
+        rejected, silence abandons it. An undelivered reply is audited and dropped."""
+        grant_id = secrets.token_hex(16)
+        granted["grant_id"] = grant_id
+
+        def _delivered(delivered: bool) -> None:
+            if not delivered:
+                audit("grant-undelivered")
+                return
+            audit("delivered")
+            old = getattr(self, "_report_slot", None)
+            if old is not None:           # a newer grant replaces one that was never reported
+                old["audit"]("grant-abandoned")
+            self._report_slot = {
+                "grant_id": grant_id,
+                "expires": time.monotonic() + GRANT_REPORT_TTL_S,
+                "commit": commit,
+                "audit": audit,
+            }
+        self._pending_grant = _delivered
+        return granted
+
+    def _expire_report_slot(self) -> None:
+        """Drop a grant whose report never came: abandoned, nothing committed."""
+        slot = getattr(self, "_report_slot", None)
+        if slot is not None and time.monotonic() >= slot["expires"]:
+            self._report_slot = None
+            log.info("grant abandoned: no report_result within %.0fs", GRANT_REPORT_TTL_S)
+            slot["audit"]("grant-abandoned")
+
+    def _report_result(self, req: dict) -> dict:
+        self._expire_report_slot()
+        gid, ok = req.get("grant_id"), req.get("ok")
+        slot = getattr(self, "_report_slot", None)
+        if (slot is None or not isinstance(gid, str) or not gid.isascii()
+                or not isinstance(ok, bool)
+                or not secrets.compare_digest(gid, slot["grant_id"])):
+            return {"ok": False, "reason": "grant-unknown"}
+        self._report_slot = None             # one-shot
+        if ok:
+            slot["commit"]()
+        else:
+            try:
+                mark_password_rejected()
+            except OSError as e:
+                log.error("could not record the rejected password: %s", e)
+            log.warning("the lock screen reports the stored password was REJECTED by Windows; "
+                        "face unlock stays off until a new password is saved")
+            slot["audit"]("password-rejected")
+        return {"ok": True}
+
     def _past_deadline(self, budget_s: float) -> bool:
-        """F-19: True once more than ``budget_s`` has passed since this request was read.
-        _serve_one stamps the read; a caller that never set the stamp (the selftests drive
-        _handle directly) has no deadline to miss."""
+        """F-19: True once more than ``budget_s`` has passed since this request was read -- or,
+        with protocol v2 (F-61), more than the client's own remaining budget minus the reply
+        reserve, whichever is smaller. _serve_one stamps the read; a caller that never set the
+        stamp (the selftests drive _handle directly) has no deadline to miss."""
         t0 = getattr(self, "_req_started", None)
         if t0 is None:
             return False
-        late = time.monotonic() - t0 > budget_s
+        client = getattr(self, "_client_budget_s", None)
+        limit = budget_s if client is None else min(budget_s, client)
+        late = time.monotonic() - t0 > limit
         if late:
             log.warning("request past its %.1fs deadline (%.1fs) -> failing closed, nothing "
-                        "released", budget_s, time.monotonic() - t0)
+                        "released", limit, time.monotonic() - t0)
         return late
 
     def _finish_grant(self, delivered: bool) -> None:
-        """F-19: settle the grant armed by the request just answered -- lockout reset + audit
-        "granted" only when the reply was written; "grant-undelivered" otherwise, lockout
-        untouched. Idempotent: the slot is taken before the commit runs."""
+        """Settle the delivery half of the grant armed by the request just answered (see
+        _arm_grant). Idempotent: the slot is taken before the callback runs."""
         commit, self._pending_grant = getattr(self, "_pending_grant", None), None
         if commit is not None:
             try:
@@ -1814,123 +1864,171 @@ class FaceService:
         log.info("clear_enrollment: gallery forgotten, %d item(s) removed", removed)
         return {"ok": True, "removed": removed}
 
-    def _serve_one(self) -> None:
-        sa = _build_pipe_sa(self.cfg)
+    def _create_instance(self, first: bool):
+        """One pipe instance. ``first`` claims the NAME (FILE_FLAG_FIRST_PIPE_INSTANCE): if anyone
+        else already holds it, CreateNamedPipe fails. Remote clients are always rejected and the
+        descriptor is always the hardened one (R2)."""
+        if getattr(self, "_pipe_sa", None) is None:
+            self._pipe_sa = _build_pipe_sa()
         open_mode = win32pipe.PIPE_ACCESS_DUPLEX
-        if self.cfg.pipe_first_instance:
-            # Refuse to bind if the name is already taken (a squatter). Safe for our per-connection
-            # re-create: the serve loop CloseHandle()s the previous instance in the finally below
-            # BEFORE this next CreateNamedPipe, so no instance of OURS exists at this point -- any
-            # same-name instance found here is therefore foreign.
+        if first:
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE
+        return win32pipe.CreateNamedPipe(
+            PIPE_NAME,
+            open_mode,
+            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT
+            | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_MAX_INSTANCES,
+            65536, 65536, 0, self._pipe_sa,
+        )
+
+    def _bind(self) -> bool:
+        """Claim the pipe name. False -- with the stop flag set -- when someone else holds it.
+
+        A loud log and a clean stop instead of a crash-loop; the watchdog retries the start and
+        every refusal is logged, so a persistent squatter is visible rather than hidden."""
         try:
-            handle = win32pipe.CreateNamedPipe(
-                PIPE_NAME,
-                open_mode,
-                win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-                win32pipe.PIPE_UNLIMITED_INSTANCES,
-                65536, 65536, 0, sa,
-            )
+            self._listen = self._create_instance(first=True)
+            return True
         except pywintypes.error as e:
-            # FIRST_PIPE_INSTANCE -> the name is occupied by someone else. Loud log + clean stop so
-            # the serve loop exits (no silent tight crash-loop). The watchdog will retry the start,
-            # and each refusal is logged, so a persistent squatter is visible rather than hidden.
-            if self.cfg.pipe_first_instance and e.winerror in (
-                    winerror.ERROR_ACCESS_DENIED, winerror.ERROR_ALREADY_EXISTS,
-                    winerror.ERROR_PIPE_BUSY):
+            if e.winerror in (winerror.ERROR_ACCESS_DENIED, winerror.ERROR_ALREADY_EXISTS,
+                              winerror.ERROR_PIPE_BUSY):
                 log.error("pipe name %s occupied (winerror=%d) -- refusing to start "
                           "(possible squatter)", PIPE_NAME, e.winerror)
+                self._listen = None
                 self._stop.set()
-                try:
-                    win32event.SetEvent(self._stop_event)
-                except Exception:
-                    pass
-                return
+                return False
             raise
+
+    def _serve_one(self) -> None:
+        """Serve one connection on the listening instance, then hand the name to the next one.
+
+        Stage 9 (R2, F-54): the next instance is created BEFORE the served one is closed, so from
+        the first bind to the stop the name is never free for another account to take. It is not
+        created before the request is handled on purpose: a client that arrives meanwhile waits in
+        WaitNamedPipe and sends only when this server can read it, so the deadline the service
+        counts from the read still matches the budget the client sent (§2.1)."""
+        if getattr(self, "_listen", None) is None and not self._bind():
+            return
+        handle = self._listen
         try:
             try:
                 win32pipe.ConnectNamedPipe(handle, None)
             except pywintypes.error as e:
-                # ERROR_PIPE_CONNECTED: a client connected between CreateNamedPipe and Connect -> fine.
+                if e.winerror == winerror.ERROR_NO_DATA:
+                    # F-59: a client connected and closed before we got here (a client that failed
+                    # its own pre-write check, the stop self-connect) -- nothing to serve.
+                    log.debug("client came and went before the connect (ERROR_NO_DATA)")
+                    return
+                # ERROR_PIPE_CONNECTED: a client connected between Create and Connect -> fine.
                 if e.winerror != winerror.ERROR_PIPE_CONNECTED:
                     raise
             # We may have been woken by stop()'s self-connect (Ctrl+C / shutdown) rather than a real
             # request -> just return so the loop re-checks _stop.
             if self._stop.is_set():
                 return
-            # Stage-5 5c diagnostic: record every accepted connection BEFORE the read, with the
-            # client's (non-sensitive) identity from _pipe_client_diag (PID / image / IL / session /
-            # openable -- no impersonation, no password/request content). A client that opens the
-            # pipe then bails on its OWN pre-write check (e.g. the CP's client-side server-SID
-            # verification) shows up here as "connection accepted" with NO following "request cmd=..."
-            # line; image=LogonUI.exe + openable=no marks the real lockscreen CP.
-            log.info("connection accepted (%s)", _pipe_client_diag(handle))
-            try:
-                _hr, data = win32file.ReadFile(handle, 65536)
-            except pywintypes.error as e:
-                # A wake-up connection that closed immediately, or a client that vanished -> no
-                # request to handle; return cleanly rather than logging a pipe error.
-                if e.winerror in (winerror.ERROR_BROKEN_PIPE, winerror.ERROR_PIPE_NOT_CONNECTED,
-                                  winerror.ERROR_NO_DATA):
-                    # Stage-5 5c diagnostic: connected but closed before sending a request. Paired
-                    # with the "connection accepted" line above and NO "request cmd=..." between
-                    # them, this is the signature of a client that bailed after its own pre-write
-                    # checks -- i.e. the request never left the client.
-                    log.info("connection closed before request (winerror=%d)", e.winerror)
-                    return
-                raise
-            if not data:
-                return
-            self._req_started = time.monotonic()      # F-19: the deadlines count from here
-            self._pending_grant = None
-            # Stage 8b (F-42). Defect: a body that was not JSON, or JSON that was not an object,
-            # raised out of here -- no reply at all, a traceback in the log -- and "cmd" was
-            # logged at whatever length the client sent. Fix: answer bad-request, log a bounded
-            # repr of cmd.
-            try:
-                req = json.loads(data.decode("utf-8"))
-            except Exception:
-                req = None
-            if not isinstance(req, dict):
-                log.info("request rejected: not a JSON object (%d bytes)", len(data))
-                resp = {"ok": False, "reason": "bad-request"}
-            else:
-                log.info("request cmd=%s", repr(req.get("cmd"))[:LOG_CMD_MAX])
-                try:
-                    resp = self._handle(req, handle)
-                except Exception as e:
-                    log.exception("handler error")
-                    resp = {"ok": False, "reason": f"exception: {e}"}
-            delivered = False
-            try:
-                win32file.WriteFile(handle, (json.dumps(resp) + "\n").encode("utf-8"))
-                delivered = True
-            except pywintypes.error as e:
-                # Stage 8b (F-43). Defect: a client that gave up before the reply (winerror 232,
-                # the pipe is being closed) surfaced as an ERROR with a traceback -- the only ERROR
-                # in the live log. It is a benign timeout on the client's side: INFO, no traceback.
-                if e.winerror in (winerror.ERROR_NO_DATA, winerror.ERROR_BROKEN_PIPE,
-                                  winerror.ERROR_PIPE_NOT_CONNECTED):
-                    log.info("client left before the reply was written (winerror=%d)", e.winerror)
-                else:
-                    log.warning("reply write failed (winerror=%d)", e.winerror)
-            finally:
-                # F-19: audit "granted" and reset the lockout only for a DELIVERED grant.
-                self._finish_grant(delivered)
-            if not delivered:
-                return
-            try:
-                win32file.FlushFileBuffers(handle)   # blocks until the client reads the buffered data
-            except pywintypes.error:
-                pass
-            # Wait for the client to finish reading and close before we discard the pipe (fixes 233).
-            self._drain_until_client_closes(handle)
+            self._serve_connection(handle)
         finally:
+            nxt = None
+            if not self._stop.is_set():
+                try:
+                    nxt = self._create_instance(first=False)
+                except pywintypes.error as e:
+                    log.error("could not pre-create the next pipe instance (winerror=%d); "
+                              "re-binding after close", e.winerror)
             try:
                 win32pipe.DisconnectNamedPipe(handle)
             except pywintypes.error:
                 pass
             win32file.CloseHandle(handle)
+            self._listen = nxt
+            if nxt is None and not self._stop.is_set():
+                self._bind()
+
+    def _close_listen(self) -> None:
+        """Release the listening instance (stop, selftests)."""
+        h, self._listen = getattr(self, "_listen", None), None
+        if h is not None:
+            try:
+                win32file.CloseHandle(h)
+            except pywintypes.error:
+                pass
+
+    def _serve_connection(self, handle) -> None:
+        """Read one request, answer it, settle the grant bookkeeping, wait for the client to close."""
+        try:
+            _hr, data = win32file.ReadFile(handle, 65536)
+        except pywintypes.error as e:
+            # A wake-up connection that closed immediately, or a client that vanished -> no request
+            # to handle; return cleanly rather than logging a pipe error. Such a client is the
+            # signature of one that bailed after its own pre-write checks (e.g. the CP's server-SID
+            # verification): the request never left the client.
+            if e.winerror in (winerror.ERROR_BROKEN_PIPE, winerror.ERROR_PIPE_NOT_CONNECTED,
+                              winerror.ERROR_NO_DATA):
+                log.info("connection closed before request (winerror=%d)", e.winerror)
+                return
+            raise
+        if not data:
+            return
+        self._req_started = time.monotonic()      # F-19: the deadlines count from here
+        self._client_budget_s = None
+        self._pending_grant = None
+        self._expire_report_slot()
+        # Stage 8b (F-42): a body that was not JSON, or JSON that was not an object, answers
+        # bad-request; "cmd" is logged bounded.
+        try:
+            req = json.loads(data.decode("utf-8"))
+        except Exception:
+            req = None
+        if not isinstance(req, dict):
+            log.info("request rejected: not a JSON object (%d bytes)", len(data))
+            resp = {"ok": False, "reason": "bad-request"}
+        else:
+            cmd = req.get("cmd")
+            (log.debug if cmd in ROUTINE_COMMANDS else log.info)(
+                "request cmd=%s", repr(cmd)[:LOG_CMD_MAX])
+            try:
+                resp = self._handle(req, handle)
+            except Exception:
+                # Stage 9 (F-66): the exception text (paths, profile names) never goes out; the
+                # unlock paths also leave an audit record of the fault.
+                log.exception("handler error")
+                if cmd in ("unlock", "unlock_gesture"):
+                    try:
+                        self._audit.write(cmd, {"outcome": "internal-error"})
+                    except Exception:
+                        pass
+                self._pending_grant = None
+                resp = {"ok": False, "reason": "internal-error"}
+        # Stage 9 (§2.1 / R3): every reply names the protocol and the UI language the tile should
+        # use. Additive keys: older Python clients ignore them.
+        resp.setdefault("v", PROTOCOL_VERSION)
+        resp.setdefault("lang", self._reply_lang())
+        delivered = False
+        try:
+            win32file.WriteFile(handle, (json.dumps(resp) + "\n").encode("utf-8"))
+            delivered = True
+        except pywintypes.error as e:
+            # Stage 8b (F-43): a client that gave up before the reply is a benign timeout: INFO.
+            if e.winerror in (winerror.ERROR_NO_DATA, winerror.ERROR_BROKEN_PIPE,
+                              winerror.ERROR_PIPE_NOT_CONNECTED):
+                log.info("client left before the reply was written (winerror=%d)", e.winerror)
+            else:
+                log.warning("reply write failed (winerror=%d)", e.winerror)
+        finally:
+            self._finish_grant(delivered)
+        if not delivered:
+            return
+        # Wait (bounded) for the client to finish reading and close before we discard the pipe
+        # (fixes 233). Stage 9 (F-58): no FlushFileBuffers before it -- that call blocks, with no
+        # bound, until the client reads, so a client that never read wedged the sequential server.
+        self._drain_until_client_closes(handle)
+
+    def _reply_lang(self) -> str:
+        """The tile's language: the UI language the user chose, reduced to what the CP carries
+        (en, ru); anything else is English (R3 / R16)."""
+        lang = getattr(self.cfg, "language", "en")
+        return lang if lang in ("en", "ru") else "en"
 
     def _warmup(self) -> None:
         """Load enrollment, preload heavy models so the first real call is fast."""
@@ -2014,8 +2112,11 @@ class FaceService:
         except Exception as e:
             log.debug("console ctrl handler not installed (no console?): %s", e)
 
-        log.info("FaceService starting; pipe=%s", PIPE_NAME)
-        if self.cfg.warmup_on_start:
+        log.info("FaceService starting; pipe=%s state=%s", PIPE_NAME, self._service_state())
+        # Stage 9 (F-54): claim the name BEFORE the warmup -- model and camera loading take seconds,
+        # and the old order left the name free for all of them. A client that connects meanwhile
+        # simply waits for the first answer.
+        if self._bind() and self.cfg.warmup_on_start and self._refusal() is None:
             self._warmup()
 
         while not self._stop.is_set():
@@ -2024,6 +2125,7 @@ class FaceService:
             except Exception:
                 log.exception("pipe error")
                 time.sleep(0.5)
+        self._close_listen()
 
         log.info("FaceService stopped")
         try:
@@ -2037,16 +2139,12 @@ class FaceService:
     def stop(self) -> None:
         """Signal a graceful stop and UNBLOCK a _serve_one() waiting in ConnectNamedPipe.
 
-        Sets the loop flag + the win32 stop event, then SELF-CONNECTS to our own pipe (a throwaway
+        Sets the loop flag, then SELF-CONNECTS to our own pipe (a throwaway
         client connect+close) so the blocking ConnectNamedPipe returns at once -- otherwise an idle
         server (e.g. on Ctrl+C) would not notice the stop until a real client happened to connect.
         Safe to call from any thread (the console-ctrl handler runs on a Windows-owned thread).
         """
         self._stop.set()
-        try:
-            win32event.SetEvent(self._stop_event)
-        except Exception:   # pragma: no cover - defensive
-            pass
         self._wake_accept()
 
     def _wake_accept(self) -> None:
@@ -2054,7 +2152,9 @@ class FaceService:
         try:
             h = win32file.CreateFile(
                 PIPE_NAME, win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                0, None, win32file.OPEN_EXISTING, 0, None,
+                0, None, win32file.OPEN_EXISTING,
+                0x00100000 | 0x00010000,   # SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION (F-63)
+                None,
             )
             win32file.CloseHandle(h)
         except pywintypes.error:

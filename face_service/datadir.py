@@ -20,9 +20,9 @@ Defect -> consequence -> fix, which is the whole reason this module exists:
       descriptor of credentials._build_secret_file_sa.
     - A read-only verification walk then checks that no ACE other than SELF / SYSTEM / BA is left,
       that every owner is one of those three, and that the secrets are protected.
-  Whatever cannot be healed or verified is reported, and the service answers unlock /
-  unlock_gesture with ``insecure-data-dir`` after its existing gates (act A-2). Presence keeps
-  working: it releases nothing.
+  Whatever cannot be healed or verified is reported, and the service then refuses every face
+  function with ``custody`` (Stage 9, R9: unlock, unlock_gesture, presence, verify, enrollment;
+  ping answers "refusing: custody"). It was ``insecure-data-dir`` on unlock only (act A-2).
 
 Reparse points (junctions, symlinks, mount points) and hard links are never followed or modified.
 Any of them inside the data tree is a finding in its own right -- nothing the service writes there
@@ -48,7 +48,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pywintypes      # type: ignore
-import win32api        # type: ignore
 import win32con        # type: ignore
 import win32file       # type: ignore
 import win32security   # type: ignore
@@ -148,12 +147,9 @@ class CustodyReport:
 
 
 def self_sid_string() -> str:
-    th = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
-    try:
-        sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
-    finally:
-        win32api.CloseHandle(th)
-    return win32security.ConvertSidToStringSid(sid)
+    """SELF -- the one helper in face_service.identity (Stage 9, D-74)."""
+    from .identity import current_user_sid
+    return current_user_sid()
 
 
 def is_reparse(path) -> bool:
@@ -350,7 +346,7 @@ def heal_data_dir(app_dir) -> CustodyReport:
     """Heal, then verify, the custody of ``app_dir``. Never raises; the report says what happened.
 
     Logs ONE INFO line with the outcome on success and ONE ERROR line on failure; the caller turns
-    ``ok=False`` into the ``insecure-data-dir`` refusal."""
+    ``ok=False`` into the ``custody`` refusal (Stage 9, R9; the wire token was insecure-data-dir)."""
     rep = CustodyReport()
     root = str(app_dir)
     try:
@@ -375,7 +371,7 @@ def heal_data_dir(app_dir) -> CustodyReport:
     if rep.ok:
         log.info("data dir custody healed: %s (%s)", rep.summary(), root)
     else:
-        log.error("data dir custody FAILED: %s -- unlock will answer insecure-data-dir; first "
+        log.error("data dir custody FAILED: %s -- face functions refused (custody); first "
                   "problems: %s", rep.summary(), "; ".join(rep.problems[:5]))
     return rep
 

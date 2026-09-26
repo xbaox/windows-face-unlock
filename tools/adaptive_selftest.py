@@ -345,6 +345,7 @@ def main(argv=None) -> int:
 
             def _svc(rec, cfg):
                 s = FaceService.__new__(FaceService)   # bypass heavy __init__ (camera/pywin32/files)
+                s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
                 s.cfg = cfg
                 s.recog = rec
                 s._audit = _AuditStub()

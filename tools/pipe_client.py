@@ -3,16 +3,15 @@
 Usage (from the repo root, with the service running):
     python tools/pipe_client.py ping
     python tools/pipe_client.py status
-    python tools/pipe_client.py verify
-    python tools/pipe_client.py unlock
+    python tools/pipe_client.py verify           # SELF-only diagnostic (no strike, no secret)
     python tools/pipe_client.py presence
-    python tools/pipe_client.py challenge            # random gesture
-    python tools/pipe_client.py challenge nod         # forced kind: blink|turn_left|turn_right|nod
     python tools/pipe_client.py reload_config
     python tools/pipe_client.py pause_camera 30
 
 Sends one JSON command line and prints the JSON reply plus the round-trip time.
-The plaintext password from `unlock` is masked before printing.
+`unlock` / `unlock_gesture` / `report_result` answer "not-authorized" here: since Stage 9 only a
+SYSTEM caller speaking protocol v2 (the lock-screen Credential Provider) may use them, and no
+config key lifts that. A password in any reply is still masked before printing.
 """
 from __future__ import annotations
 
@@ -39,8 +38,8 @@ SEND_TIMEOUT_S = 30.0
 
 
 def send(req: dict, connect_timeout_s: float = SEND_TIMEOUT_S) -> dict:
-    """One request/reply through face_service.pipe_io.exchange (server SID checked BEFORE the write
-    when pipe_first_instance is on; the whole exchange bounded by ``connect_timeout_s``). Raises
+    """One request/reply through face_service.pipe_io.exchange (server SID and pipe owner checked
+    BEFORE the write, always; the whole exchange bounded by ``connect_timeout_s``). Raises
     PipeServerIdentityError on an untrusted server and SystemExit when nothing usable came back."""
     resp, why = exchange(req, connect_timeout_s)
     if why == "untrusted-server":
@@ -56,9 +55,7 @@ def main(argv: list[str]) -> int:
         return 2
     cmd = argv[0]
     req: dict = {"cmd": cmd}
-    if cmd == "challenge" and len(argv) > 1:
-        req["kind"] = argv[1]
-    elif cmd == "pause_camera" and len(argv) > 1:
+    if cmd == "pause_camera" and len(argv) > 1:
         req["seconds"] = float(argv[1])
 
     t0 = time.time()

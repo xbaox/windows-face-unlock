@@ -35,6 +35,7 @@ os.environ.setdefault("FACE_UNLOCK_HOME", tempfile.mkdtemp(prefix="faceunlock_ge
 
 import numpy as np
 
+from tools.testkit import deliver_and_report  # noqa: E402  (Stage 9: v2 report)
 from face_service.config import Config
 from face_service import service as svc
 from face_service.service import FaceService, VerifyOutcome, GESTURE_TOKEN_TTL_S
@@ -82,7 +83,8 @@ class _AuditStub:
 def _svc(cfg=None, remaining_s: float = 0.0):
     """Lightweight FaceService: real methods, no camera / model / pywin32 init."""
     s = FaceService.__new__(FaceService)
-    s.cfg = cfg if cfg is not None else Config(pipe_unlock_require_system=False)
+    s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
+    s.cfg = cfg if cfg is not None else Config()
     s._lockout = _LockoutSpy(remaining_s)
     s._audit = _AuditStub()
     s._camera_paused_until = 0.0
@@ -109,7 +111,7 @@ def _needs_gesture_svc(cfg=None):
 def test_phase1_discriminator():
     print("[1] phase-1 discriminator")
     s = _needs_gesture_svc()
-    r = s._handle({"cmd": "unlock"}, None)
+    r = s._handle({"cmd": "unlock", "v": 2}, None)
     check("NEEDS_GESTURE -> reason 'needs-gesture'", r.get("reason") == "needs-gesture", r)
     check("gesture is one of the four kinds",
           r.get("gesture") in ("blink", "turn_left", "turn_right", "nod"), r.get("gesture"))
@@ -124,13 +126,13 @@ def test_phase1_discriminator():
     check("ok is False (this is not a grant)", r.get("ok") is False, r)
     check("no password field leaked", "password" not in r, sorted(r))
 
-    ru = _needs_gesture_svc(Config(pipe_unlock_require_system=False, language="ru"))
-    r_ru = ru._handle({"cmd": "unlock"}, None)
+    ru = _needs_gesture_svc(Config(language="ru"))
+    r_ru = ru._handle({"cmd": "unlock", "v": 2}, None)
     check("ru language yields a Cyrillic prompt",
           any("Ѐ" <= c <= "ӿ" for c in r_ru.get("prompt", "")), r_ru.get("prompt"))
 
-    xx = _needs_gesture_svc(Config(pipe_unlock_require_system=False, language="ja"))
-    r_xx = xx._handle({"cmd": "unlock"}, None)
+    xx = _needs_gesture_svc(Config(language="ja"))
+    r_xx = xx._handle({"cmd": "unlock", "v": 2}, None)
     check("unlisted language falls back to the English prompt",
           r_xx.get("prompt") in ("Blink now", "Turn your head left",
                                  "Turn your head right", "Nod your head"), r_xx.get("prompt"))
@@ -142,16 +144,16 @@ def test_phase1_other_verdicts():
 
     p = _svc()
     p._capture_and_verify = lambda: _outcome("PASS", match=True, distance=0.05)
-    rp = p._handle({"cmd": "unlock"}, None)
+    rp = p._handle({"cmd": "unlock", "v": 2}, None)
     check("PASS -> credentials", rp.get("ok") is True and rp.get("username") == "admin", rp)
     # Stage 8b (F-19): the reset is part of the grant and is settled when the reply was WRITTEN
     # (_serve_one calls _finish_grant); nothing is recorded before that.
     check("PASS -> nothing recorded before delivery", p._lockout.records == [], p._lockout.records)
-    p._finish_grant(True)
+    deliver_and_report(p)
     check("PASS -> record(True) once delivered", p._lockout.records == [True], p._lockout.records)
     u = _svc()
     u._capture_and_verify = lambda: _outcome("PASS", match=True, distance=0.05)
-    u._handle({"cmd": "unlock"}, None)
+    u._handle({"cmd": "unlock", "v": 2}, None)
     u._finish_grant(False)
     check("undelivered grant -> no reset, no strike", u._lockout.records == [], u._lockout.records)
     check("undelivered grant -> audited as grant-undelivered",
@@ -159,14 +161,14 @@ def test_phase1_other_verdicts():
 
     n = _svc()
     n._capture_and_verify = lambda: _outcome("NOT_LIVE", distance=0.9)
-    rn = n._handle({"cmd": "unlock"}, None)
+    rn = n._handle({"cmd": "unlock", "v": 2}, None)
     check("NOT_LIVE -> reason 'no-match'", rn.get("reason") == "no-match", rn)
     check("NOT_LIVE -> record(False)", n._lockout.records == [False], n._lockout.records)
     check("NOT_LIVE arms no token", n._gesture_slot is None, n._gesture_slot)
 
     m = _svc()
     m._capture_and_verify = lambda: _outcome(None)
-    rm = m._handle({"cmd": "unlock"}, None)
+    rm = m._handle({"cmd": "unlock", "v": 2}, None)
     check("missing verdict -> fail closed to 'no-match'", rm.get("reason") == "no-match", rm)
     check("missing verdict arms no token", m._gesture_slot is None, m._gesture_slot)
 
@@ -185,58 +187,58 @@ def test_token_slot():
     svc.load_password = lambda: {"u": "admin", "p": "pw", "d": "."}
 
     s = _needs_gesture_svc()
-    tok = s._handle({"cmd": "unlock"}, None)["token"]
+    tok = s._handle({"cmd": "unlock", "v": 2}, None)["token"]
     s._run_challenge = _pass_round(s._gesture_slot["kind"] if s._gesture_slot else "blink")
-    r1 = s._handle({"cmd": "unlock_gesture", "token": tok}, None)
+    r1 = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
     check("valid token -> credentials", r1.get("ok") is True and r1.get("username") == "admin", r1)
-    r2 = s._handle({"cmd": "unlock_gesture", "token": tok}, None)
+    r2 = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
     check("replay of the same token -> gesture-token-invalid",
           r2.get("reason") == "gesture-token-invalid", r2)
 
     w = _needs_gesture_svc()
-    tok_w = w._handle({"cmd": "unlock"}, None)["token"]
-    rw = w._handle({"cmd": "unlock_gesture", "token": "f" * 32}, None)
+    tok_w = w._handle({"cmd": "unlock", "v": 2}, None)["token"]
+    rw = w._handle({"cmd": "unlock_gesture", "v": 2, "token": "f" * 32}, None)
     check("wrong token -> invalid", rw.get("reason") == "gesture-token-invalid", rw)
     check("wrong token does NOT burn the live slot", w._gesture_slot is not None)
     w._run_challenge = _pass_round("blink")
     check("the real token still works after a wrong one",
-          w._handle({"cmd": "unlock_gesture", "token": tok_w}, None).get("ok") is True)
+          w._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_w}, None).get("ok") is True)
 
     e = _needs_gesture_svc()
-    tok_e = e._handle({"cmd": "unlock"}, None)["token"]
+    tok_e = e._handle({"cmd": "unlock", "v": 2}, None)["token"]
     e._gesture_slot["expires"] = time.monotonic() - 1.0
-    re_ = e._handle({"cmd": "unlock_gesture", "token": tok_e}, None)
+    re_ = e._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_e}, None)
     check("expired token -> invalid", re_.get("reason") == "gesture-token-invalid", re_)
     check("expired slot is dropped", e._gesture_slot is None)
 
     o = _needs_gesture_svc()
-    tok_a = o._handle({"cmd": "unlock"}, None)["token"]
-    tok_b = o._handle({"cmd": "unlock"}, None)["token"]
+    tok_a = o._handle({"cmd": "unlock", "v": 2}, None)["token"]
+    tok_b = o._handle({"cmd": "unlock", "v": 2}, None)["token"]
     check("a second phase 1 issues a different token", tok_a != tok_b)
     check("the older token is dead",
-          o._handle({"cmd": "unlock_gesture", "token": tok_a}, None).get("reason")
+          o._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_a}, None).get("reason")
           == "gesture-token-invalid")
 
     n = _svc()
     check("unlock_gesture with no armed slot -> invalid",
-          n._handle({"cmd": "unlock_gesture", "token": "a" * 32}, None).get("reason")
+          n._handle({"cmd": "unlock_gesture", "v": 2, "token": "a" * 32}, None).get("reason")
           == "gesture-token-invalid")
     check("missing token field -> invalid",
-          _svc()._handle({"cmd": "unlock_gesture"}, None).get("reason") == "gesture-token-invalid")
+          _svc()._handle({"cmd": "unlock_gesture", "v": 2}, None).get("reason") == "gesture-token-invalid")
 
     # Hostile token shapes must be rejected cleanly, never raise out of the handler (which would
     # answer "exception: ..."). compare_digest refuses non-ASCII str outright.
     h = _needs_gesture_svc()
-    tok_h = h._handle({"cmd": "unlock"}, None)["token"]
+    tok_h = h._handle({"cmd": "unlock", "v": 2}, None)["token"]
     for label, bad in (("non-ASCII", "é" * 32), ("non-string", 12345),
                        ("list", ["a"]), ("None", None), ("empty", "")):
-        rh = h._handle({"cmd": "unlock_gesture", "token": bad}, None)
+        rh = h._handle({"cmd": "unlock_gesture", "v": 2, "token": bad}, None)
         check(f"hostile token ({label}) -> clean invalid",
               rh.get("reason") == "gesture-token-invalid", rh)
     check("hostile tokens did not burn the live slot", h._gesture_slot is not None)
     h._run_challenge = _pass_round("blink")
     check("the real token still works after hostile ones",
-          h._handle({"cmd": "unlock_gesture", "token": tok_h}, None).get("ok") is True)
+          h._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_h}, None).get("ok") is True)
 
 
 # --- [3] gate order -----------------------------------------------------------------------
@@ -250,15 +252,16 @@ def test_gate_order():
         return {"ok": True, "challenge": k, "prompt": "x", "passed": True, "state": "passed",
                 "identity_frames": 2, "distance_best": 0.07}
 
-    # Arm a real token first (phase 1 is itself SYSTEM-gated), THEN turn the gate on: what is
-    # under test is unlock_gesture's own gate, on a request that is otherwise perfectly valid.
+    # Arm a real token first (phase 1 is itself SYSTEM-gated), THEN let a non-SYSTEM caller in:
+    # what is under test is unlock_gesture's own gate, on a request that is otherwise valid.
+    # (Stage 9: the gate has no config switch; the caller identity is what changes here.)
     g = _needs_gesture_svc()
-    tok = g._handle({"cmd": "unlock"}, None)["token"]
-    g.cfg.pipe_unlock_require_system = True
+    tok = g._handle({"cmd": "unlock", "v": 2}, None)["token"]
+    g._caller_sid = lambda h: "S-1-5-21-1-2-3-1001"
     g._run_challenge = _spy
     audit_before = len(g._audit.records)
-    rg = g._handle({"cmd": "unlock_gesture", "token": tok}, None)
-    check("require_system=True + non-SYSTEM -> not-authorized",
+    rg = g._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+    check("non-SYSTEM caller -> not-authorized",
           rg == {"ok": False, "reason": "not-authorized"}, rg)
     check("SYSTEM gate short-circuits before the round", ran["n"] == 0)
     check("SYSTEM gate does NOT burn the token", g._gesture_slot is not None)
@@ -266,10 +269,10 @@ def test_gate_order():
     check("SYSTEM gate adds no strike", g._lockout.records == [])
 
     l = _needs_gesture_svc()
-    tok_l = l._handle({"cmd": "unlock"}, None)["token"]
+    tok_l = l._handle({"cmd": "unlock", "v": 2}, None)["token"]
     l._lockout._remaining = 42.5
     l._run_challenge = _spy
-    rl = l._handle({"cmd": "unlock_gesture", "token": tok_l}, None)
+    rl = l._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_l}, None)
     check("lockout -> locked-out + retry_after_s",
           rl.get("reason") == "locked-out" and rl.get("retry_after_s") == 42.5, rl)
     check("lockout short-circuits before the round", ran["n"] == 0)
@@ -278,13 +281,13 @@ def test_gate_order():
 
     t = _svc()
     t._run_challenge = _spy
-    t._handle({"cmd": "unlock_gesture", "token": "b" * 32}, None)
+    t._handle({"cmd": "unlock_gesture", "v": 2, "token": "b" * 32}, None)
     check("token gate short-circuits before the round (camera never opens)", ran["n"] == 0)
 
     b = _needs_gesture_svc()
-    tok_b = b._handle({"cmd": "unlock"}, None)["token"]
+    tok_b = b._handle({"cmd": "unlock", "v": 2}, None)["token"]
     b._run_challenge = lambda k, *, identity=False: {"ok": False, "reason": "camera-busy"}
-    rb = b._handle({"cmd": "unlock_gesture", "token": tok_b}, None)
+    rb = b._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_b}, None)
     check("camera-busy surfaces as itself", rb == {"ok": False, "reason": "camera-busy"}, rb)
     check("camera-busy is lockout-neutral", b._lockout.records == [], b._lockout.records)
     check("camera-busy still burnt the token (one-shot is unconditional)",
@@ -358,7 +361,7 @@ class _ClockShim:
 
 def _round(kind, frames, identity):
     """Drive the REAL _run_challenge over canned frames."""
-    s = _svc(Config(pipe_unlock_require_system=False, persistent_camera=False))
+    s = _svc(Config(persistent_camera=False))
     cam = _StubCam([_WARMUP, _WARMUP] + list(frames))
     s.recog = _StubRecog()
     s._acquire_camera = lambda: (cam, False)
@@ -427,7 +430,7 @@ def test_strikes_and_audit():
     svc.load_password = lambda: {"u": "admin", "p": "pw", "d": "."}
 
     s = _needs_gesture_svc()
-    tok = s._handle({"cmd": "unlock"}, None)["token"]
+    tok = s._handle({"cmd": "unlock", "v": 2}, None)["token"]
     check("needs-gesture adds NO strike", s._lockout.records == [], s._lockout.records)
     ev, rec = s._audit.records[-1]
     check("phase-1 audit event is 'unlock'", ev == "unlock", ev)
@@ -440,36 +443,36 @@ def test_strikes_and_audit():
           "token" not in rec and tok not in repr(rec), rec)
 
     f = _needs_gesture_svc()
-    tok_f = f._handle({"cmd": "unlock"}, None)["token"]
+    tok_f = f._handle({"cmd": "unlock", "v": 2}, None)["token"]
     f._run_challenge = lambda k, *, identity=False: {
         "ok": True, "challenge": k, "prompt": "x", "passed": False, "state": "failed",
         "identity_frames": 1, "distance_best": 0.08}
-    rf = f._handle({"cmd": "unlock_gesture", "token": tok_f}, None)
+    rf = f._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_f}, None)
     check("failed round -> gesture-failed", rf.get("reason") == "gesture-failed", rf)
     check("failed round exposes challenge/state/identity_frames",
           rf.get("state") == "failed" and rf.get("identity_frames") == 1, rf)
     check("failed round -> record(False)", f._lockout.records == [False], f._lockout.records)
 
     t = _needs_gesture_svc()
-    tok_t = t._handle({"cmd": "unlock"}, None)["token"]
+    tok_t = t._handle({"cmd": "unlock", "v": 2}, None)["token"]
     t._run_challenge = lambda k, *, identity=False: {
         "ok": True, "challenge": k, "prompt": "x", "passed": True, "state": "passed",
         "identity_frames": 1, "distance_best": 0.08}
-    rt = t._handle({"cmd": "unlock_gesture", "token": tok_t}, None)
+    rt = t._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_t}, None)
     check("task passed but too few identity frames -> gesture-failed",
           rt.get("reason") == "gesture-failed", rt)
     check("thin-identity failure -> record(False)", t._lockout.records == [False])
 
     g = _needs_gesture_svc()
-    tok_g = g._handle({"cmd": "unlock"}, None)["token"]
+    tok_g = g._handle({"cmd": "unlock", "v": 2}, None)["token"]
     g._run_challenge = _pass_round("blink", identity_frames=3)
-    rg = g._handle({"cmd": "unlock_gesture", "token": tok_g}, None)
+    rg = g._handle({"cmd": "unlock_gesture", "v": 2, "token": tok_g}, None)
     check("granted round -> credentials", rg.get("ok") is True and rg.get("username") == "admin", rg)
-    g._finish_grant(True)       # Stage 8b (F-19): settled once the reply is delivered
+    deliver_and_report(g)       # Stage 8b (F-19): settled once the reply is delivered
     check("granted round -> record(True)", g._lockout.records == [True], g._lockout.records)
 
     i = _svc()
-    i._handle({"cmd": "unlock_gesture", "token": "c" * 32}, None)
+    i._handle({"cmd": "unlock_gesture", "v": 2, "token": "c" * 32}, None)
     check("invalid token -> no strike at all", i._lockout.records == [], i._lockout.records)
 
     keys = {"challenge", "passed", "identity_frames", "distance_best", "reason"}
@@ -482,15 +485,15 @@ def test_strikes_and_audit():
             "ok": False, "reason": "camera-busy"}), "camera-busy"),
     ):
         s2._run_challenge = runner
-        s2._handle({"cmd": "unlock_gesture", "token": tok2}, None)
-        s2._finish_grant(True)  # Stage 8b (F-19): the "granted" record is written on delivery
+        s2._handle({"cmd": "unlock_gesture", "v": 2, "token": tok2}, None)
+        deliver_and_report(s2)  # Stage 8b (F-19): the "granted" record is written on delivery
         ev2, rec2 = s2._audit.records[-1]
         check(f"audit '{label}': event is unlock_gesture", ev2 == "unlock_gesture", ev2)
         check(f"audit '{label}': stable five-key record", set(rec2) == keys, sorted(rec2))
         check(f"audit '{label}': reason == {expect}", rec2.get("reason") == expect, rec2)
 
     inv = _svc()
-    inv._handle({"cmd": "unlock_gesture", "token": "d" * 32}, None)
+    inv._handle({"cmd": "unlock_gesture", "v": 2, "token": "d" * 32}, None)
     ev3, rec3 = inv._audit.records[-1]
     check("audit 'gesture-token-invalid': stable five-key record",
           ev3 == "unlock_gesture" and set(rec3) == keys
@@ -504,7 +507,7 @@ def _armed(runner):
     """A service with a live phase-1 token, plus that token. (runner is returned untouched so
     the caller's tuple unpacking stays readable.)"""
     s = _needs_gesture_svc()
-    tok = s._handle({"cmd": "unlock"}, None)["token"]
+    tok = s._handle({"cmd": "unlock", "v": 2}, None)["token"]
     return s, tok, runner
 
 

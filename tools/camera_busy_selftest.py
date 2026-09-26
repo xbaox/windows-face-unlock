@@ -164,6 +164,7 @@ def main(argv=None) -> int:
             # test actually touch: a field added there has to be added here too, or the first case
             # that reaches it fails with AttributeError instead of testing anything.
             s = FaceService.__new__(FaceService)
+            s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
             s.cfg = cfg
             s._cam = None
             s._cam_lock = threading.Lock()
@@ -182,7 +183,7 @@ def main(argv=None) -> int:
             # "not-authorized" before the camera-busy branch is ever reached. The gate
             # is not what these cases exercise -- same reason and same shape as
             # tools/pipe_hardening_selftest.py:155.
-            c.pipe_unlock_require_system = False
+            pass   # Stage 9: no config switch for the SYSTEM gate; the service stands in via _caller_sid
             return c
 
         orig_camera = SVC.Camera
@@ -209,7 +210,7 @@ def main(argv=None) -> int:
             FakeCamera.made = 0
             FakeCamera.next_open = False
             s = _svc(_cfg())
-            resp = s._handle({"cmd": "unlock"})
+            resp = s._handle({"cmd": "unlock", "v": 2})
             t.ok(resp.get("reason") == "camera-busy" and resp.get("ok") is False,
                  "busy unlock -> reason 'camera-busy' (NOT 'exception: Cannot open camera...')")
             t.ok(s._lockout.records == [], "camera-busy does NOT touch the lockout counter (neutral)")
@@ -217,7 +218,7 @@ def main(argv=None) -> int:
             t.ok(ev == "unlock" and rec.get("outcome") == "camera-busy",
                  "audit records outcome 'camera-busy'")
             t.ok(s._cam is None, "after a busy unlock self._cam is None (no stuck handle)")
-            resp2 = s._handle({"cmd": "unlock"})
+            resp2 = s._handle({"cmd": "unlock", "v": 2})
             t.ok(resp2.get("reason") == "camera-busy" and s._lockout.records == [],
                  "2nd busy unlock RE-DETECTS busy (no AssertionError on a broken camera)")
 
@@ -239,7 +240,7 @@ def main(argv=None) -> int:
             FakeCamera.next_open = False   # would be busy IF an open were attempted
             s = _svc(_cfg())
             s._camera_paused_until = 1e18  # our own enrollment holds the camera
-            resp = s._handle({"cmd": "unlock"})
+            resp = s._handle({"cmd": "unlock", "v": 2})
             t.ok(resp.get("reason") == "camera-busy" and s._lockout.records == [],
                  "leased unlock -> 'camera-busy' (8b F-46), lockout untouched")
             t.ok(FakeCamera.made == 0, "leased path never even constructs / opens a camera")

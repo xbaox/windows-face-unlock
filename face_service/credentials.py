@@ -18,7 +18,6 @@ import logging
 import os
 from pathlib import Path
 
-import win32api      # type: ignore
 import win32con      # type: ignore
 import win32crypt    # type: ignore
 import win32file     # type: ignore
@@ -40,14 +39,9 @@ _V2_PREFIX = b"v2:"
 
 
 def _self_sid_string() -> str:
-    """String SID of the account this process runs as (SELF). Duplicated (not imported from
-    service.py) so this module stays free of the heavy service/recognizer import chain."""
-    th = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
-    try:
-        sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
-    finally:
-        win32api.CloseHandle(th)
-    return win32security.ConvertSidToStringSid(sid)
+    """String SID of the account this process runs as (SELF) -- face_service.identity (D-74)."""
+    from .identity import current_user_sid
+    return current_user_sid()
 
 
 def _build_secret_file_sa() -> win32security.SECURITY_ATTRIBUTES:
@@ -115,12 +109,37 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+# Stage 9 (§2.1 protocol v2, F-92): the lock screen reported that Windows REJECTED the password
+# this store released. Defect before: the Credential Provider latched that only for its own
+# instance, so every new lock screen submitted the stale password again and each one counted
+# toward the account-lockout policy. Fix: the service writes this flag on report_result ok=false
+# and refuses unlock ("password-rejected") while it exists; saving a new password clears it.
+PASSWORD_REJECTED_PATH = CREDS_PATH.parent / "password_rejected.flag"
+
+
+def password_rejected() -> bool:
+    return PASSWORD_REJECTED_PATH.exists()
+
+
+def mark_password_rejected() -> None:
+    PASSWORD_REJECTED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PASSWORD_REJECTED_PATH.write_text("rejected by Windows at the lock screen", encoding="utf-8")
+
+
+def clear_password_rejected() -> None:
+    try:
+        PASSWORD_REJECTED_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def save_password(username: str, password: str, domain: str = ".") -> None:
     blob = json.dumps({"u": username, "p": password, "d": domain}).encode("utf-8")
     secret = _ensure_entropy_secret()
     enc = _V2_PREFIX + win32crypt.CryptProtectData(blob, "face-unlock", secret, None, None, 0)
     CREDS_PATH.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_bytes(CREDS_PATH, enc)
+    clear_password_rejected()        # a new password answers the lock screen's rejection
 
 
 def load_password() -> "dict | None":
@@ -158,3 +177,4 @@ def load_password() -> "dict | None":
 def clear_password() -> None:
     if CREDS_PATH.exists():
         CREDS_PATH.unlink()
+    clear_password_rejected()

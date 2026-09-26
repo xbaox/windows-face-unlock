@@ -90,4 +90,6 @@ class AuditLog:
             size = self.path.stat().st_size
         except OSError:
             size = 0
-        return {"enabled": self.enabled, "path": str(self.path), "size": size}
+        # Stage 9 (F-113): the file NAME only -- the full path carries the account name and this
+        # dict goes out over the pipe.
+        return {"enabled": self.enabled, "path": self.path.name, "size": size}

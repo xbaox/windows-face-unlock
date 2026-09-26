@@ -332,7 +332,7 @@ class Recognizer:
         directory.mkdir(parents=True, exist_ok=True)
         images = [p for p in directory.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}]
         if not images:
-            raise RuntimeError(f"No enroll images in {directory}")
+            raise RuntimeError(f"No enroll images in {directory.name}")   # F-113: no profile path
 
         vecs: list[np.ndarray] = []
         accepted: list[tuple[str, FrameQuality]] = []

@@ -123,6 +123,7 @@ def test_engine_error():
         S.log.setLevel(old)
 
     s = S.FaceService.__new__(S.FaceService)
+    s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
     s.cfg = Config()
     s._presence_probe = lambda: ("error", False)
     r = s._handle({"cmd": "presence"}, None)
@@ -161,6 +162,7 @@ class _AuditStub:
 
 def _svc_with_real_recognizer():
     s = S.FaceService.__new__(S.FaceService)
+    s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
     s.cfg = Config(adaptive_gallery=True)
     s.recog = R.Recognizer(s.cfg)
     s._audit = _AuditStub()

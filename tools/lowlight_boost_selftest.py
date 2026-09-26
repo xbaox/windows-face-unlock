@@ -23,6 +23,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tools.testkit import deliver_and_report  # noqa: E402  (Stage 9: v2 report)
 from face_service import camera_boost as CB
 from face_service.config import Config
 
@@ -189,6 +190,7 @@ def main(argv=None) -> int:
 
         def _svc(cfg, dark, boost_spy):
             s = FaceService.__new__(FaceService)
+            s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
             s.cfg = cfg
             s._lockout = _LockoutSpy()
             s._audit = _AuditStub()
@@ -200,7 +202,7 @@ def main(argv=None) -> int:
 
         def _svc_cfg():
             c = Config()
-            # This harness calls _handle({"cmd": "unlock"}) with NO pipe handle, so the
+            # This harness calls _handle({"cmd": "unlock", "v": 2}) with NO pipe handle, so the
             # Stage-5 SID gate resolves the client SID to None and refuses with
             # "not-authorized" before the low-light path is ever reached. The gate is not
             # what these cases exercise -- same reason and same shape as
@@ -209,7 +211,7 @@ def main(argv=None) -> int:
             # asserts both that it REFUSES a non-SYSTEM caller when on (:148-153) and that
             # it allows one through when off (:155-160). Test scaffold only: production
             # behaviour and the Stage-4/5 perimeter are untouched.
-            c.pipe_unlock_require_system = False
+            pass   # Stage 9: no config switch for the SYSTEM gate; the service stands in via _caller_sid
             return c
 
         cfg = _svc_cfg()  # low_light_luma_min 45, low_light_boost True, step 2
@@ -224,8 +226,8 @@ def main(argv=None) -> int:
         try:
             spy = _BoostSpy(bright_match, baud)
             svc = _svc(cfg, dark, spy)
-            resp = svc._handle({"cmd": "unlock"})
-            svc._finish_grant(True)   # Stage 8b (F-19): grant bookkeeping runs on delivery
+            resp = svc._handle({"cmd": "unlock", "v": 2})
+            deliver_and_report(svc)   # Stage 8b (F-19): grant bookkeeping runs on delivery
             t.ok(spy.calls == 1, "dark first burst + boost enabled -> _maybe_boost called")
             t.ok(resp.get("ok") is True and resp.get("username") == "admin",
                  "boost lifted + matched -> GRANT via the normal path")
@@ -241,7 +243,7 @@ def main(argv=None) -> int:
         bright_nomatch = VerifyOutcome(False, 0.50, True, {"verdict": "NOT_LIVE", "scene_luma": 60.0}, None, 60.0)
         spy = _BoostSpy(bright_nomatch, {**baud, "scene_luma_after": 60.0})
         svc = _svc(cfg, dark, spy)
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(resp.get("reason") == "no-match" and svc._lockout.records == [False],
              "boost lifted but no-match -> reason 'no-match', strike recorded (light is adequate now)")
 
@@ -249,7 +251,7 @@ def main(argv=None) -> int:
         still_dark = VerifyOutcome(False, 0.36, True, {"verdict": "NOT_LIVE", "scene_luma": 12.0}, None, 12.0)
         spy = _BoostSpy(still_dark, {"boost_applied": False, "boost_honored": True, "scene_luma_before": 10.0})
         svc = _svc(cfg, dark, spy)
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(resp.get("reason") == "too-dark" and svc._lockout.records == [],
              "boost couldn't lift -> too-dark, Lockout.record NOT called (neutral)")
         ev, rec = svc._audit.records[-1]
@@ -260,7 +262,7 @@ def main(argv=None) -> int:
         bright_first = VerifyOutcome(False, 0.50, True, {"verdict": "NOT_LIVE", "scene_luma": 80.0}, None, 80.0)
         spy = _BoostSpy(bright_first, {})
         svc = _svc(cfg, bright_first, spy)
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(spy.calls == 0 and resp.get("reason") == "no-match" and svc._lockout.records == [False],
              "scene >= floor -> no boost, normal no-match (unchanged 3.2 path)")
 
@@ -269,7 +271,7 @@ def main(argv=None) -> int:
         cfg_off.low_light_boost = False
         spy = _BoostSpy(dark, {})
         svc = _svc(cfg_off, dark, spy)
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(spy.calls == 0 and resp.get("reason") == "too-dark" and svc._lockout.records == [],
              "low_light_boost=False -> no camera touch; dark stays too-dark (3.2 behaviour)")
 

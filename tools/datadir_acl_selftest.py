@@ -5,11 +5,11 @@ Everything runs on a FACE_UNLOCK_HOME this test creates itself under %TEMP%; the
   [1] heal: a tree seeded with BUILTIN\\Users:Modify (the 0.1.0 installer ACE) is reported unclean,
       the heal removes every foreign ACE, protects APP_DIR, re-locks the secrets to SELF+SYSTEM,
       the verification walk comes back clean, and a second heal rewrites nothing.
-  [2] fail-closed: a heal that cannot write a descriptor reports ok=False, and unlock /
-      unlock_gesture then answer "insecure-data-dir" -- AFTER the existing gates (a non-SYSTEM
-      caller, a lockout, a busy camera and a bad token still get their own answers first),
-      without touching the lockout counter and without reaching _release_credentials. presence
-      is not gated.
+  [2] fail-closed: a heal that cannot write a descriptor reports ok=False, and every face function
+      is refused with "custody" (Stage 9, R9 / D-46): unlock and unlock_gesture right after the
+      SYSTEM and version gates -- BEFORE the lockout, the camera and the token -- without touching
+      the lockout counter and without reaching _release_credentials; presence, verify and the
+      enrollment commands too; ping reports {"state":"refusing","why":"custody"}.
   [3] reparse points: a junction at APP_DIR, enroll or debug_frames makes the heal fail without
       following it; the target's descriptor and files are left exactly as they were.
   [4] purge-on-start removes only dump-named files, never enters a junction, and removes the
@@ -139,9 +139,10 @@ class _AuditStub:
         self.records.append((ev, rec))
 
 
-def _svc(insecure: bool, remaining_s: float = 0.0, require_system: bool = False):
+def _svc(insecure: bool, remaining_s: float = 0.0, caller: str = "S-1-5-18"):
     s = FaceService.__new__(FaceService)
-    s.cfg = Config(pipe_unlock_require_system=require_system)
+    s._caller_sid = lambda h: caller       # Stage 9: stand in for the lock screen (SYSTEM)
+    s.cfg = Config()
     s._lockout = _LockoutSpy(remaining_s)
     s._audit = _AuditStub()
     s._camera_paused_until = 0.0
@@ -175,58 +176,66 @@ def test_fail_closed():
     svc.load_password = lambda: released.append(1) or {"u": "admin", "p": "pw", "d": "."}
 
     s = _svc(insecure=True)
-    r = s._handle({"cmd": "unlock"}, None)
-    check("unlock -> insecure-data-dir", r == {"ok": False, "reason": "insecure-data-dir"}, r)
+    r = s._handle({"cmd": "unlock", "v": 2}, None)
+    check("unlock -> custody", r == {"ok": False, "reason": "custody"}, r)
     check("no strike, no reset (lockout-neutral)", s._lockout.records == [], s._lockout.records)
-    check("audit outcome insecure-data-dir",
-          s._audit.records and s._audit.records[-1][1].get("outcome") == "insecure-data-dir",
+    check("audit outcome custody",
+          s._audit.records and s._audit.records[-1][1].get("outcome") == "custody",
           s._audit.records)
     check("_release_credentials never reached", released == [], released)
 
-    # Existing gates still answer first, in their order.
-    s = _svc(insecure=True, require_system=True)
-    orig_sid, orig_diag = svc._pipe_client_sid_string, svc._pipe_client_diag
-    svc._pipe_client_sid_string = lambda h: "S-1-5-21-1-2-3-1001"
+    # The SYSTEM gate and the protocol version still answer first.
+    s = _svc(insecure=True, caller="S-1-5-21-1-2-3-1001")
+    orig_diag = svc._pipe_client_diag
     svc._pipe_client_diag = lambda h: "stub"
     try:
-        r = s._handle({"cmd": "unlock"}, None)
+        r = s._handle({"cmd": "unlock", "v": 2}, None)
         check("non-SYSTEM caller still gets not-authorized first",
               r.get("reason") == "not-authorized", r)
-        r = s._handle({"cmd": "unlock_gesture", "token": "a" * 32}, None)
+        r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": "a" * 32}, None)
         check("unlock_gesture: not-authorized first", r.get("reason") == "not-authorized", r)
     finally:
-        svc._pipe_client_sid_string, svc._pipe_client_diag = orig_sid, orig_diag
+        svc._pipe_client_diag = orig_diag
+    s = _svc(insecure=True)
+    r = s._handle({"cmd": "unlock"}, None)
+    check("a v1 request still gets version-mismatch first", r.get("reason") == "version-mismatch", r)
+    # ...and custody now comes BEFORE the lockout, the camera and the token (D-46).
     s = _svc(insecure=True, remaining_s=42.0)
-    r = s._handle({"cmd": "unlock"}, None)
-    check("locked-out still answers first", r.get("reason") == "locked-out", r)
+    r = s._handle({"cmd": "unlock", "v": 2}, None)
+    check("custody before the lockout", r.get("reason") == "custody", r)
     s = _svc(insecure=True)
-    s._capture_and_verify = lambda: VerifyOutcome(False, 1.0, False, {"verdict": "SKIPPED"},
-                                                  camera_busy=True)
-    r = s._handle({"cmd": "unlock"}, None)
-    check("camera-busy still answers first", r.get("reason") == "camera-busy", r)
+    opened = []
+    s._capture_and_verify = lambda: opened.append(1) or VerifyOutcome(
+        False, 1.0, False, {"verdict": "SKIPPED"}, camera_busy=True)
+    r = s._handle({"cmd": "unlock", "v": 2}, None)
+    check("custody before the camera (no burst at all)", r.get("reason") == "custody" and not opened,
+          (r, opened))
     s = _svc(insecure=True)
-    r = s._handle({"cmd": "unlock_gesture", "token": "b" * 32}, None)
-    check("bad token still answers first", r.get("reason") == "gesture-token-invalid", r)
-
-    s = _svc(insecure=True)
-    s._gesture_slot = {"token": "c" * 32, "kind": "blink", "expires": 1e18}
-    s._run_challenge = lambda k, *, identity=False: {
-        "ok": True, "challenge": k, "prompt": "x", "passed": True, "state": "passed",
-        "identity_frames": 5, "distance_best": 0.05}
-    r = s._handle({"cmd": "unlock_gesture", "token": "c" * 32}, None)
-    check("unlock_gesture after a passed round -> insecure-data-dir",
-          r == {"ok": False, "reason": "insecure-data-dir"}, r)
+    s._gesture_slot = {"token": "c" * 32, "kind": "nod", "expires": 1e18}
+    ran = []
+    s._run_challenge = lambda k, *, identity=False: ran.append(k) or {"ok": True}
+    r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": "c" * 32}, None)
+    check("unlock_gesture -> custody, before the token and the round",
+          r == {"ok": False, "reason": "custody"} and not ran and s._gesture_slot is not None,
+          (r, ran))
     check("gesture path: no strike, no reset", s._lockout.records == [], s._lockout.records)
     check("gesture path: _release_credentials never reached", released == [], released)
 
     s = _svc(insecure=False)
-    r = s._handle({"cmd": "unlock"}, None)
+    r = s._handle({"cmd": "unlock", "v": 2}, None)
     check("secure directory: unlock grants as before", r.get("ok") is True, sorted(r))
 
     s = _svc(insecure=True)
     s._presence_probe = lambda: ("present", True)
-    r = s._handle({"cmd": "presence"}, None)
-    check("presence is not gated", r.get("ok") is True and r.get("state") == "present", r)
+    for cmd in ("presence", "build_enrollment", "clear_enrollment"):
+        r = s._handle({"cmd": cmd}, None)
+        check(f"{cmd} refused with custody (R9)", r == {"ok": False, "reason": "custody"}, r)
+    s._caller_sid = lambda h: svc.current_user_sid()
+    r = s._handle({"cmd": "verify"}, None)
+    check("verify refused with custody (R9)", r == {"ok": False, "reason": "custody"}, r)
+    r = s._handle({"cmd": "ping"}, None)
+    check("ping: alive, refusing, why=custody",
+          r == {"ok": True, "pong": True, "state": "refusing", "why": "custody"}, r)
 
 
 # --- [3] reparse points -----------------------------------------------------------------------
@@ -288,6 +297,7 @@ def test_purge():
     (ring / "keep-me.txt").write_bytes(b"k")
     import numpy as np
     s = FaceService.__new__(FaceService)
+    s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
     s.cfg = Config(debug_dump_frames=True)
     old_max = svc.DEBUG_DUMP_RING_MAX
     svc.DEBUG_DUMP_RING_MAX = 2

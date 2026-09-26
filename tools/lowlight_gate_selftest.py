@@ -123,6 +123,7 @@ def main(argv=None) -> int:
 
         def _svc(cfg, outcome):
             s = FaceService.__new__(FaceService)   # bypass heavy __init__ (camera/pywin32/files)
+            s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
             s.cfg = cfg
             s._lockout = _LockoutSpy()
             s._audit = _AuditStub()
@@ -141,7 +142,7 @@ def main(argv=None) -> int:
 
         def _svc_cfg():
             c = Config()
-            # This harness calls _handle({"cmd": "unlock"}) with NO pipe handle, so the
+            # This harness calls _handle({"cmd": "unlock", "v": 2}) with NO pipe handle, so the
             # Stage-5 SID gate resolves the client SID to None and refuses with
             # "not-authorized" before the low-light path is ever reached. The gate is not
             # what these cases exercise -- same reason and same shape as
@@ -150,7 +151,7 @@ def main(argv=None) -> int:
             # asserts both that it REFUSES a non-SYSTEM caller when on (:148-153) and that
             # it allows one through when off (:155-160). Test scaffold only: production
             # behaviour and the Stage-4/5 perimeter are untouched.
-            c.pipe_unlock_require_system = False
+            pass   # Stage 9: no config switch for the SYSTEM gate; the service stands in via _caller_sid
             return c
 
         cfg = _svc_cfg()  # low_light_luma_min = 45.0
@@ -158,7 +159,7 @@ def main(argv=None) -> int:
 
         # (a) too-dark AND recognition WOULD have matched -> still denied, NO lockout touch.
         svc = _svc(cfg, VerifyOutcome(True, 0.36, True, dict(detail_dark), None, 10.0))
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(resp.get("reason") == "too-dark" and resp.get("ok") is False,
              "too-dark + would-match -> deny reason 'too-dark' (match forced off in the dark)")
         t.ok(svc._lockout.records == [],
@@ -169,13 +170,13 @@ def main(argv=None) -> int:
 
         # (b) too-dark AND no-match -> honest 'too-dark' (NOT 'no-match'), still no lockout touch.
         svc = _svc(cfg, VerifyOutcome(False, 0.90, True, {"verdict": "NOT_LIVE", "scene_luma": 8.0}, None, 8.0))
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(resp.get("reason") == "too-dark" and svc._lockout.records == [],
              "too-dark + no-match -> reason 'too-dark', Lockout.record NOT called")
 
         # (c) ABOVE floor + no-match -> unchanged: records the failed attempt, reason 'no-match'.
         svc = _svc(cfg, VerifyOutcome(False, 0.50, True, {"verdict": "NOT_LIVE", "scene_luma": 80.0}, None, 80.0))
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(resp.get("reason") == "no-match" and svc._lockout.records == [False],
              "above floor + no-match -> reason 'no-match', Lockout.record(False) called (unchanged)")
 
@@ -183,13 +184,13 @@ def main(argv=None) -> int:
         cfg0 = _svc_cfg()
         cfg0.low_light_luma_min = 0.0
         svc = _svc(cfg0, VerifyOutcome(False, 0.50, True, {"verdict": "NOT_LIVE", "scene_luma": 5.0}, None, 5.0))
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(resp.get("reason") == "no-match" and svc._lockout.records == [False],
              "floor=0 -> gate off: dark scene still takes the normal path (record called)")
 
         # (e) no scene measured (camera leased / no frame): scene_luma None -> gate skipped.
         svc = _svc(cfg, VerifyOutcome(False, 1.0, False, {"verdict": "SKIPPED", "reason": "camera-leased"}, None, None))
-        resp = svc._handle({"cmd": "unlock"})
+        resp = svc._handle({"cmd": "unlock", "v": 2})
         t.ok(resp.get("reason") == "no-match" and svc._lockout.records == [False],
              "scene_luma None -> not mislabeled too-dark (falls through to existing path)")
 

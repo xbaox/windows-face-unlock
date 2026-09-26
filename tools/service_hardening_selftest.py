@@ -8,7 +8,7 @@
              honest reason; a judged burst still strikes.
   [5]  F-19  past the deadline nothing is released and nothing recorded; a grant is recorded and
              audited only when the reply was delivered (real _serve_one on a private pipe name).
-  [6]  F-20  pipe_first_instance is under the ratchet; pipe_io refuses an untrusted server without
+  [6]  F-20  (Stage 9: no pipe keys, no ratchet) pipe_io refuses an untrusted server without
              writing, and bounds a server that never answers.
   [7]  F-21  reset_lockout is gone.
   [8]  F-32  threshold ceiling 0.5 in validate and in the Settings spec.
@@ -95,7 +95,8 @@ class _AuditStub:
 
 def _svc(cfg=None):
     s = FaceService.__new__(FaceService)
-    s.cfg = cfg or Config(pipe_unlock_require_system=False)
+    s._caller_sid = lambda h: "S-1-5-18"   # Stage 9: stand in for the lock screen (SYSTEM)
+    s.cfg = cfg or Config()
     s._lockout = _LockoutSpy()
     s._audit = _AuditStub()
     s._camera_paused_until = 0.0
@@ -130,7 +131,7 @@ def test_screen_in_round():
         def analyze_frame(self, _f):
             return FrameAnalysis(True, True, 0.05, True, np.zeros((106, 2)), (0.0, 0.0, 0.0))
 
-    s = _svc(Config(pipe_unlock_require_system=False, persistent_camera=False))
+    s = _svc(Config(persistent_camera=False))
     s.recog = _Recog()
     cam = _Cam(12)
     s._acquire_camera = lambda: (cam, False)
@@ -248,14 +249,14 @@ def test_fault_neutral():
         s = _svc()
         s.recog = type("R", (), {"_refs": refs})()
         s._capture_and_verify = lambda d=detail: VerifyOutcome(False, 1.0, False, d, None, None)
-        r = s._handle({"cmd": "unlock"}, None)
+        r = s._handle({"cmd": "unlock", "v": 2}, None)
         check(f"{label} -> {reason}", r == {"ok": False, "reason": reason}, r)
         check(f"{label} -> no strike", s._lockout.records == [], s._lockout.records)
     s = _svc()
     s.recog = type("R", (), {"_refs": np.zeros((1, 512))})()
     s._capture_and_verify = lambda: VerifyOutcome(
         False, 0.9, True, {"verdict": "NOT_LIVE", "frames_ok": 5, "engine_errors": 2}, None, None)
-    r = s._handle({"cmd": "unlock"}, None)
+    r = s._handle({"cmd": "unlock", "v": 2}, None)
     check("a judged burst still strikes", r.get("reason") == "no-match"
           and s._lockout.records == [False], (r, s._lockout.records))
 
@@ -267,6 +268,7 @@ def _serve_on(s, name, n):
     S.PIPE_NAME = name
     for _ in range(n):
         s._serve_one()
+    s._close_listen()     # Stage 9: the next instance is pre-created; release it
 
 
 def _client(name, payload: bytes, *, read=True, timeout=5.0):
@@ -301,7 +303,7 @@ def test_deadline_and_delivery():
         s = _svc()
         s._req_started = time.monotonic() - (S.UNLOCK_DEADLINE_S + 0.5)
         s._capture_and_verify = lambda: VerifyOutcome(True, 0.05, True, {"verdict": "PASS"})
-        r = s._handle({"cmd": "unlock"}, None)
+        r = s._handle({"cmd": "unlock", "v": 2}, None)
         check("unlock past 11 s -> deadline-exceeded", r == {"ok": False, "reason":
                                                             "deadline-exceeded"}, r)
         check("nothing released", released == [], released)
@@ -312,7 +314,7 @@ def test_deadline_and_delivery():
             "ok": True, "challenge": k, "prompt": "x", "passed": True, "state": "passed",
             "identity_frames": 5, "distance_best": 0.05}
         g._req_started = time.monotonic() - (S.UNLOCK_GESTURE_DEADLINE_S + 0.5)
-        r = g._handle({"cmd": "unlock_gesture", "token": "a" * 32}, None)
+        r = g._handle({"cmd": "unlock_gesture", "v": 2, "token": "a" * 32}, None)
         check("unlock_gesture past 14 s -> deadline-exceeded",
               r.get("reason") == "deadline-exceeded" and released == [] and g._lockout.records == [],
               (r, g._lockout.records))
@@ -324,14 +326,22 @@ def test_deadline_and_delivery():
         s = _svc()
         s._capture_and_verify = lambda: VerifyOutcome(True, 0.05, True, {"verdict": "PASS"})
         s._maybe_adapt_gallery = lambda r: None
-        th = threading.Thread(target=_serve_on, args=(s, name, 1), daemon=True)
+        th = threading.Thread(target=_serve_on, args=(s, name, 2), daemon=True)
         th.start()
-        rep = _client(name, b'{"cmd":"unlock"}')
+        rep = _client(name, b'{"cmd":"unlock","v":2}')
+        check("delivered grant: client got the credentials and a grant_id",
+              rep.get("username") == "admin" and len(rep.get("grant_id", "")) == 32, rep)
+        time.sleep(0.2)
+        check("delivered grant: nothing committed before report_result (Stage 9, F-60)",
+              s._lockout.records == [] and s._audit.records[-1][1].get("outcome") == "delivered",
+              (s._lockout.records, s._audit.records[-1:]))
+        rep2 = _client(name, json.dumps({"cmd": "report_result", "v": 2,
+                                         "grant_id": rep.get("grant_id"), "ok": True}).encode())
         th.join(5)
-        check("delivered grant: client got the credentials", rep.get("username") == "admin", rep)
-        check("delivered grant: lockout reset recorded", s._lockout.records == [True],
+        check("report_result ok -> acknowledged", rep2.get("ok") is True, rep2)
+        check("reported grant: lockout reset recorded", s._lockout.records == [True],
               s._lockout.records)
-        check("delivered grant: audited granted",
+        check("reported grant: audited granted",
               s._audit.records[-1][1].get("outcome") == "granted", s._audit.records[-1])
 
         # (c) client gone before the reply -> grant-undelivered, INFO not ERROR
@@ -355,7 +365,7 @@ def test_deadline_and_delivery():
         try:
             th = threading.Thread(target=_serve_on, args=(s, name, 1), daemon=True)
             th.start()
-            _client(name, b'{"cmd":"unlock"}', read=False)
+            _client(name, b'{"cmd":"unlock","v":2}', read=False)
             th.join(5)
         finally:
             S.log.removeHandler(hdl)
@@ -376,7 +386,8 @@ def test_deadline_and_delivery():
                             ("huge cmd", json.dumps({"cmd": "x" * 5000}).encode())):
             rep = _client(name, body)
             want = "unknown-command" if label == "huge cmd" else "bad-request"
-            check(f"{label} -> {want}", rep == {"ok": False, "reason": want}, rep)
+            check(f"{label} -> {want} (+ v, lang)",
+                  rep == {"ok": False, "reason": want, "v": 2, "lang": "en"}, rep)
         th.join(5)
     finally:
         S.PIPE_NAME = orig_name
@@ -385,12 +396,12 @@ def test_deadline_and_delivery():
 # --- [6] F-20 -----------------------------------------------------------------------------------
 
 def test_perimeter_clients():
-    print("[6] F-20 ratchet + client identity check + read deadline")
-    check("pipe_first_instance is a posture key", "pipe_first_instance" in S.POSTURE_KEYS)
-    s = _svc(Config(pipe_first_instance=True))
-    new = Config(pipe_first_instance=False)
-    s._apply_posture_ratchet(new)
-    check("reload cannot switch pipe_first_instance off", new.pipe_first_instance is True)
+    print("[6] client identity check + read deadline (Stage 9: no perimeter keys left)")
+    check("Config carries none of the three pipe keys (R2)",
+          not any(hasattr(Config(), k) for k in ("pipe_hardened_sd", "pipe_first_instance",
+                                                  "pipe_unlock_require_system")))
+    check("the ratchet is gone with them (F-104)", not hasattr(S, "POSTURE_KEYS")
+          and not hasattr(S.FaceService, "_apply_posture_ratchet"))
 
     name = r"\\.\pipe\FaceUnlockSelftest-" + uuid.uuid4().hex
     got = []
@@ -418,7 +429,7 @@ def test_perimeter_clients():
     try:
         th = threading.Thread(target=server, args=(True,), daemon=True)
         th.start()
-        resp, why = P.exchange({"cmd": "ping"}, 3.0, pipe_name=name, verify_server=True)
+        resp, why = P.exchange({"cmd": "ping"}, 3.0, pipe_name=name)
         th.join(3)
     finally:
         P.server_sid_string = orig
@@ -429,7 +440,7 @@ def test_perimeter_clients():
     th = threading.Thread(target=server, args=(False,), daemon=True)
     th.start()
     t0 = time.monotonic()
-    resp, why = P.exchange({"cmd": "ping"}, 0.8, pipe_name=name, verify_server=True)
+    resp, why = P.exchange({"cmd": "ping"}, 0.8, pipe_name=name)
     dt = time.monotonic() - t0
     th.join(3)
     check("SELF server that never answers -> reply-timeout", why == "reply-timeout", why)
@@ -497,11 +508,14 @@ def test_atomic_and_cache():
     st2 = AdaptiveStore(_ROOT / "home" / "adaptive.npz")
     check("adaptive.npz round-trips, no .tmp left",
           st2.load() and st2.count == 1 and not (_ROOT / "home" / "adaptive.npz.tmp").exists())
-    C._current_user_sid.cache_clear()
-    Config().validate()
-    Config().validate()
-    info = C._current_user_sid.cache_info()
-    check("validate() SID lookup cached (1 miss, >=1 hit)", info.misses == 1 and info.hits >= 1,
+    # Stage 9 (D-74): the one SID helper lives in face_service.identity; validate() no longer
+    # needs it at all (the pipe_hardened_sd check went with the key, R2).
+    from face_service import identity as I
+    I.current_user_sid.cache_clear()
+    I.current_user_sid()
+    I.current_user_sid()
+    info = I.current_user_sid.cache_info()
+    check("identity.current_user_sid cached (1 miss, >=1 hit)", info.misses == 1 and info.hits >= 1,
           info)
 
 
