@@ -206,6 +206,12 @@ def test_build():
           "_analysis.binaries = [b for b in _analysis.binaries if _keep_binary(b)]" in spec
           and "_analysis.datas = [d for d in _analysis.datas if _keep_binary(d)]" in spec
           and spec.index("for _analysis in") < spec.index("coll = COLLECT("))
+    sys.path.insert(0, str(REPO / "installer"))
+    import build as _build
+    allow = _build.nvidia_allowlist(spec)
+    check("the gate reads the spec's NVIDIA allowlist (16 DLLs, cudart..cuDNN; not nvJitLink/curand)",
+          len(allow) == 16 and "cudart64_12.dll" in allow and "cudnn_ops64_9.dll" in allow
+          and not any("nvJitLink" in n or "curand" in n for n in allow), sorted(allow))
     check("pystray collected as .py (LGPL, F-261)", 'COLLECTION_MODE = {"pystray": "py"}' in spec
           and spec.count("module_collection_mode=COLLECTION_MODE") == 3)
     check("unused packages excluded (F-51)", all(f'"{m}"' in spec for m in ("pandas", "sympy", "pip", "setuptools")))

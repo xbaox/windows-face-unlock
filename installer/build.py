@@ -388,6 +388,15 @@ def gate_no_models(dist_root: Path) -> None:
                          + ", ".join(found[:5]) + ") -- decision 9-02: the installer downloads them.")
 
 
+def nvidia_allowlist(spec_text: str) -> "set[str]":
+    """The DLL names of the spec's ``NVIDIA_ALLOWLIST = {...}`` assignment. 9c-BUILD: the first
+    version split on the first mention of the name -- a header comment -- and found nothing, so the
+    first GPU build refused every NVIDIA file."""
+    import re
+    m = re.search(r"^NVIDIA_ALLOWLIST\s*=\s*\{(.*?)^\}", spec_text, re.M | re.S)
+    return set(re.findall(r'"([\w.-]+\.dll)"', m.group(1))) if m else set()
+
+
 def gate_variant(variant: str, dist_root: Path) -> None:
     """F-219: the bundle IS the variant it is named after."""
     internal = dist_root / "_internal"
@@ -401,8 +410,9 @@ def gate_variant(variant: str, dist_root: Path) -> None:
     if variant == "gpu":
         if not cuda or not nv:
             raise BuildAbort("GATE FAILED: the GPU variant lacks the CUDA provider or NVIDIA files")
-        spec = (INSTALLER_DIR / "windows_face_unlock.spec").read_text(encoding="utf-8")
-        allowed = {n for n in __import__("re").findall(r'"([\w.-]+\.dll)"', spec.split("NVIDIA_ALLOWLIST", 1)[1].split("}", 1)[0])}
+        allowed = nvidia_allowlist((INSTALLER_DIR / "windows_face_unlock.spec").read_text(encoding="utf-8"))
+        if not allowed:
+            raise BuildAbort("GATE FAILED: cannot read NVIDIA_ALLOWLIST from the spec")
         extra = sorted(f.name for f in nv if f.name not in allowed)
         if extra:
             raise BuildAbort(f"GATE FAILED: NVIDIA files outside the allowlist: {extra}")
