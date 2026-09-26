@@ -172,6 +172,16 @@ IMPORT_KINDS = frozenset({"__import__", "import_module"})
 
 REVIEWED: dict[str, tuple[frozenset, str]] = {
     # ---- frozen / _MEIPASS branches (exact modules only)
+    # Stage 9 (9c-BUILD): pywin32's COM layer ships since 9c-5 -- face_service.taskreg drives the
+    # Task Scheduler with LATE-BOUND win32com.client.Dispatch("Schedule.Service"); nothing calls
+    # EnsureDispatch / makepy, and the product is never a COM server.
+    "pythoncom": (
+        frozenset({"frozen"}),
+        "module __getattr__('frozen') deprecation shim that returns sys.frozen; no path lookup"),
+    "win32com": (
+        frozenset({"frozen"}),
+        "when frozen it skips the developer registry PythonPath and the build-dir helper; gen_py "
+        "falls back to %TEMP%\\gen_py, used only by generated (early-bound) wrappers we never make"),
     "insightface.data.pickle_object": (
         FROZEN_KINDS,
         "mine 3: resolves objects/ under sys._MEIPASS; spec ships the bundle-root "
@@ -239,6 +249,11 @@ REVIEWED: dict[str, tuple[frozenset, str]] = {
     "jinja2.*": (IMPORT_KINDS, "via the pandas chain; unused at runtime"),
     "imageio.*": (IMPORT_KINDS, "via skimage.io; unused at runtime"),
     "google.protobuf.*": (IMPORT_KINDS, "protobuf backend selection via onnx; unused at runtime"),
+    # Stage 9 (9c-BUILD): computed imports of GENERATED typelib wrappers (win32com.gen_py.*, outside
+    # the bundle by design; an ImportError falls back to late binding) and of COM-server policies.
+    "win32com.client.gencache": (IMPORT_KINDS, "win32com.gen_py.<typelib> wrappers; late binding used"),
+    "win32com.client.makepy": (IMPORT_KINDS, "imports the wrapper it just generated; never called"),
+    "win32com.server.policy": (IMPORT_KINDS, "COM server policy classes; the product is no COM server"),
 }
 
 # Names a bundled .pyd embeds that are real modules in site-packages but are
