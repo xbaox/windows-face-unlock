@@ -1,28 +1,23 @@
-// Live unlock harness for the Face Unlock Credential Provider (dev / bring-up).
+// Live harness for the Face Unlock Credential Provider's pipe client (dev / bring-up).
 //
-// Calls FaceUnlock::RequestUnlock against a RUNNING FaceService over
-// \\.\pipe\FaceUnlock -- the same code path the credential provider DLL uses --
-// and prints ONLY a safe, password-masked summary:
-//   * server-SID identity-check outcome (checked / trusted / server SID string)
-//   * ok / username / domain
-//   * password LENGTH plus a masked preview (first+last char for len>=4)
+// Sends a protocol-v2 {"cmd":"unlock"} through FaceUnlock::RequestUnlock -- the client the
+// credential provider DLL uses -- to a RUNNING FaceService on \\.\pipe\FaceUnlock, and prints:
+//   * the server identity check (checked / trusted / server SID) against the recorded owner
+//   * the outcome and the service's reason
 //
-// The plaintext password is NEVER printed or logged. This is a diagnostic tool;
-// it does NOT register anything and does NOT touch the camera itself (the
-// service does the capture).
+// Since Stage 9 no configuration lets a non-SYSTEM caller unlock: run as the logged-in user this
+// harness is ANSWERED "not-authorized", which is the expected result -- it proves the pipe, the
+// owner-pinned server check and the SYSTEM gate. Run as SYSTEM (psexec -s) it can also receive a
+// grant; then it prints the password LENGTH only (Stage 9, F-95: the first and last characters
+// used to be printed), wipes the copy and does NOT send report_result, so the grant is abandoned
+// and nothing is committed.
 //
-// Intended run context (Bao's machine, as the logged-in user / SELF):
-//   * FaceService running in the user session
-//   * enrollment present, credentials stored (~/.face-unlock)
-//   * config pipe_unlock_require_system = FALSE  (so a SELF caller is allowed;
-//     with TRUE the service would answer this non-SYSTEM caller "not-authorized")
-//
-// Build (from a VS2022 x64 dev prompt) via tests/CMakeLists.txt:
+// Build via tests/CMakeLists.txt:
 //   cmake -B build-tests -S credential_provider/tests -A x64
 //   cmake --build build-tests --config Release
 //   build-tests\Release\unlock_harness.exe
 //
-// Exit code: 0 on a successful unlock, 1 otherwise.
+// Exit code: 0 when the service answered at all (any reason), 1 on a transport / trust failure.
 
 #include "../PipeClient.h"
 
@@ -40,54 +35,38 @@ static std::string ToUtf8(const std::wstring& w) {
     return out;
 }
 
-// Password preview that never reveals the secret: always the length; for
-// len>=4 also the first and last character (ASCII-printable, else '.'), with
-// the middle collapsed to a fixed "***". Short passwords are fully masked.
-static std::string MaskPassword(const std::wstring& pw) {
-    const size_t n = pw.size();
-    if (n == 0) return "len=0 (empty)";
-    auto safe = [](wchar_t c) -> char { return (c >= 0x20 && c < 0x7F) ? (char)c : '.'; };
-    std::string s = "len=" + std::to_string(n) + " ";
-    if (n < 4) {
-        s += std::string(n, '*');
-    } else {
-        s += safe(pw.front());
-        s += "***";
-        s += safe(pw.back());
-    }
-    return s;
-}
-
 int main() {
     SetConsoleOutputCP(CP_UTF8);
 
-    std::printf("Face Unlock live harness\n");
-    std::printf("========================\n");
-    std::printf("(sends {\"cmd\":\"unlock\"} to \\\\.\\pipe\\FaceUnlock; masked summary only)\n\n");
+    std::printf("Face Unlock live harness (protocol v%d)\n", kProtocolVersion);
+    std::printf("======================================\n\n");
 
-    std::wstring user, pass, dom;
-    std::string err;
+    std::wstring owner;
+    std::printf("recorded owner   : %s\n",
+                ReadOwnerSid(owner) ? ToUtf8(owner).c_str() : "(none -- HKLM value missing)");
+
+    UnlockReply r;
     ServerTrust trust;
-
     const ULONGLONG t0 = GetTickCount64();
-    const bool ok = RequestUnlock(user, pass, dom, err, &trust);
+    const bool ok = RequestUnlock(r, nullptr, &trust);
     const ULONGLONG dt = GetTickCount64() - t0;
 
-    std::printf("server-SID check : checked=%s trusted=%s sid=%s\n",
+    std::printf("server check     : checked=%s trusted=%s sid=%s\n",
                 trust.checked ? "yes" : "no",
                 trust.trusted ? "yes" : "no",
                 trust.serverSid.empty() ? "(unresolved)" : ToUtf8(trust.serverSid).c_str());
-
     if (ok) {
-        std::printf("unlock result    : ok=true\n");
-        std::printf("  username       : %s\n", ToUtf8(user).c_str());
-        std::printf("  domain         : %s\n", ToUtf8(dom).c_str());
-        std::printf("  password       : %s   (masked; plaintext never printed)\n",
-                    MaskPassword(pass).c_str());
+        std::printf("unlock result    : ok=true user=%s domain=%s password_len=%u grant=%s\n",
+                    ToUtf8(r.username).c_str(), ToUtf8(r.domain).c_str(),
+                    (unsigned)r.password.size(), r.grantId.c_str());
+        std::printf("                   (not reported: the service abandons the grant in 30 s)\n");
     } else {
-        std::printf("unlock result    : ok=false  reason=%s\n", err.c_str());
+        std::printf("unlock result    : ok=false reason=%s lang=%s v=%d\n",
+                    r.reason.c_str(), r.lang.c_str(), r.version);
     }
     std::printf("round-trip       : %llu ms\n", (unsigned long long)dt);
 
-    return ok ? 0 : 1;
+    const bool answered = ok || (r.reason != "pipe-unavailable" && r.reason != "server-untrusted" &&
+                                 r.reason != "no-owner" && r.reason != "cancelled");
+    return answered ? 0 : 1;   // UnlockReply's destructor wipes the password copy
 }

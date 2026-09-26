@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
-project(FaceCredentialProvider LANGUAGES CXX)
+project(FaceCredentialProvider LANGUAGES CXX RC)
+
+# Stage 9 (R3, F-96): x64 only. LogonUI on the supported Windows builds is x64, the installer is
+# x64-only, and an ARM64 or Win32 build of this DLL would register and then never load.
+if(NOT CMAKE_GENERATOR_PLATFORM STREQUAL "x64" AND NOT CMAKE_VS_PLATFORM_NAME STREQUAL "x64")
+    message(FATAL_ERROR "FaceCredentialProvider builds for x64 only: configure with -A x64 "
+                        "(got platform '${CMAKE_GENERATOR_PLATFORM}${CMAKE_VS_PLATFORM_NAME}')")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,6 +34,7 @@ add_library(FaceCredentialProvider SHARED
     PipeClient.cpp
     helpers.cpp
     FaceCredentialProvider.def
+    FaceCredentialProvider.rc
 )
 
 target_compile_definitions(FaceCredentialProvider PRIVATE
@@ -34,13 +42,18 @@ target_compile_definitions(FaceCredentialProvider PRIVATE
     WIN32_LEAN_AND_MEAN
 )
 
+# /utf-8: the Russian tile texts in PipeClient.cpp are UTF-8 source (D-61).
+# /guard:cf + /CETCOMPAT (R3, F-96): Control Flow Guard and CET shadow-stack compatibility for a
+# DLL that runs inside LogonUI as SYSTEM.
+target_compile_options(FaceCredentialProvider PRIVATE /utf-8 /guard:cf)
+target_link_options(FaceCredentialProvider PRIVATE /guard:cf /CETCOMPAT)
+
+# Stage 9 (D-63): credui, shlwapi and oleaut32 were linked with no symbol used from them.
 target_link_libraries(FaceCredentialProvider PRIVATE
-    credui
     secur32
-    shlwapi
     ole32
-    oleaut32
     advapi32
+    user32
 )
 
 set_target_properties(FaceCredentialProvider PROPERTIES

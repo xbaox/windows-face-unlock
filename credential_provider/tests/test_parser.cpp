@@ -1,33 +1,65 @@
-// Offline unit test for FaceUnlock::ParseUnlockResponse (credential_provider).
+// Offline unit test for the Credential Provider's pipe client (credential_provider/PipeClient).
 //
-// Camera-free, service-free, pipe-free: feeds hand-crafted JSON replies straight
-// into the parser and asserts decode/accept/reject. Directly proves the four
-// Stage-5 parser fixes:
-//   #1 JSON escape decoding (\" \\ \/ \b \f \n \r \t \uXXXX + surrogate pairs)
-//   #2 empty username/password on ok=true are rejected
-//   #3 robust whitespace skip (incl. \r\n) around tokens
-//   #4 tolerance of added / reordered / nested fields and delimiter-bearing values
+// Camera-free and service-free. Most cases feed hand-crafted JSON replies straight into the
+// parser; the Stage 9 transport cases run a private pipe server inside this process (test build
+// only: FACEUNLOCK_TESTING swaps the owner and the pipe name).
+//   baseline      the Stage-5 parser fixes (escapes, empty credentials, whitespace, extra fields)
+//   Stage 7-i     the phase-1 gesture section
+//   8b            hostile vectors, length caps, IsHexToken, sanitizer
+//   Stage 9       protocol v2 (§2.1): version, grant_id, retry_after_s, lang, report_result,
+//                 strict JSON (D-58), strict UTF-8 (F-73), R2 sanitizer (F-74), honest texts EN/RU
+//                 (R3), owner-pinned server trust (R1), cancellable transport (R3), oversize (D-54)
 //
-// Test vectors below are SYNTHETIC -- not real credentials -- so decoded values
-// are printed on failure for debugging.
+// Every reply the service sends carries "v":2 since Stage 9, and every grant a "grant_id". The
+// older suites keep their vectors: Reply() inserts those two fields in front of each object, so
+// what each case proves is unchanged; the cases that test the version itself build raw replies.
 //
-// Build (from a VS2022 x64 dev prompt), or via tests/CMakeLists.txt:
-//   cl /EHsc /std:c++17 test_parser.cpp ..\PipeClient.cpp
+// Test vectors are SYNTHETIC -- not real credentials -- so decoded values are printed on failure.
+//
+// Build via tests/CMakeLists.txt (it passes /utf-8, which the UTF-8 literals below need; D-61):
+//   cmake -B build-tests -S credential_provider/tests -A x64
+//   cmake --build build-tests --config Release
+// or by hand from a VS2022 x64 prompt:
+//   cl /EHsc /std:c++17 /utf-8 /DFACEUNLOCK_TESTING test_parser.cpp ..\PipeClient.cpp advapi32.lib user32.lib
 // Exit code 0 = all pass, 1 = at least one failure.
 
 #include "../PipeClient.h"
+#include "../helpers.h"
 
 #include <windows.h>
-#include <string>
+#include <sddl.h>
 #include <cstdio>
+#include <functional>
+#include <string>
+#include <thread>
 
 using FaceUnlock::ParseUnlockReply;
-using FaceUnlock::ParseUnlockResponse;
 using FaceUnlock::UnlockReply;
 using namespace std::string_literals;   // "..."s keeps embedded NUL bytes (8b hostile vectors)
 
 static int g_pass = 0;
 static int g_fail = 0;
+
+// D-56: the pre-7-i five-argument wrapper used to ship inside the LogonUI DLL for this test and
+// the harness only; it lives here now.
+static bool ParseUnlockResponse(const std::string& response, std::wstring& username,
+                                std::wstring& password, std::wstring& domain, std::string& errorOut) {
+    UnlockReply r;
+    const bool ok = ParseUnlockReply(response, r);
+    username = r.username;
+    password = r.password;
+    domain   = r.domain;
+    errorOut = r.reason;
+    return ok;
+}
+
+// Insert "v":2 and a grant id in front of the first member of an object reply.
+static std::string Reply(const std::string& json) {
+    size_t i = 0;
+    while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) ++i;
+    if (i >= json.size() || json[i] != '{') return json;
+    return json.substr(0, i + 1) + "\"v\":2,\"grant_id\":\"a1b2c3\"," + json.substr(i + 1);
+}
 
 static std::string ToUtf8(const std::wstring& w) {
     if (w.empty()) return "";
@@ -42,7 +74,7 @@ static void CaseOk(const char* label, const std::string& resp,
                    const std::wstring& eu, const std::wstring& ep, const std::wstring& ed) {
     std::wstring u, p, d;
     std::string err;
-    bool ok = ParseUnlockResponse(resp, u, p, d, err);
+    bool ok = ParseUnlockResponse(Reply(resp), u, p, d, err);
     bool good = ok && u == eu && p == ep && d == ed;
     if (good) {
         ++g_pass;
@@ -58,28 +90,28 @@ static void CaseOk(const char* label, const std::string& resp,
     }
 }
 
-// Expect the parse to be rejected (return false). If expectErr is non-null, the
-// errorOut must match it exactly.
-static void CaseReject(const char* label, const std::string& resp, const char* expectErr) {
+// Expect the parse to be rejected. If expectErr is non-null, the reason must match exactly.
+// `raw` skips Reply() (the version cases).
+static void CaseReject(const char* label, const std::string& resp, const char* expectErr,
+                       bool raw = false) {
     std::wstring u, p, d;
     std::string err;
-    bool ok = ParseUnlockResponse(resp, u, p, d, err);
-    bool good = !ok && (expectErr == nullptr || err == expectErr);
+    bool ok = ParseUnlockResponse(raw ? resp : Reply(resp), u, p, d, err);
+    bool good = !ok && (expectErr == nullptr || err == expectErr) && u.empty() && p.empty();
     if (good) {
         ++g_pass;
         std::printf("  PASS  %s  (rejected: %s)\n", label, err.c_str());
     } else {
         ++g_fail;
         std::printf("  FAIL  %s\n", label);
-        std::printf("        expected reject%s%s, got ok=%d err=%s\n",
+        std::printf("        expected reject%s%s, got ok=%d err=%s pass_len=%d\n",
                     expectErr ? " err=" : "", expectErr ? expectErr : "",
-                    (int)ok, err.c_str());
+                    (int)ok, err.c_str(), (int)p.size());
     }
 }
 
-// Expect a REJECTED parse (no credentials) whose UnlockReply carries the given Stage-7-i
-// phase-1 section. Pass nullptr for a field that must come back EMPTY -- the parser must
-// never invent a value. Also asserts no credential leaked out of a non-ok reply.
+// Expect a REJECTED parse (no credentials) whose UnlockReply carries the given phase-1 section.
+// nullptr = the field must come back EMPTY -- the parser must never invent a value.
 static void CaseGesture(const char* label, const std::string& resp, const char* expectReason,
                         const char* expectGesture, const wchar_t* expectPrompt,
                         const char* expectToken) {
@@ -87,7 +119,7 @@ static void CaseGesture(const char* label, const std::string& resp, const char* 
     const std::wstring wantP = expectPrompt ? expectPrompt : L"";
     const std::string wantT = expectToken ? expectToken : "";
     UnlockReply r;
-    bool ok = ParseUnlockReply(resp, r);
+    bool ok = ParseUnlockReply(Reply(resp), r);
     bool good = !ok && r.reason == expectReason && r.gesture == wantG
                 && r.prompt == wantP && r.token == wantT
                 && r.username.empty() && r.password.empty();
@@ -103,13 +135,9 @@ static void CaseGesture(const char* label, const std::string& resp, const char* 
         std::printf("        prompt  exp=[%s] got=[%s]\n",
                     ToUtf8(wantP).c_str(), ToUtf8(r.prompt).c_str());
         std::printf("        token   exp=[%s] got=[%s]\n", wantT.c_str(), r.token.c_str());
-        std::printf("        creds leaked: user=[%s] pass_len=%d\n",
-                    ToUtf8(r.username).c_str(), (int)r.password.size());
     }
 }
 
-// 8b: a plain boolean assertion, for the helpers that are not parse cases (IsHexToken,
-// FailureTextForReason, SanitizePromptText).
 static void Check(const char* label, bool cond) {
     if (cond) {
         ++g_pass;
@@ -139,13 +167,13 @@ static std::wstring RepeatW(const std::wstring& unit, size_t n) {
     return s;
 }
 
-// 8b: parse a needs-gesture reply carrying `promptJson` (a raw JSON string body) and compare
-// the decoded + sanitized prompt.
+// Parse a needs-gesture reply carrying `promptJson` (a raw JSON string body) and compare the
+// decoded + sanitized prompt.
 static void CasePrompt(const char* label, const std::string& promptJson, const std::wstring& expect) {
     UnlockReply r;
-    const std::string resp = "{\"ok\":false,\"reason\":\"needs-gesture\",\"gesture\":\"blink\","
+    const std::string resp = "{\"ok\":false,\"reason\":\"needs-gesture\",\"gesture\":\"nod\","
                              "\"token\":\"ab\",\"prompt\":\"" + promptJson + "\"}";
-    const bool ok = ParseUnlockReply(resp, r);
+    const bool ok = ParseUnlockReply(Reply(resp), r);
     const bool good = !ok && r.reason == "needs-gesture" && r.prompt == expect;
     if (good) {
         ++g_pass;
@@ -159,8 +187,287 @@ static void CasePrompt(const char* label, const std::string& promptJson, const s
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Stage 9 transport cases: a private pipe server in this process stands in for the service.
+// ---------------------------------------------------------------------------------------------
+struct FakeServer {
+    std::wstring name;
+    std::string reply;
+    bool silent = false;       // read the request, then never answer
+    bool oversize = false;     // answer with a 70000-byte message
+    bool gotRequest = false;
+    std::string received;
+    HANDLE ready = nullptr;
+};
+
+static void ServeOnce(FakeServer* s) {
+    HANDLE h = CreateNamedPipeW(s->name.c_str(), PIPE_ACCESS_DUPLEX,
+                                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1,
+                                131072, 131072, 0, nullptr);
+    SetEvent(s->ready);
+    if (h == INVALID_HANDLE_VALUE) return;
+    if (ConnectNamedPipe(h, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+        std::string buf(65536, '\0');
+        DWORD n = 0;
+        if (ReadFile(h, &buf[0], (DWORD)buf.size(), &n, nullptr) && n) {
+            s->gotRequest = true;
+            s->received.assign(buf.data(), n);
+            if (s->silent) {
+                Sleep(2500);
+            } else {
+                const std::string out = s->oversize ? std::string(70000, ' ') : s->reply;
+                DWORD w = 0;
+                WriteFile(h, out.data(), (DWORD)out.size(), &w, nullptr);
+                // wait (bounded) for the client to read and close, like the service's drain
+                char one;
+                DWORD r1 = 0;
+                ReadFile(h, &one, 1, &r1, nullptr);
+            }
+        }
+    }
+    DisconnectNamedPipe(h);
+    CloseHandle(h);
+}
+
+static std::wstring SelfSid() {
+    HANDLE tok = nullptr;
+    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok);
+    DWORD len = 0;
+    GetTokenInformation(tok, TokenUser, nullptr, 0, &len);
+    std::string buf(len, '\0');
+    GetTokenInformation(tok, TokenUser, &buf[0], len, &len);
+    CloseHandle(tok);
+    LPWSTR s = nullptr;
+    ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(&buf[0])->User.Sid, &s);
+    std::wstring out = s ? s : L"";
+    LocalFree(s);
+    return out;
+}
+
+static void RunWithServer(FakeServer& srv, const std::function<void()>& client) {
+    srv.ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::thread t(ServeOnce, &srv);
+    WaitForSingleObject(srv.ready, 5000);
+    client();
+    // Unblock a server still waiting in ConnectNamedPipe (a client that never connected).
+    HANDLE poke = CreateFileW(srv.name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+    if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
+    t.join();
+    CloseHandle(srv.ready);
+}
+
+static void TransportTests() {
+    using namespace FaceUnlock;
+    const std::wstring self = SelfSid();
+    const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlockCpTest-" + std::to_wstring(GetCurrentProcessId());
+    TestSetPipeName(pipe);
+    TestSetOwnerOverride(self);
+
+    {   // A: a v2 grant through the real transport; the request is v2 and carries its budget
+        FakeServer srv;
+        srv.name = pipe;
+        srv.reply = R"({"v":2,"lang":"en","ok":true,"username":"u","password":"p","grant_id":"abcd"})";
+        UnlockReply r;
+        ServerTrust tr;
+        bool ok = false;
+        RunWithServer(srv, [&] { ok = RequestUnlock(r, nullptr, &tr); });
+        const size_t b = srv.received.find("\"budget_ms\":");
+        const long budget = (b == std::string::npos) ? -1 : std::stol(srv.received.substr(b + 12));
+        Check("transport: owner-run server -> grant, trusted", ok && tr.trusted && r.grantId == "abcd");
+        Check("transport: request is {cmd:unlock, v:2, budget_ms}",
+              srv.received.rfind(R"({"cmd":"unlock","v":2,"budget_ms":)", 0) == 0);
+        Check("transport: budget_ms is what is left of 12 s after the connect",
+              budget > 10000 && budget <= (long)kUnlockTimeoutMs);
+    }
+    {   // B: R1 -- a server that is not the owner never receives the request
+        TestSetOwnerOverride(L"S-1-5-21-1111111111-2222222222-3333333333-1001");
+        FakeServer srv;
+        srv.name = pipe;
+        srv.reply = R"({"v":2,"ok":false,"reason":"no-match"})";
+        UnlockReply r;
+        ServerTrust tr;
+        bool ok = true;
+        RunWithServer(srv, [&] { ok = RequestUnlock(r, nullptr, &tr); });
+        Check("transport: non-owner server -> server-untrusted",
+              !ok && r.reason == "server-untrusted" && tr.checked && !tr.trusted);
+        Check("transport: nothing was written to the non-owner server", !srv.gotRequest);
+        TestSetOwnerOverride(self);
+    }
+    {   // C: R3 -- a silent server; the cancel event ends the call at once
+        FakeServer srv;
+        srv.name = pipe;
+        srv.silent = true;
+        UnlockReply r;
+        bool ok = true;
+        DWORD took = 0;
+        HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        RunWithServer(srv, [&] {
+            std::thread canceller([&] { Sleep(200); SetEvent(cancel); });
+            const DWORD t0 = GetTickCount();
+            ok = RequestUnlock(r, cancel);
+            took = GetTickCount() - t0;
+            canceller.join();
+        });
+        CloseHandle(cancel);
+        Check("transport: cancel during the reply wait -> 'cancelled'", !ok && r.reason == "cancelled");
+        Check("transport: ... within 300 ms of the cancel (N-04), not the 12 s budget", took < 500);
+    }
+    {   // D: D-54 -- a reply over 64 KiB is malformed, not "unavailable"
+        FakeServer srv;
+        srv.name = pipe;
+        srv.oversize = true;
+        UnlockReply r;
+        bool ok = true;
+        RunWithServer(srv, [&] { ok = RequestUnlock(r, nullptr); });
+        Check("transport: 70000-byte reply -> malformed-response", !ok && r.reason == "malformed-response");
+    }
+    {   // E: report_result
+        FakeServer srv;
+        srv.name = pipe;
+        srv.reply = R"({"v":2,"lang":"en","ok":true})";
+        bool ok = false;
+        RunWithServer(srv, [&] { ok = SendReportResult("abcd", false, nullptr); });
+        Check("transport: report_result sent and acknowledged",
+              ok && srv.received == R"({"cmd":"report_result","v":2,"grant_id":"abcd","ok":false})");
+        Check("transport: report_result refuses a non-hex grant id locally",
+              !SendReportResult("ab\"cd", true, nullptr));
+    }
+    {   // F: no service at all; the connect loop watches the cancel event too
+        HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::thread canceller([&] { Sleep(300); SetEvent(cancel); });
+        UnlockReply r;
+        const DWORD t0 = GetTickCount();
+        const bool ok = RequestUnlock(r, cancel);
+        const DWORD took = GetTickCount() - t0;
+        canceller.join();
+        CloseHandle(cancel);
+        Check("transport: no pipe + cancel -> 'cancelled' within 1 s", !ok && r.reason == "cancelled" && took < 1000);
+        Check("transport: no pipe -> ServicePipeExists() is false", !ServicePipeExists());
+    }
+    {   // G: a malformed phase-1 token never reaches the pipe
+        UnlockReply r;
+        Check("transport: non-hex token refused locally",
+              !RequestUnlockGesture("ab\",\"cmd\":\"x", r, nullptr) && r.reason == "gesture-token-invalid");
+    }
+    {   // H: no owner recorded -> nothing is attempted
+        TestSetOwnerOverride(L"S-1-5-18");      // not a person -> treated as "no owner"
+        UnlockReply r;
+        Check("transport: no (valid) owner -> 'no-owner'", !RequestUnlock(r, nullptr) && r.reason == "no-owner");
+        TestSetOwnerOverride(self);
+    }
+    TestSetPipeName(L"");
+    TestSetOwnerOverride(L"");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 9: more transport shapes (B14 N-03) and the logon buffer (B14 N-06).
+// ---------------------------------------------------------------------------------------------
+static void TransportShapes() {
+    using namespace FaceUnlock;
+    const std::wstring self = SelfSid();
+    const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlockCpTest2-" + std::to_wstring(GetCurrentProcessId());
+    TestSetPipeName(pipe);
+    TestSetOwnerOverride(self);
+
+    {   // NOT_FOUND for a while, then the server appears: retried inside the budget
+        UnlockReply r;
+        bool ok = false;
+        std::thread late([&] {
+            Sleep(700);
+            FakeServer srv;
+            srv.name = pipe;
+            srv.reply = R"({"v":2,"ok":false,"reason":"no-match"})";
+            srv.ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            ServeOnce(&srv);
+            CloseHandle(srv.ready);
+        });
+        ok = RequestUnlock(r, nullptr);
+        late.join();
+        Check("transport: FILE_NOT_FOUND is retried until the service appears",
+              !ok && r.reason == "no-match");
+    }
+    {   // zero-byte reply -> unavailable, never a parse of nothing
+        FakeServer srv;
+        srv.name = pipe;
+        srv.reply = "";
+        UnlockReply r;
+        bool ok = true;
+        RunWithServer(srv, [&] { ok = RequestUnlock(r, nullptr); });
+        Check("transport: zero-byte reply -> pipe-unavailable", !ok && r.reason == "pipe-unavailable");
+    }
+    {   // a byte-mode server: the client still reads one whole reply or fails safe
+        HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::thread srv([&] {
+            HANDLE h = CreateNamedPipeW(pipe.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_WAIT, 1,
+                                        4096, 4096, 0, nullptr);
+            SetEvent(ready);
+            if (ConnectNamedPipe(h, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+                char buf[4096];
+                DWORD n = 0;
+                ReadFile(h, buf, sizeof(buf), &n, nullptr);
+                const char part[] = "{\"v\":2,\"ok\":fa";      // half a reply, then close
+                DWORD w = 0;
+                WriteFile(h, part, (DWORD)strlen(part), &w, nullptr);
+                FlushFileBuffers(h);
+            }
+            DisconnectNamedPipe(h);
+            CloseHandle(h);
+        });
+        WaitForSingleObject(ready, 5000);
+        UnlockReply r;
+        const bool ok = RequestUnlock(r, nullptr);
+        srv.join();
+        CloseHandle(ready);
+        Check("transport: byte-mode server with a torn reply fails safe (no credential)",
+              !ok && r.password.empty() &&
+              (r.reason == "malformed-response" || r.reason == "pipe-unavailable"));
+    }
+    TestSetPipeName(L"");
+    TestSetOwnerOverride(L"");
+}
+
+static void KerbPackTests() {
+    using namespace FaceUnlock;
+    CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION cs{};
+    HRESULT hr = KerbPackInteractiveUnlock(L"PC", L"user", L"pa55word", CPUS_UNLOCK_WORKSTATION, &cs);
+    bool inside = false, unlockType = false;
+    if (SUCCEEDED(hr) && cs.rgbSerialization) {
+        auto* k = reinterpret_cast<KERB_INTERACTIVE_UNLOCK_LOGON*>(cs.rgbSerialization);
+        const KERB_INTERACTIVE_LOGON& l = k->Logon;
+        unlockType = l.MessageType == KerbWorkstationUnlockLogon;
+        auto in = [&](const UNICODE_STRING& u) {
+            const ULONG_PTR off = (ULONG_PTR)u.Buffer;
+            return u.Length == 0 || (off >= sizeof(KERB_INTERACTIVE_UNLOCK_LOGON) &&
+                                     off + u.Length <= cs.cbSerialization);
+        };
+        inside = in(l.LogonDomainName) && in(l.UserName) && in(l.Password) &&
+                 l.UserName.Length == 4 * sizeof(wchar_t) && l.LogonDomainName.Length == 2 * sizeof(wchar_t);
+        // F-94: the password field no longer holds the plain text
+        const wchar_t* pw = reinterpret_cast<const wchar_t*>(cs.rgbSerialization + (ULONG_PTR)l.Password.Buffer);
+        const std::wstring packed(pw, l.Password.Length / sizeof(wchar_t));
+        Check("kerbpack: the password is CredProtect-ed, not plain", packed != L"pa55word" && !packed.empty());
+    }
+    Check("kerbpack: unlock scenario -> KerbWorkstationUnlockLogon", SUCCEEDED(hr) && unlockType);
+    Check("kerbpack: every string lies inside the buffer, as an offset", inside);
+    KerbUnpackFree(&cs);
+    Check("kerbpack: KerbUnpackFree releases and clears", cs.rgbSerialization == nullptr && cs.cbSerialization == 0);
+
+    CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION c2{};
+    hr = KerbPackInteractiveUnlock(L".", L"user", L"pw", CPUS_LOGON, &c2);
+    Check("kerbpack: logon scenario -> KerbInteractiveLogon",
+          SUCCEEDED(hr) && reinterpret_cast<KERB_INTERACTIVE_UNLOCK_LOGON*>(c2.rgbSerialization)->Logon.MessageType ==
+                               KerbInteractiveLogon);
+    KerbUnpackFree(&c2);
+    CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION c3{};
+    Check("kerbpack: an embedded NUL is refused",
+          KerbPackInteractiveUnlock(L".", L"us\0er"s, L"pw", CPUS_LOGON, &c3) == E_INVALIDARG);
+    Check("kerbpack: a field over USHORT bytes is refused",
+          KerbPackInteractiveUnlock(L".", L"u", std::wstring(40000, L'p'), CPUS_LOGON, &c3) == E_INVALIDARG);
+}
+
 int main() {
-    std::printf("ParseUnlockResponse unit test\n");
+    std::printf("CP pipe-client unit test\n");
     std::printf("-----------------------------\n");
 
     // --- Happy path ---
@@ -226,9 +533,9 @@ int main() {
     CaseReject("ok=false surfaces reason 'locked-out'",
                R"({"ok":false,"reason":"locked-out","retry_after_s":42.5})", "locked-out");
 
-    // ok=false without reason -> generic "no-match"
-    CaseReject("ok=false without reason -> no-match",
-               R"({"ok":false})", "no-match");
+    // ok=false without reason: Stage 9 (F-79) -- a protocol defect, not a face mismatch
+    CaseReject("ok=false without reason -> malformed-response",
+               R"({"ok":false})", "malformed-response");
 
     // Malformed JSON rejected
     CaseReject("unterminated object rejected",
@@ -331,6 +638,7 @@ int main() {
     }
     const int stage7iTotal = pre8bTotal - baseTotal;
     const int pre8bCount = g_pass + g_fail;
+    int total8b = 0;
 
     std::printf("\n8b: hostile vectors, length caps, IsHexToken, failure texts\n");
     std::printf("-----------------------------\n");
@@ -421,7 +729,7 @@ int main() {
            R"({"ok":true,"username":"u","password":"first","password":"second"})",
            L"u", L"second", L".");
     CaseReject("duplicate: a later \"ok\":false wins over an earlier true",
-               R"({"ok":true,"username":"u","password":"x","ok":false})", "no-match");
+               R"({"ok":true,"username":"u","password":"x","ok":false})", "malformed-response");
     CaseReject("duplicate: a later non-string password wins and is rejected",
                R"({"ok":true,"username":"u","password":"x","password":7})", "malformed-response");
 
@@ -431,7 +739,7 @@ int main() {
                ",\"username\":\"u\",\"password\":\"x\"}",
            L"u", L"x", L".");
     CaseReject("type: ok as number 1 is not truthy",
-               R"({"ok":1,"username":"u","password":"x"})", "no-match");
+               R"({"ok":1,"username":"u","password":"x"})", "malformed-response");
     CaseReject("type: username as number rejected",
                R"({"ok":true,"username":12345,"password":"x"})", "malformed-response");
     CaseReject("type: password as array rejected",
@@ -442,21 +750,22 @@ int main() {
                R"({"ok":true,"username":"u","password":null})", "malformed-response");
     CaseReject("type: password true rejected",
                R"({"ok":true,"username":"u","password":true})", "malformed-response");
-    CaseReject("type: non-string reason -> no-match",
-               R"({"ok":false,"reason":42})", "no-match");
+    CaseReject("type: non-string reason -> malformed-response",
+               R"({"ok":false,"reason":42})", "malformed-response");
     CaseOk("type: non-string domain is ignored -> \".\"",
            R"({"ok":true,"username":"u","password":"x","domain":7})", L"u", L"x", L".");
 
     // --- Gesture prompt: C0/DEL stripped, capped at 120 UTF-16 units ---
     CasePrompt("prompt: escaped C0 controls and DEL stripped",
                "Bl\\n\\tink\\u0007 \\u001bnow\\u007f!", L"Blink now!");
-    CasePrompt("prompt: raw control bytes stripped",
-               "Bl\x01ink\x1f now", L"Blink now");
+    CaseReject("prompt: raw control bytes rejected (Stage 9 D-58: strict strings)",
+               "{\"ok\":false,\"reason\":\"needs-gesture\",\"prompt\":\"Bl\x01ink\x1f now\"}",
+               "malformed-response");
     CasePrompt("prompt: 300 chars capped to 120", std::string(300, 'a'), std::wstring(120, L'a'));
     CasePrompt("prompt: cap never splits a surrogate pair",
                std::string(119, 'a') + "\\uD83D\\uDE00", std::wstring(119, L'a'));
-    CasePrompt("prompt: C1/non-ASCII text is kept",
-               "Turn \\u00e9 \\u0085", L"Turn \u00e9 \u0085");
+    CasePrompt("prompt: non-ASCII kept, C1 stripped (Stage 9 R2)",
+               "Turn \\u00e9 \\u0085", L"Turn \u00e9 ");
     CasePrompt("prompt: only controls -> empty", "\\n\\r\\t", L"");
 
     // --- IsHexToken (the only token shape pasted back into the phase-2 request) ---
@@ -474,35 +783,178 @@ int main() {
     Check("IsHexToken: space -> false", !IsHexToken("ab cd"));
     Check("IsHexToken: embedded NUL -> false", !IsHexToken("ab\0cd"s));
     Check("IsHexToken: JSON-breaking payload -> false", !IsHexToken("ab\",\"cmd\":\"x"));
+    total8b = g_pass + g_fail - pre8bCount;
 
-    // --- Fixed failure texts by reason ---
-    using FaceUnlock::FailureTextForReason;
-    Check("text: no-match -> not recognised",
-          std::wstring(FailureTextForReason("no-match")) == FaceUnlock::kTextNotRecognised);
-    Check("text: gesture-failed -> not recognised",
-          std::wstring(FailureTextForReason("gesture-failed")) == FaceUnlock::kTextNotRecognised);
-    Check("text: too-dark -> not recognised",
-          std::wstring(FailureTextForReason("too-dark")) == FaceUnlock::kTextNotRecognised);
-    Check("text: locked-out -> temporarily locked",
-          std::wstring(FailureTextForReason("locked-out")) == FaceUnlock::kTextLockedOut);
-    Check("text: pipe-unavailable -> unavailable",
-          std::wstring(FailureTextForReason("pipe-unavailable")) == FaceUnlock::kTextUnavailable);
-    Check("text: server-untrusted -> unavailable",
-          std::wstring(FailureTextForReason("server-untrusted")) == FaceUnlock::kTextUnavailable);
-    Check("text: insecure-data-dir -> unavailable (ordinary failure)",
-          std::wstring(FailureTextForReason("insecure-data-dir")) == FaceUnlock::kTextUnavailable);
-    Check("text: unknown / empty / exception reasons -> generic unavailable",
-          std::wstring(FailureTextForReason("")) == FaceUnlock::kTextUnavailable &&
-          std::wstring(FailureTextForReason("exception: boom")) == FaceUnlock::kTextUnavailable &&
-          std::wstring(FailureTextForReason("needs-gesture")) == FaceUnlock::kTextUnavailable);
-    Check("text: stored-password-rejected text is exact, with U+2014",
-          std::wstring(FaceUnlock::kTextPasswordRejected) ==
-              L"Stored password was rejected \u2014 sign in with PIN and update it in Face Unlock");
-
-    const int total8b = g_pass + g_fail - pre8bCount;
-
+    // ------------------------------------------------------------------------------------------
+    std::printf("\nStage 9: protocol v2, strict JSON / UTF-8, sanitizer, texts, transport\n");
     std::printf("-----------------------------\n");
-    std::printf("PASS=%d  FAIL=%d  (baseline 16 + Stage 7-i %d + 8b %d)\n",
-                g_pass, g_fail, stage7iTotal, total8b);
+    const int pre9Count = g_pass + g_fail;
+    using namespace FaceUnlock;
+
+    // --- §2.1 version: a reply that is not v2 is refused whole, credentials included ---
+    CaseReject("v2: grant without \"v\" -> version-mismatch, nothing kept",
+               R"({"ok":true,"username":"u","password":"x","grant_id":"ab"})", "version-mismatch", true);
+    CaseReject("v2: grant with \"v\":1 -> version-mismatch",
+               R"({"v":1,"ok":true,"username":"u","password":"x","grant_id":"ab"})", "version-mismatch", true);
+    CaseReject("v2: failure without \"v\" (a 0.1.x service) -> version-mismatch",
+               R"({"ok":false,"reason":"no-match"})", "version-mismatch", true);
+    CaseReject("v2: \"v\" as a string is not a version",
+               R"({"v":"2","ok":true,"username":"u","password":"x","grant_id":"ab"})", "version-mismatch", true);
+    CaseReject("v2: the service's own version-mismatch surfaces verbatim",
+               R"({"v":2,"ok":false,"reason":"version-mismatch"})", "version-mismatch", true);
+    // --- grant_id is mandatory on a grant, and hex ---
+    CaseReject("v2: grant without grant_id -> malformed",
+               R"({"v":2,"ok":true,"username":"u","password":"x"})", "malformed-response", true);
+    CaseReject("v2: non-hex grant_id -> malformed",
+               R"({"v":2,"ok":true,"username":"u","password":"x","grant_id":"zz\"}"})", "malformed-response", true);
+    CaseReject("v2: 65-char grant_id -> malformed",
+               "{\"v\":2,\"ok\":true,\"username\":\"u\",\"password\":\"x\",\"grant_id\":\"" +
+                   std::string(65, 'a') + "\"}", "malformed-response", true);
+    {
+        UnlockReply r;
+        const bool ok = ParseUnlockReply(
+            R"({"v":2,"ok":true,"username":"u","password":"x","grant_id":"0123abcd","lang":"ru"})", r);
+        Check("v2: grant carries grant_id and lang", ok && r.grantId == "0123abcd" && r.lang == "ru" &&
+                                                     r.version == 2);
+    }
+    {
+        UnlockReply r;
+        const bool ok = ParseUnlockReply(
+            R"({"v":2,"lang":"en","ok":false,"reason":"locked-out","retry_after_s":42.5})", r);
+        Check("v2: locked-out carries retry_after_s = 42.5",
+              !ok && r.reason == "locked-out" && r.retryAfterS > 42.49 && r.retryAfterS < 42.51);
+        UnlockReply r2;
+        ParseUnlockReply(R"({"v":2,"ok":false,"reason":"locked-out","retry_after_s":-3})", r2);
+        Check("v2: a negative retry_after_s is ignored", r2.retryAfterS < 0.0);
+        UnlockReply r3;
+        ParseUnlockReply(R"({"v":2,"ok":false,"reason":"locked-out","retry_after_s":"42"})", r3);
+        Check("v2: a string retry_after_s is ignored", r3.retryAfterS < 0.0);
+    }
+
+    // --- D-58 strict JSON ---
+    CaseReject("strict: {\"ok\":} (no value) rejected", R"({"ok":})", "malformed-response");
+    CaseReject("strict: bare word value rejected", R"({"ok":false,"reason":"x","n":abc})", "malformed-response");
+    CaseReject("strict: '{' closed by ']' rejected", R"({"ok":false,"reason":"x","m":{"a":1]})", "malformed-response");
+    CaseReject("strict: trailing garbage after the object rejected",
+               R"({"ok":false,"reason":"no-match"}xyz)", "malformed-response");
+    CaseReject("strict: a second object after the first rejected",
+               R"({"ok":false,"reason":"no-match"}{"ok":true})", "malformed-response");
+    CaseOk("strict: trailing whitespace after the object is fine",
+           "{\"ok\":true,\"username\":\"u\",\"password\":\"x\"}\r\n  ", L"u", L"x", L".");
+    CaseReject("strict: leading zero number rejected", R"({"ok":false,"reason":"x","n":012})", "malformed-response");
+    CaseReject("strict: lone minus rejected", R"({"ok":false,"reason":"x","n":-})", "malformed-response");
+    CaseReject("strict: '1.' rejected", R"({"ok":false,"reason":"x","n":1.})", "malformed-response");
+    CaseReject("strict: '1e' rejected", R"({"ok":false,"reason":"x","n":1e})", "malformed-response");
+    CaseOk("strict: -0.5e+3 is a valid number",
+           R"({"n":-0.5e+3,"ok":true,"username":"u","password":"x"})", L"u", L"x", L".");
+    CaseReject("strict: raw TAB byte inside a string rejected",
+               "{\"ok\":true,\"username\":\"u\",\"password\":\"a\tb\"}", "malformed-response");
+    CaseReject("strict: raw control byte inside a prompt rejected",
+               "{\"ok\":false,\"reason\":\"needs-gesture\",\"gesture\":\"nod\",\"token\":\"ab\","
+               "\"prompt\":\"Bl\x01ink\"}", "malformed-response");
+    CaseOk("strict: empty nested object and array are skipped",
+           R"({"a":{},"b":[],"ok":true,"username":"u","password":"x"})", L"u", L"x", L".");
+
+    // --- F-73 strict UTF-8 ---
+    CaseReject("utf8: invalid raw bytes in the password rejected (no silent U+FFFD)",
+               "{\"ok\":true,\"username\":\"u\",\"password\":\"a\xC3\x28z\"}", "malformed-response");
+    CaseReject("utf8: truncated raw sequence in the username rejected",
+               "{\"ok\":true,\"username\":\"u\xE2\x82\",\"password\":\"x\"}", "malformed-response");
+    CaseOk("utf8: valid raw UTF-8 (U+00E9) accepted",
+           "{\"ok\":true,\"username\":\"u\",\"password\":\"caf\xC3\xA9\"}", L"u", L"café", L".");
+
+    // --- F-74 / R2 sanitizer: C1, bidi controls, line / paragraph separators ---
+    CasePrompt("sanitize: RLO/PDF bidi override stripped", "a\\u202Eevil\\u202Cz", L"aevilz");
+    CasePrompt("sanitize: LRI..PDI isolates stripped", "\\u2066a\\u2067b\\u2068c\\u2069", L"abc");
+    CasePrompt("sanitize: LRM/RLM stripped", "a\\u200Eb\\u200Fc", L"abc");
+    CasePrompt("sanitize: U+2028 / U+2029 stripped", "line1\\u2028line2\\u2029end", L"line1line2end");
+    CasePrompt("sanitize: C1 U+0080..U+009F stripped", "a\\u0080b\\u009Fc", L"abc");
+    Check("sanitize: direct call keeps ordinary Cyrillic",
+          SanitizePromptText(L"Поверните голову") == L"Поверните голову");
+
+    // --- requests ---
+    Check("request: unlock v2 with budget",
+          BuildUnlockRequest(11500) == R"({"cmd":"unlock","v":2,"budget_ms":11500})");
+    Check("request: unlock_gesture v2 with token and budget",
+          BuildGestureRequest("ab12", 14000) ==
+              R"({"cmd":"unlock_gesture","v":2,"token":"ab12","budget_ms":14000})");
+    Check("request: report_result ok=true",
+          BuildReportRequest("0a0b", true) == R"({"cmd":"report_result","v":2,"grant_id":"0a0b","ok":true})");
+    Check("request: report_result ok=false",
+          BuildReportRequest("0a0b", false) == R"({"cmd":"report_result","v":2,"grant_id":"0a0b","ok":false})");
+    Check("report reply: {\"ok\":true,\"v\":2} accepted", ParseReportReply(R"({"ok":true,"v":2,"lang":"en"})"));
+    Check("report reply: grant-unknown refused",
+          !ParseReportReply(R"({"ok":false,"reason":"grant-unknown","v":2})"));
+    Check("report reply: without v refused", !ParseReportReply(R"({"ok":true})"));
+
+    // --- R3 honest texts ---
+    Check("class: no-match / gesture-failed / motion-before-prompt / screen-suspected -> not recognised",
+          FailureClass("no-match") == Text::NotRecognised && FailureClass("gesture-failed") == Text::NotRecognised &&
+          FailureClass("motion-before-prompt") == Text::NotRecognised &&
+          FailureClass("screen-suspected") == Text::NotRecognised);
+    Check("class: too-dark has its own text (no longer 'not recognised')", FailureClass("too-dark") == Text::TooDark);
+    Check("class: no-credentials -> no password", FailureClass("no-credentials") == Text::NoPassword);
+    Check("class: no-enrollment -> no enrollment", FailureClass("no-enrollment") == Text::NoEnrollment);
+    Check("class: camera-busy / camera-error / no-frames -> camera",
+          FailureClass("camera-busy") == Text::CameraBusy && FailureClass("camera-error") == Text::CameraBusy &&
+          FailureClass("no-frames") == Text::CameraBusy);
+    Check("class: password-rejected", FailureClass("password-rejected") == Text::PasswordRejected);
+    Check("class: version-mismatch -> update", FailureClass("version-mismatch") == Text::UpdateNeeded);
+    Check("class: refusals -> needs attention",
+          FailureClass("not-owner") == Text::NeedsAttention && FailureClass("custody") == Text::NeedsAttention &&
+          FailureClass("insecure-data-dir") == Text::NeedsAttention &&
+          FailureClass("no-models") == Text::NeedsAttention &&
+          FailureClass("lockout-store-error") == Text::NeedsAttention);
+    Check("class: 'unavailable' only for an unreachable / untrusted service",
+          FailureClass("pipe-unavailable") == Text::Unavailable &&
+          FailureClass("server-untrusted") == Text::Unavailable &&
+          FailureClass("deadline-exceeded") == Text::Failed && FailureClass("engine-error") == Text::Failed &&
+          FailureClass("malformed-response") == Text::Failed && FailureClass("") == Text::Failed &&
+          FailureClass("internal-error") == Text::Failed && FailureClass("gesture-token-invalid") == Text::Failed);
+    Check("text: locked-out with seconds (EN)",
+          FailureText("locked-out", 42.4, "en") == L"Face sign-in is locked for 42 s. Use PIN or password.");
+    Check("text: locked-out with seconds (RU)",
+          FailureText("locked-out", 299.6, "ru") ==
+              L"Вход по лицу заблокирован на 300 с. Войдите по PIN-коду или паролю.");
+    Check("text: locked-out without seconds",
+          FailureText("locked-out", -1.0, "en") == TileText(Text::LockedOut, "en"));
+    {
+        bool allDiffer = true, allRu = true;
+        for (int i = (int)Text::Label + 1; i <= (int)Text::GestureFallback; ++i) {
+            const Text t = (Text)i;
+            if (TileText(t, "en").empty() || TileText(t, "ru").empty()) allRu = false;
+            if (TileText(t, "en") == TileText(t, "ru")) allDiffer = false;
+        }
+        Check("texts: every text exists in EN and RU", allRu);
+        Check("texts: every RU text differs from the EN one (the label aside)", allDiffer);
+    }
+    Check("lang: reply lang wins", ResolveLang("ru") == "ru" && ResolveLang("en") == "en");
+    Check("lang: unknown reply lang -> system language, en or ru",
+          ResolveLang("ja") == "en" || ResolveLang("ja") == "ru");
+    Check("gesture text: turn_left,nod (EN)", GesturePromptFromKinds("turn_left,nod", "en") ==
+                                                L"Turn your head left, then nod");
+    Check("gesture text: nod,turn_right (RU)", GesturePromptFromKinds("nod,turn_right", "ru") ==
+                                                 L"Кивните, затем поверните голову вправо");
+    Check("gesture text: an unknown kind gives no text",
+          GesturePromptFromKinds("blink", "en").empty() && GesturePromptFromKinds("", "en").empty() &&
+          GesturePromptFromKinds("nod,", "en").empty());
+
+    // --- R1 person SIDs ---
+    Check("sid: local account S-1-5-21-a-b-c-rid", IsPersonSid(L"S-1-5-21-1-2-3-1001"));
+    Check("sid: Entra ID S-1-12-1-a-b-c-d", IsPersonSid(L"S-1-12-1-111-222-333-444"));
+    Check("sid: SYSTEM / LOCAL SERVICE / NETWORK SERVICE refused",
+          !IsPersonSid(L"S-1-5-18") && !IsPersonSid(L"S-1-5-19") && !IsPersonSid(L"S-1-5-20"));
+    Check("sid: truncated S-1-5-21-1 refused", !IsPersonSid(L"S-1-5-21-1"));
+    Check("sid: garbage refused", !IsPersonSid(L"not a sid") && !IsPersonSid(L""));
+
+    // --- transport against a private pipe server in this process (FACEUNLOCK_TESTING) ---
+    TransportTests();
+    TransportShapes();
+    KerbPackTests();
+
+    const int total9 = g_pass + g_fail - pre9Count;
+    std::printf("-----------------------------\n");
+    std::printf("PASS=%d  FAIL=%d  (baseline 16 + Stage 7-i %d + 8b %d + Stage 9 %d)\n",
+                g_pass, g_fail, stage7iTotal, total8b, total9);
     return g_fail == 0 ? 0 : 1;
 }

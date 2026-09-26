@@ -1,18 +1,11 @@
 #include "PipeClient.h"
-#include <vector>
-#include <map>
-#include <cstring>
+#include <aclapi.h>     // GetSecurityInfo
 #include <sddl.h>       // ConvertSidToStringSidW / ConvertStringSidToSidW
+#include <cstring>
+#include <map>
+#include <vector>
 
 namespace FaceUnlock {
-
-static std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring out(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), n);
-    return out;
-}
 
 // 8b F-25: reply buffers and parsed strings holding the password were freed unwiped ->
 // plaintext residue in the LogonUI (SYSTEM) heap -> wipe them in place before release.
@@ -38,45 +31,60 @@ private:
     S& m_s;
 };
 
-// 8b F-25: Utf8ToWide returns a temporary whose buffer (or small-string storage) is released
-// unwiped -> a password copy survives -> decode a secret straight into its destination,
-// sized exactly once so no intermediate buffer is ever freed holding it.
-static void Utf8ToWideSecret(const std::string& s, std::wstring& out) {
+// Stage 9 (F-71): raw HANDLEs leaked when an allocation threw between open and close -> a leaked,
+// connected, silent client handle wedged the sequential server -> RAII on every handle.
+class UniqueHandle {
+public:
+    UniqueHandle() = default;
+    explicit UniqueHandle(HANDLE h) : m_h(h) {}
+    ~UniqueHandle() { reset(); }
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+    HANDLE get() const { return m_h; }
+    bool valid() const { return m_h != nullptr && m_h != INVALID_HANDLE_VALUE; }
+    void reset(HANDLE h = nullptr) {
+        if (valid()) CloseHandle(m_h);
+        m_h = h;
+    }
+private:
+    HANDLE m_h = nullptr;
+};
+
+// Stage 9 (F-73): invalid UTF-8 was replaced with U+FFFD in silence, so a mangled password was
+// packed and rejected by Windows -> decode strictly; a failure is "malformed-response".
+// 8b F-25: decode a secret straight into its destination, sized exactly once.
+static bool Utf8ToWideStrict(const std::string& s, std::wstring& out) {
     WipeAndClear(out);
-    if (s.empty()) return;
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    if (n <= 0) return;
+    if (s.empty()) return true;
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return false;
     out.resize((size_t)n);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), &out[0], n) != n) {
+        WipeAndClear(out);
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// Minimal, dependency-free JSON reader.
+// Minimal, dependency-free, STRICT JSON reader for the flat reply objects of this protocol.
 //
-// Replaces the previous naive substring scanner, which broke on: JSON escape
-// sequences (a password containing a quote or backslash arrives escaped as \"
-// or \\ and truncated the value), pretty-printed whitespace, empty values, and
-// added/reordered fields. This reader parses the whole top-level object
-// structurally -- respecting string escaping so a '"' inside a value is never
-// mistaken for a delimiter -- and decodes every JSON escape the service can
-// emit. The Python service uses json.dumps() with ensure_ascii=True (its
-// default), so every non-ASCII character is sent as \uXXXX (astral chars as a
-// UTF-16 surrogate pair); both are decoded here.
-//
-// Scope note: this is intentionally NOT a general-purpose JSON library (no
-// vendored dependency -- zero-deps is a project principle). It parses exactly
-// the flat request/response shapes this protocol uses.
+// Stage 9 (D-55, D-58). The reader accepted non-JSON: any unknown value start was a "number"
+// ({"ok":} parsed), '{' could be closed by ']', bytes after the closing brace were ignored and
+// raw control bytes inside strings were taken. A hostile server could not get a credential
+// through that (only typed STRING / BOOL fields are consumed), but the grammar is now enforced:
+// strict numbers, matched brackets, nothing but whitespace after the object, no raw byte < 0x20
+// inside a string. The service uses json.dumps (ensure_ascii), so every non-ASCII character
+// arrives as \uXXXX (astral ones as a surrogate pair); both are decoded here.
 // ---------------------------------------------------------------------------
 namespace {
 
 struct JsonValue {
     enum Type { STRING, BOOL, NUMBER, NUL, OBJECT, ARRAY } type = NUL;
-    std::string str;        // decoded UTF-8, valid when type == STRING
+    std::string str;        // decoded UTF-8 (STRING) or the literal text (NUMBER)
     bool boolean = false;   // valid when type == BOOL
 
-    // 8b F-25: the "password" value lived in a temporary JsonValue plus a map copy, both freed
-    // unwiped -> residue -> non-copyable (values are swapped into the map, never copied) and
-    // wiped on destruction.
+    // 8b F-25: non-copyable (values are swapped into the map, never copied), wiped on destruction.
     JsonValue() = default;
     JsonValue(const JsonValue&) = delete;
     JsonValue& operator=(const JsonValue&) = delete;
@@ -87,7 +95,6 @@ inline void SkipWs(const char*& p, const char* end) {
     while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p;
 }
 
-// Encode a Unicode code point as UTF-8.
 void AppendUtf8(std::string& out, unsigned int cp) {
     if (cp <= 0x7F) {
         out.push_back((char)cp);
@@ -106,7 +113,6 @@ void AppendUtf8(std::string& out, unsigned int cp) {
     }
 }
 
-// Parse 4 hex digits at p (advancing p). Returns false on non-hex/short input.
 bool ParseHex4(const char*& p, const char* end, unsigned int& out) {
     if (end - p < 4) return false;
     unsigned int v = 0;
@@ -123,14 +129,13 @@ bool ParseHex4(const char*& p, const char* end, unsigned int& out) {
     return true;
 }
 
-// Parse a JSON string. p must point AT the opening quote; on success p is left
-// just past the closing quote and `out` holds the decoded UTF-8 bytes.
+// Parse a JSON string. p must point AT the opening quote; on success p is just past the closing
+// quote and `out` holds the decoded UTF-8 bytes.
 bool ParseString(const char*& p, const char* end, std::string& out) {
     if (p >= end || *p != '"') return false;
-    ++p;  // opening quote
-    // 8b F-25: growing `out` by push_back reallocated and freed partial password copies
-    // unwiped -> residue -> reserve the raw span up front. Decoding never lengthens a string
-    // (an escape is at least as long as what it decodes to), so no reallocation follows.
+    ++p;
+    // 8b F-25: reserve the raw span up front so no reallocation frees a partial password copy.
+    // Decoding never lengthens a string, so no reallocation follows.
     {
         const char* q = p;
         while (q < end && *q != '"') {
@@ -141,8 +146,9 @@ bool ParseString(const char*& p, const char* end, std::string& out) {
     }
     while (p < end) {
         char c = *p++;
-        if (c == '"') return true;                 // closing quote
-        if (c != '\\') { out.push_back(c); continue; }  // raw byte (incl UTF-8 tail)
+        if (c == '"') return true;
+        if ((unsigned char)c < 0x20) return false;          // D-58: raw control byte
+        if (c != '\\') { out.push_back(c); continue; }
         if (p >= end) return false;
         char e = *p++;
         switch (e) {
@@ -158,7 +164,6 @@ bool ParseString(const char*& p, const char* end, std::string& out) {
                 unsigned int cp;
                 if (!ParseHex4(p, end, cp)) return false;
                 if (cp >= 0xD800 && cp <= 0xDBFF) {
-                    // High surrogate -> expect a \uXXXX low surrogate next.
                     if (end - p >= 2 && p[0] == '\\' && p[1] == 'u') {
                         const char* save = p;
                         p += 2;
@@ -167,53 +172,80 @@ bool ParseString(const char*& p, const char* end, std::string& out) {
                         if (lo >= 0xDC00 && lo <= 0xDFFF) {
                             cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
                         } else {
-                            // Not a low surrogate: emit U+FFFD for the unpaired
-                            // high surrogate and rewind so `lo` is parsed normally.
-                            AppendUtf8(out, 0xFFFD);
-                            p = save;
+                            AppendUtf8(out, 0xFFFD);   // unpaired high surrogate
+                            p = save;                  // re-read `lo` as its own escape
                             break;
                         }
                     } else {
-                        cp = 0xFFFD;  // lone high surrogate at end of string
+                        cp = 0xFFFD;
                     }
                 } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-                    cp = 0xFFFD;      // unpaired low surrogate
+                    cp = 0xFFFD;
                 }
                 AppendUtf8(out, cp);
                 break;
             }
-            default: return false;    // invalid escape
+            default: return false;
         }
     }
-    return false;  // unterminated string
+    return false;  // unterminated
 }
 
-// Consume any JSON value at p (advancing p). Content is discarded; used to skip
-// over fields we don't care about so parsing stays aligned. Respects string
-// escaping and nested containers.
-bool SkipValue(const char*& p, const char* end) {
-    SkipWs(p, end);
+// JSON number grammar: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+bool ParseNumber(const char*& p, const char* end, std::string& text) {
+    const char* s = p;
+    if (p < end && *p == '-') ++p;
     if (p >= end) return false;
-    if (*p == '"') { std::string tmp; return ParseString(p, end, tmp); }
-    if (*p == '{' || *p == '[') {
-        int depth = 0;
-        while (p < end) {
-            char c = *p;
-            if (c == '"') { std::string tmp; if (!ParseString(p, end, tmp)) return false; continue; }
-            if (c == '{' || c == '[') { ++depth; ++p; continue; }
-            if (c == '}' || c == ']') { --depth; ++p; if (depth == 0) return true; continue; }
-            ++p;
-        }
-        return false;  // unbalanced
+    if (*p == '0') {
+        ++p;
+    } else if (*p >= '1' && *p <= '9') {
+        while (p < end && *p >= '0' && *p <= '9') ++p;
+    } else {
+        return false;
     }
-    // number / true / false / null
-    while (p < end && *p != ',' && *p != '}' && *p != ']') ++p;
+    if (p < end && *p == '.') {
+        ++p;
+        if (p >= end || !(*p >= '0' && *p <= '9')) return false;
+        while (p < end && *p >= '0' && *p <= '9') ++p;
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        ++p;
+        if (p < end && (*p == '+' || *p == '-')) ++p;
+        if (p >= end || !(*p >= '0' && *p <= '9')) return false;
+        while (p < end && *p >= '0' && *p <= '9') ++p;
+    }
+    text.assign(s, p);
     return true;
 }
 
-// Parse a flat top-level JSON object into a key->value map. Tolerant of extra
-// fields, reordering, nested values (skipped), and any whitespace. Last value
-// wins on duplicate keys.
+// Skip a nested object or array starting AT '{' or '['. Iterative (no recursion, so no stack
+// exhaustion), brackets must match by type, strings are parsed so a quoted bracket is inert.
+bool SkipContainer(const char*& p, const char* end) {
+    std::string closers;
+    while (p < end) {
+        char c = *p;
+        if (c == '"') {
+            std::string tmp;
+            if (!ParseString(p, end, tmp)) return false;
+            continue;
+        }
+        if (c == '{') { closers.push_back('}'); ++p; continue; }
+        if (c == '[') { closers.push_back(']'); ++p; continue; }
+        if (c == '}' || c == ']') {
+            if (closers.empty() || closers.back() != c) return false;
+            closers.pop_back();
+            ++p;
+            if (closers.empty()) return true;
+            continue;
+        }
+        if ((unsigned char)c < 0x20 && c != ' ' && c != '\t' && c != '\n' && c != '\r') return false;
+        ++p;
+    }
+    return false;
+}
+
+// Parse a flat top-level JSON object into a key->value map. Nested values are skipped; last
+// value wins on duplicate keys; only whitespace may follow the closing brace.
 bool ParseObject(const std::string& json, std::map<std::string, JsonValue>& out) {
     const char* p = json.data();
     const char* end = p + json.size();
@@ -221,11 +253,15 @@ bool ParseObject(const std::string& json, std::map<std::string, JsonValue>& out)
     if (p >= end || *p != '{') return false;
     ++p;
     SkipWs(p, end);
-    if (p < end && *p == '}') return true;  // empty object
+    if (p < end && *p == '}') {
+        ++p;
+        SkipWs(p, end);
+        return p == end;
+    }
     while (p < end) {
         SkipWs(p, end);
         std::string key;
-        if (!ParseString(p, end, key)) return false;   // key
+        if (!ParseString(p, end, key)) return false;
         SkipWs(p, end);
         if (p >= end || *p != ':') return false;
         ++p;
@@ -238,7 +274,7 @@ bool ParseObject(const std::string& json, std::map<std::string, JsonValue>& out)
             if (!ParseString(p, end, v.str)) return false;
         } else if (c == 't' || c == 'f') {
             v.type = JsonValue::BOOL;
-            if (end - p >= 4 && std::strncmp(p, "true", 4) == 0)  { v.boolean = true;  p += 4; }
+            if (end - p >= 4 && std::strncmp(p, "true", 4) == 0)       { v.boolean = true;  p += 4; }
             else if (end - p >= 5 && std::strncmp(p, "false", 5) == 0) { v.boolean = false; p += 5; }
             else return false;
         } else if (c == 'n') {
@@ -246,17 +282,12 @@ bool ParseObject(const std::string& json, std::map<std::string, JsonValue>& out)
             if (end - p >= 4 && std::strncmp(p, "null", 4) == 0) p += 4; else return false;
         } else if (c == '{' || c == '[') {
             v.type = (c == '{') ? JsonValue::OBJECT : JsonValue::ARRAY;
-            if (!SkipValue(p, end)) return false;
+            if (!SkipContainer(p, end)) return false;
         } else {
             v.type = JsonValue::NUMBER;
-            const char* s = p;
-            while (p < end && *p != ',' && *p != '}' &&
-                   *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') ++p;
-            v.str.assign(s, p);
+            if (!ParseNumber(p, end, v.str)) return false;
         }
-        // 8b F-25: `out[key] = v` left an unwiped copy behind (and, on a duplicate key,
-        // overwrote the previous value without wiping it) -> wipe the slot, then swap the
-        // value in so each decoded byte exists in exactly one place. Last value still wins.
+        // 8b F-25: wipe the slot, then swap the value in, so each decoded byte exists once.
         JsonValue& slot = out[key];
         WipeAndClear(slot.str);
         slot.type = v.type;
@@ -264,25 +295,82 @@ bool ParseObject(const std::string& json, std::map<std::string, JsonValue>& out)
         slot.str.swap(v.str);
         SkipWs(p, end);
         if (p < end && *p == ',') { ++p; continue; }
-        if (p < end && *p == '}') { ++p; return true; }
-        return false;  // malformed separator
+        if (p < end && *p == '}') {
+            ++p;
+            SkipWs(p, end);
+            return p == end;                       // D-58: nothing may trail the object
+        }
+        return false;
     }
     return false;
 }
 
-// Copy a top-level STRING field into `out`. A field that is absent, or present with any
-// other type, leaves `out` untouched -- callers rely on that to keep a default ("." for
-// domain) or an empty string (the gesture fields) rather than inventing a value.
+// Copy a top-level STRING field. Absent or another type leaves `out` untouched.
 void TakeString(const std::map<std::string, JsonValue>& obj, const char* key, std::string& out) {
     auto it = obj.find(key);
     if (it != obj.end() && it->second.type == JsonValue::STRING) out = it->second.str;
 }
 
+// Value of a validated JSON number literal, without locale-dependent strtod.
+double NumberValue(const std::string& t) {
+    const char* p = t.c_str();
+    bool neg = false;
+    if (*p == '-') { neg = true; ++p; }
+    double v = 0.0;
+    while (*p >= '0' && *p <= '9') { v = v * 10.0 + (*p - '0'); ++p; }
+    if (*p == '.') {
+        ++p;
+        double scale = 0.1;
+        while (*p >= '0' && *p <= '9') { v += (*p - '0') * scale; scale /= 10.0; ++p; }
+    }
+    if (*p == 'e' || *p == 'E') {
+        ++p;
+        bool eneg = false;
+        if (*p == '+' || *p == '-') { eneg = (*p == '-'); ++p; }
+        int e = 0;
+        while (*p >= '0' && *p <= '9' && e < 400) { e = e * 10 + (*p - '0'); ++p; }
+        for (int i = 0; i < e; ++i) v = eneg ? v / 10.0 : v * 10.0;
+    }
+    return neg ? -v : v;
+}
+
+bool TakeNumber(const std::map<std::string, JsonValue>& obj, const char* key, double& out) {
+    auto it = obj.find(key);
+    if (it == obj.end() || it->second.type != JsonValue::NUMBER) return false;
+    out = NumberValue(it->second.str);
+    return true;
+}
+
 }  // anonymous namespace
 
-// Parse an unlock reply. Exposed (declared in the header) so the offline unit
-// test can exercise it without a live pipe or service. Returns true only for a
-// well-formed success reply with non-empty username AND password.
+bool IsHexToken(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) {
+        const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
+    return true;
+}
+
+std::wstring SanitizePromptText(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size() < kMaxPromptChars ? text.size() : kMaxPromptChars);
+    for (wchar_t c : text) {
+        if (c < 0x20 || c == 0x7F) continue;                     // C0 controls and DEL
+        if (c >= 0x80 && c <= 0x9F) continue;                    // C1 controls (U+0085 NEL too)
+        if (c == 0x200E || c == 0x200F) continue;                // LRM / RLM
+        if (c >= 0x202A && c <= 0x202E) continue;                // LRE RLE PDF LRO RLO
+        if (c >= 0x2066 && c <= 0x2069) continue;                // LRI RLI FSI PDI
+        if (c == 0x2028 || c == 0x2029) continue;                // line / paragraph separator
+        if (out.size() >= kMaxPromptChars) break;
+        out.push_back(c);
+    }
+    // Never leave half a surrogate pair at the cut.
+    if (!out.empty() && out.back() >= 0xD800 && out.back() <= 0xDBFF) out.pop_back();
+    return out;
+}
+
+// Parse an unlock reply. Exposed so the offline test can exercise it without a pipe.
 bool ParseUnlockReply(const std::string& response, UnlockReply& out) {
     std::map<std::string, JsonValue> obj;
     if (!ParseObject(response, obj)) {
@@ -290,57 +378,63 @@ bool ParseUnlockReply(const std::string& response, UnlockReply& out) {
         return false;
     }
 
-    // Stage 7-i phase 1. Read the gesture section BEFORE branching on ok, and independently
-    // of it: the fields belong to the reply, not to a particular outcome, and a caller that
-    // sees reason "needs-gesture" must be able to tell "the service sent a challenge" from
-    // "the service sent needs-gesture but no usable token" -- which it does by finding these
-    // empty. `prompt` is display text and may be non-ASCII: the service emits it as \uXXXX
-    // (json.dumps defaults to ensure_ascii), ParseString decodes that to UTF-8, and it is
-    // widened here. `ttl_s` is deliberately NOT read -- the client owns its own phase-2
-    // timeout and must not take a duration from the wire.
+    // Optional fields, read whatever the outcome (the parser never invents a value).
     TakeString(obj, "gesture", out.gesture);
     TakeString(obj, "token", out.token);
+    TakeString(obj, "grant_id", out.grantId);
+    TakeString(obj, "lang", out.lang);
+    double num = 0.0;
+    if (TakeNumber(obj, "retry_after_s", num) && num >= 0.0 && num < 1e7) out.retryAfterS = num;
+    if (TakeNumber(obj, "v", num) && num >= 0.0 && num < 1e6) out.version = (int)num;
     std::string promptUtf8;
     TakeString(obj, "prompt", promptUtf8);
-    // 8b F-48: the prompt went onto the secure-desktop tile unbounded and with control
-    // characters -> arbitrary server text on the lock screen -> strip C0/DEL and cap it.
-    out.prompt = SanitizePromptText(Utf8ToWide(promptUtf8));
+    std::wstring promptWide;
+    if (!Utf8ToWideStrict(promptUtf8, promptWide)) {
+        out.reason = "malformed-response";
+        return false;
+    }
+    // 8b F-48 + Stage 9 R2: server text reaches the secure desktop only sanitized and capped.
+    out.prompt = SanitizePromptText(promptWide);
 
-    auto itOk = obj.find("ok");
-    bool ok = (itOk != obj.end() && itOk->second.type == JsonValue::BOOL && itOk->second.boolean);
-    if (!ok) {
-        std::string reason;
-        auto itR = obj.find("reason");
-        if (itR != obj.end() && itR->second.type == JsonValue::STRING) reason = itR->second.str;
-        out.reason = reason.empty() ? "no-match" : reason;
+    // §2.1: a reply that is not protocol v2 is refused as a whole -- nothing is kept.
+    if (out.version != kProtocolVersion) {
+        out.reason = "version-mismatch";
         return false;
     }
 
-    // On ok=true, username and password are mandatory and must be non-empty --
-    // an empty credential must never be packed into a logon buffer.
+    auto itOk = obj.find("ok");
+    const bool ok = (itOk != obj.end() && itOk->second.type == JsonValue::BOOL && itOk->second.boolean);
+    if (!ok) {
+        std::string reason;
+        TakeString(obj, "reason", reason);
+        // Stage 9 (F-79): ok:false without a reason is a protocol defect, not a face mismatch.
+        out.reason = reason.empty() ? "malformed-response" : reason;
+        return false;
+    }
+
+    // ok=true: username, password and a hex grant id are mandatory; empty credentials are never
+    // packed.
     auto itU = obj.find("username");
     auto itP = obj.find("password");
     const bool haveU = (itU != obj.end() && itU->second.type == JsonValue::STRING && !itU->second.str.empty());
     const bool haveP = (itP != obj.end() && itP->second.type == JsonValue::STRING && !itP->second.str.empty());
-    if (!haveU || !haveP) {
+    if (!haveU || !haveP || !IsHexToken(out.grantId)) {
         out.reason = "malformed-response";
         return false;
     }
 
     std::string d;
     TakeString(obj, "domain", d);
+    const bool decoded = Utf8ToWideStrict(itU->second.str, out.username) &&
+                         Utf8ToWideStrict(itP->second.str, out.password) &&
+                         Utf8ToWideStrict(d.empty() ? std::string(".") : d, out.domain);
 
-    Utf8ToWideSecret(itU->second.str, out.username);
-    Utf8ToWideSecret(itP->second.str, out.password);
-    Utf8ToWideSecret(d.empty() ? std::string(".") : d, out.domain);
-
-    // 8b F-48: no bounds and no NUL check on the credential fields -> USHORT truncation in
-    // KerbPack and a wcslen/size() mismatch on an embedded \u0000 -> enforce the caps and
-    // reject any NUL here, before anything is stored or packed.
+    // 8b F-48: caps and no embedded NUL, checked before anything is stored or packed.
     auto badField = [](const std::wstring& w, size_t cap) {
         return w.empty() || w.size() > cap || w.find(L'\0') != std::wstring::npos;
     };
-    if (badField(out.username, kMaxUsernameChars) ||
+    if (!decoded ||
+        badField(out.username, kMaxUsernameChars) ||
         badField(out.password, kMaxPasswordChars) ||
         badField(out.domain,   kMaxDomainChars)) {
         WipeAndClear(out.username);
@@ -352,339 +446,469 @@ bool ParseUnlockReply(const std::string& response, UnlockReply& out) {
     return true;
 }
 
-// Back-compat wrapper: the pre-Stage-7-i signature, unchanged in behaviour.
-bool ParseUnlockResponse(const std::string& response,
-                         std::wstring& username,
-                         std::wstring& password,
-                         std::wstring& domain,
-                         std::string& errorOut) {
-    UnlockReply r;
-    const bool ok = ParseUnlockReply(response, r);
-    username = r.username;
-    password = r.password;
-    domain   = r.domain;
-    errorOut = r.reason;
-    return ok;
+bool ParseReportReply(const std::string& response) {
+    std::map<std::string, JsonValue> obj;
+    if (!ParseObject(response, obj)) return false;
+    double v = 0.0;
+    if (!TakeNumber(obj, "v", v) || (int)v != kProtocolVersion) return false;
+    auto itOk = obj.find("ok");
+    return itOk != obj.end() && itOk->second.type == JsonValue::BOOL && itOk->second.boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Client-side pipe-server identity check (defense-in-depth against a squatter
-// owning the \\.\pipe\FaceUnlock name). We read the SID of the process on the
-// SERVER end of the connection and accept it only if it is a trusted owner.
-// This is an OS-level control (SID comparison) -- no crypto is introduced.
-//
-// Accepted server owners:
-//   * SYSTEM (S-1-5-18)                 -- a SYSTEM-hosted service
-//   * this process's own token user     -- SELF harness: the service runs as the
-//                                          same user as the client
-//   * any real user account (S-1-5-21-) -- registered CP: the client is
-//                                          LogonUI/SYSTEM and the service runs as
-//                                          the interactive user, so we accept a
-//                                          normal machine/domain user account
-//
-// What the server side does and does NOT buy us (be precise here -- an earlier
-// version of this comment claimed "a foreign account cannot own this pipe", which
-// is not true):
-//   * The hardened DACL applies to an ALREADY-CREATED object. It constrains who may
-//     open (and add instances to) OUR pipe once our server exists; it does NOT
-//     reserve the NAME in advance.
-//   * So there is a COLD WINDOW -- from boot/logon until FaceService binds the name --
-//     in which \\.\pipe\FaceUnlock is simply free, and any S-1-5-21 user on the box
-//     can take it with their own CreateNamedPipe and their own DACL.
-//   * FIRST_PIPE_INSTANCE does not PREVENT that squat. It only guarantees we never
-//     silently share a name someone else already owns: our server refuses to start
-//     and logs loudly, which makes a persistent squatter visible instead of hidden.
-//   * The client rule below accepts ANY real S-1-5-21 account, so in that cold window
-//     a squatter running as another (or the same) local user is trusted -> interposition
-//     is possible. This check rejects only well-known / service SIDs (SYSTEM aside,
-//     LOCAL/NETWORK SERVICE, logon and capability SIDs).
-//
-// What a squatter still cannot do: obtain the password. The client sends only the
-// literal {"cmd":"unlock"} -- no secret travels in the request. A valid password comes
-// back only from the genuine service, which decrypts its own DPAPI-protected store; a
-// squatter has no way to read it and can only return a failure. The realistic worst
-// case is therefore DENIAL OF SERVICE: face unlock fails and the user falls back to PIN.
-//
-// This check also deliberately does NOT depend on WTSQueryUserToken/session resolution,
-// which is unreliable in the LogonUI secure-desktop context (it was silently failing and
-// closing the pipe before the request was sent).
+// Requests
+// ---------------------------------------------------------------------------
+std::string BuildUnlockRequest(DWORD budgetMs) {
+    return "{\"cmd\":\"unlock\",\"v\":2,\"budget_ms\":" + std::to_string(budgetMs) + "}";
+}
+
+std::string BuildGestureRequest(const std::string& token, DWORD budgetMs) {
+    // The token came over the pipe and is pasted back into JSON: only hex is allowed, so a quote
+    // or backslash can never shape the request (callers check IsHexToken first).
+    return "{\"cmd\":\"unlock_gesture\",\"v\":2,\"token\":\"" + token + "\",\"budget_ms\":" +
+           std::to_string(budgetMs) + "}";
+}
+
+std::string BuildReportRequest(const std::string& grantId, bool ok) {
+    return "{\"cmd\":\"report_result\",\"v\":2,\"grant_id\":\"" + grantId + "\",\"ok\":" +
+           (ok ? "true" : "false") + "}";
+}
+
+// ---------------------------------------------------------------------------
+// Tile texts (R3). English and Russian; the service tells us which one the user chose.
 // ---------------------------------------------------------------------------
 namespace {
 
-bool SidStringFromToken(HANDLE hToken, std::wstring& out) {
-    DWORD len = 0;
-    GetTokenInformation(hToken, TokenUser, nullptr, 0, &len);  // query required size
-    if (len == 0) return false;
-    std::vector<BYTE> buf(len);
-    if (!GetTokenInformation(hToken, TokenUser, buf.data(), len, &len)) return false;
-    const TOKEN_USER* tu = reinterpret_cast<const TOKEN_USER*>(buf.data());
+struct TextPair { const wchar_t* en; const wchar_t* ru; };
+
+const TextPair& TextFor(Text id) {
+    static const TextPair kLabel        { L"Face Unlock", L"Face Unlock" };
+    static const TextPair kPressArrow   { L"Press the arrow to scan your face",
+                                          L"Нажмите стрелку, чтобы распознать лицо" };
+    static const TextPair kScanning     { L"Scanning face...", L"Распознаю лицо..." };
+    static const TextPair kVerified     { L"Face verified — press the arrow",
+                                          L"Лицо распознано — нажмите стрелку" };
+    static const TextPair kPacking      { L"Could not prepare the sign-in. Use PIN or password.",
+                                          L"Не удалось подготовить вход. Войдите по PIN-коду или паролю." };
+    static const TextPair kNotRecog     { L"Face not recognised. Try again or use PIN or password.",
+                                          L"Лицо не распознано. Попробуйте ещё раз или войдите по PIN-коду или паролю." };
+    static const TextPair kLocked       { L"Face sign-in is temporarily locked. Use PIN or password.",
+                                          L"Вход по лицу временно заблокирован. Войдите по PIN-коду или паролю." };
+    static const TextPair kLockedSecs   { L"Face sign-in is locked for %u s. Use PIN or password.",
+                                          L"Вход по лицу заблокирован на %u с. Войдите по PIN-коду или паролю." };
+    static const TextPair kUnavailable  { L"Face Unlock service is not running. Use PIN or password.",
+                                          L"Служба Face Unlock не запущена. Войдите по PIN-коду или паролю." };
+    static const TextPair kNoPassword   { L"No Windows password is saved in Face Unlock. Sign in with PIN and save it in Face Unlock.",
+                                          L"В Face Unlock не сохранён пароль Windows. Войдите по PIN-коду и сохраните его в Face Unlock." };
+    static const TextPair kNoEnrollment { L"No face is set up yet. Sign in with PIN and set it up in Face Unlock.",
+                                          L"Лицо ещё не настроено. Войдите по PIN-коду и настройте его в Face Unlock." };
+    static const TextPair kCameraBusy   { L"The camera is busy or not responding. Use PIN or password.",
+                                          L"Камера занята или не отвечает. Войдите по PIN-коду или паролю." };
+    static const TextPair kTooDark      { L"Too dark to recognise your face. Add light or use PIN or password.",
+                                          L"Слишком темно для распознавания. Добавьте света или войдите по PIN-коду или паролю." };
+    static const TextPair kPwRejected   { L"Windows rejected the saved password. Sign in with PIN and update it in Face Unlock.",
+                                          L"Windows отклонила сохранённый пароль. Войдите по PIN-коду и обновите его в Face Unlock." };
+    static const TextPair kUpdate       { L"Face Unlock components do not match. Update Face Unlock.",
+                                          L"Компоненты Face Unlock разных версий. Обновите Face Unlock." };
+    static const TextPair kAttention    { L"Face Unlock needs attention. Sign in with PIN and open Face Unlock.",
+                                          L"Face Unlock требует внимания. Войдите по PIN-коду и откройте Face Unlock." };
+    static const TextPair kFailed       { L"Face sign-in did not complete. Try again or use PIN or password.",
+                                          L"Вход по лицу не завершён. Попробуйте ещё раз или войдите по PIN-коду или паролю." };
+    static const TextPair kGesture      { L"Move your head as asked, then hold still.",
+                                          L"Двигайте головой, как просят, затем замрите." };
+    switch (id) {
+        case Text::Label:            return kLabel;
+        case Text::PressArrow:       return kPressArrow;
+        case Text::Scanning:         return kScanning;
+        case Text::Verified:         return kVerified;
+        case Text::PackingFailed:    return kPacking;
+        case Text::NotRecognised:    return kNotRecog;
+        case Text::LockedOut:        return kLocked;
+        case Text::LockedOutSecs:    return kLockedSecs;
+        case Text::Unavailable:      return kUnavailable;
+        case Text::NoPassword:       return kNoPassword;
+        case Text::NoEnrollment:     return kNoEnrollment;
+        case Text::CameraBusy:       return kCameraBusy;
+        case Text::TooDark:          return kTooDark;
+        case Text::PasswordRejected: return kPwRejected;
+        case Text::UpdateNeeded:     return kUpdate;
+        case Text::NeedsAttention:   return kAttention;
+        case Text::GestureFallback:  return kGesture;
+        case Text::Failed:
+        default:                     return kFailed;
+    }
+}
+
+}  // anonymous namespace
+
+std::string ResolveLang(const std::string& replyLang) {
+    if (replyLang == "ru") return "ru";
+    if (replyLang == "en") return "en";
+    return PRIMARYLANGID(GetSystemDefaultUILanguage()) == LANG_RUSSIAN ? "ru" : "en";
+}
+
+std::wstring TileText(Text id, const std::string& lang) {
+    const TextPair& t = TextFor(id);
+    return (lang == "ru") ? t.ru : t.en;
+}
+
+Text FailureClass(const std::string& r) {
+    if (r == "no-match" || r == "gesture-failed" || r == "motion-before-prompt" ||
+        r == "screen-suspected")
+        return Text::NotRecognised;
+    if (r == "locked-out") return Text::LockedOut;
+    if (r == "pipe-unavailable" || r == "server-untrusted") return Text::Unavailable;
+    if (r == "no-credentials") return Text::NoPassword;
+    if (r == "no-enrollment") return Text::NoEnrollment;
+    if (r == "camera-busy" || r == "camera-error" || r == "no-frames") return Text::CameraBusy;
+    if (r == "too-dark") return Text::TooDark;
+    if (r == "password-rejected") return Text::PasswordRejected;
+    if (r == "version-mismatch") return Text::UpdateNeeded;
+    if (r == "not-owner" || r == "custody" || r == "insecure-data-dir" || r == "no-models" ||
+        r == "lockout-store-error" || r == "no-owner")
+        return Text::NeedsAttention;
+    // deadline-exceeded, engine-error, internal-error, malformed-response, bad-request,
+    // unknown-command, not-authorized, gesture-token-invalid, cancelled, anything unknown.
+    return Text::Failed;
+}
+
+std::wstring FailureText(const std::string& reason, double retryAfterS, const std::string& lang) {
+    const Text cls = FailureClass(reason);
+    if (cls == Text::LockedOut && retryAfterS >= 0.5 && retryAfterS < 86400.0) {
+        wchar_t buf[256];
+        const unsigned secs = (unsigned)(retryAfterS + 0.5);
+        swprintf_s(buf, TileText(Text::LockedOutSecs, lang).c_str(), secs);
+        return buf;
+    }
+    return TileText(cls, lang);
+}
+
+std::wstring GesturePromptFromKinds(const std::string& kinds, const std::string& lang) {
+    const bool ru = (lang == "ru");
+    std::wstring out;
+    size_t start = 0;
+    int steps = 0;
+    while (start <= kinds.size()) {
+        size_t comma = kinds.find(',', start);
+        if (comma == std::string::npos) comma = kinds.size();
+        const std::string k = kinds.substr(start, comma - start);
+        const wchar_t* phrase = nullptr;
+        if (k == "turn_left")  phrase = ru ? L"поверните голову влево" : L"turn your head left";
+        if (k == "turn_right") phrase = ru ? L"поверните голову вправо" : L"turn your head right";
+        if (k == "nod")        phrase = ru ? L"кивните" : L"nod";
+        if (!phrase || steps >= 4) return std::wstring();
+        if (steps > 0) out += ru ? L", затем " : L", then ";
+        out += phrase;
+        ++steps;
+        start = comma + 1;
+        if (comma == kinds.size()) break;
+    }
+    if (out.empty()) return out;
+    out[0] = (wchar_t)(ULONG_PTR)CharUpperW((LPWSTR)(ULONG_PTR)out[0]);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Owner (R1) and server identity.
+//
+// Stage 9 (R1, F-54 / F-83 / F-86 / F-103). The CP used to trust ANY regular S-1-5-21 account as
+// the pipe server, so another local user holding the name in the cold window could put text on
+// the lock screen or answer for the owner's service. Now the server is trusted only when both the
+// server PROCESS and the pipe OBJECT belong to the owner the installer recorded (the pipe owner is
+// fixed at creation, so a reused PID cannot pass, F-64). The rule no longer depends on the account
+// kind: local, domain and Entra ID (S-1-12-1-*) owners are all accepted.
+// ---------------------------------------------------------------------------
+namespace {
+
+#ifdef FACEUNLOCK_TESTING
+std::wstring g_testOwner;
+std::wstring g_testPipe;
+#endif
+
+bool SidString(PSID sid, std::wstring& out) {
     LPWSTR s = nullptr;
-    if (!ConvertSidToStringSidW(tu->User.Sid, &s)) return false;
-    out = s;
+    if (!ConvertSidToStringSidW(sid, &s)) return false;
+    bool ok = true;
+    try { out = s; } catch (...) { ok = false; }
     LocalFree(s);
-    return true;
+    return ok;
 }
 
-bool SidStringFromProcess(HANDLE hProcess, std::wstring& out) {
-    HANDLE htok = nullptr;
-    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &htok)) return false;
-    bool r = SidStringFromToken(htok, out);
-    CloseHandle(htok);
-    return r;
-}
-
-// SID of the process on the SERVER end of an open pipe handle:
-// GetNamedPipeServerProcessId -> OpenProcess(QUERY_LIMITED) -> token -> SID.
-bool ServerSidString(HANDLE hPipe, std::wstring& out) {
+bool ServerProcessSid(HANDLE hPipe, std::wstring& out) {
     ULONG pid = 0;
     if (!GetNamedPipeServerProcessId(hPipe, &pid)) return false;
-    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hp) return false;
-    bool r = SidStringFromProcess(hp, out);
-    CloseHandle(hp);
-    return r;
+    UniqueHandle proc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!proc.valid()) return false;
+    HANDLE tokRaw = nullptr;
+    if (!OpenProcessToken(proc.get(), TOKEN_QUERY, &tokRaw)) return false;
+    UniqueHandle tok(tokRaw);
+    DWORD len = 0;
+    GetTokenInformation(tok.get(), TokenUser, nullptr, 0, &len);
+    if (len == 0) return false;
+    std::vector<BYTE> buf(len);
+    if (!GetTokenInformation(tok.get(), TokenUser, buf.data(), len, &len)) return false;
+    return SidString(reinterpret_cast<const TOKEN_USER*>(buf.data())->User.Sid, out);
 }
 
-// True iff sidStr is a regular machine/domain user account SID: NT authority
-// (S-1-5-) with first sub-authority 21 (SECURITY_NT_NON_UNIQUE), i.e. S-1-5-21-<...>.
-// Deliberately EXCLUDES SYSTEM (S-1-5-18), LOCAL/NETWORK SERVICE (S-1-5-19/20),
-// well-known groups, logon SIDs and capability SIDs -- so a service or pseudo
-// account cannot masquerade as a legitimate user-owned FaceService.
-bool IsRegularUserSid(const std::wstring& sidStr) {
+bool PipeObjectOwnerSid(HANDLE hPipe, std::wstring& out) {
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (GetSecurityInfo(hPipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr,
+                        nullptr, nullptr, &sd) != ERROR_SUCCESS)
+        return false;
+    const bool ok = owner != nullptr && SidString(owner, out);
+    LocalFree(sd);
+    return ok;
+}
+
+const wchar_t* PipeNameInUse() {
+#ifdef FACEUNLOCK_TESTING
+    if (!g_testPipe.empty()) return g_testPipe.c_str();
+#endif
+    return kPipeName;
+}
+
+// Wait on an overlapped operation AND the cancel event, bounded by timeoutMs. On a timeout or a
+// cancel the operation is cancelled and DRAINED before the caller may free the buffer or handle.
+enum class WaitResult { Done, Failed, Timeout, Cancelled };
+WaitResult OverlappedWait(HANDLE pipe, OVERLAPPED& ov, DWORD timeoutMs, HANDLE cancel,
+                          DWORD& transferred, DWORD& err) {
+    HANDLE hs[2] = { ov.hEvent, cancel };
+    const DWORD n = cancel ? 2 : 1;
+    const DWORD wr = WaitForMultipleObjects(n, hs, FALSE, timeoutMs);
+    if (wr != WAIT_OBJECT_0) {
+        CancelIoEx(pipe, &ov);
+        GetOverlappedResult(pipe, &ov, &transferred, TRUE);   // drain: the kernel owns the buffer
+        return (wr == WAIT_OBJECT_0 + 1) ? WaitResult::Cancelled : WaitResult::Timeout;
+    }
+    if (!GetOverlappedResult(pipe, &ov, &transferred, FALSE)) {
+        err = GetLastError();
+        return WaitResult::Failed;
+    }
+    err = 0;
+    return WaitResult::Done;
+}
+
+bool Cancelled(HANDLE cancel) {
+    return cancel && WaitForSingleObject(cancel, 0) == WAIT_OBJECT_0;
+}
+
+// Sleep up to `ms`, returning early (true) when the cancel event fires.
+bool SleepOrCancel(HANDLE cancel, DWORD ms) {
+    if (!cancel) { Sleep(ms); return false; }
+    return WaitForSingleObject(cancel, ms) == WAIT_OBJECT_0;
+}
+
+}  // anonymous namespace
+
+bool IsPersonSid(const std::wstring& sidStr) {
     PSID sid = nullptr;
     if (!ConvertStringSidToSidW(sidStr.c_str(), &sid)) return false;
     bool ok = false;
     if (IsValidSid(sid)) {
         PSID_IDENTIFIER_AUTHORITY auth = GetSidIdentifierAuthority(sid);
-        const bool ntAuthority =
-            auth->Value[0] == 0 && auth->Value[1] == 0 && auth->Value[2] == 0 &&
-            auth->Value[3] == 0 && auth->Value[4] == 0 && auth->Value[5] == 5;
-        if (ntAuthority && *GetSidSubAuthorityCount(sid) >= 1 &&
-            *GetSidSubAuthority(sid, 0) == 21) {   // SECURITY_NT_NON_UNIQUE -> S-1-5-21-...
-            ok = true;
-        }
+        const bool a012 = auth->Value[0] == 0 && auth->Value[1] == 0 && auth->Value[2] == 0 &&
+                          auth->Value[3] == 0 && auth->Value[4] == 0;
+        const UCHAR count = *GetSidSubAuthorityCount(sid);
+        if (a012 && auth->Value[5] == 5 && count >= 5 && *GetSidSubAuthority(sid, 0) == 21)
+            ok = true;                                   // S-1-5-21-a-b-c-RID (local / domain)
+        if (a012 && auth->Value[5] == 12 && count >= 5 && *GetSidSubAuthority(sid, 0) == 1)
+            ok = true;                                   // S-1-12-1-a-b-c-d (Entra ID)
     }
     LocalFree(sid);
     return ok;
 }
 
-bool IsTrustedServerSid(const std::wstring& serverSid) {
-    if (serverSid == L"S-1-5-18") return true;   // SYSTEM: a SYSTEM-hosted service
-    std::wstring own;
-    if (SidStringFromProcess(GetCurrentProcess(), own) && !own.empty() && serverSid == own)
-        return true;                             // same-user: the SELF harness (client == service)
-    // Registered-CP case: the client is SYSTEM (LogonUI) and the service runs as the interactive
-    // user, so neither rule above matches. Trust the server iff it is a real machine/domain user
-    // account (S-1-5-21-...). See the header comment for why this does NOT resolve the session user
-    // via WTSQueryUserToken (unreliable on the secure desktop), and for the limits of this rule --
-    // it accepts ANY real user account, so it does not by itself exclude a cold-window squatter.
-    if (IsRegularUserSid(serverSid)) return true;
-    return false;
+bool ReadOwnerSid(std::wstring& out) {
+#ifdef FACEUNLOCK_TESTING
+    if (!g_testOwner.empty()) { out = g_testOwner; return IsPersonSid(out); }
+#endif
+    wchar_t buf[256] = {};
+    DWORD cb = sizeof(buf) - sizeof(wchar_t);
+    DWORD type = 0;
+    const LSTATUS st = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\WindowsFaceUnlock",
+                                    L"OriginalUserSid", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+                                    &type, buf, &cb);
+    if (st != ERROR_SUCCESS) return false;
+    out = buf;
+    return IsPersonSid(out);
+}
+
+bool ServicePipeExists() {
+    // WaitNamedPipe never connects: it returns at once with ERROR_FILE_NOT_FOUND when no
+    // instance exists, TRUE when one is listening, or times out (1 ms) when all are busy.
+    if (WaitNamedPipeW(PipeNameInUse(), 1)) return true;
+    return GetLastError() == ERROR_SEM_TIMEOUT;
+}
+
+#ifdef FACEUNLOCK_TESTING
+void TestSetOwnerOverride(const std::wstring& sid) { g_testOwner = sid; }
+void TestSetPipeName(const std::wstring& name) { g_testPipe = name; }
+#endif
+
+CallStatus PipeCall(const wchar_t* pipeName, const std::wstring& ownerSid,
+                    RequestBuilder buildRequest, const void* ctx,
+                    std::string& response, DWORD timeoutMs, HANDLE cancelEvent,
+                    ServerTrust* trust) {
+    const DWORD startTick = GetTickCount();
+    auto remaining = [&]() -> DWORD {
+        const DWORD elapsed = GetTickCount() - startTick;     // wrap-safe unsigned difference
+        return (elapsed >= timeoutMs) ? 0 : (timeoutMs - elapsed);
+    };
+    // Allocate before connecting (F-71): an allocation failure never strands a connected handle.
+    std::vector<char> buf(65536);
+    WipeOnExit<std::vector<char>> wipeBuf(buf);    // 8b F-25: the raw reply may carry the password
+
+    UniqueHandle h;
+    for (;;) {
+        if (Cancelled(cancelEvent)) return CallStatus::Cancelled;
+        // 8b F-26: identification only -- the service reads the caller SID, never impersonates.
+        h.reset(CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                            nullptr));
+        DWORD err = 0;
+        if (h.valid()) {
+            DWORD mode = PIPE_READMODE_MESSAGE;
+            if (SetNamedPipeHandleState(h.get(), &mode, nullptr, nullptr)) break;
+            // Stage 9 (F-72): the instance was torn down (or is byte-mode) -> never read a reply
+            // in byte mode; retry within the budget like the Python client does.
+            h.reset();
+            err = ERROR_PIPE_BUSY;
+        } else {
+            err = GetLastError();
+        }
+        // 8b F-03: read the budget once; every wait below is capped by it and never 0.
+        const DWORD rem = remaining();
+        if (rem == 0) return CallStatus::Unavailable;
+        if (err == ERROR_PIPE_BUSY) {
+            // WaitNamedPipe cannot watch the cancel event: keep each wait short.
+            WaitNamedPipeW(pipeName, (rem < 200) ? rem : 200);
+        } else if (err == ERROR_FILE_NOT_FOUND) {
+            if (SleepOrCancel(cancelEvent, (rem < 200) ? rem : 200)) return CallStatus::Cancelled;
+        } else {
+            return CallStatus::Unavailable;
+        }
+    }
+
+    // Anti-squatting (R1): check the SERVER on this exact handle BEFORE anything is sent.
+    std::wstring serverSid, pipeOwner;
+    const bool haveSid = ServerProcessSid(h.get(), serverSid);
+    const bool haveOwner = PipeObjectOwnerSid(h.get(), pipeOwner);
+    const bool trusted = haveSid && haveOwner && !ownerSid.empty() &&
+                         serverSid == ownerSid && pipeOwner == ownerSid;
+    if (trust) {
+        trust->checked = true;
+        trust->trusted = trusted;
+        trust->serverSid = haveSid ? serverSid : std::wstring();
+    }
+    if (!trusted) return CallStatus::Untrusted;
+
+    UniqueHandle ev(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!ev.valid()) return CallStatus::Unavailable;
+    OVERLAPPED ov{};
+    ov.hEvent = ev.get();
+    DWORD transferred = 0, err = 0;
+
+    // The request carries the budget left NOW, after the connect wait (F-61).
+    const std::string request = buildRequest(remaining(), ctx);
+    if (!WriteFile(h.get(), request.data(), (DWORD)request.size(), nullptr, &ov) &&
+        GetLastError() != ERROR_IO_PENDING)
+        return CallStatus::Unavailable;
+    WaitResult w = OverlappedWait(h.get(), ov, remaining(), cancelEvent, transferred, err);
+    if (w == WaitResult::Cancelled) return CallStatus::Cancelled;
+    if (w != WaitResult::Done || transferred != request.size()) return CallStatus::Unavailable;
+
+    ResetEvent(ev.get());
+    ov = OVERLAPPED{};
+    ov.hEvent = ev.get();
+    if (!ReadFile(h.get(), buf.data(), (DWORD)buf.size(), nullptr, &ov)) {
+        const DWORD rerr = GetLastError();
+        // D-54: ERROR_MORE_DATA was "accepted" here and then failed as "unavailable" -> a reply
+        // over 64 KiB is its own outcome: the caller maps it to malformed-response.
+        if (rerr == ERROR_MORE_DATA) {
+            GetOverlappedResult(h.get(), &ov, &transferred, TRUE);
+            return CallStatus::Oversize;
+        }
+        if (rerr != ERROR_IO_PENDING) return CallStatus::Unavailable;
+    }
+    w = OverlappedWait(h.get(), ov, remaining(), cancelEvent, transferred, err);
+    if (w == WaitResult::Cancelled) return CallStatus::Cancelled;
+    if (w == WaitResult::Failed && err == ERROR_MORE_DATA) return CallStatus::Oversize;
+    if (w != WaitResult::Done || transferred == 0) return CallStatus::Unavailable;
+    response.assign(buf.data(), transferred);
+    return CallStatus::Ok;
+}
+
+namespace {
+
+struct GestureCtx { const std::string* token; };
+
+std::string BuildUnlockCb(DWORD remainingMs, const void*) {
+    return BuildUnlockRequest(remainingMs);
+}
+std::string BuildGestureCb(DWORD remainingMs, const void* ctx) {
+    return BuildGestureRequest(*static_cast<const GestureCtx*>(ctx)->token, remainingMs);
+}
+struct ReportCtx { const std::string* grantId; bool ok; };
+std::string BuildReportCb(DWORD, const void* ctx) {
+    const auto* c = static_cast<const ReportCtx*>(ctx);
+    return BuildReportRequest(*c->grantId, c->ok);
+}
+
+const char* ReasonFor(CallStatus st) {
+    switch (st) {
+        case CallStatus::Untrusted: return "server-untrusted";
+        case CallStatus::Oversize:  return "malformed-response";
+        case CallStatus::Cancelled: return "cancelled";
+        default:                    return "pipe-unavailable";
+    }
+}
+
+bool Exchange(RequestBuilder build, const void* ctx, DWORD budget, HANDLE cancel,
+              ServerTrust* trust, UnlockReply& out) {
+    std::wstring owner;
+    if (!ReadOwnerSid(owner)) {
+        out.reason = "no-owner";
+        return false;
+    }
+    std::string resp;
+    WipeOnExit<std::string> wipeResp(resp);   // 8b F-25: raw reply JSON may carry the password
+    ServerTrust localTrust;
+    const CallStatus st = PipeCall(PipeNameInUse(), owner, build, ctx, resp, budget, cancel,
+                                   trust ? trust : &localTrust);
+    if (st != CallStatus::Ok) {
+        out.reason = ReasonFor(st);
+        return false;
+    }
+    return ParseUnlockReply(resp, out);
 }
 
 }  // anonymous namespace
 
-static bool OverlappedWait(HANDLE pipe, OVERLAPPED& ov, DWORD timeoutMs, DWORD& transferred) {
-    DWORD wr = WaitForSingleObject(ov.hEvent, timeoutMs);
-    if (wr != WAIT_OBJECT_0) {
-        CancelIoEx(pipe, &ov);
-        // drain any pending completion so CloseHandle is safe
-        GetOverlappedResult(pipe, &ov, &transferred, TRUE);
-        return false;
-    }
-    return GetOverlappedResult(pipe, &ov, &transferred, FALSE) != 0;
+bool RequestUnlock(UnlockReply& out, HANDLE cancelEvent, ServerTrust* trust) {
+    return Exchange(&BuildUnlockCb, nullptr, kUnlockTimeoutMs, cancelEvent, trust, out);
 }
 
-bool PipeCall(const std::wstring& pipeName,
-              const std::string& requestJson,
-              std::string& response,
-              DWORD timeoutMs,
-              bool verifyServer,
-              ServerTrust* trust) {
-    // Total deadline for the whole transaction.
-    const DWORD startTick = GetTickCount();
-    auto remaining = [&]() -> DWORD {
-        DWORD elapsed = GetTickCount() - startTick;
-        return (elapsed >= timeoutMs) ? 0 : (timeoutMs - elapsed);
-    };
-
-    // Try to open the pipe within the total timeout.
-    HANDLE h = INVALID_HANDLE_VALUE;
-    while (true) {
-        // 8b F-26: without SECURITY_SQOS_PRESENT the server was offered impersonation of the
-        // SYSTEM client -> more than the service needs -> offer identification only. The
-        // service SID gate (ImpersonateNamedPipeClient + OpenThreadToken(TOKEN_QUERY)) works
-        // at identification level (proven on a test pipe in 8b, work\f26\f26-proof.txt).
-        h = CreateFileW(pipeName.c_str(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        0, nullptr, OPEN_EXISTING,
-                        FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                        nullptr);
-        if (h != INVALID_HANDLE_VALUE) break;
-        DWORD err = GetLastError();
-        // 8b F-03: remaining() was read separately for the check and for the wait argument,
-        // so a tick crossing the deadline passed 0 (= NMPWAIT_USE_DEFAULT_WAIT, a wait of the
-        // server's choosing) -> the join on the LogonUI thread lost its bound -> read the
-        // budget once; every wait and sleep below is capped by it and is never 0.
-        const DWORD rem = remaining();
-        if (rem == 0) return false;
-        if (err == ERROR_PIPE_BUSY) {
-            WaitNamedPipeW(pipeName.c_str(), (rem < 500) ? rem : 500);
-        } else if (err == ERROR_FILE_NOT_FOUND) {
-            // Service not running; short sleep and retry within budget.
-            Sleep((rem < 200) ? rem : 200);
-        } else {
-            return false;
-        }
-    }
-
-    // Anti-squatting: verify the SERVER end is a trusted owner BEFORE sending
-    // anything on this exact handle (same-connection -> no TOCTOU window).
-    if (verifyServer) {
-        std::wstring serverSid;
-        bool haveSid = ServerSidString(h, serverSid);
-        bool trusted = haveSid && IsTrustedServerSid(serverSid);
-        if (trust) {
-            trust->checked = true;
-            trust->trusted = trusted;
-            trust->serverSid = haveSid ? serverSid : std::wstring();
-        }
-        if (!trusted) {
-            CloseHandle(h);
-            return false;  // refuse: do NOT send the request to an untrusted server
-        }
-    }
-
-    DWORD mode = PIPE_READMODE_MESSAGE;
-    SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
-
-    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!ev) { CloseHandle(h); return false; }
-
-    bool success = false;
-    OVERLAPPED ov{};
-    ov.hEvent = ev;
-    DWORD transferred = 0;
-    std::vector<char> buf(65536);
-    WipeOnExit<std::vector<char>> wipeBuf(buf);   // 8b F-25: the raw reply may carry the password
-
-    do {
-        BOOL w = WriteFile(h, requestJson.data(), (DWORD)requestJson.size(), nullptr, &ov);
-        if (!w && GetLastError() != ERROR_IO_PENDING) break;
-        if (!OverlappedWait(h, ov, remaining(), transferred)) break;
-        if (transferred != requestJson.size()) break;
-
-        ResetEvent(ev);
-        BOOL r = ReadFile(h, buf.data(), (DWORD)buf.size(), nullptr, &ov);
-        DWORD rerr = r ? 0 : GetLastError();
-        if (!r && rerr != ERROR_IO_PENDING && rerr != ERROR_MORE_DATA) break;
-        if (!OverlappedWait(h, ov, remaining(), transferred)) break;
-        if (transferred == 0) break;
-
-        response.assign(buf.data(), transferred);
-        success = true;
-    } while (false);
-
-    CloseHandle(ev);
-    CloseHandle(h);
-    return success;
-}
-
-bool RequestUnlock(UnlockReply& out, ServerTrust* trust) {
-    const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlock";
-    // 12s total: if the service is dead or the user is not visible, fail fast
-    // so the user can switch to the password/PIN tile without feeling stuck.
-    const DWORD kUnlockTimeoutMs = 12000;
-
-    std::string resp;
-    WipeOnExit<std::string> wipeResp(resp);   // 8b F-25: raw reply JSON may carry the password
-    ServerTrust localTrust;
-    ServerTrust* t = trust ? trust : &localTrust;
-    if (!PipeCall(pipe, "{\"cmd\":\"unlock\"}", resp, kUnlockTimeoutMs, /*verifyServer=*/true, t)) {
-        // Distinguish an untrusted-server refusal from a plain transport failure.
-        out.reason = (t->checked && !t->trusted) ? "server-untrusted" : "pipe-unavailable";
-        return false;
-    }
-    return ParseUnlockReply(resp, out);
-}
-
-// The phase-1 token is data we received over the pipe and are about to paste back into a
-// request document. Constrain it to what the service actually issues (hex) instead of
-// escaping: a token carrying a quote or backslash would otherwise build malformed -- or
-// attacker-shaped -- request JSON. 64 is a generous ceiling over the 32 chars in use.
-// (8b F-48: moved out of the anonymous namespace -> reachable from the offline test.)
-bool IsHexToken(const std::string& s) {
-    if (s.empty() || s.size() > 64) return false;
-    for (char c : s) {
-        const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-        if (!hex) return false;
-    }
-    return true;
-}
-
-// 8b F-48: see PipeClient.h. Reason tokens are the service's (face_service/service.py unlock
-// and unlock_gesture handlers) plus the client-side ones produced in this file.
-const wchar_t* FailureTextForReason(const std::string& reason) {
-    if (reason == "no-match" || reason == "gesture-failed" || reason == "too-dark")
-        return kTextNotRecognised;
-    if (reason == "locked-out")
-        return kTextLockedOut;
-    // pipe-unavailable, server-untrusted, malformed-response, camera-busy, not-authorized,
-    // no-credentials, gesture-token-invalid, an unusable needs-gesture, insecure-data-dir,
-    // exception: ..., and anything unknown.
-    return kTextUnavailable;
-}
-
-std::wstring SanitizePromptText(const std::wstring& text) {
-    std::wstring out;
-    out.reserve(text.size() < kMaxPromptChars ? text.size() : kMaxPromptChars);
-    for (wchar_t c : text) {
-        if (c < 0x20 || c == 0x7F) continue;          // C0 controls and DEL
-        if (out.size() >= kMaxPromptChars) break;
-        out.push_back(c);
-    }
-    // Never leave half a surrogate pair at the cut.
-    if (!out.empty() && out.back() >= 0xD800 && out.back() <= 0xDBFF) out.pop_back();
-    return out;
-}
-
-bool RequestUnlockGesture(const std::string& token, UnlockReply& out, ServerTrust* trust) {
-    const std::wstring pipe = L"\\\\.\\pipe\\FaceUnlock";
-    // Deliberately NOT kUnlockTimeoutMs: phase 2 waits for a human to blink or turn their
-    // head, and the service's own round is capped well above the passive-unlock budget. A
-    // separate constant so tightening one never silently tightens the other.
-    const DWORD kGestureTimeoutMs = 15000;
-
+bool RequestUnlockGesture(const std::string& token, UnlockReply& out, HANDLE cancelEvent,
+                          ServerTrust* trust) {
     if (!IsHexToken(token)) {
         out.reason = "gesture-token-invalid";
         return false;
     }
-
-    std::string resp;
-    WipeOnExit<std::string> wipeResp(resp);   // 8b F-25: raw reply JSON may carry the password
-    ServerTrust localTrust;
-    ServerTrust* t = trust ? trust : &localTrust;
-    const std::string req = "{\"cmd\":\"unlock_gesture\",\"token\":\"" + token + "\"}";
-    if (!PipeCall(pipe, req, resp, kGestureTimeoutMs, /*verifyServer=*/true, t)) {
-        out.reason = (t->checked && !t->trusted) ? "server-untrusted" : "pipe-unavailable";
-        return false;
-    }
-    return ParseUnlockReply(resp, out);
+    GestureCtx ctx{ &token };
+    return Exchange(&BuildGestureCb, &ctx, kGestureTimeoutMs, cancelEvent, trust, out);
 }
 
-// Back-compat overload: same call, gesture fields discarded.
-bool RequestUnlock(std::wstring& username,
-                   std::wstring& password,
-                   std::wstring& domain,
-                   std::string& errorOut,
-                   ServerTrust* trust) {
-    UnlockReply r;
-    const bool ok = RequestUnlock(r, trust);
-    username = r.username;
-    password = r.password;
-    domain   = r.domain;
-    errorOut = r.reason;
-    return ok;
+bool SendReportResult(const std::string& grantId, bool ok, HANDLE cancelEvent) {
+    if (!IsHexToken(grantId)) return false;
+    std::wstring owner;
+    if (!ReadOwnerSid(owner)) return false;
+    std::string resp;
+    ReportCtx ctx{ &grantId, ok };
+    if (PipeCall(PipeNameInUse(), owner, &BuildReportCb, &ctx, resp, kReportTimeoutMs,
+                 cancelEvent, nullptr) != CallStatus::Ok)
+        return false;
+    return ParseReportReply(resp);
 }
 
 }  // namespace FaceUnlock

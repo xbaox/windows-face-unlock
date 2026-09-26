@@ -1,18 +1,27 @@
 #include "helpers.h"
-#include <wincred.h>
-#include <intsafe.h>
+#include <wincred.h>    // CredProtectW / CredIsProtectedW (advapi32)
 #include <climits>
 #include <new>
+#include <string>
+#include <vector>
 
-#pragma comment(lib, "credui.lib")
 #pragma comment(lib, "secur32.lib")
 
 namespace FaceUnlock {
 
+// The provider logo / label field GUIDs from ShlGuid.h (SDK 10.0.26100: CPFG_CREDENTIAL_PROVIDER_LOGO
+// and CPFG_CREDENTIAL_PROVIDER_LABEL), spelled out here so no initguid/uuid.lib dance is needed.
+// Stage 9 (R3, F-88): with them LogonUI shows our image and name in "Sign-in options" instead of
+// a generic icon with no label.
+static const GUID kCpfgProviderLogo =
+    { 0x2d837775, 0xf6cd, 0x464e, { 0xa7, 0x45, 0x48, 0x2f, 0xd0, 0xb4, 0x74, 0x93 } };
+static const GUID kCpfgProviderLabel =
+    { 0x286bbff3, 0xbad4, 0x438f, { 0xb0, 0x07, 0x79, 0xb7, 0x26, 0x7c, 0x3d, 0x48 } };
+
 // Static field layout for our tile.
 const CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR s_FieldDescriptors[FIELD_COUNT] = {
-    { FIELD_TILE_IMAGE, CPFT_TILE_IMAGE,    const_cast<PWSTR>(L"Image"),  GUID_NULL },
-    { FIELD_LABEL,      CPFT_LARGE_TEXT,    const_cast<PWSTR>(L"Label"),  GUID_NULL },
+    { FIELD_TILE_IMAGE, CPFT_TILE_IMAGE,    const_cast<PWSTR>(L"Face Unlock"), kCpfgProviderLogo },
+    { FIELD_LABEL,      CPFT_LARGE_TEXT,    const_cast<PWSTR>(L"Face Unlock"), kCpfgProviderLabel },
     { FIELD_SUBMIT,     CPFT_SUBMIT_BUTTON, const_cast<PWSTR>(L"Submit"), GUID_NULL },
     { FIELD_STATUS,     CPFT_SMALL_TEXT,    const_cast<PWSTR>(L"Status"), GUID_NULL },
 };
@@ -41,12 +50,44 @@ static void PackString(UNICODE_STRING& u, PCWSTR src, USHORT len, BYTE* base, US
     }
 }
 
+// Stage 9 (F-94): the password went into the serialization as plain UNICODE, unlike Microsoft's
+// sample provider -> the plaintext sat in the CoTaskMem buffer until LogonUI freed it -> protect
+// it with CredProtectW first (LSA unprotects it), exactly as the sample does for LOGON / UNLOCK.
+// An already-protected string is left as it is; a CredProtect failure keeps the plain text (the
+// sample's behaviour too) rather than failing the sign-in.
+static bool ProtectPassword(const std::wstring& plain, std::wstring& out) {
+    out.clear();
+    CRED_PROTECTION_TYPE kind;
+    if (CredIsProtectedW(const_cast<LPWSTR>(plain.c_str()), &kind) && kind != CredUnprotected)
+        return false;
+    DWORD cch = 0;
+    std::wstring src(plain);
+    CredProtectW(FALSE, &src[0], (DWORD)src.size() + 1, nullptr, &cch, nullptr);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || cch == 0) {
+        SecureZeroMemory(&src[0], src.size() * sizeof(wchar_t));
+        return false;
+    }
+    std::vector<wchar_t> buf(cch);
+    const BOOL ok = CredProtectW(FALSE, &src[0], (DWORD)src.size() + 1, buf.data(), &cch, nullptr);
+    SecureZeroMemory(&src[0], src.size() * sizeof(wchar_t));
+    if (ok) out.assign(buf.data());          // NUL-terminated protected form
+    SecureZeroMemory(buf.data(), buf.size() * sizeof(wchar_t));
+    return ok && !out.empty();
+}
+
 HRESULT KerbPackInteractiveUnlock(const std::wstring& domain,
                                   const std::wstring& username,
-                                  const std::wstring& password,
+                                  const std::wstring& plainPassword,
                                   CREDENTIAL_PROVIDER_USAGE_SCENARIO cpus,
                                   CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* pcpcs) {
     const bool isUnlock = (cpus == CPUS_UNLOCK_WORKSTATION);
+    std::wstring protectedPw;
+    const bool isProtected = ProtectPassword(plainPassword, protectedPw);
+    struct Wipe {
+        std::wstring& s;
+        ~Wipe() { if (!s.empty()) SecureZeroMemory(&s[0], s.size() * sizeof(wchar_t)); }
+    } wipeProtected{ protectedPw };
+    const std::wstring& password = isProtected ? protectedPw : plainPassword;
 
     // 8b F-48: byte lengths were narrowed to USHORT unchecked, and the running offset was a
     // USHORT too -> an oversized field wrapped and produced a malformed serialization -> check
