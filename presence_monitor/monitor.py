@@ -193,6 +193,36 @@ def pipe_call(req: dict, timeout_s: float = 30.0) -> dict | None:
 # Backwards-compat alias
 _pipe_call = pipe_call
 
+# 9e (F2-07): at logon the tray starts before the service has its pipe up and its engine loaded
+# (8.5-9 s measured in the VM, 4 vCPU) -- the first status call logged WARNING no-pipe /
+# reply-timeout on every start. The tray now pings quietly first, with pauses, for up to this long.
+STARTUP_PIPE_WAIT_S = 30.0
+STARTUP_PIPE_RETRY_S = 2.0
+
+
+def wait_for_service(stop: threading.Event, total_s: float = STARTUP_PIPE_WAIT_S,
+                     retry_s: float = STARTUP_PIPE_RETRY_S, _exchange=None,
+                     _clock=time.monotonic) -> "float | None":
+    """Ping the service quietly (DEBUG only) until it answers, ``stop`` is set, or ``total_s``
+    passed. Returns the seconds waited when it answered, else None -- the first tick then logs
+    the WARNING exactly as before."""
+    if _exchange is None:
+        from face_service.pipe_io import exchange as _exchange
+    t0 = _clock()
+    while not stop.is_set():
+        left = total_s - (_clock() - t0)
+        if left <= 0:
+            return None
+        resp, why = _exchange({"cmd": "ping"}, min(5.0, max(0.5, left)))
+        if resp and resp.get("ok"):
+            return _clock() - t0
+        log.debug("service not answering yet at start (%s)", why)
+        left = total_s - (_clock() - t0)
+        if left <= 0:
+            return None
+        stop.wait(min(retry_s, left))
+    return None
+
 
 @dataclass
 class TickSnapshot:
@@ -628,6 +658,11 @@ class PresenceMonitor:
                  self.cfg.presence_interval_s,
                  self.cfg.presence_absent_strikes,
                  self.cfg.presence_mode)
+        waited = wait_for_service(self._stop)           # 9e (F2-07)
+        if waited is not None:
+            log.info("service answered %.1fs after the tray started", waited)
+        elif not self._stop.is_set():
+            log.info("service not answering after %.0fs; presence ticks go ahead", STARTUP_PIPE_WAIT_S)
         while not self._stop.is_set():
             try:
                 self._tick()

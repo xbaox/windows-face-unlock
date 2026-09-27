@@ -151,11 +151,17 @@ def _prep_cuda_dlls() -> None:
 
 
 def _select_providers(ort):
-    """Return (providers, ctx_id). CUDA if available, else CPU with a warning."""
+    """Return (providers, ctx_id). CUDA if available, else CPU -- with a WARNING only in the GPU
+    build of onnxruntime (CUDA was expected); the CPU build runs on CPU by design, so the same
+    line is INFO there (9e F2-07: a WARNING on every start of the CPU variant was noise)."""
     avail = ort.get_available_providers()
     if "CUDAExecutionProvider" in avail:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"], 0
-    log.warning(
+    try:
+        gpu_build = str(ort.get_device()).upper() == "GPU"
+    except Exception:
+        gpu_build = True                     # unknown: keep the warning
+    (log.warning if gpu_build else log.info)(
         "CUDAExecutionProvider not available; running InsightFace on CPU (slower). "
         "Available providers: %s", avail,
     )

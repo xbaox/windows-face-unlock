@@ -237,6 +237,9 @@ class PasswordWindow:
         self.pw1_entry.focus_set()
         threading.Thread(target=_custody_worker, args=(self._q,), daemon=True).start()
         self.root.after(50, self._drain)
+        from .ui import bring_to_front
+        # 9e (F2-03): opened from Setup's Finish page -- in front, the password field focused
+        self.root.after(150, lambda: (bring_to_front(self.root), self.pw1_entry.focus_set()))
 
     # -- helpers ------------------------------------------------------------------------------
     def _set_status(self, text: str, level: str = "ok") -> None:

@@ -127,14 +127,15 @@ Root: HKLM64; Subkey: "SOFTWARE\Classes\CLSID\{#CPClsid}"; Flags: uninsdeletekey
 ; exe with a FLAG (a flag router, never a second tray), as the original user (the password is sealed
 ; for that account and the data lives in that profile), never during a silent (update) install, and
 ; one after the other. Each is offered checked only when it is still missing (F-192).
+; 9e (F2-03): BeforeInstall lets the window they open take the foreground (AllowForeground).
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; Description: "{cm:RunSavePassword}"; \
-  Check: not CredentialsSaved; Flags: postinstall runasoriginaluser skipifsilent
+  Check: not CredentialsSaved; BeforeInstall: AllowForeground; Flags: postinstall runasoriginaluser skipifsilent
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--set-password"; Description: "{cm:RunUpdatePassword}"; \
-  Check: CredentialsSaved; Flags: postinstall runasoriginaluser skipifsilent unchecked
+  Check: CredentialsSaved; BeforeInstall: AllowForeground; Flags: postinstall runasoriginaluser skipifsilent unchecked
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--enroll"; Description: "{cm:RunEnroll}"; \
-  Check: not EnrollmentExists; Flags: postinstall runasoriginaluser skipifsilent
+  Check: not EnrollmentExists; BeforeInstall: AllowForeground; Flags: postinstall runasoriginaluser skipifsilent
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--enroll"; Description: "{cm:RunReEnroll}"; \
-  Check: EnrollmentExists; Flags: postinstall runasoriginaluser skipifsilent unchecked
+  Check: EnrollmentExists; BeforeInstall: AllowForeground; Flags: postinstall runasoriginaluser skipifsilent unchecked
 
 [UninstallRun]
 ; 1. Stop the stack and remove the tasks through the product exe (Task Scheduler over COM, no
@@ -213,6 +214,17 @@ const
   WTS_USER_NAME = 5;
   WTS_DOMAIN_NAME = 7;
   NO_CONSOLE_SESSION = $FFFFFFFF;
+
+{ 9e (F2-03): Setup is the foreground process when Finish is pressed; the windows the Finish-page
+  entries open (as the original user, through another process) came up behind it without the
+  focus. Setup grants the right to take the foreground first -- the standard way, no topmost. }
+function AllowSetForegroundWindow(dwProcessId: Cardinal): Boolean;
+  external 'AllowSetForegroundWindow@user32.dll stdcall';
+
+procedure AllowForeground();
+begin
+  AllowSetForegroundWindow($FFFFFFFF);    // ASFW_ANY
+end;
 
 function WTSGetActiveConsoleSessionId(): Cardinal;
   external 'WTSGetActiveConsoleSessionId@kernel32.dll stdcall';

@@ -231,6 +231,41 @@ def keep_in_work_area(win) -> bool:
     return False
 
 
+def bring_to_front(win) -> bool:
+    """9e (F2-03): a window opened from Setup's Finish page (postinstall, runasoriginaluser) came
+    up BEHIND Setup, without the focus. Standard means only: deiconify and lift, a topmost that is
+    taken back at once (never a lasting topmost), focus_force and SetForegroundWindow -- Setup
+    grants the right first (AllowSetForegroundWindow in installer.iss). When Windows still refuses
+    the foreground, the taskbar button flashes. True when the window got the foreground; never
+    raises."""
+    try:
+        prev = win.focus_lastfor()             # the widget that has the focus stays focused
+        win.deiconify()
+        win.lift()
+        win.attributes("-topmost", True)
+        win.update_idletasks()
+        win.attributes("-topmost", False)
+        win.focus_force()
+        if prev is not None and prev is not win:
+            prev.focus_set()
+        import ctypes
+        from ctypes import wintypes
+        hwnd = int(win.wm_frame(), 16)
+        u32 = ctypes.windll.user32
+        if u32.SetForegroundWindow(wintypes.HWND(hwnd)):
+            return True
+
+        class _Flash(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND), ("dwFlags", wintypes.DWORD),
+                        ("uCount", wintypes.UINT), ("dwTimeout", wintypes.DWORD)]
+        fl = _Flash(ctypes.sizeof(_Flash), hwnd, 0x3 | 0xC, 3, 0)   # FLASHW_ALL | FLASHW_TIMERNOFG
+        u32.FlashWindowEx(ctypes.byref(fl))
+        return False
+    except Exception:
+        log.debug("bring_to_front failed", exc_info=True)
+        return False
+
+
 def set_app_icon(root) -> bool:
     """9d (V-48): the face icon for ``root`` and every Toplevel it owns (iconphoto default=True).
     Never raises."""

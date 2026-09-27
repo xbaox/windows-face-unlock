@@ -28,6 +28,7 @@ from typing import Callable
 
 from face_service.config import APP_DIR, CONFIG_PATH, LOG_DIR, WATCHDOG_PAUSE_PATH, Config
 from face_service.i18n import set_language, shown_languages, t
+from face_service.speed import status_text as speed_status_text   # 9e (F2-05)
 
 from .monitor import PresenceMonitor, pipe_call
 from .ui import UiThread, bind_standard_keys, px
@@ -200,6 +201,7 @@ STATUS_ROWS = [
     ("status.service", "svc"),
     ("status.enrollment", "enroll"),
     ("status.password", "pwd"),
+    ("status.speed", "speed"),                 # 9e (F2-05)
     ("status.auto_lock", "auto"),
     ("status.last", "last"),
     ("status.result", "result"),
@@ -307,6 +309,7 @@ class StatusWindow:
         else:
             v["enroll"].set(t("status.val.yes") if status.get("enrollment") else t("status.val.no_enroll"))
         v["pwd"].set(password_line(status, self._pwd_presence))
+        v["speed"].set("—" if status is None else speed_status_text(status.get("speed")))
         v["auto"].set(t("status.val.on") if snap.get("auto_lock") else t("status.val.off"))
         v["last"].set(_format_age(snap.get("last_at", 0)))
         v["result"].set(result_text(snap.get("last_result", "-")))

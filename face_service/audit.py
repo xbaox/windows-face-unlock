@@ -83,6 +83,30 @@ class AuditLog:
             except OSError as e:
                 log.warning("audit write failed: %s", e)
 
+    def tail(self, max_bytes: int = 65536) -> "list[dict]":
+        """9e (F2-05): the records at the end of the current file (oldest first), for the speed
+        estimate at start. Unparsable lines are skipped; never raises."""
+        try:
+            with self._lock, open(self.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - int(max_bytes)))
+                data = f.read()
+        except OSError:
+            return []
+        out = []
+        lines = data.split(b"\n")
+        if len(data) >= int(max_bytes):
+            lines = lines[1:]                     # the first line may be cut
+        for ln in lines:
+            try:
+                r = json.loads(ln.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(r, dict):
+                out.append(r)
+        return out
+
     def reconfigure(self, enabled: bool, max_mb: float) -> None:
         with self._lock:
             self.enabled = bool(enabled)

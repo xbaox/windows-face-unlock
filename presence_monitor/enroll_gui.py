@@ -32,6 +32,13 @@ Stage 9 (act 9b R12) rebuilt it around four rules:
   rejected, a secure data folder, the service seeing the new face profile, the camera given back
   -- and shows each with a button to fix it (F-180).
 
+9e (live run in a VM, F2): a failed head-turn calibration stays on screen and the readiness
+panel says whether the turn is calibrated (F2-01); the panel goes beside the preview, or under it,
+and the preview shrinks, so every button is on screen at any work area and scale (F2-02); the
+window takes the focus when Setup opens it, the camera's process opts out of background
+throttling, and the preview no longer waits for the face detector (F2-03); the panel shows the
+PC's measured speed (F2-05); the profile is built as soon as the last photo is taken (F2-06).
+
 Also: pick the camera by device name (R10, F-141); Replace / Add is a dialog with those words on
 its buttons (F-202); an unbuilt Replace session asks before it is thrown away, and a stale one is
 removed at start (F-182); Close waits for a running build (F-185); Delete is off while capturing
@@ -72,7 +79,7 @@ PREVIEW_W = 480
 PREVIEW_H = 360
 CAPTURE_COOLDOWN_S = 1.0    # min gap between captures
 FACE_STABLE_FRAMES = 3      # a face must be seen this many frames in a row before a capture
-DETECT_EVERY_N_FRAMES = 2   # YuNet is fast, but every other frame is enough to feel live
+DETECT_MIN_INTERVAL_S = 0.1  # 9e (F2-03): the detector (on its own thread) at most this often
 CAMERA_LEASE_S = 120        # the lease asked of the service; renewed while it is needed
 LEASE_RENEW_S = 45
 SERVICE_WAIT_S = 60.0       # after this the wizard SAYS the service is not answering (it keeps trying)
@@ -89,11 +96,29 @@ CAMERA_JOIN_S = 5.0          # 9d-r2 (W-18): the end state waits this long for t
 PREVIEW_MAX_FRAC = 0.5       # 9d-r2 (W-10): the preview takes at most this share of the work-area height
 PREVIEW_MIN_K = 0.3          # ...and is never scaled below this share of its 96-dpi size
 READY_WRAP_PX = 300          # 9d-r2 (W-10): the readiness panel's text width (96-dpi pixels)
+# 9e (F2-02): the panel's text width is chosen from these (the widest that fits wins), the panel
+# goes beside the preview or under it, and the preview may shrink down to PREVIEW_ABS_MIN_K
+READY_WRAP_CHOICES = (READY_WRAP_PX, 260, 220, 180)
+PREVIEW_ABS_MIN_K = 0.15
+STATUS_LINES = 3             # the status line's height reserved by the layout (it wraps to the column)
 
-# 9d-r2 (W-10): the readiness texts the layout is measured with (the longest one of the language)
-_READY_TEXT_KEYS = ("enroll.ready.password.none", "enroll.ready.password.unreadable",
-                    "enroll.ready.password.rejected", "enroll.ready.custody.bad",
-                    "enroll.ready.camera.bad", "enroll.ready.service.bad", "enroll.ready.enrollment.bad")
+# 9d-r2 (W-10) / 9e (F2-02): the readiness texts the layout is measured with -- each row at the
+# longest text IT can show, in the current language
+_READY_ROW_TEXTS = {
+    "service": ("enroll.ready.service.ok", "enroll.ready.service.bad"),
+    "custody": ("enroll.ready.custody.ok", "enroll.ready.custody.bad"),
+    "enrollment": ("enroll.ready.enrollment.ok", "enroll.ready.enrollment.bad"),
+    "password": ("enroll.ready.password.ok", "enroll.ready.password.none",
+                 "enroll.ready.password.unreadable", "enroll.ready.password.rejected"),
+    "camera": ("enroll.ready.camera.ok", "enroll.ready.camera.bad"),
+    "turn": ("enroll.ready.turn.ok", "enroll.ready.turn.bad"),
+    "speed": ("enroll.ready.speed.quick", "enroll.ready.speed.slow", "enroll.ready.speed.too_slow",
+              "enroll.ready.speed.unknown"),
+}
+_READY_TEXT_FMT = {"fps": "00.0", "delta": "+00.0"}
+# the panel's rows (F-180; 9e: + the head turn, F2-01, and the speed, F2-05)
+_READY_KEYS = ("service", "custody", "enrollment", "password", "camera", "turn", "speed")
+_READY_MARK = {"ok": "✓ ", "warn": "! ", "err": "✗ ", "info": "• "}
 # 9d-r2 (W-20): the one optional button slot of the button row
 _EXTRA_MODES = {"retry": "enroll.btn.retry", "camera_on": "enroll.btn.camera_on",
                 "cancel_calib": "enroll.btn.cancel_calib"}
@@ -116,17 +141,153 @@ def pose_warning(pitch: float, yaw: float) -> bool:
     return pitch < POSE_PITCH_WARN_DEG or abs(yaw) > POSE_YAW_WARN_DEG
 
 
-def fit_preview(work_w: int, work_h: int, chrome_w: int, chrome_h: int,
-                scale: float) -> "tuple[int, int]":
-    """9d-r2 (W-10): the preview size, in physical pixels, that keeps the whole wizard inside a
-    work area of ``work_w`` x ``work_h``. ``chrome_w`` / ``chrome_h`` is the rest of the window
-    (its full size -- title bar, borders, readiness panel, buttons -- minus the preview) at this
-    ``scale``. The 96-dpi preview is scaled to ``scale``, kept to PREVIEW_MAX_FRAC of the work-area
-    height and to what the chrome leaves free, never below PREVIEW_MIN_K; 4:3 is kept. Pure."""
-    pw, ph = PREVIEW_W * scale, PREVIEW_H * scale
-    k = min(1.0, work_h * PREVIEW_MAX_FRAC / ph, (work_h - chrome_h) / ph, (work_w - chrome_w) / pw)
-    k = max(PREVIEW_MIN_K, k)
-    return int(pw * k), int(ph * k)
+class LayoutParts(NamedTuple):
+    """9e (F2-02): the wizard's parts, physical pixels at the window's scale."""
+    left_w: int                              # the widest row of the left column (not the preview)
+    left_h: int                              # the left column's height without the preview
+    panel: "dict[int, tuple[int, int]]"      # the readiness panel (w, h) per text wrap (96-dpi key)
+    extra_w: int                             # frame (borders, title bar) + outer padding
+    extra_h: int
+    gap: int                                 # between the column and the panel
+
+
+class Layout(NamedTuple):
+    side: str                                # "right" (beside the preview) | "below" (under it)
+    wrap: int                                # the panel's text wrap (96-dpi px)
+    preview: "tuple[int, int]"               # physical px, 4:3
+    fits: bool                               # the whole window inside the work area
+    size: "tuple[int, int]"                  # the whole window, frame included
+
+
+def window_size(side: str, wrap: int, preview: "tuple[int, int]", parts: LayoutParts) -> "tuple[int, int]":
+    """The whole window for a layout. Pure."""
+    pw, ph = preview
+    qw, qh = parts.panel[wrap]
+    col_w, col_h = max(parts.left_w, pw), parts.left_h + ph
+    if side == "right":
+        return col_w + parts.gap + qw + parts.extra_w, max(col_h, qh) + parts.extra_h
+    return max(col_w, qw) + parts.extra_w, col_h + parts.gap + qh + parts.extra_h
+
+
+def plan_layout(work_w: int, work_h: int, scale: float, parts: LayoutParts) -> Layout:
+    """9d-r2 (W-10) / 9e (F2-02): where the readiness panel goes, how wide its text wraps and how
+    big the preview is, so that the WHOLE window -- the panel with its buttons, the button row
+    and the optional button's row, a status line of STATUS_LINES lines, title bar and borders --
+    fits a work area of ``work_w`` x ``work_h``. In order of preference: the panel beside the
+    preview, then under it; the widest text wrap first; the first that leaves the preview at
+    least PREVIEW_MIN_K of its 96-dpi size (never above PREVIEW_MAX_FRAC of the work-area height),
+    else the first that fits at PREVIEW_ABS_MIN_K. 4:3 is kept. Pure."""
+    pw96, ph96 = PREVIEW_W * scale, PREVIEW_H * scale
+    cands = []
+    for side in ("right", "below"):
+        for wrap in sorted(parts.panel, reverse=True):
+            qw, qh = parts.panel[wrap]
+            if side == "right":
+                avail_w = work_w - parts.extra_w - parts.gap - qw
+                avail_h = work_h - parts.extra_h - parts.left_h
+                fixed_ok = parts.left_w <= avail_w and qh + parts.extra_h <= work_h
+            else:
+                avail_w = work_w - parts.extra_w
+                avail_h = work_h - parts.extra_h - parts.left_h - parts.gap - qh
+                fixed_ok = max(parts.left_w, qw) <= avail_w
+            k = min(1.0, work_h * PREVIEW_MAX_FRAC / ph96, avail_h / ph96, avail_w / pw96)
+            cands.append((side, wrap, k, fixed_ok))
+    choice = (next((c for c in cands if c[3] and c[2] >= PREVIEW_MIN_K), None)
+              or next((c for c in cands if c[3] and c[2] >= PREVIEW_ABS_MIN_K), None))
+    fits = choice is not None
+    if choice is None:                       # nothing fits: the least bad, preview at the floor
+        choice = max(cands, key=lambda c: (c[3], c[2]))
+    k = max(PREVIEW_ABS_MIN_K, choice[2])
+    preview = (int(pw96 * k), int(ph96 * k))
+    size = window_size(choice[0], choice[1], preview, parts)
+    return Layout(choice[0], choice[1], preview, fits and size[0] <= work_w and size[1] <= work_h, size)
+
+
+def detect_due(now: float, last_start: float, pending: bool) -> bool:
+    """9e (F2-03): hand this frame to the detector thread? Only when it has nothing in hand and at
+    most every DETECT_MIN_INTERVAL_S. The detector runs on its own thread, so on a slow CPU the
+    preview keeps the camera's pace instead of the detector's (the old loop detected in line,
+    every second frame, and the preview stalled with it). Pure."""
+    return not pending and now - last_start >= DETECT_MIN_INTERVAL_S
+
+
+def _detect_worker(s: "Session", detector, jobs: "queue.Queue", results: "queue.Queue",
+                   stop: threading.Event) -> None:
+    """9e (F2-03): detection + the framing coach off the preview loop. A job is a frame; the
+    result is (that frame, faces, coach) -- a shot is only ever the frame that was judged."""
+    while not (stop.is_set() or s.stop.is_set()):
+        try:
+            frame = jobs.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if frame is None:
+            return
+        try:
+            h, w = frame.shape[:2]
+            det = detector._ensure(w, h)  # type: ignore[attr-defined]
+            _, res = det.detect(frame) if det is not None else (None, None)
+            faces = list(res) if res is not None else []
+        except Exception as e:
+            log.debug("detect failed: %s", e)
+            faces = []
+        try:
+            coach = evaluate_coach(frame, faces, s.cfg, bool(getattr(detector, "unavailable", False)))
+        except Exception:
+            log.exception("framing coach failed")
+            coach = CoachState("enroll.status.waiting", False, "err")
+        results.put((frame, faces, coach))
+
+
+def final_line(core_ok: bool, calibrated: bool, speed_level: str,
+               calib_fail_text: "str | None") -> "tuple[str, str] | None":
+    """9e (F2-01, F2-05): the wizard's last line once the readiness checks are in, or None (a
+    check failed: its row says what to do). Never "All set" over a failed calibration or a PC
+    that is too slow; a calibration that failed in this session keeps its own text (it says what
+    to do). Pure."""
+    if not core_ok:
+        return None
+    if speed_level == "too-slow":
+        return t("enroll.ready.too_slow"), "err"
+    if not calibrated:
+        return (calib_fail_text, "warn") if calib_fail_text else (t("enroll.ready.all_ok_uncalibrated"), "warn")
+    return t("enroll.ready.all_ok"), "ok"
+
+
+def turn_text(turn: "dict | None") -> "tuple[str, str]":
+    """9e (F2-01): the readiness panel's head-turn row and its level. Pure."""
+    turn = turn or {}
+    if turn.get("calibrated"):
+        d = turn.get("delta_deg")
+        if isinstance(d, (int, float)):
+            return t("enroll.ready.turn.ok", delta=f"{d:+.1f}"), "ok"
+        return t("enroll.ready.turn.ok_nodelta"), "ok"
+    return t("enroll.ready.turn.bad"), "warn"
+
+
+def set_power_throttling(allow: bool) -> bool:
+    """9e (F2-03): opt this process out of Windows' execution-speed throttling (EcoQoS) while the
+    wizard's camera runs, and hand the decision back to Windows afterwards (``allow``). A window
+    that is not in front gets its process throttled -- on a heavy CPU detector the live preview
+    "lagged badly" until the window was clicked (9e, E-03). SetProcessInformation(
+    ProcessPowerThrottling, EXECUTION_SPEED). True when Windows took it; never raises."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _State(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                    ("StateMask", wintypes.ULONG)]
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetProcessInformation.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                              wintypes.DWORD)
+        k32.SetProcessInformation.restype = wintypes.BOOL
+        st = _State(1, 0 if allow else 1, 0)      # CURRENT_VERSION, EXECUTION_SPEED, off
+        return bool(k32.SetProcessInformation(k32.GetCurrentProcess(), 4,   # ProcessPowerThrottling
+                                              ctypes.byref(st), ctypes.sizeof(st)))
+    except Exception:
+        log.debug("SetProcessInformation(ProcessPowerThrottling) failed", exc_info=True)
+        return False
 
 
 def build_failure_text(raw: "str | None") -> str:
@@ -472,6 +633,14 @@ def _camera_session(s: Session, q: "queue.Queue") -> None:
         last_capture = 0.0
         first = False
         first_deadline = time.monotonic() + FIRST_FRAME_S
+        # 9e (F2-03): the detector on its own thread -- the preview draws every frame
+        jobs: "queue.Queue" = queue.Queue(maxsize=1)
+        results: "queue.Queue" = queue.Queue()
+        det_stop = threading.Event()
+        det_thread = threading.Thread(target=_detect_worker, args=(s, detector, jobs, results, det_stop),
+                                      name="enroll-detect", daemon=True)
+        det_thread.start()
+        det_start, pending = 0.0, False
         while not s.stop.is_set():
             if not first and time.monotonic() >= first_deadline:
                 log.warning("enroll camera: no usable frame within %.0fs", FIRST_FRAME_S)
@@ -489,18 +658,19 @@ def _camera_session(s: Session, q: "queue.Queue") -> None:
                 q.put(("first_frame", gen))
             if not first:
                 continue                      # black frames of a camera still starting up
-            measured = frame_idx % DETECT_EVERY_N_FRAMES == 0
-            if measured:
+            if detect_due(time.monotonic(), det_start, pending):
                 try:
-                    h, w = frame.shape[:2]
-                    det = detector._ensure(w, h)  # type: ignore[attr-defined]
-                    _, res = det.detect(frame) if det is not None else (None, None)
-                    faces = list(res) if res is not None else []
-                except Exception as e:
-                    log.debug("detect failed: %s", e)
-                    faces = []
-                coach = evaluate_coach(frame, faces, s.cfg, bool(getattr(detector, "unavailable", False)))
+                    jobs.put_nowait(frame.copy())
+                    det_start, pending = time.monotonic(), True
+                except queue.Full:
+                    pass
+            judged = frame
+            try:
+                judged, faces, coach = results.get_nowait()
+                measured, pending = True, False
                 streak = streak + 1 if faces else 0
+            except queue.Empty:
+                measured = False
             if coach.key != last_coach:
                 last_coach = coach.key
                 q.put(("coach", coach, gen))
@@ -512,7 +682,7 @@ def _camera_session(s: Session, q: "queue.Queue") -> None:
                     phase, left = calib
                     name = f"{phase}_{int(now * 1000)}.png"
                     CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
-                    if imio.imwrite(CALIBRATION_DIR / name, frame):
+                    if imio.imwrite(CALIBRATION_DIR / name, judged):
                         last_capture = now
                         with s.lock:
                             s.calib_names[phase].append(name)
@@ -525,7 +695,7 @@ def _camera_session(s: Session, q: "queue.Queue") -> None:
                     try:
                         d.mkdir(parents=True, exist_ok=True)
                         path = d / f"enroll_{int(now * 1000)}.jpg"
-                        if imio.imwrite(path, frame):      # R8: checked, Unicode-safe
+                        if imio.imwrite(path, judged):     # R8: checked, Unicode-safe
                             last_capture = now
                             with s.lock:
                                 s.captured += 1
@@ -543,6 +713,12 @@ def _camera_session(s: Session, q: "queue.Queue") -> None:
             q.put(("frame", annotate(frame, faces, coach.level, s.preview_size), gen))
             time.sleep(0.03)
     finally:
+        try:
+            if "det_thread" in locals():
+                det_stop.set()
+                det_thread.join(1.0)
+        except Exception:
+            log.debug("detector thread stop failed", exc_info=True)
         try:
             cap.release()
         except Exception:
@@ -686,7 +862,9 @@ def readiness_worker(q: "queue.Queue", camera_released: bool) -> None:
         "password": pwd == "ok" and not status.get("password_rejected"),
         "camera": bool(camera_released),
     }
-    q.put(("readiness", checks, pwd, bool(status.get("password_rejected"))))
+    # 9e: the head turn (F2-01) and the speed (F2-05) -- shown, but not conditions of "ready"
+    info = {"turn": status.get("turn_calibration"), "speed": status.get("speed")}
+    q.put(("readiness", checks, pwd, bool(status.get("password_rejected")), info))
 
 
 def release_and_check_worker(q: "queue.Queue", s: "Session | None",
@@ -852,6 +1030,12 @@ class EnrollWindow:
         self._pending_camera_save = ""       # 9d (V-34): the default camera, saved after a build
         self._calib_progress_at = 0.0        # 9d (V-31)
         self._calib_gen = 0
+        self._calib_fail_text: "str | None" = None   # 9e (F2-01): this session's failed calibration
+        self._layout: "Layout | None" = None         # 9e (F2-02)
+        self._parts: "LayoutParts | None" = None
+        self._refits = 0
+        self._ready_wrap = READY_WRAP_PX
+        self._throttle_off = False                   # 9e (F2-03)
         self.closing = False
 
         # A stale pending session (a tray Quit killed an earlier wizard mid-Replace) holds face
@@ -877,6 +1061,8 @@ class EnrollWindow:
         self._start_camera()
         self.root.after(33, self._drain)
         self.root.after(250, self._keep_in_work_area)
+        from .ui import bring_to_front
+        self.root.after(150, bring_to_front, self.root)     # 9e (F2-03): opened by Setup, in front
 
     # ---- UI ----
     def _build_ui(self) -> None:
@@ -938,24 +1124,27 @@ class EnrollWindow:
         self.close_btn = ttk.Button(btns, text=t("enroll.btn.close"), command=self._on_close)
         self.close_btn.pack(side="right", padx=3)
         # 9d-r2 (W-20): ONE slot for Retry / Turn the camera on again / Cancel calibration (they
-        # never show together), and a spacer as wide as the row with its widest text -- the
-        # window does not change width when the button appears.
-        self.extra_btn = ttk.Button(btns, text="")
-        widest = 0
+        # never show together). 9e (F2-02): in a row of its own under the buttons, reserved at the
+        # height of a button -- the window neither widens nor grows when it appears, and the main
+        # row stays narrow enough for a small work area.
+        self.extra_row = ttk.Frame(frm)
+        self.extra_btn = ttk.Button(self.extra_row, text="")
+        widest, tallest = 0, 0
         for mode in _EXTRA_MODES:
             self.extra_btn.configure(text=t(_EXTRA_MODES[mode]))
-            self.extra_btn.pack(side="left", padx=3, after=self.wipe_btn)
-            btns.update_idletasks()
-            widest = max(widest, btns.winfo_reqwidth())
-            self.extra_btn.pack_forget()
-        ttk.Frame(frm, width=widest, height=1).pack(anchor="w")
+            self.extra_btn.update_idletasks()
+            widest = max(widest, self.extra_btn.winfo_reqwidth())
+            tallest = max(tallest, self.extra_btn.winfo_reqheight())
+        self.extra_row.configure(width=widest + self._px(6), height=tallest + self._px(4))
+        self.extra_row.pack_propagate(False)
+        self.extra_row.pack(fill="x", pady=(2, 0))
 
         # The end-state panel (F-180), shown after a build -- 9d-r2 (W-10): in its own column
         # beside the preview, its buttons stacked, so it is always on screen with them.
         self.ready_frm = ttk.LabelFrame(outer, text=t("enroll.ready.title"), padding=8)
         self.ready_lines: dict = {}
         wrap = self._px(READY_WRAP_PX)
-        for i, key in enumerate(("service", "custody", "enrollment", "password", "camera")):
+        for i, key in enumerate(_READY_KEYS):
             lbl = ttk.Label(self.ready_frm, text="", wraplength=wrap, justify="left")
             lbl.grid(row=i, column=0, sticky="w", pady=1)
             self.ready_lines[key] = lbl
@@ -979,62 +1168,92 @@ class EnrollWindow:
         self.start_btn.focus_set()
         self._refresh_existing()
 
-    def _measure_chrome(self) -> "tuple[int, int]":
-        """The window's size minus the preview, in its fullest state: readiness panel shown with
-        its longest texts, a four-line status line, title bar and borders."""
+    def _measure_parts(self) -> LayoutParts:
+        """9e (F2-02): the parts plan_layout needs, measured on the real widgets in their fullest
+        state: the optional button's row reserved, a status line of STATUS_LINES lines, the texts
+        under the preview wrapped to the narrowest column, the readiness panel with its longest
+        texts at every text wrap of READY_WRAP_CHOICES."""
         from .ui import frame_extra
         r = self.root
         saved = self.line.cget("text")
         saved_ready = {k: lbl.cget("text") for k, lbl in self.ready_lines.items()}
         shown = bool(self.ready_frm.winfo_manager())
-        longest = max((t(k) for k in _READY_TEXT_KEYS), key=len)
+        longest = {row: max((t(k, **_READY_TEXT_FMT) for k in keys), key=len)
+                   for row, keys in _READY_ROW_TEXTS.items()}
+        wrapping = (self.line, self.hint)
         try:
-            self.line.configure(text="\n".join(["M"] * 4))
-            for lbl in self.ready_lines.values():
-                lbl.configure(text="✗ " + longest)
+            self.line.configure(text="\n".join(["M"] * STATUS_LINES))
+            r.update_idletasks()
+            rows = [c for c in self.left.pack_slaves() if c is not self.preview and c not in wrapping]
+            left_w = max(c.winfo_reqwidth() for c in rows)
+            for lbl in wrapping:
+                lbl.configure(wraplength=left_w)
+            r.update_idletasks()
+            left_h = self.left.winfo_reqheight() - self.preview.winfo_reqheight()
             if not shown:
                 self._grid_ready()
-            r.update_idletasks()
+            panel = {}
+            for wrap in READY_WRAP_CHOICES:
+                for row, lbl in self.ready_lines.items():
+                    lbl.configure(text="✗ " + longest[row], wraplength=self._px(wrap))
+                r.update_idletasks()
+                panel[wrap] = (self.ready_frm.winfo_reqwidth(), self.ready_frm.winfo_reqheight())
             dw, dh = frame_extra(r)
-            return (r.winfo_reqwidth() + dw - self.preview.winfo_reqwidth(),
-                    r.winfo_reqheight() + dh - self.preview.winfo_reqheight())
+            pad = 2 * self._px(10)                       # the outer frame's padding
+            return LayoutParts(int(left_w), int(left_h), panel, dw + pad, dh + pad, self._px(12))
         finally:
             self.line.configure(text=saved)
             for k, lbl in self.ready_lines.items():
-                lbl.configure(text=saved_ready[k])
+                lbl.configure(text=saved_ready[k], wraplength=self._px(self._ready_wrap))
             if not shown:
                 self.ready_frm.grid_remove()
 
     def _fit_layout(self) -> None:
-        """9d-r2 (W-10): size the preview so that the whole window -- readiness panel and its
-        buttons, the button row with its optional button, a four-line status line, title bar and
-        borders -- fits the work area of its monitor (``fit_preview``). A narrower preview wraps
-        the texts under it into more lines, so the fit is repeated until it holds."""
+        """9d-r2 (W-10) / 9e (F2-02): measure the parts, plan the layout for the work area of the
+        window's monitor (plan_layout) and apply it: preview size, the panel beside or under the
+        preview, its text wrap, the texts under the preview wrapped to the column."""
         from .ui import work_area_of
         left, top, right, bottom = work_area_of(self.root)
-        for _ in range(4):
-            chrome_w, chrome_h = self._measure_chrome()
-            size = fit_preview(right - left, bottom - top, chrome_w, chrome_h, self.scale)
-            self.chrome = (chrome_w, chrome_h)
-            if size == self.preview_size:
-                break
-            self._set_preview_size(size)
-        log.info("wizard layout: work area %dx%d, scale %.2f, chrome %dx%d -> preview %dx%d",
-                 right - left, bottom - top, self.scale, self.chrome[0], self.chrome[1],
-                 *self.preview_size)
+        parts = self._measure_parts()
+        lay = plan_layout(right - left, bottom - top, self.scale, parts)
+        self._parts = parts
+        self._apply_layout(lay)
+        log.info("wizard layout: work area %dx%d, scale %.2f, panel %s (text %d px), preview %dx%d, "
+                 "window %dx%d%s", right - left, bottom - top, self.scale, lay.side, lay.wrap,
+                 lay.preview[0], lay.preview[1], lay.size[0], lay.size[1],
+                 "" if lay.fits else " -- DOES NOT FIT")
+
+    def _apply_layout(self, lay: Layout) -> None:
+        self._layout = lay
+        self._ready_wrap = lay.wrap
+        for lbl in self.ready_lines.values():
+            lbl.configure(wraplength=self._px(lay.wrap))
+        if lay.preview != self.preview_size:
+            self._set_preview_size(lay.preview)
+        self._wrap_texts()
+        if self.ready_frm.winfo_manager():
+            self._grid_ready()
+
+    def _wrap_texts(self) -> None:
+        """The status line and the hint wrap to the column (never to a shrunken preview alone)."""
+        col = max(self.preview_size[0], self._parts.left_w if self._parts else 0)
+        self.line.configure(wraplength=col)
+        self.hint.configure(wraplength=col)
 
     def _set_preview_size(self, size: "tuple[int, int]") -> None:
         self.preview_size = size
         pw, ph = size
         self.preview.configure(width=pw, height=ph)
-        self.line.configure(wraplength=pw)
-        self.hint.configure(wraplength=pw)
+        self._wrap_texts()
         if self.session is not None:
             self.session.preview_size = size
         self._blank_preview()
 
     def _grid_ready(self) -> None:
-        self.ready_frm.grid(row=0, column=1, sticky="n", padx=(self._px(12), 0))
+        if self._layout is not None and self._layout.side == "below":
+            self.ready_frm.grid(row=1, column=0, sticky="w", pady=(self._px(12), 0), padx=0)
+        else:
+            self.ready_frm.grid(row=0, column=1, sticky="n", padx=(self._px(12), 0), pady=0)
 
     def _relayout(self) -> None:
         """9d-r2 (W-10): after any change of the layout, the window goes back inside the work area."""
@@ -1050,7 +1269,28 @@ class EnrollWindow:
         self._relayout_pending = False
         if self.closing:
             return
-        from .ui import keep_in_work_area
+        from .ui import keep_in_work_area, window_rect, work_area_of
+        # 9e (F2-02): checked on the window as it IS -- other fonts, a size Windows or the user
+        # gave it (then the panel was cut off): natural size again and a fresh plan, a few times
+        # per fitting state at most
+        try:
+            r = self.root
+            r.update_idletasks()
+            rect, work = window_rect(r), work_area_of(r)
+            clipped = r.winfo_width() < r.winfo_reqwidth() or r.winfo_height() < r.winfo_reqheight()
+            big = rect is not None and (rect[2] - rect[0] > work[2] - work[0] + 1
+                                        or rect[3] - rect[1] > work[3] - work[1] + 1)
+            if (clipped or big) and self._refits < 3:
+                self._refits += 1
+                log.info("wizard does not fit as shown (%s) -- natural size and a new layout",
+                         "cut off" if clipped else "larger than the work area")
+                r.geometry("")
+                self._fit_layout()
+                r.update_idletasks()
+            elif not (clipped or big):
+                self._refits = 0
+        except tk.TclError:
+            return
         if keep_in_work_area(self.root):
             log.info("wizard moved back inside the work area")
 
@@ -1063,7 +1303,7 @@ class EnrollWindow:
                 else self._on_retry
             self.extra_btn.configure(text=t(_EXTRA_MODES[mode]), command=cmd)
             if not self.extra_btn.winfo_manager():
-                self.extra_btn.pack(side="left", padx=3, after=self.wipe_btn)
+                self.extra_btn.pack(side="left", padx=3)
         self._relayout()
 
     def _on_enter(self, _e=None) -> None:
@@ -1236,6 +1476,7 @@ class EnrollWindow:
             self._set_line(t("enroll.status.switching"), "info")
         elif kind == "camera_opened":
             self.root.after(int(FIRST_FRAME_S * 1000), self._first_frame_due, msg[-1])
+            self._throttle(False)                        # 9e (F2-03): the camera runs
         elif kind == "camera_failed":
             self._camera_failed(msg[1])
         elif kind == "camera_closed":
@@ -1244,6 +1485,7 @@ class EnrollWindow:
             self.cam_gen = None
             self._blank_preview()
             self._set_extra("camera_on")
+            self._throttle(True)                         # 9e (F2-03): back to Windows
             self._refresh_buttons()
         elif kind == "closed":
             self._finish_close()
@@ -1269,6 +1511,7 @@ class EnrollWindow:
             self._show_count(msg[1])
             self._set_line(t("enroll.guide.done_capture"), "ok")
             self._refresh_buttons()
+            self.root.after(300, self._auto_build)       # 9e (F2-06): no extra click
         elif kind == "built":
             self._on_built(msg[1])
         elif kind == "calib_shots":
@@ -1276,14 +1519,24 @@ class EnrollWindow:
         elif kind == "calibrated":
             self._on_calibrated(msg[1])
         elif kind == "readiness":
-            self._show_ready(msg[1], msg[2], msg[3])
+            self._show_ready(msg[1], msg[2], msg[3], msg[4] if len(msg) > 4 else None)
         elif kind == "wiped":
             self._on_wiped(msg[1])
+
+    def _throttle(self, allow: bool) -> None:
+        """9e (F2-03): background throttling off while the camera runs, back to Windows after."""
+        if (not allow) == self._throttle_off:
+            return
+        self._throttle_off = not allow
+        ok = set_power_throttling(allow)
+        log.info("background throttling %s for the camera (%s)",
+                 "handed back to Windows" if allow else "switched off", "ok" if ok else "not available")
 
     def _camera_failed(self, reason: str) -> None:
         self.camera_ok = False
         self.cam_gen = None
         self._blank_preview()
+        self._throttle(True)
         if self.calibrating:                         # the calibration cannot go on without it
             self.calibrating = False
             self._calib_gen += 1
@@ -1350,12 +1603,24 @@ class EnrollWindow:
         if n >= target:
             self._set_line(t("enroll.guide.done_capture"), "ok")
             self._refresh_buttons()
+            self._auto_build()                           # 9e (F2-06)
             return
         s.armed.set()
         self._set_line(t("enroll.guide.capturing"), "ok")
         self._refresh_buttons()
 
     # ---- build ----
+    def _auto_build(self) -> None:
+        """9e (F2-06): the profile is built as soon as the last photo is taken (Build stays for a
+        rebuild)."""
+        if self.closing or self.building or self.calibrating:
+            return
+        if self.session is not None and self.session.armed.is_set():
+            return
+        if count_images(self._capture_dir()) > 0:
+            log.info("all photos taken: building the face profile")
+            self._on_build()
+
     def _on_build(self) -> None:
         if self.building:
             return
@@ -1481,13 +1746,17 @@ class EnrollWindow:
         self.calibrating = False
         self._set_extra(None)
         if resp and resp.get("ok"):
+            self._calib_fail_text = None
             self._set_line(t("enroll.calib.done"), "ok")
         else:
             reason = (resp or {}).get("reason") or ("timeout" if resp is None else "?")
-            log.warning("head-turn calibration failed: reason=%r", reason)   # W-19: the code, here only
+            log.warning("head-turn calibration failed: reason=%r delta=%s", reason,
+                        (resp or {}).get("delta_deg"))   # W-19: the code, here only
             key = {"turn-too-small": "enroll.calib.too_small",
                    "no-face": "enroll.calib.no_face"}.get(reason, "enroll.calib.failed")
-            self._set_line(t(key), "warn")
+            # 9e (F2-01): kept -- the readiness check that follows must not write "All set" over it
+            self._calib_fail_text = t(key)
+            self._set_line(self._calib_fail_text, "warn")
         self._release_and_check()
 
     # ---- end state (F-180) ----
@@ -1513,7 +1782,8 @@ class EnrollWindow:
             self._grid_ready()
             self._relayout()
 
-    def _show_ready(self, checks: dict, pwd: str, rejected: bool) -> None:
+    def _show_ready(self, checks: dict, pwd: str, rejected: bool, info: "dict | None" = None) -> None:
+        from face_service.speed import level as speed_level, ready_text as speed_ready_text
         self._show_ready_panel()
         for key, ok in checks.items():
             text = t(f"enroll.ready.{key}.{'ok' if ok else 'bad'}")
@@ -1522,8 +1792,19 @@ class EnrollWindow:
                          else f"enroll.ready.password.{pwd}")
             self.ready_lines[key].configure(text=("✓ " if ok else "✗ ") + text,
                                             foreground=_COACH_FG["ok" if ok else "err"])
-        if all(checks.values()):
-            self._set_line(t("enroll.ready.all_ok"), "ok")
+        info = info or {}
+        # 9e (F2-01): the head turn -- not a condition of "ready", but never hidden
+        turn = info.get("turn") or {}
+        text, lv = turn_text(turn)
+        self.ready_lines["turn"].configure(text=_READY_MARK[lv] + text, foreground=_COACH_FG[lv])
+        # 9e (F2-05): the PC's measured speed
+        speed = info.get("speed") or {}
+        text, lv = speed_ready_text(speed)
+        self.ready_lines["speed"].configure(text=_READY_MARK[lv] + text, foreground=_COACH_FG[lv])
+        final = final_line(all(checks.values()), bool(turn.get("calibrated")),
+                           speed_level(speed.get("fps")), self._calib_fail_text)
+        if final is not None:
+            self._set_line(*final)
         self._refresh_buttons()
         self._relayout()
 
@@ -1583,6 +1864,7 @@ class EnrollWindow:
                     return
         self.stop_all.set()
         self.closing = True
+        self._throttle(True)
         try:
             self.root.withdraw()
         except Exception:

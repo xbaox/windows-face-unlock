@@ -715,6 +715,131 @@ def test_9d():
           r.get("reason") == "no-credentials" and s._lockout.records == [], (r, s._lockout.records))
 
 
+class _ExpCap:
+    """A cv2.VideoCapture-like exposure pair (EXPOSURE / AUTO_EXPOSURE) that honors every set."""
+    def __init__(self, exposure=-6.0, auto=0.75, honor=True, sticky=False):
+        import cv2
+        self.p, self.ap = cv2.CAP_PROP_EXPOSURE, cv2.CAP_PROP_AUTO_EXPOSURE
+        self.v = {self.p: float(exposure), self.ap: float(auto)}
+        self.honor, self.sticky, self.sets = honor, sticky, []
+
+    def get(self, prop):
+        return self.v.get(prop, 0.0)
+
+    def set(self, prop, value):
+        self.sets.append((prop, float(value)))
+        if not self.honor:
+            return False
+        if self.sticky and prop == self.ap:
+            return False                   # a driver that never goes back to auto
+        self.v[prop] = float(value)
+        if self.sticky and prop == self.p:
+            self.v[self.ap] = 0.25         # ... and an exposure set switches it to manual (F-129)
+        return True
+
+
+def test_f2_04():
+    """9e (F2-04, the A-7 decision): phase 2 of an attempt INHERITS the exposure phase 1's boost set
+    (measured in the VM: phase 1 -6 -> -4, sceneL 42 -> 108; phase 2 back at -6, sceneL 44 ->
+    too-dark). No boost of its own; the original exposure comes back after the round."""
+    print("[F2-04] phase 2 inherits the exposure of this attempt's phase-1 boost")
+    patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
+    floor = Config().low_light_luma_min
+
+    def dark_needs_gesture(luma):
+        return VerifyOutcome(False, 0.09, True, {"verdict": "NEEDS_GESTURE", "frames_ok": 5,
+                                                 "engine_errors": 0, "faces": 5}, None, luma)
+    boost_ok = {"boost_applied": True, "boost_honored": True, "exposure_before": -6.0,
+                "exposure_after": -4.0, "scene_luma_before": 42.0, "scene_luma_after": 108.0}
+    # phase 1: the boost applied -> the slot carries the exposure it ran at
+    a = _svc()
+    a._capture_and_verify = lambda: dark_needs_gesture(42.0)
+    a._maybe_boost = lambda r: (dark_needs_gesture(108.0), dict(boost_ok))
+    r = a._handle({"cmd": "unlock", "v": 2}, None)
+    check("F2-04: phase 1 boosted (-6 -> -4) -> needs-gesture, the slot carries exposure -4",
+          r.get("reason") == "needs-gesture" and (a._gesture_slot or {}).get("exposure") == -4.0,
+          (r.get("reason"), a._gesture_slot))
+    for label, aud in (("not applied", {**boost_ok, "boost_applied": False}),
+                       ("restore failed", {**boost_ok, "boost_restore_failed": True})):
+        b = _svc()
+        b._capture_and_verify = lambda: dark_needs_gesture(42.0)
+        b._maybe_boost = lambda r, aud=aud: (dark_needs_gesture(108.0), dict(aud))
+        b._handle({"cmd": "unlock", "v": 2}, None)
+        check(f"F2-04: boost {label} -> nothing to inherit", (b._gesture_slot or {}).get("exposure") is None,
+              b._gesture_slot)
+    c = _svc()
+    c._capture_and_verify = lambda: dark_needs_gesture(90.0)
+    c._maybe_boost = lambda r: (_ for _ in ()).throw(AssertionError("no boost in a lit scene"))
+    c._handle({"cmd": "unlock", "v": 2}, None)
+    check("F2-04: a lit phase 1 (no boost) -> nothing to inherit",
+          (c._gesture_slot or {}).get("exposure") is None, c._gesture_slot)
+
+    # phase 2, the REAL round: the scene is 108 at -4 and 44 at -6 (the VM measurement)
+    def attempt(inherit: "float | None", cap):
+        s = _svc(Config(persistent_camera=False))
+        frames = _hold(_BASE) + _hold(_LEFT, 2) + _hold(_LEFT, 3) + _hold(_NOD, 2)
+        cam = _StubCam([_WARMUP, _WARMUP] + frames, 0)
+        cam._cap = cap
+        class _DarkBlind:
+            # in the dark (sceneL 44) the landmarks do not follow the head: no movement is seen
+            def analyze_frame(self, frame):
+                return frame if cap.get(cap.p) >= -4.0 else _f(True, _BASE)
+        s.recog = _DarkBlind()
+        s._acquire_camera = lambda: (cam, False)
+        s._camera_leased_out = lambda: False
+        s._note_camera_health = lambda *x: False
+        s._calibration = {}
+        s._release_credentials = lambda: {"ok": True, "u": "admin", "p": "pw", "d": "."}
+        seen = []
+        orig_luma = svc.scene_luma
+
+        def luma(frame):
+            seen.append(cap.get(cap.p))
+            return 108.0 if cap.get(cap.p) >= -4.0 else 44.0
+        svc.scene_luma = luma
+        real = svc.time
+        svc.time = _Clock(cam)
+        try:
+            s._issue_gesture_token(exposure=inherit)
+            s._gesture_slot["kind"] = "turn_left,nod"
+            tok = s._gesture_slot["token"]
+            out = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+        finally:
+            svc.time = real
+            svc.scene_luma = orig_luma
+        return s, out, seen
+    cap = _ExpCap(-6.0)
+    s, out, seen = attempt(-4.0, cap)
+    tel = s._audit.last("gesture_telemetry") or {}
+    check("F2-04: the round runs at the inherited exposure (-4 on every frame) -> passes, not too-dark",
+          out.get("ok") is True and seen and set(seen) == {-4.0} and s._lockout.records == [],
+          (out.get("reason"), sorted(set(seen)), s._lockout.records))
+    check("F2-04: after the round the ORIGINAL exposure and auto mode are back (-6, 0.75)",
+          cap.get(cap.p) == -6.0 and cap.get(cap.ap) == 0.75 and cap.sets[-2:] == [(cap.p, -6.0), (cap.ap, 0.75)],
+          (cap.v, cap.sets[-3:]))
+    ei = tel.get("exposure_inherited") or {}
+    check("F2-04: gesture_telemetry records the inherited exposure (numbers only)",
+          ei.get("exposure_before") == -6.0 and ei.get("exposure_after") == -4.0 and ei.get("honored") is True
+          and ei.get("restored") is True and tel.get("scene_luma") == 108.0, tel)
+    cap2 = _ExpCap(-6.0)
+    s2, out2, seen2 = attempt(None, cap2)
+    check("F2-04: control -- the same scene WITHOUT the inherited exposure is too-dark (the VM failure)",
+          out2.get("reason") == "too-dark" and set(seen2) == {-6.0} and cap2.sets == []
+          and (s2._audit.last("gesture_telemetry") or {}).get("exposure_inherited") is None,
+          (out2.get("reason"), sorted(set(seen2)), cap2.sets))
+    check("F2-04: the floor is unchanged (low_light_luma_min 45)", floor == 45, floor)
+    # a device that does not come back: handled as after a phase-1 boost (F-129)
+    cap3 = _ExpCap(-6.0, sticky=True)
+    s3, out3, _seen3 = attempt(-4.0, cap3)
+    check("F2-04: a device that does not return to auto -> boost off until restart (F-129)",
+          s3._boost_disabled is True, (out3.get("reason"), cap3.v))
+    # no own boost: a dark phase 2 WITHOUT a phase-1 boost never touches the exposure
+    src = Path(svc.__file__).read_text(encoding="utf-8")
+    body = src.split("    def _run_challenge", 1)[1].split("\n    def ", 1)[0]
+    check("F2-04: phase 2 has no boost of its own (no try_exposure_boost / plan_exposure in the round)",
+          "try_exposure_boost" not in body and "plan_exposure" not in body and "ExposureHold(cap, exposure)" in body)
+
+
 def main() -> int:
     run_restoring(
         test_phase1,
@@ -725,6 +850,7 @@ def main() -> int:
         test_audit_and_adaptation,
         test_x03,
         test_9d,
+        test_f2_04,
     )
     if FAILS:
         print(f"\nGESTURE-ROUND SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")

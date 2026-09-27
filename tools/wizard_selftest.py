@@ -33,6 +33,15 @@ recorder with canned answers. What it pins:
   9e-0:
   [X-01] two camera changes while the first camera thread hangs in read(): the newest worker
          waits for EVERY earlier camera thread still alive ("switching"), never two devices open.
+  9e-f2 (live run in a VM):
+  [F2-02] plan_layout: the whole window -- readiness panel, both button rows -- fits the logical
+         work areas 1024x720, 1280x672, 1366x728, 1920x1032 at 100/125/150 % (the parts measured on
+         this window, and a conservative model); the REAL window, with the panel and the optional
+         button shown, fits each of them at this PC's scale (work area substituted).
+  [F2-01] a failed head-turn calibration: the last line keeps its warning (never "All set"), the
+         panel says "not calibrated"; after a good one "All set" and "calibrated (delta ...)"; a PC
+         that is too slow gets the speed warning instead of "All set" (F2-05).
+  [F2-06] the profile is built as soon as the last photo is taken.
 
 Run:  python -m tools.wizard_selftest [--shots DIR [--lang en|ru]]
 With --shots the window is captured (PNG) at each state -- the frames are synthetic, no face.
@@ -472,29 +481,48 @@ def test_r2_workers() -> None:
           txt == t("enroll.build.fail.generic") and "Errno" not in txt and "Users" not in txt, txt)
 
 
-def test_geometry(chrome_logical: "tuple[float, float] | None") -> None:
-    print("[W-10] the wizard fits the work area (pure geometry)")
+F2_AREAS = ((1024, 720), (1280, 672), (1366, 728), (1920, 1032))   # logical work areas (9e F2-02)
+F2_SCALES = (1.0, 1.25, 1.5)
+
+
+def _scaled(lp, s: float):
+    return E.LayoutParts(int(lp.left_w * s), int(lp.left_h * s),
+                         {w: (int(a * s), int(b * s)) for w, (a, b) in lp.panel.items()},
+                         int(lp.extra_w * s), int(lp.extra_h * s), int(lp.gap * s))
+
+
+def test_geometry(parts_logical) -> None:
+    print("[W-10 / F2-02] the whole wizard fits the work area (plan_layout)")
     from presence_monitor.ui import clamp_window
-    # the taskbar is 48 logical px; the chrome (everything but the preview) scales with the DPI
-    configs = [("1920x1080 @100%", 1920, 1080, 1.00), ("1920x1080 @125%", 1920, 1080, 1.25),
-               ("1920x1080 @150%", 1920, 1080, 1.50), ("1920x1080 @175%", 1920, 1080, 1.75),
-               ("1366x768 @100%", 1366, 768, 1.00)]
-    models = [("a conservative model chrome 700x400", (700.0, 400.0))]
-    if chrome_logical is not None:
-        models.append((f"the chrome measured here ({chrome_logical[0]:.0f}x{chrome_logical[1]:.0f})",
-                       chrome_logical))
-    for label, (cw, ch) in models:
-        for name, sw, sh, s in configs:
-            work_w, work_h = sw, sh - int(48 * s)
-            chrome_w, chrome_h = int(cw * s), int(ch * s)
-            pw, ph = E.fit_preview(work_w, work_h, chrome_w, chrome_h, s)
-            fits = chrome_h + ph <= work_h and chrome_w + pw <= work_w
-            check(f"W-10: {name}, {label}: preview {pw}x{ph} -> window "
-                  f"{chrome_w + pw}x{chrome_h + ph} in {work_w}x{work_h}",
-                  fits and ph <= work_h * E.PREVIEW_MAX_FRAC + 1 and abs(pw * 3 - ph * 4) <= 4
-                  and ph >= E.PREVIEW_H * s * 0.4, (pw, ph))
+    # a conservative model: a wide button column, a tall panel at every text wrap
+    model = E.LayoutParts(430, 300, {w: (w + 30, 440) for w in E.READY_WRAP_CHOICES}, 40, 60, 12)
+    models = [("a conservative model", model)]
+    if parts_logical is not None:
+        models.append(("the parts measured here", parts_logical))
+    for label, lp in models:
+        for aw, ah in F2_AREAS:
+            for sc in F2_SCALES:
+                ww, wh = int(aw * sc), int(ah * sc)
+                lay = E.plan_layout(ww, wh, sc, _scaled(lp, sc))
+                pw, ph = lay.preview
+                check(f"F2-02: {aw}x{ah} @{int(sc * 100)}%, {label}: panel {lay.side}, preview {pw}x{ph} "
+                      f"-> window {lay.size[0]}x{lay.size[1]} in {ww}x{wh}",
+                      lay.fits and lay.size[0] <= ww and lay.size[1] <= wh and abs(pw * 3 - ph * 4) <= 4
+                      and ph >= int(E.PREVIEW_H * sc * E.PREVIEW_MIN_K) - 1, lay)
+    if parts_logical is not None:
+        # the literal physical reading at 150 % (683x480 logical and less): reported, not required
+        for aw, ah in F2_AREAS:
+            lay = E.plan_layout(aw, ah, 1.5, _scaled(parts_logical, 1.5))
+            print(f"  info  physical {aw}x{ah} @150%: panel {lay.side}, window {lay.size}, fits={lay.fits}")
     check("W-10: a roomy screen keeps the full 96-dpi preview at 100 %",
-          E.fit_preview(2560, 1392, 600, 400, 1.0) == (E.PREVIEW_W, E.PREVIEW_H))
+          E.plan_layout(2560, 1392, 1.0, model).preview == (E.PREVIEW_W, E.PREVIEW_H))
+    narrow = E.LayoutParts(430, 300, {300: (330, 440), 180: (210, 960)}, 40, 60, 12)
+    lay = E.plan_layout(700, 1000, 1.0, narrow)
+    check("F2-02: a column too narrow for the panel beside it -> the panel goes under the preview",
+          lay.side == "below" and lay.fits, lay)
+    lay = E.plan_layout(700, 820, 1.0, E.LayoutParts(430, 300, {300: (330, 440), 180: (210, 470)}, 40, 60, 12))
+    check("F2-02: ... or beside it with a narrower text wrap when that fits",
+          lay.side == "right" and lay.wrap == 180 and lay.fits, lay)
     check("W-10: clamp_window pulls a window below the taskbar back up and a left-off one right",
           clamp_window(100, 900, 800, 400, (0, 0, 1920, 1032)) == (100, 632)
           and clamp_window(-300, 10, 800, 400, (0, 0, 1920, 1032)) == (0, 10))
@@ -610,7 +638,10 @@ def test_window(shots: "Path | None") -> "tuple[float, float] | None":
             abs(w.preview_size[0] * 3 - w.preview_size[1] * 4) <= 4
         res["camera_name"] = w.cfg.camera_name
         res["left_w0"] = w.left.winfo_width()
-        res["chrome"] = (w.chrome[0] / w.scale, w.chrome[1] / w.scale)
+        pp, k = w._parts, w.scale
+        res["parts"] = E.LayoutParts(pp.left_w / k, pp.left_h / k,
+                                     {wr: (a / k, b / k) for wr, (a, b) in pp.panel.items()},
+                                     pp.extra_w / k, pp.extra_h / k, pp.gap / k)
         shot(w.root, shots, "wizard-idle")
         w._on_enter()                              # Enter -> Start (focused / default)
         res["armed"] = bool(w.session and w.session.armed.is_set())
@@ -750,6 +781,75 @@ def test_window(shots: "Path | None") -> "tuple[float, float] | None":
     def s_clamped():
         res["clamped"] = (window_rect(w.root), work_area_of(w.root))
 
+    # ---- 9e-f2 ----
+    import face_service.credentials as CR
+    saved_pwd = CR.password_state
+
+    def s_f2_fail():
+        # F2-01: a failed calibration (the 9e VM: turn-too-small, -12.8 deg) with every other check
+        # green -- the readiness check that follows must not write "All set" over it
+        CR.password_state = lambda *a, **k: ("ok", {})
+        E.pipe_call.replies["status"] = {**E.pipe_call.replies["status"],
+                                         "turn_calibration": {"calibrated": False, "delta_deg": None},
+                                         "speed": {"fps": 2.4, "source": "attempts", "samples": 3}}
+        w.calibrating = True
+        w._on_calibrated({"ok": False, "reason": "turn-too-small", "delta_deg": -12.8})
+
+    def s_f2_fail_seen():
+        res["f2_fail"] = (w.line.cget("text"), w.ready_lines["turn"].cget("text"),
+                          w.ready_lines["speed"].cget("text"), bool(w.ready_lines["turn"].winfo_ismapped()))
+        shot(w.root, shots, "wizard-f2-calibration-failed")
+        E.pipe_call.replies["status"] = {**E.pipe_call.replies["status"],
+                                         "turn_calibration": {"calibrated": True, "delta_deg": 55.1},
+                                         "speed": {"fps": 4.6, "source": "attempts", "samples": 5}}
+        w.calibrating = True
+        w._on_calibrated({"ok": True, "left_is_negative_yaw": False, "delta_deg": 55.1})
+
+    def s_f2_ok_seen():
+        res["f2_ok"] = (w.line.cget("text"), w.ready_lines["turn"].cget("text"),
+                        w.ready_lines["speed"].cget("text"))
+        shot(w.root, shots, "wizard-f2-ready")
+        E.pipe_call.replies["status"] = {**E.pipe_call.replies["status"],
+                                         "speed": {"fps": 1.3, "source": "enroll", "samples": 1}}
+        w._check_ready()
+
+    def s_f2_slow_seen():
+        res["f2_slow"] = (w.line.cget("text"), w.ready_lines["speed"].cget("text"))
+        shot(w.root, shots, "wizard-f2-too-slow")
+        CR.password_state = saved_pwd
+        # F2-02 on the real widgets: the panel shown, the optional button shown, each logical
+        # work area at this PC's scale
+        import presence_monitor.ui as UI
+        saved_wa = UI.work_area_of
+        w._set_extra("camera_on")
+        out = []
+        try:
+            for aw, ah in F2_AREAS:
+                area = (0, 0, int(aw * w.scale), int(ah * w.scale))
+                UI.work_area_of = lambda win, area=area: area
+                w._fit_layout()
+                w.root.update_idletasks()
+                dw, dh = UI.frame_extra(w.root)
+                size = (w.root.winfo_reqwidth() + dw, w.root.winfo_reqheight() + dh)
+                out.append(((aw, ah), size, area, w._layout.side, w._layout.fits,
+                            bool(w.ready_frm.winfo_manager()), bool(w.extra_btn.winfo_manager())))
+                if shots is not None:
+                    shot(w.root, shots, f"wizard-f2-area-{aw}x{ah}")
+        finally:
+            UI.work_area_of = saved_wa
+            w._fit_layout()
+            w._set_extra("camera_on" if not w.camera_ok else None)
+        res["f2_areas"] = out
+        # F2-06: all photos taken -> the build starts by itself
+        res["calls_before_auto"] = len(CALLS)
+        E.pipe_call.replies["build_enrollment"] = {"ok": True, "count": 2, "other_person": 0}
+        w.q.put(("done_capture", 15, w.session.gen))
+
+    def s_f2_auto_seen():
+        later = CALLS[res["calls_before_auto"]:]
+        res["f2_auto"] = ("pipe", "build_enrollment") in later
+        w._on_retry()
+
     def s_close():
         w._on_calibrate()
         res["resume_before_close"] = CALLS.count(("pipe", "resume_camera"))
@@ -775,7 +875,12 @@ def test_window(shots: "Path | None") -> "tuple[float, float] | None":
     at(3500, s_blocked)
     at(2500, s_notfound)
     at(600, s_clamped)
-    at(300, s_close)
+    at(300, s_f2_fail)
+    at(2500, s_f2_fail_seen)
+    at(2500, s_f2_ok_seen)
+    at(2000, s_f2_slow_seen)
+    at(2500, s_f2_auto_seen)
+    at(2500, s_close)
 
     def run_steps(i=0):
         if i >= len(steps):
@@ -792,7 +897,7 @@ def test_window(shots: "Path | None") -> "tuple[float, float] | None":
             run_steps(i + 1)
         w.root.after(delay, go)
     run_steps()
-    watchdog = threading.Timer(150.0, lambda: w.root.after(0, w.root.destroy))
+    watchdog = threading.Timer(190.0, lambda: w.root.after(0, w.root.destroy))
     watchdog.start()
     w.run()
     watchdog.cancel()
@@ -868,10 +973,31 @@ def test_window(shots: "Path | None") -> "tuple[float, float] | None":
     check("V-31 / V-42: Close during a calibration closes; the lease is released by a worker",
           CALLS.count(("pipe", "resume_camera")) > res.get("resume_before_close", 10**6)
           and not w.lease.held and (w.cam_thread is None or not w.cam_thread.is_alive()))
+    line, turn, speed, mapped = res.get("f2_fail", ("", "", "", False))
+    check("F2-01: a failed calibration -> the last line is its warning with what to do, NOT 'All set'",
+          line == t("enroll.calib.too_small") and line != t("enroll.ready.all_ok"), line)
+    check("F2-01: ... the panel's head-turn row says 'not calibrated' (the default direction)",
+          mapped and turn.endswith(t("enroll.ready.turn.bad")), turn)
+    check("F2-05: ... the panel's speed row shows the measured speed (2.4 -> slow)",
+          speed.endswith(t("enroll.ready.speed.slow", fps="2.4")), speed)
+    line, turn, speed = res.get("f2_ok", ("", "", ""))
+    check("F2-01: a good calibration -> 'All set', the row 'calibrated (delta +55.1)', speed quick",
+          line == t("enroll.ready.all_ok") and turn.endswith(t("enroll.ready.turn.ok", delta="+55.1"))
+          and speed.endswith(t("enroll.ready.speed.quick", fps="4.6")), (line, turn, speed))
+    line, speed = res.get("f2_slow", ("", ""))
+    check("F2-05: a PC that is too slow -> the speed warning instead of 'All set'",
+          line == t("enroll.ready.too_slow") and speed.endswith(t("enroll.ready.speed.too_slow", fps="1.3")),
+          (line, speed))
+    for (area, size, wa, side, fits, panel, extra) in res.get("f2_areas", []):
+        check(f"F2-02: the real window, panel + optional button shown, logical {area[0]}x{area[1]} at "
+              f"this scale ({wa[2]}x{wa[3]}): {size[0]}x{size[1]}, panel {side}",
+              fits and panel and extra and size[0] <= wa[2] and size[1] <= wa[3], (size, wa, side, fits))
+    check("F2-02: all four work areas were tried on the real window", len(res.get("f2_areas", [])) == 4)
+    check("F2-06: all photos taken -> the face profile is built without a click", res.get("f2_auto") is True)
     tk_thread = threading.main_thread().name
     check("V-42: every pipe call of the run was made off the Tk thread",
           tk_thread not in E.pipe_call.threads, [n for n in E.pipe_call.threads if n == tk_thread])
-    return res.get("chrome")
+    return res.get("parts")
 
 
 def main(argv=None) -> int:

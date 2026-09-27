@@ -24,7 +24,9 @@ the lockout state can be saved again). reload_config refuses "custody" too (9d, 
   {"cmd":"status"}
       -> {"ok":true,"uptime_s":float,"config":{...},"enrollment":bool,"lockout":{...},
           "audit":{...},"data_dir_secure":bool,"state":str[,"why":str],
-          "password_rejected":bool,"protocol":2}
+          "password_rejected":bool,"protocol":2,
+          "speed":{"fps":float|null,"source":"attempts"|"enroll"|null,"samples":int},   # 9e F2-05
+          "turn_calibration":{"calibrated":bool,"delta_deg":float|null}}               # 9e F2-01
   {"cmd":"reload_config"}
       -> {"ok":true,"config":{...}}
       -> {"ok":false,"reason":"custody"|"invalid-config: ..."|"reload-failed: ..."}
@@ -115,7 +117,8 @@ from .liveness import BlinkDetector, SCREEN_DOUBT_FRAC, Verdict, verdict
 from . import imio
 from .lockout import Lockout
 from .lowlight import evaluate_low_light, scene_luma
-from .camera_boost import try_exposure_boost
+from .camera_boost import ExposureHold, try_exposure_boost
+from .speed import estimate as speed_estimate, from_records as speed_from_records
 from .camera_open import BoundedOpener
 from .recognizer import Recognizer
 
@@ -514,6 +517,12 @@ class FaceService:
         self._lockout = Lockout(LOCKOUT_PATH, cfg.max_face_attempts, cfg.lockout_seconds)
         # Structured JSONL audit trail (verify/unlock/challenge; never stores the password).
         self._audit = AuditLog(AUDIT_PATH, cfg.audit_max_mb, enabled=cfg.audit_log)
+        # 9e (F2-05): the frame-pipeline speed, seeded from the last audit records
+        self._speed_fps, self._speed_enroll = [], None
+        try:
+            self._speed_fps, self._speed_enroll = speed_from_records(self._audit.tail())
+        except Exception as e:
+            log.debug("speed seed from the audit failed: %r", e)
         # The serve loop is driven by _stop; ConnectNamedPipe is unblocked by the self-connect in
         # stop(). (Stage 9, D-44: the parallel win32 _stop_event nobody ever waited on is gone.)
         self._stop = threading.Event()
@@ -1116,7 +1125,8 @@ class FaceService:
         name = str(getattr(self.cfg, "camera_name", "") or "").strip()
         return f"name:{name}" if name else f"index:{self.cfg.camera_index}"
 
-    def _run_challenge(self, kind_name: "str | None" = None, *, identity: bool = True) -> dict:
+    def _run_challenge(self, kind_name: "str | None" = None, *, identity: bool = True,
+                       exposure: "float | None" = None) -> dict:
         """Stage 9 (act 9b R4): the lock screen's phase 2 -- a GestureSequence.
 
         ``kind_name`` is the sequence armed in phase 1, e.g. "turn_left,nod". The camera is
@@ -1133,8 +1143,13 @@ class FaceService:
            or None), "identity_frames", "distance_best", "faces", "frames_ok", "engine_errors",
            "screen_flagged",
            "screen_checked", "scene_luma", "fps", "stillness" (9e-0 X-03: the still window's
-           numbers, GestureSequence.stillness_telemetry), "_embedding" (best identity frame,
-           never sent)}
+           numbers, GestureSequence.stillness_telemetry), "exposure_inherited" (9e F2-04, below),
+           "_embedding" (best identity frame, never sent)}
+
+        9e (F2-04, the A-7 decision): ``exposure`` is the exposure this attempt's phase-1 boost ran
+        at. The round then runs at it (camera_boost.ExposureHold) and the original is written back
+        after the round -- inherited, never a boost of its own (no light reading decides here).
+        A device that does not come back is handled as after a phase-1 boost (F-129).
         """
         from .liveness import Challenge, GestureSequence
         from .recognizer import EngineError
@@ -1169,11 +1184,20 @@ class FaceService:
             limit = UNLOCK_GESTURE_DEADLINE_S if client is None else min(UNLOCK_GESTURE_DEADLINE_S, client)
             return time.monotonic() - t0 > limit - 0.3
 
+        hold = None
         with self._cam_lock:
             cam, busy = self._acquire_camera()
             if busy:
                 return {"ok": False, "reason": _camera_reason({"reason": busy})}
             try:
+                cap = getattr(cam, "_cap", None)
+                if exposure is not None and cap is not None and not self._boost_disabled:
+                    try:
+                        hold = ExposureHold(cap, exposure)
+                        log.info("gesture round: inherited exposure %.1f -> %.1f (honored=%s)",
+                                 hold.before, hold.readback, hold.honored)
+                    except Exception as e:     # never break the round over the exposure
+                        log.warning("gesture round: inherited exposure not set: %r", e)
                 for _ in range(2):
                     cam.read()
                 # Frames first: the round cannot start before one arrives, but a camera that never
@@ -1234,8 +1258,24 @@ class FaceService:
                     seq.feed(a.landmark, a.pose)
             except CameraReadTimeout:
                 self._camera_problem = "camera-error"      # R10 (F-144): the read hung
+                if hold is not None:
+                    hold.abandon()                         # the capture is gone: no writes to it
                 return {"ok": False, "reason": "camera-error"}
             finally:
+                if hold is not None:
+                    try:
+                        restored = hold.finish()
+                    except Exception as e:
+                        log.warning("gesture round: restoring the exposure failed: %r", e)
+                        restored = False
+                    if restored is False:
+                        # F-129, as after a phase-1 boost: drop the capture, boost off until restart
+                        self._boost_disabled = True
+                        if getattr(self, "_cam", None) is cam:
+                            self._cam = None
+                        cam.close()
+                        log.error("gesture round: the camera did not return to its exposure "
+                                  "settings -- capture dropped, boost off until restart")
                 self._done_with(cam)
 
         self._note_camera_health(frames_ok, luma_max, "gesture")
@@ -1269,6 +1309,7 @@ class FaceService:
             "scene_luma": None if luma_max is None else round(luma_max, 2),
             "fps": fps,
             "stillness": seq.stillness_telemetry(),
+            "exposure_inherited": hold.audit() if hold is not None else None,
             "_embedding": best_emb,
         }
 
@@ -1292,16 +1333,18 @@ class FaceService:
             out += tr("gesture.then") + (p[:1].lower() + p[1:])
         return out
 
-    def _issue_gesture_token(self) -> tuple[str, str, str]:
+    def _issue_gesture_token(self, exposure: "float | None" = None) -> tuple[str, str, str]:
         """Pick a random two-movement sequence, arm the one-shot token slot, return
         (sequence, prompt, token). The order is drawn with the system CSPRNG so an observer
         cannot predict what the next lock screen will ask for. Overwrites any previous slot: the
-        newest phase-1 reply is the only one that can be answered."""
+        newest phase-1 reply is the only one that can be answered. 9e (F2-04): ``exposure`` is
+        the exposure this attempt's phase-1 boost ran at (None: no boost) -- phase 2 inherits it."""
         from .liveness import random_sequence
         kind = ",".join(k.name.lower() for k in random_sequence())
         token = secrets.token_hex(16)          # 32 hex chars
         self._gesture_slot = {"token": token, "kind": kind,
-                              "expires": time.monotonic() + GESTURE_TOKEN_TTL_S}
+                              "expires": time.monotonic() + GESTURE_TOKEN_TTL_S,
+                              "exposure": exposure}
         return kind, self._prompt_for(kind), token
 
     def _take_gesture_token(self, token) -> "dict | None":
@@ -1583,7 +1626,48 @@ class FaceService:
                        "open": getattr(self, "_cam", None) is not None,
                        "warm": time.monotonic() < self._warm_until,
                        "boost_disabled": self._boost_disabled},
+            # 9e (F2-05), additive: the frame-pipeline speed estimate (numbers + the source word)
+            "speed": self._speed(),
+            # 9e (F2-01), additive: the head-turn calibration of the current camera
+            "turn_calibration": self._turn_calibration(),
         }
+
+    def _speed(self) -> dict:
+        return speed_estimate(getattr(self, "_speed_fps", []), getattr(self, "_speed_enroll", None))
+
+    def _note_speed(self, fps, faces) -> None:
+        """9e (F2-05): one round's frame rate -- only a round that saw a face (a faceless frame
+        skips recognition and would read fast)."""
+        try:
+            if int(faces or 0) <= 0 or fps is None or float(fps) <= 0:
+                return
+        except (TypeError, ValueError):
+            return
+        lst = getattr(self, "_speed_fps", None)
+        if lst is None:
+            lst = self._speed_fps = []
+        lst.append(float(fps))
+        del lst[:-20]
+
+    def _note_enroll_speed(self, elapsed_s: float) -> "float | None":
+        """9e (F2-05): seconds per photo of the build just done (every image the engine read)."""
+        info = getattr(self.recog, "last_enroll_info", {}) or {}
+        try:
+            n = int(info.get("images") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0 or elapsed_s <= 0:
+            return None
+        self._speed_enroll = round(float(elapsed_s) / n, 3)
+        return self._speed_enroll
+
+    def _turn_calibration(self) -> dict:
+        cal = getattr(self, "_calibration", None) or {}
+        entry = (cal.get("cameras") or {}).get(self._camera_id()) if isinstance(cal, dict) else None
+        if isinstance(entry, dict) and isinstance(entry.get("left_is_negative_yaw"), bool):
+            d = entry.get("delta_deg")
+            return {"calibrated": True, "delta_deg": d if isinstance(d, (int, float)) else None}
+        return {"calibrated": False, "delta_deg": None}
 
     def _check_models(self) -> None:
         """9d (V-15): the one start-up check of the model pack (see __init__). Idempotent."""
@@ -1885,6 +1969,7 @@ class FaceService:
         if refused is not None:
             return refused
         r = self._capture_and_verify()
+        self._note_speed(r.detail.get("fps"), r.detail.get("faces"))     # 9e (F2-05)
         # Stage 3.4 busy camera: the webcam is held by ANOTHER process (or leased to the wizard).
         # Refuse cleanly with reason "camera-busy" -- LOCKOUT-NEUTRAL (act 9b R5).
         if r.camera_busy:
@@ -1910,6 +1995,8 @@ class FaceService:
         # (Stage 9, D-83: the "not leased" conjunct here was dead -- a lease already answered
         # camera-busy above.)
         boost_audit: dict = {}
+        # 9e (F2-04): the exposure this attempt's boost ran at -- phase 2 inherits it
+        inherit_exposure: "float | None" = None
         if (r.scene_luma is not None and r.scene_luma < self.cfg.low_light_luma_min
                 and self.cfg.low_light_boost):
             r_dark = r
@@ -1932,6 +2019,10 @@ class FaceService:
                          self._burst_fault(r))
                 boost_audit = {**boost_audit, "boost_recapture_fault": self._burst_fault(r)}
                 r = r_dark
+            if (r is not r_dark and boost_audit.get("boost_applied")
+                    and not boost_audit.get("boost_restore_failed") and not self._boost_disabled
+                    and boost_audit.get("exposure_after") is not None):
+                inherit_exposure = float(boost_audit["exposure_after"])
             r = r._replace(detail={**r.detail, **boost_audit})
         # Stage 3.2 low-light gate: below the floor refuse honestly ("too-dark"), LOCKOUT-NEUTRAL.
         too_dark = False
@@ -1961,7 +2052,8 @@ class FaceService:
                 # D-62: the CP has already left -- arm no token for nobody.
                 self._audit.write("unlock", {**r.detail, "outcome": "deadline-exceeded"})
                 return {"ok": False, "reason": "deadline-exceeded"}
-            kind, prompt, token = self._issue_gesture_token()
+            kind, prompt, token = self._issue_gesture_token(
+                **({"exposure": inherit_exposure} if inherit_exposure is not None else {}))
             # Audit records the gesture but NEVER the token.
             self._audit.write("unlock", {**r.detail, "outcome": "needs-gesture",
                                          "gesture": kind})
@@ -2005,7 +2097,11 @@ class FaceService:
             # state, not a failed face attempt -- the camera never even opened.
             self._audit_gesture(reason="gesture-token-invalid")
             return {"ok": False, "reason": "gesture-token-invalid"}
-        resp = self._run_challenge(slot["kind"], identity=True)
+        # 9e (F2-04): the exposure of this attempt's phase-1 boost, when there was one (passed
+        # only then, so a runner without the keyword keeps working)
+        inherit = slot.get("exposure")
+        resp = self._run_challenge(slot["kind"], identity=True,
+                                   **({"exposure": inherit} if inherit is not None else {}))
         if not resp.get("ok"):
             # The round never ran, or the device / engine / deadline cut it off: camera-busy,
             # no-frames, no-enrollment, engine-error, deadline-exceeded -- every one of them is
@@ -2016,6 +2112,7 @@ class FaceService:
         frames = int(resp.get("identity_frames") or 0)
         best = resp.get("distance_best")
         faces = int(resp.get("faces") or 0)
+        self._note_speed(resp.get("fps"), faces)                         # 9e (F2-05)
 
         # R6 telemetry for every round that ran (numbers only, no image data); 9e-0 (X-03): with
         # the still window's numbers, to measure live pose noise in 9e -- it decides nothing
@@ -2024,7 +2121,9 @@ class FaceService:
             "screen_flagged": resp.get("screen_flagged"),
             "screen_checked": resp.get("screen_checked"), "scene_luma": resp.get("scene_luma"),
             "steps_done": resp.get("steps_done"), "sequence_reason": resp.get("reason"),
-            "stillness": resp.get("stillness")})
+            "stillness": resp.get("stillness"),
+            # 9e (F2-04): the inherited exposure (numbers only; None without a phase-1 boost)
+            "exposure_inherited": resp.get("exposure_inherited")})
 
         def _audit_round(reason, passed=None):
             self._audit_gesture(challenge=resp.get("challenge"), passed=passed,
@@ -2059,8 +2158,8 @@ class FaceService:
                     "identity_frames": frames}
         # 9d (A-7, V-10): a phase-2 failure in a scene below the light floor -- or one whose light
         # could not be measured -- is too-dark, without a strike: head pose and identity are not
-        # trustworthy in the dark, and a strike there could lock the owner out. (No boost in phase
-        # 2: that is for the 9e dusk measurements to decide.)
+        # trustworthy in the dark, and a strike there could lock the owner out. (9e, F2-04: no
+        # boost OF ITS OWN in phase 2 -- it inherits the exposure of this attempt's phase-1 boost.)
         # 9d-r2 (A-7 revised, W-03): except gesture-order -- a later movement performed before an
         # earlier one is an active signature, not pose noise, so it strikes in the dark too.
         dark = luma is None or luma < self.cfg.low_light_luma_min
@@ -2234,6 +2333,7 @@ class FaceService:
         """``build_enrollment`` without ``replace`` (the wizard's "Add"): rebuild the gallery from
         every image in ENROLL_DIR. Stage 9 (D-82): audited, success or not."""
         from .config import ENROLL_DIR
+        t0 = time.monotonic()
         try:
             n = self.recog.enroll_from_dir(ENROLL_DIR)
         except Exception as e:
@@ -2241,6 +2341,7 @@ class FaceService:
                                                "reason": _scrub(e)[:200]})
             raise
         self._audit.write("enroll_build", {"mode": "add", "ok": True, "accepted": n,
+                                           "s_per_image": self._note_enroll_speed(time.monotonic() - t0),
                                            **self._enroll_telemetry()})
         return {"ok": True, "count": n, "other_person": self._other_person()}
 
@@ -2274,12 +2375,14 @@ class FaceService:
         for d in (ENROLL_DIR, ENROLL_PENDING_DIR):
             if is_reparse(d):
                 return {"ok": False, "reason": f"{d.name} is a reparse point (not followed)"}
+        t0 = time.monotonic()
         try:
             embeds, _rep = self.recog.build_gallery(ENROLL_PENDING_DIR)   # raises: old kept
         except Exception as e:
             self._audit.write("enroll_build", {"mode": "replace", "ok": False,
                                                "reason": _scrub(e)[:200]})
             raise
+        s_per_image = self._note_enroll_speed(time.monotonic() - t0)       # 9e (F2-05)
         images = {".jpg", ".jpeg", ".png"}
         retired = ENROLL_DIR / ".retired"
         moved_old: list = []
@@ -2327,6 +2430,7 @@ class FaceService:
                                            "old_removed": len(moved_old),
                                            "promoted": len(moved_new),
                                            "cleanup_problems": len(problems),
+                                           "s_per_image": s_per_image,
                                            **self._enroll_telemetry()})
         resp = {"ok": True, "count": n, "replaced": True, "other_person": self._other_person()}
         if problems:

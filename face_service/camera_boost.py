@@ -22,6 +22,9 @@ restored together with EXPOSURE, and both are READ BACK. When the device does no
 where it was, ``restored`` is False: the service then drops its capture (the next open gets the
 driver's defaults) and switches the boost off for that device until the service restarts.
 
+9e (F2-04): phase 2 of the same attempt INHERITS the exposure phase 1's boost set
+(``ExposureHold``) -- no boost of its own -- and gets the original back after the round.
+
 ``plan_exposure`` / ``honored`` are pure and camera-free (unit-tested). ``try_exposure_boost``
 takes a cv2.VideoCapture-like handle plus a ``recapture`` callable, so a fake camera can drive it
 in tests. Nothing here imports the recognizer or edits camera.py.
@@ -71,6 +74,59 @@ class BoostOutcome(NamedTuple):
             d["boost_error"] = self.error
         if not self.restored:
             d["boost_restore_failed"] = True
+        return d
+
+
+class ExposureHold:
+    """9e (F2-04, the A-7 decision): phase 2 of an attempt runs at the exposure phase 1's boost set.
+
+    INHERITED, not a boost of its own: no light reading decides anything here -- the caller passes
+    the exposure the phase-1 boost of the SAME attempt ran at (the driver's read-back), or makes
+    no hold at all. Measured 2026-09-27 in the VM: phase 1 lifted -6 -> -4 (sceneL 42 -> 108), the
+    restored -6 made phase 2 of that attempt dark again (44) -> too-dark.
+
+    Restored like try_exposure_boost: EXPOSURE then AUTO_EXPOSURE written back and READ back after
+    the round (``finish``), on every path but an abandoned capture (``abandon``: a read hung, the
+    capture is gone and nothing is written to it). ``restored`` is True / False / None (abandoned).
+    """
+
+    def __init__(self, cap, target: float):
+        import cv2
+        self._cap = cap
+        self._prop, self._aprop = cv2.CAP_PROP_EXPOSURE, cv2.CAP_PROP_AUTO_EXPOSURE
+        self.target = float(target)
+        self.before = float(cap.get(self._prop))
+        self.auto_before = float(cap.get(self._aprop))
+        self.restored: "bool | None" = True
+        self._abandoned = False
+        self._done = False
+        cap.set(self._prop, self.target)
+        self.readback = float(cap.get(self._prop))
+        self.honored = honored(self.target, self.readback)
+
+    def abandon(self) -> None:
+        self._abandoned = True
+
+    def finish(self) -> "bool | None":
+        """Write the original exposure back (once) and report whether it read back as before."""
+        if self._done:
+            return self.restored
+        self._done = True
+        if self._abandoned:
+            self.restored = None
+            return None
+        self._cap.set(self._prop, self.before)
+        self._cap.set(self._aprop, self.auto_before)
+        self.restored = bool(abs(float(self._cap.get(self._aprop)) - self.auto_before) < AUTO_MODE_TOL
+                             and honored(self.before, float(self._cap.get(self._prop))))
+        return self.restored
+
+    def audit(self) -> dict:
+        """Numbers only, for gesture_telemetry."""
+        d = {"exposure_before": round(self.before, 3), "exposure_target": round(self.target, 3),
+             "exposure_after": round(self.readback, 3), "honored": self.honored}
+        if self._done:
+            d["restored"] = self.restored
         return d
 
 
