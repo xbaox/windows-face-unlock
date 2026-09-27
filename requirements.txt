@@ -1,6 +1,8 @@
-# Face recognition engine: InsightFace on onnxruntime-GPU (RTX 4070).
-# onnxruntime-gpu is pinned: 1.27 requires CUDA 13 (no pip redistributable);
-# 1.26 uses CUDA 12. Exact CUDA/cuDNN wheels are pinned in requirements.lock.
+# Face recognition engine: InsightFace on ONNX Runtime 1.26 (1.27 requires CUDA 13, which has no
+# pip redistributable). The two variants take different packages (9d, A-6):
+#   GPU: onnxruntime-gpu -- requirements-gpu.lock (installed with --no-deps, then tools/lock_check)
+#   CPU: onnxruntime      -- requirements.lock
+# This file names the GPU development setup; the exact CUDA/cuDNN wheels are in requirements-gpu.lock.
 onnxruntime-gpu==1.26.0
 insightface>=1.0
 onnx>=1.22

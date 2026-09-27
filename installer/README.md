@@ -45,14 +45,18 @@ Prerequisites: Windows 10/11 x64; Python **3.12**; Inno Setup **6.5+** (`ISCC.ex
 the sign-in tile on purpose.
 
 ```powershell
-.\setup.ps1 -SkipAutostart                         # .venv + requirements.lock (hash-checked)
+.\setup.ps1 -SkipAutostart                         # .venv + requirements.lock (CPU, hash-checked)
 .\.venv\Scripts\python -m pip install --require-hashes -r installer\requirements-build.txt
 .\.venv\Scripts\python installer\build.py --variant cpu
 ```
 
-For the GPU variant install `requirements-gpu.lock` instead (`setup.ps1 -Gpu`) and pass
-`--variant gpu`; without the NVIDIA wheels the GPU build refuses rather than producing a CPU
-bundle under a GPU name.
+For the GPU variant use a venv made with `setup.ps1 -Gpu` (`requirements-gpu.lock`, installed
+`--no-deps` and checked with `tools/lock_check.py`) and pass `--variant gpu`. 9d (A-6): each
+variant needs its own ONNX Runtime package -- the preflight refuses a CPU build from a venv with
+`onnxruntime-gpu` (or both) and a GPU build without the NVIDIA wheels -- never a CPU bundle under a
+GPU name or the other way round. Set `FU_GATE_MODELS` to a local `buffalo_l` folder to have the gate
+run the frozen engine (`face_service.exe --selfcheck-engine`, 9d V-61) on the variant's providers;
+the pack is only read. In CI it is not set and the step is a loud SKIP.
 
 `build.py` steps (the signing order is act 9b R18's):
 
@@ -92,14 +96,19 @@ Signing uses Azure Trusted Signing when `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
 `AZURE_CODESIGN_DLIB` are set; `FU_SIGN_SUBJECT` pins the expected signer, and every signed file
 must verify `Valid`. Without them every signing step prints `SIGNING SKIPPED` with the missing
 names, and the result is a test build. See `credential_provider\SIGNING.md`.
+`--require-signed` (9d, V-72; with `--resign` or `--half 2`) turns that skip into an error and
+checks the finished installer is `Valid` -- the CI sign job uses it, so an unsigned file is never
+uploaded as "signed".
 
 ## CI (`.github/workflows/release.yml`)
 
 `test` (selftests + CP unit tests) -> `build` (cpu and gpu, read-only token, no secrets,
 hash-checked installs, unsigned) -> `sign` (only when the Azure variables exist; OIDC, no
-repository rights; `--resign` + `--half 2`) -> `publish` (only for a `vX.Y.Z` tag equal to
-`face_service/_version.py`; the only job with `contents: write`; a **draft** release that the
-operator smokes and publishes by hand).
+repository rights; the pinned Inno Setup; `--resign` + `--half 2`, both `--require-signed`) ->
+`publish` (only for a `vX.Y.Z` tag equal to `face_service/_version.py`, and only after a
+successful sign job; the only job with `contents: write`; takes the signed installers only and
+refuses unless each is Authenticode `Valid`; a **draft** release that the operator smokes and
+publishes by hand). Every install is followed by `tools/lock_check.py`.
 
 ## Scripted install
 

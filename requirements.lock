@@ -2,7 +2,10 @@
 # Install with hashes enforced:   pip install --require-hashes -r requirements.lock
 # Every version is the one the selftests and the frozen gate ran against; every hash is a file
 # PyPI publishes for that exact version. Regenerate only together with a re-test.
-# CPU variant (the main one). The GPU variant: requirements-gpu.lock.
+# CPU variant (the main one) -- 9d (A-6): the CPU package onnxruntime, so pip's own resolver is
+# satisfied (insightface names onnxruntime) and the CPU build carries no CUDA provider at all.
+# Then:  python -m tools.lock_check --lock requirements.lock
+# The GPU variant: requirements-gpu.lock (installed with --no-deps; see its header).
 certifi==2026.6.17 \
     --hash=sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432 \
     --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
@@ -270,17 +273,31 @@ onnx==1.22.0 \
     --hash=sha256:cc8b66b312f8f03a53e268afb67180a2d97dd12cc79e2b61361c6c0073448016 \
     --hash=sha256:ef40c0aaf0b643857ea9306fc7eddce17eaf9fb0407e4801f1fc5758443a38e0 \
     --hash=sha256:f3c120dcdb70ad738f3c061b32798f408ea299eb69f84dd69ab4a6bf3c2ec01f
-onnxruntime-gpu==1.26.0 \
-    --hash=sha256:3c01119ed4d9449d60367fa8ccffcd02bd3fe736754284e4b198d131f54edad6 \
-    --hash=sha256:3e592439b0183d303c2374517b5b392599a3d50b2dc9de949b9b15731ac921c9 \
-    --hash=sha256:4fa231294c2643911d2a7d16469c4808b0bdcdc4b5f4063d3a53744ce25b683a \
-    --hash=sha256:56dc7b73954ff4bdc71f5b8ab306b6f61be5d007881b6ef423a609e2b9cd088b \
-    --hash=sha256:5f49c44689894650990e4c8a857d2edafc276fbd79bba57ceb224bd18d25d491 \
-    --hash=sha256:6ab9f9c741d2e239b2e321ab0d389c04329d4ab7f11e3b92dd3aa7db1c59dee4 \
-    --hash=sha256:9e6e4fb1ec9ae1cf456534d9115f106ab2a1ae96fa513b4ed0f4795302b4a2c6 \
-    --hash=sha256:bcf6f347cad9f88a9a625c2b352cf9de927528aedb627ebbc089a201f1990b94 \
-    --hash=sha256:cc5329aad02d9745cc3ae9cdb185bfa1aad242a7bf89b8c471280002ec40f98a \
-    --hash=sha256:cfda2fad535595bfc3e570eb588092717711dcb2957656d814695e0c9ceb1508
+onnxruntime==1.26.0 \
+    --hash=sha256:01498e80ba8988428d08c2d51b1338f89e3de2a93e6ffe555f79c68f26a5c06b \
+    --hash=sha256:05b028781b322ad74b57ce5b50aa5280bb1fe96ceec334628ade681e0b24c1ac \
+    --hash=sha256:11a8df4dcfe9ad5ff0bd71a7571dbed019fabc7594676c89fe8b86ea029c246f \
+    --hash=sha256:31d71a53490e46910877d0902b5ad99c69a5955e5c7ea6c82863519410e1ba7c \
+    --hash=sha256:33a791f31432a3af1a96db5e54818b37aba5e5eefc2e6af5794c10a9118a9993 \
+    --hash=sha256:35c7c7b0ac2e02001d28fab6c9fc24e9abc5e6faa35e6e19c63cecf1406ba89f \
+    --hash=sha256:4eefd386a45202aefb7a5132b94f32df9d506c9edcc7faf2fc60d65183f4b183 \
+    --hash=sha256:54a8053410fd31fd66469bd754fcfe8a4df9f7eb44756b4b5479bf50c842d948 \
+    --hash=sha256:5e016edc15d3c19f36807e1c6b10be5b27807688c32720f91b5ae480a95215d0 \
+    --hash=sha256:61bec80655efa460591c2bc655392d57d2650ce85533a6b9b3b7a790d7ea7916 \
+    --hash=sha256:7ead61450d8405167c87dd3a31d8da1d576b490a57dab1aa8b82a7da6825f5aa \
+    --hash=sha256:91f2bb870a4b9224eba0a6728c1fa7a9e552b8e59e1083c51fbbc3d013f2b5c0 \
+    --hash=sha256:9b6dd70599005bd1bf29779f04a91978b92b5e719c11a20068a8f8e535f725b6 \
+    --hash=sha256:a26374dc7fbcaae593601086b242120e13f2310558df0991da6dd8b8fac00414 \
+    --hash=sha256:a6677545ff451e3539a02746d2f207d8c5baa4a0a818886bb9d6a6eb9511ee89 \
+    --hash=sha256:bdbed8cf3b672b66acb032f33a253bc27f42bce6ece48ae3fab4fa483a5e96e0 \
+    --hash=sha256:c07af6fc6d5557835f2b6ee7a96d8b3235d0c57a8e230efdedaee106a8a3cbc6 \
+    --hash=sha256:ccce19c5f771b8268902f77d9fed9e88f9499465d6780808faa6611a789d33f0 \
+    --hash=sha256:cd920e45b730e4a87833e2910d8ca375aaca9da6ccc09e24bce463b3356d637f \
+    --hash=sha256:d7b6d258fb78fdfcf049795bcfaa74dcb90ae7baa277afd21e6fd28b83f2c496 \
+    --hash=sha256:e6456718125fd777c673f3b78d4a9ab58d6adea641e9afae85ee6444f0e0e9a9 \
+    --hash=sha256:e90c00732c4553618103149d93f688e8c3063017938f8983e21a71d9f3b6d22e \
+    --hash=sha256:ee1109ef4ef27cad90e823399e61e03b3c6c7bfe0fb820b4baf3678c15be8b3c \
+    --hash=sha256:f5fc48a91a046a6a5c9b147f83fb41d65d24d24923373b222cdd248f0f4f4aac
 opencv-python==5.0.0.93 \
     --hash=sha256:08d5d91d967b58d6db86073b2ad3eaef88ca4ebdfd45c9059bf59f5ded0c7ad2 \
     --hash=sha256:198a75138241810206a17c829dbcc40a7cb1841cda538ca86cbbfc6c7d95f898 \

@@ -33,6 +33,9 @@ the credentials every signing step says SKIPPED and why; the build still complet
     --half 1 / --half 2     steps 0-6 / steps 7-8 (the operator dist-smoke sits between)
     --gate-only             re-run step 6 on the existing dist
     --resign                on an existing dist: steps 2, 4, 5, 6 (the CI sign job)
+    --require-signed        9d (V-72), with --resign / --half 2: no Azure credentials, or anything
+                            not signed "Valid" at the end, is an ERROR -- never a loud skip. The
+                            CI sign job uses it, so no "signed" artefact can be unsigned.
 """
 from __future__ import annotations
 
@@ -58,7 +61,7 @@ OUTPUT_DIR = REPO_ROOT / "installer_output"
 ISS = INSTALLER_DIR / "installer.iss"
 CP_DLL_NAME = "FaceCredentialProvider.dll"
 GATE_STAMP = DIST_DIR / "WindowsFaceUnlock.gate.json"
-GATE_STAMP_SCHEMA = 2
+GATE_STAMP_SCHEMA = 3          # 9d: + engine (V-61)
 TOTAL_STEPS = 8
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -217,6 +220,26 @@ def step_preflight(variant: str, need_cp: bool) -> dict:
     if importlib.util.find_spec("PyInstaller") is None:
         raise BuildAbort("PyInstaller missing: pip install --require-hashes -r "
                          "installer/requirements-build.txt")
+    # 9d (A-6, V-60): each variant is built from its OWN onnxruntime package, never from both.
+    from importlib import metadata as _md
+
+    def _installed(dist: str) -> bool:
+        try:
+            _md.version(dist)
+            return True
+        except _md.PackageNotFoundError:
+            return False
+    ort_cpu, ort_gpu = _installed("onnxruntime"), _installed("onnxruntime-gpu")
+    if variant == "cpu" and (not ort_cpu or ort_gpu):
+        raise BuildAbort("the CPU variant is built from the CPU package: this interpreter has "
+                         f"onnxruntime={'yes' if ort_cpu else 'no'}, onnxruntime-gpu="
+                         f"{'yes' if ort_gpu else 'no'}. Use a venv made from requirements.lock "
+                         "(e.g. .venv-cpu): pip install --require-hashes -r requirements.lock")
+    if variant == "gpu" and (not ort_gpu or ort_cpu):
+        raise BuildAbort("the GPU variant is built from onnxruntime-gpu alone: this interpreter "
+                         f"has onnxruntime-gpu={'yes' if ort_gpu else 'no'}, onnxruntime="
+                         f"{'yes' if ort_cpu else 'no'}. Use a venv made with pip install "
+                         "--require-hashes --no-deps -r requirements-gpu.lock")
     has_nvidia = importlib.util.find_spec("nvidia") is not None
     if variant == "gpu" and not has_nvidia:
         raise BuildAbort("the GPU variant needs the NVIDIA wheels: pip install --require-hashes -r "
@@ -421,6 +444,10 @@ def gate_variant(variant: str, dist_root: Path) -> None:
     pyst = internal / "pystray"
     if not pyst.is_dir() or not list(pyst.glob("*.py")):
         raise BuildAbort("GATE FAILED: pystray is not shipped as replaceable .py sources (F-261)")
+    # 9d (V-69): onnxruntime's tutorial sample models never ship.
+    ds = [p for p in internal.rglob("*") if p.parent.name == "datasets" and "onnxruntime" in p.parts]
+    if (internal / "onnxruntime" / "datasets").exists() or ds:
+        raise BuildAbort("GATE FAILED: onnxruntime\\datasets is in the bundle")
     log(f"gate: bundle shape matches the {variant.upper()} variant")
 
 
@@ -480,6 +507,55 @@ def gate_frozen_custody(dist_root: Path) -> dict:
     return summary
 
 
+def gate_engine(variant: str, dist_root: Path) -> dict:
+    """9d (V-61): the FROZEN engine on the variant's providers -- face_service.exe
+    --selfcheck-engine on a model pack given in FU_GATE_MODELS (read only, never copied). CPU: only
+    CPUExecutionProvider, no CUDA load attempt. GPU: CUDAExecutionProvider in every session (which
+    proves the 16-DLL NVIDIA allowlist complete). No FU_GATE_MODELS (CI): a loud SKIP."""
+    import tempfile
+    pack = os.environ.get("FU_GATE_MODELS", "").strip()
+    if not pack:
+        loud("ENGINE CHECK SKIPPED: FU_GATE_MODELS is not set (no model pack on this machine -- CI). "
+             "The frozen engine is NOT proven for this build.")
+        return {"state": "skipped-no-models"}
+    exe = dist_root / "face_service.exe"
+    with tempfile.TemporaryDirectory(prefix="fu_gate_engine_") as tmp:
+        out = Path(tmp) / "engine.json"
+        try:
+            proc = subprocess.run([str(exe), "--selfcheck-engine", pack, "--out", str(out)],
+                                  env=child_env(FU_BUILD_GATE="1"), capture_output=True, timeout=600)
+        except subprocess.TimeoutExpired as e:
+            raise BuildAbort("GATE FAILED: the engine self-check hung") from e
+        try:
+            data = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else {}
+        except ValueError:
+            data = {}
+    sessions = data.get("sessions") or {}
+    log(f"gate: frozen engine rc={proc.returncode} variant={data.get('variant')} "
+        f"sessions={sessions} init={data.get('init_ms')} ms median={data.get('run_ms_median')} ms")
+    bad = []
+    if proc.returncode != 0 or data.get("rc") != 0:
+        bad.append(f"rc={proc.returncode}/{data.get('rc')} errors={data.get('errors')}")
+    if data.get("frozen") is not True:
+        bad.append("the self-check did not run frozen")
+    if data.get("variant") != variant:
+        bad.append(f"the bundle's onnxruntime is {data.get('onnxruntime_dist')}, not the {variant} package")
+    if len(sessions) != 4:
+        bad.append(f"expected 4 sessions, got {sorted(sessions)}")
+    if variant == "cpu" and any(p != ["CPUExecutionProvider"] for p in sessions.values()):
+        bad.append(f"CPU variant: a session is not CPU-only: {sessions}")
+    if variant == "cpu" and data.get("provider_load_errors"):
+        bad.append(f"CPU variant: provider load messages {data.get('provider_load_errors')[:3]}")
+    if variant == "gpu" and any(not p or p[0] != "CUDAExecutionProvider" for p in sessions.values()):
+        bad.append(f"GPU variant: CUDA is not active in every session: {sessions} "
+                   f"(load errors: {data.get('provider_load_errors')[:3]})")
+    if bad:
+        raise BuildAbort("GATE FAILED: frozen engine self-check -> " + "; ".join(bad))
+    keep = ("variant", "onnxruntime_dist", "providers_requested", "available_providers", "sessions",
+            "init_ms", "run_ms", "run_ms_median", "errors", "provider_load_errors", "pack_problems")
+    return {"state": "passed", **{k: data.get(k) for k in keep}}
+
+
 def step_gate(variant: str, dist_root: Path, signing: dict) -> dict:
     step(6, "GATE (on the signed bundle) + stamp")
     if not dist_root.is_dir():
@@ -492,6 +568,7 @@ def step_gate(variant: str, dist_root: Path, signing: dict) -> dict:
     custody = gate_frozen_custody(dist_root)
     gate_no_models(dist_root)
     gate_variant(variant, dist_root)
+    engine = gate_engine(variant, dist_root)                       # 9d (V-61)
     sys.path.insert(0, str(INSTALLER_DIR))
     import notices
     lic_problems = notices.check(dist_root, variant)
@@ -511,6 +588,7 @@ def step_gate(variant: str, dist_root: Path, signing: dict) -> dict:
         "git_dirty_paths": len((_git("status", "--porcelain") or "").splitlines()),
         "python": sys.version.split()[0],
         "frozen_custody": custody,
+        "engine": engine,
     }
     GATE_STAMP.write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
     log(f"GATE PASSED: {manifest['files']} files, {manifest['bytes'] / 2**30:.2f} GiB, "
@@ -583,15 +661,45 @@ def parse_args(argv):
     mode.add_argument("--resign", action="store_true",
                       help="on an existing dist (CI sign job): sign the staged CP DLL and our PE "
                            "files, check NVIDIA's, re-run the gate")
+    ap.add_argument("--require-signed", action="store_true",
+                    help="9d (V-72): fail instead of skipping when signing is not possible, and "
+                         "verify the installer is signed Valid")
     return ap.parse_args(argv)
+
+
+def _require_signing() -> None:
+    """9d (V-72): the CI sign job never produces an unsigned "signed" artefact."""
+    if not azure_ready():
+        raise BuildAbort("--require-signed: Azure Trusted Signing is not configured (missing: "
+                         f"{', '.join(azure_missing())}) -- nothing may be published as signed")
+
+
+def _verify_signed(path: Path) -> None:
+    sig = authenticode(path)
+    subject = os.environ.get("FU_SIGN_SUBJECT", "")
+    if sig.get("Status") != "Valid" or (subject and subject not in (sig.get("Subject") or "")):
+        raise BuildAbort(f"--require-signed: {path.name} is {sig.get('Status')} "
+                         f"({sig.get('Subject')!r}), not Valid by {subject or '(any)'}")
+    log(f"{path.name}: Authenticode {sig.get('Status')} ({sig.get('Subject')})")
 
 
 def _run(args) -> int:
     variant = args.variant
+    if args.require_signed:
+        if not (args.resign or args.half == 2):
+            raise BuildAbort("--require-signed goes with --resign or --half 2")
+        _require_signing()
     tools = step_preflight(variant, need_cp=not cp_skipped() and args.half != 2 and not args.gate_only
                            and not args.resign)
     if args.half == 2:
         out = step_inno(variant, DIST_ROOT, tools["iscc"])
+        if args.require_signed:
+            stamp = check_gate_stamp(variant, DIST_ROOT)
+            states = {k: (v or {}).get("state") for k, v in (stamp.get("signing") or {}).items()
+                      if k != "nvidia"}
+            if any(s not in ("signed", "nothing-to-sign") for s in states.values()):
+                raise BuildAbort(f"--require-signed: the gated bundle is not fully signed: {states}")
+            _verify_signed(out)
         step_checksums(out, variant)
         log(f"Installer ready: {out}")
         return 0

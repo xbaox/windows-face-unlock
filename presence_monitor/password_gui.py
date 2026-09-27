@@ -9,7 +9,7 @@ What Stage 9 changed:
   owner -- and its name is read from the token (``GetUserNameExW``), not from %USERNAME% /
   %USERDOMAIN% in two editable fields (F-159, F-84):
     - a local or Microsoft-account-linked local account: ``COMPUTER\\SAM`` -- the form the lock
-      screen accepts, confirmed live on PC-1 for an MSA-linked account;
+      screen accepts, confirmed live on the reference machine for an MSA-linked account;
     - an Entra ID account (SID S-1-12-1-...): the UPN (``user@tenant``) with an empty domain; if
       Windows reports no UPN, ``AzureAD\\user``. Final confirmation of the Entra form is a VM run
       (9e).

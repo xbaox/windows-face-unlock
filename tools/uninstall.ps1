@@ -605,8 +605,10 @@ if ($Mode -eq 'Installed') {
     # Stage 9 (R17): an installed copy removes its tasks through its own executable.
     $fuTrayExe = if ($fuBefore['appDir']) { Join-Path $fuBefore['appDir'] 'face_unlock_tray.exe' } else { '' }
     if ($fuTrayExe -and (Test-Path -LiteralPath $fuTrayExe)) {
-        & $fuTrayExe --unregister
-        if ($LASTEXITCODE) { Write-Warning ("face_unlock_tray.exe --unregister exited {0}" -f $LASTEXITCODE) }
+        # 9d (V-65): face_unlock_tray.exe is a WINDOWED exe -- "& exe" neither waits for it nor sets
+        # $LASTEXITCODE. Start-Process -Wait -PassThru gives the real exit code.
+        $fuProc = Start-Process -FilePath $fuTrayExe -ArgumentList '--unregister' -Wait -PassThru -WindowStyle Hidden
+        if ($fuProc.ExitCode) { Write-Warning ("face_unlock_tray.exe --unregister exited {0}" -f $fuProc.ExitCode) }
     }
     else { Write-Warning "no $fuTrayExe -- run the installed copy's unins000.exe instead" }
 }

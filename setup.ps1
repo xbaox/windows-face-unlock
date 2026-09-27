@@ -33,8 +33,17 @@ if (-not (Test-Path "$root\.venv")) {
     Invoke-Checked 'creating the venv' { & $PythonExe -m venv "$root\.venv" }
 }
 $py = "$root\.venv\Scripts\python.exe"
-$lock = if ($Gpu) { "$root\requirements-gpu.lock" } else { "$root\requirements.lock" }
-Invoke-Checked 'installing the dependencies' { & $py -m pip install --require-hashes -r $lock }
+# 9d (A-6, V-60): the CPU lock (onnxruntime) installs with pip's resolver; the GPU lock carries
+# onnxruntime-gpu where insightface names onnxruntime, so it installs with --no-deps and
+# tools\lock_check.py proves it complete.
+if ($Gpu) {
+    $lock = "$root\requirements-gpu.lock"
+    Invoke-Checked 'installing the dependencies (GPU)' { & $py -m pip install --require-hashes --no-deps -r $lock }
+} else {
+    $lock = "$root\requirements.lock"
+    Invoke-Checked 'installing the dependencies (CPU)' { & $py -m pip install --require-hashes -r $lock }
+}
+Invoke-Checked 'checking the install is complete' { & $py -m tools.lock_check --lock $lock }
 
 # 2. The data directory only; no config file is seeded -- the service runs on its built-in defaults.
 $home_cfg = Join-Path $env:USERPROFILE ".face-unlock"

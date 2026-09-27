@@ -26,6 +26,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCK = REPO_ROOT / "requirements.lock"
+GPU_LOCK = REPO_ROOT / "requirements-gpu.lock"
+
+
+def lock_for(variant: str) -> Path:
+    """9d (A-6): each variant is built from its own lock -- the CPU one names onnxruntime, the GPU
+    one onnxruntime-gpu and the NVIDIA wheels (whose texts are staged under licenses\\nvidia)."""
+    return GPU_LOCK if variant == "gpu" else LOCK
 LICENSE_NAME_RE = re.compile(r"^(LICEN[CS]E|COPYING|NOTICE|THIRDPARTYNOTICES|PRIVACY)", re.I)
 BUILD_DISTS = ("pyinstaller", "pyinstaller-hooks-contrib")
 NVIDIA_PREFIX = "nvidia-"
@@ -101,18 +108,19 @@ def _norm(name: str) -> str:
 
 
 def runtime_dists(lock: Path = LOCK) -> "list[str]":
-    """Package names pinned in requirements.lock (``name==version`` lines)."""
+    """Package names pinned in ``lock`` (``name==version`` lines), the NVIDIA wheels aside -- only
+    those the bundle takes DLLs from get their texts, under licenses\\nvidia."""
     names = []
     for line in lock.read_text(encoding="utf-8").splitlines():
         m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==", line.strip())
-        if m:
+        if m and not _norm(m.group(1)).startswith(NVIDIA_PREFIX):
             names.append(m.group(1))
     return names
 
 
-def expected_folders(variant: str, lock: Path = LOCK) -> "list[str]":
+def expected_folders(variant: str, lock: "Path | None" = None) -> "list[str]":
     """Folder names under licenses\\ the gate insists on (NVIDIA ones are checked as a group)."""
-    names = [_norm(n) for n in runtime_dists(lock)] + list(BUILD_DISTS)
+    names = [_norm(n) for n in runtime_dists(lock or lock_for(variant))] + list(BUILD_DISTS)
     names += ["python", "yunet", "inno-setup"]
     if variant == "gpu":
         names.append("nvidia")
@@ -133,9 +141,10 @@ def _copy(src: Path, dest_dir: Path, name: "str | None" = None) -> None:
     shutil.copyfile(src, dest_dir / (name or src.name))
 
 
-def stage(dist_root: Path, variant: str, iscc: "str | None", lock: Path = LOCK) -> "list[str]":
+def stage(dist_root: Path, variant: str, iscc: "str | None", lock: "Path | None" = None) -> "list[str]":
     """Fill <dist_root>\\licenses. Returns problems (empty = complete)."""
     from importlib import metadata
+    lock = lock or lock_for(variant)
     lic = dist_root / "licenses"
     if lic.exists():
         shutil.rmtree(lic)
@@ -235,7 +244,7 @@ def stage(dist_root: Path, variant: str, iscc: "str | None", lock: Path = LOCK) 
     return problems
 
 
-def check(dist_root: Path, variant: str, lock: Path = LOCK, notices_doc: bool = True) -> "list[str]":
+def check(dist_root: Path, variant: str, lock: "Path | None" = None, notices_doc: bool = True) -> "list[str]":
     """The gate: every expected licenses\\ folder is present and non-empty."""
     lic = dist_root / "licenses"
     problems = []

@@ -11,9 +11,15 @@ The MIT license of this project does **not** apply to any component listed here.
 ## Not included: the face-recognition models
 
 The InsightFace **buffalo_l** models (`det_10g`, `w600k_r50`, `2d106det`, `1k3d68`,
-`genderage`) are **not part of this program and are not redistributed by it**. InsightFace states:
-*"The pretrained models provided with this library are for non-commercial research only, whether
-downloaded automatically or manually."* Setup shows these terms, and only after you accept them
+`genderage`) are **not part of this program and are not redistributed by it**. The terms, verbatim
+from the "License" section of the insightface library's README
+(<https://github.com/deepinsight/insightface/blob/master/python-package/README.md#license>):
+
+> The library code is released under the **MIT License**, for academic and
+> commercial use. **The pretrained models provided with this library are for
+> non-commercial research only**, whether downloaded automatically or manually.
+
+Setup shows these terms, and only after you accept them
 downloads the official archive from InsightFace's own release
 (`https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip`), verified by its
 SHA-256. Whether your use is permitted by those terms is between you and InsightFace.

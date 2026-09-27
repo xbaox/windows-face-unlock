@@ -84,6 +84,11 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl,lang\ru.isl"
 Name: "cp"; Description: "{cm:TaskCP}"; GroupDescription: "{cm:TaskGroup}"
 
 [InstallDelete]
+; 9d (V-66): the Start-menu shortcuts of 0.1.x ("Windows Face Unlock", "... - Uninstall", and the
+; em-dash spelling of an earlier build); 0.2.0 names them "Face Unlock" / "Uninstall Face Unlock".
+Type: files; Name: "{group}\{#MyAppName}.lnk"
+Type: files; Name: "{group}\{#MyAppName} - Uninstall.lnk"
+Type: files; Name: "{group}\{#MyAppName} — Uninstall.lnk"
 ; Leftovers of 0.1.x that 0.2.0 no longer ships: the PowerShell registrar, the CP dev script and the
 ; bundled model pack (now downloaded into {app}\models).
 Type: filesandordirs; Name: "{app}\postinstall"
@@ -460,6 +465,8 @@ var
   DownloadPage: TDownloadWizardPage;
   StackStopped, InstallDone: Boolean;
   FailCode: Integer;
+  // 9d (V-62): the silent download failed -- Setup completes without the models and exits 23.
+  ModelsDownloadError: string;
 
 function ExpectedAppDir(): string;
 begin
@@ -835,8 +842,10 @@ begin
     end else
       ModelZip := '';
   end;
-  // Interactive download with a progress page, after the Ready page.
-  if (CurPageID = wpReady) and ModelsNeeded and (ModelZip = '') then
+  // Interactive download with a progress page, after the Ready page. 9d (V-62): NextButtonClick
+  // runs in a silent install too (checked: Inno calls it for wpReady) -- there the download is
+  // PrepareToInstall's, with no message box.
+  if (CurPageID = wpReady) and ModelsNeeded and (ModelZip = '') and not WizardSilent() then
   begin
     DownloadPage.Clear;
     DownloadPage.Add('{#BuffaloURL}', 'buffalo_l.zip', '{#BuffaloSHA256}');
@@ -907,15 +916,18 @@ var
   Left: Integer;
 begin
   Result := '';
-  if ModelsNeeded and (ModelZip = '') then
+  // 9d (V-62): the SILENT download (the interactive one ran after the Ready page). A failure is
+  // not returned as a Preparing-page error -- that exits 7 and never reaches
+  // GetCustomSetupExitCode (checked) -- but recorded: Setup completes without the models (the
+  // service then refuses "no-models", honestly) and exits 23, with no message box.
+  if ModelsNeeded and (ModelZip = '') and WizardSilent() then
   begin
     try
       DownloadTemporaryFile('{#BuffaloURL}', 'buffalo_l.zip', '{#BuffaloSHA256}', nil);
       ModelZip := ExpandConstant('{tmp}\buffalo_l.zip');
     except
-      Result := FmtMessage(CustomMessage('ModelsDownloadFailed'), [GetExceptionMessage]);
-      FailCode := 23;
-      exit;
+      ModelsDownloadError := GetExceptionMessage;
+      Log('model download failed (silent): ' + ModelsDownloadError);
     end;
   end;
   Dir := ExpectedAppDir();
@@ -999,6 +1011,15 @@ begin
   end;
   if not AclOk then
   begin
+    // 9d (V-63): an UPGRADE may carry the provider of the previous version, registered from a
+    // folder that is no longer safe -- it is taken away first (regsvr32 /u, then the keys
+    // themselves in case the DLL cannot run), and only then is 22 reported.
+    Exec(ExpandConstant('{sys}\regsvr32.exe'), '/u /s "' + Dll + '"', '', SW_HIDE,
+         ewWaitUntilTerminated, ResultCode);
+    Log('ACL check failed: regsvr32 /u exit ' + IntToStr(ResultCode));
+    RegDeleteKeyIncludingSubkeys(HKLM64,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{#CPClsid}');
+    RegDeleteKeyIncludingSubkeys(HKLM64, 'SOFTWARE\Classes\CLSID\{#CPClsid}');
     Fail(22, CustomMessage('AclFailed'));
     exit;
   end;
@@ -1012,13 +1033,28 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   AclOk: Boolean;
 begin
+  // 9d (V-64): the program folder, checked where it is FINAL -- a /LOADINF file with Dir= reaches
+  // {app} without passing the /DIR= check of InitializeSetup. Aborting here installs nothing
+  // (Setup exits 3).
+  if CurStep = ssInstall then
+  begin
+    if CompareText(RemoveBackslashUnlessRoot(ExpandConstant('{app}')), ExpectedAppDir()) <> 0 then
+    begin
+      Log('Setup stops: the program folder ' + ExpandConstant('{app}') + ' is not ' + ExpectedAppDir());
+      if not WizardSilent() then
+        MsgBox(FmtMessage(CustomMessage('DirRefused'), [ExpectedAppDir()]), mbCriticalError, MB_OK);
+      Abort;
+    end;
+  end;
   if CurStep = ssPostInstall then
   begin
     // R1: the owner, always rewritten (F-213).
     RegWriteStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', GetOwnerSid());
     AclOk := RunTrayFlag('--verify-acl') = 0;
     RegisterProvider(AclOk);
-    if not InstallModels() then
+    if ModelsDownloadError <> '' then
+      Fail(23, FmtMessage(CustomMessage('ModelsDownloadFailed'), [ModelsDownloadError]))
+    else if not InstallModels() then
       Fail(23, CustomMessage('ModelsInstallFailed'));
     WizardForm.StatusLabel.Caption := CustomMessage('StatusRegTasks');
     if RunTrayFlag('--register --user-sid ' + GetOwnerSid()) <> 0 then

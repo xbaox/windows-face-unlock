@@ -36,10 +36,12 @@ if ($Mode -eq 'Installed') {
     $fuExe = if ($fuDir) { Join-Path $fuDir 'face_unlock_tray.exe' } else { '' }
     if (-not $fuExe -or -not (Test-Path -LiteralPath $fuExe)) { Write-Host 'No installed Face Unlock found.'; exit 1 }
     if ($DryRun) { Write-Host "Would run: `"$fuExe`" --stop, then --start"; exit 0 }
-    & $fuExe --stop
-    if ($LASTEXITCODE) { Write-Warning "--stop exited $LASTEXITCODE" }
-    & $fuExe --start
-    exit $LASTEXITCODE
+    # 9d (V-65): the tray exe is windowed -- "& exe" would not wait and $LASTEXITCODE would not be its
+    # exit code. Start-Process -Wait -PassThru gives both.
+    $fuStop = Start-Process -FilePath $fuExe -ArgumentList '--stop' -Wait -PassThru -WindowStyle Hidden
+    if ($fuStop.ExitCode) { Write-Warning "--stop exited $($fuStop.ExitCode)" }
+    $fuStart = Start-Process -FilePath $fuExe -ArgumentList '--start' -Wait -PassThru -WindowStyle Hidden
+    exit $fuStart.ExitCode
 }
 
 # Splatted rather than positional so -InstallDir is omitted entirely when empty.

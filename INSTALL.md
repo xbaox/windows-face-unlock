@@ -193,9 +193,19 @@ Settings → Basic → **Face sign-in check**:
   `/ACCEPTMODELLICENSE` means you accept the InsightFace model terms on behalf of the user; without
   it a silent installation that needs the models stops. `/OWNER=` names the face-sign-in user
   (otherwise: the user at the console); replacing a different recorded owner needs `/FORCEOWNER`.
-  Exit codes besides Inno Setup's usual ones: **21** the background tasks could not be registered,
-  **22** the lock-screen tile could not be registered, **23** the models could not be installed.
-  Password and face still have to be set up by the user.
+  Exit codes:
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | Installed. |
+  | 1 | Setup did not start: no owner could be established, the recorded owner differs and `/FORCEOWNER` is missing, `/DIR=` is not the fixed folder, a `/MODELZIP=` file is not the pinned archive, or `/ACCEPTMODELLICENSE` is missing when the models are needed. The reason is in the Setup log. |
+  | 3 | Setup stopped before copying anything: the program folder (for example from a `/LOADINF` file) is not the fixed one. |
+  | 7 | Setup stopped on the preparing step: an older Face Unlock could not be stopped. |
+  | 21 | Installed, but the background tasks could not be registered. |
+  | 22 | Installed, but the lock-screen tile was not registered (the program folder is writable by non-administrators, or registration failed); a tile of the previous version is removed. |
+  | 23 | Installed, but the models could not be downloaded or unpacked: face sign-in stays off (Status: "the face recognition models are missing") until Setup runs again. No message box appears in a silent install. |
+
+  Other codes are Inno Setup's own. Password and face still have to be set up by the user.
 
 ## 6. Troubleshooting
 

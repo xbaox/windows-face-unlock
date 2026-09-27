@@ -1,6 +1,9 @@
-"""Hidden frozen self-check of data-directory custody (Stage 8b-2).
+"""Hidden frozen self-checks the build gate runs out of the BUILT exe (Stage 8b-2; 9d).
 
     face_service.exe --selfcheck-custody <dir> --out <file.json>
+    face_service.exe --selfcheck-engine <models_dir> --out <file.json>     (9d, V-61)
+
+Both run only with FU_BUILD_GATE=1 (face_service/__main__.py).
 
 Defect -> consequence -> fix: the 8b build passed every static check and every venv selftest,
 yet the FROZEN service could not heal the data directory at all (a lazily imported pywin32 module
@@ -89,3 +92,134 @@ def selfcheck_custody_main(argv) -> int:
     except Exception:
         return 1
     return 0 if result["ok"] else 1
+
+
+# ---------------------------------------------------------------------------------------------
+# 9d (V-61): the engine, frozen
+# ---------------------------------------------------------------------------------------------
+
+def _capture_native_stderr(path: str):
+    """Point the C-level stderr (fd 2) at ``path``: ONNX Runtime reports a provider that failed to
+    load ("LoadLibrary failed with error 126 ...") there, and the windowed exe has no console."""
+    try:
+        f = open(path, "w+b")
+        os.dup2(f.fileno(), 2)
+        return f
+    except Exception:
+        return None
+
+
+def selfcheck_engine_main(argv) -> int:
+    """argv: ["--selfcheck-engine", <models_dir>, "--out", <file>].
+
+    <models_dir> is a buffalo_l pack (read only). Writes one JSON object: frozen, variant (what the
+    onnxruntime package in THIS bundle is), the pack check, the providers requested and those
+    each session actually runs, init ms, the median of three runs on a synthetic 640x480 frame,
+    errors, and any provider-load failure ONNX Runtime printed. Exit 0 = the engine ran on the
+    requested providers in every session; 1 = not; 2 = usage."""
+    import statistics
+    import time as _time
+    try:
+        models_dir = argv[argv.index("--selfcheck-engine") + 1]
+        out = argv[argv.index("--out") + 1]
+    except (ValueError, IndexError):
+        return 2
+    result: dict = {"frozen": bool(getattr(sys, "frozen", False)), "models_dir": models_dir,
+                    "errors": [], "sessions": {}, "provider_load_errors": []}
+    rc = 1
+    err_path = out + ".stderr.txt"
+    cap = _capture_native_stderr(err_path)
+    log_lines = _ListHandler()
+    logging.getLogger().addHandler(log_lines)
+    logging.getLogger().setLevel(logging.INFO)
+    try:
+        from pathlib import Path
+        import numpy as np
+        from face_service.model_pins import PACK_NAME, check_pack
+        pack = Path(models_dir)
+        result["pack_problems"] = check_pack(pack, hashes=True)
+        if pack.name != PACK_NAME:
+            result["pack_problems"].append(f"the pack folder must be named {PACK_NAME}")
+        from importlib import metadata
+        variant = "unknown"
+        for dist, v in (("onnxruntime-gpu", "gpu"), ("onnxruntime", "cpu")):
+            try:
+                result["onnxruntime_dist"] = f"{dist} {metadata.version(dist)}"
+                variant = v
+                break
+            except metadata.PackageNotFoundError:
+                continue
+        result["variant"] = variant
+        if not result["pack_problems"]:
+            from face_service import recognizer as R
+            R._prep_cuda_dlls()
+            import onnxruntime as ort
+            from face_service.ort_privacy import disable_ort_telemetry
+            disable_ort_telemetry()
+            try:
+                ort.preload_dlls()
+            except Exception as e:
+                result["errors"].append(f"preload_dlls: {e!r}")
+            providers, ctx_id = R._select_providers(ort)
+            result["available_providers"] = list(ort.get_available_providers())
+            result["providers_requested"] = providers
+            from insightface.app import FaceAnalysis
+            t0 = _time.perf_counter()
+            app = FaceAnalysis(name=PACK_NAME, allowed_modules=R.ALLOWED_MODULES,
+                               providers=providers, root=str(pack.parent.parent))
+            app.prepare(ctx_id=ctx_id, det_size=(R.DET_SIZE, R.DET_SIZE))
+            result["init_ms"] = round((_time.perf_counter() - t0) * 1000.0, 1)
+            for task, model in getattr(app, "models", {}).items():
+                try:
+                    result["sessions"][task] = list(model.session.get_providers())
+                except Exception as e:
+                    result["errors"].append(f"{task}: {e!r}")
+            rng = np.random.default_rng(0)
+            frame = (rng.random((480, 640, 3)) * 255).astype(np.uint8)   # synthetic, no face
+            runs = []
+            for _ in range(3):
+                t1 = _time.perf_counter()
+                app.get(frame)
+                runs.append((_time.perf_counter() - t1) * 1000.0)
+            result["run_ms"] = [round(x, 1) for x in runs]
+            result["run_ms_median"] = round(statistics.median(runs), 1)
+            want = "CUDAExecutionProvider" if variant == "gpu" else "CPUExecutionProvider"
+            sessions = result["sessions"]
+            all_on = bool(sessions) and all(p and p[0] == want for p in sessions.values())
+            cpu_only = variant != "cpu" or all(p == ["CPUExecutionProvider"] for p in sessions.values())
+            result["all_sessions_on"] = want
+            result["ok_sessions"] = all_on and cpu_only
+            rc = 0 if (all_on and cpu_only and not result["errors"]) else 1
+    except Exception as e:
+        result["errors"].append(f"{e.__class__.__name__}: {e}")
+        rc = 1
+    finally:
+        logging.getLogger().removeHandler(log_lines)
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        native = ""
+        try:
+            with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+                native = f.read()
+        except Exception:
+            pass
+        lines = [ln for ln in (native.splitlines() + log_lines.lines)
+                 if any(k in ln for k in ("LoadLibrary", "CUDA", "cudnn", "cublas", "Failed", "fell back"))]
+        result["provider_load_errors"] = lines[:40]
+        if result.get("variant") == "cpu" and any("CUDA" in ln or "cudnn" in ln for ln in lines):
+            result["errors"].append("CPU variant: a CUDA provider load was attempted / reported")
+            rc = 1
+        result["rc"] = rc
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+        except Exception:
+            rc = 1
+        if cap is not None:
+            try:
+                cap.close()
+            except Exception:
+                pass
+    return rc

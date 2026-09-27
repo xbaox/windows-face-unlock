@@ -13,3 +13,4 @@ __pycache__/
 # lock screen -- ignore it, but do NOT delete it.
 build-cp/
 build-tests/
+.venv-cpu/

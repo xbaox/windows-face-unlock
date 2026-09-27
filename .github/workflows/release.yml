@@ -7,11 +7,19 @@ name: release
 #               Read-only token, no secrets, checkout without persisted credentials, every pip
 #               install hash-checked (--require-hashes).
 #   sign     -- per variant, only when Azure Trusted Signing is configured (repository variables
-#               AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CODESIGN_*): OIDC login, no repository
-#               rights; signs the CP DLL and our unsigned PE files (never NVIDIA's), re-runs the gate
-#               on the signed bundle and compiles the installer with SignTool + SignedUninstaller.
+#               AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_CODESIGN_*; the job condition): OIDC login,
+#               no repository rights; signs the CP DLL and our unsigned PE files (never NVIDIA's),
+#               re-runs the gate on the signed bundle and compiles the installer with SignTool +
+#               SignedUninstaller. 9d (V-72): build.py --require-signed -- a missing credential or
+#               anything not "Valid" fails the job, so no unsigned file is uploaded as "signed".
 #   publish  -- only for a vX.Y.Z tag, the ONLY job with contents: write; creates a DRAFT release
-#               (the operator smokes the artefacts, then publishes by hand -- F-223).
+#               (the operator smokes the artefacts, then publishes by hand -- F-223). 9d (V-72): it
+#               takes SIGNED artefacts only and refuses unless every installer is Authenticode
+#               "Valid" -- there is no fallback to the unsigned build.
+#
+# Installs (9d, A-6 / V-60): the CPU lock with pip's resolver; the GPU lock with --no-deps
+# (insightface names onnxruntime, the GPU lock carries onnxruntime-gpu); tools/lock_check.py
+# then proves either one complete.
 #
 # Assets: WindowsFaceUnlock-Setup-<ver>-cpu.exe and -gpu.exe, each with .sha256 and
 # .buildinfo.json. Neither contains a recognition model (the installer downloads them; the gate
@@ -53,6 +61,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           # the frozen-gate tests (verifier, frozen_custody) read PyInstaller's archive format
           python -m pip install --require-hashes -r installer/requirements-build.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m tools.lock_check --lock requirements.lock
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Selftests (each with its own TEMP and a FACE_UNLOCK_HOME inside it)
         shell: pwsh
@@ -98,10 +108,17 @@ jobs:
         env:
           VARIANT: ${{ matrix.variant }}
         run: |
-          $lock = if ($env:VARIANT -eq 'gpu') { 'requirements-gpu.lock' } else { 'requirements.lock' }
-          python -m pip install --require-hashes -r $lock
+          if ($env:VARIANT -eq 'gpu') {
+            $lock = 'requirements-gpu.lock'
+            python -m pip install --require-hashes --no-deps -r $lock
+          } else {
+            $lock = 'requirements.lock'
+            python -m pip install --require-hashes -r $lock
+          }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python -m pip install --require-hashes -r installer/requirements-build.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m tools.lock_check --lock $lock
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Install Inno Setup (pinned)
         shell: pwsh
@@ -149,7 +166,8 @@ jobs:
 
   sign:
     needs: build
-    if: vars.AZURE_CLIENT_ID != ''
+    # 9d (V-72): only when EVERY Azure Trusted Signing variable is configured
+    if: vars.AZURE_CLIENT_ID != '' && vars.AZURE_TENANT_ID != '' && vars.AZURE_CODESIGN_ENDPOINT != '' && vars.AZURE_CODESIGN_ACCOUNT != '' && vars.AZURE_CODESIGN_PROFILE != ''
     runs-on: windows-2022
     timeout-minutes: 120
     environment: release-signing
@@ -171,11 +189,32 @@ jobs:
         env:
           VARIANT: ${{ matrix.variant }}
         run: |
-          $lock = if ($env:VARIANT -eq 'gpu') { 'requirements-gpu.lock' } else { 'requirements.lock' }
-          python -m pip install --require-hashes -r $lock
+          if ($env:VARIANT -eq 'gpu') {
+            $lock = 'requirements-gpu.lock'
+            python -m pip install --require-hashes --no-deps -r $lock
+          } else {
+            $lock = 'requirements.lock'
+            python -m pip install --require-hashes -r $lock
+          }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python -m pip install --require-hashes -r installer/requirements-build.txt
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m tools.lock_check --lock $lock
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      # 9d (V-72): the sign job compiles the installer too (--half 2), so it needs ISCC -- the same
+      # pinned Inno Setup, checked by SHA-256.
+      - name: Install Inno Setup (pinned)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = 'is-' + $env:INNO_VERSION.Replace('.', '_')
+          $exe = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_VERSION.exe"
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$env:INNO_VERSION.exe" -OutFile $exe
+          if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLower() -ne $env:INNO_SHA256) { throw 'Inno Setup hash mismatch' }
+          $dir = Join-Path $env:RUNNER_TEMP "InnoSetup"
+          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$dir`"")
+          if ($p.ExitCode -ne 0) { throw "Inno Setup installer exited $($p.ExitCode)" }
+          "INNO_SETUP_ISCC=$(Join-Path $dir 'ISCC.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: dist-${{ matrix.variant }}
@@ -196,9 +235,9 @@ jobs:
           AZURE_CODESIGN_PROFILE: ${{ vars.AZURE_CODESIGN_PROFILE }}
           FU_SIGN_SUBJECT: ${{ vars.FU_SIGN_SUBJECT }}
         run: |
-          python installer/build.py --variant $env:VARIANT --resign
+          python installer/build.py --variant $env:VARIANT --resign --require-signed
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python installer/build.py --variant $env:VARIANT --half 2
+          python installer/build.py --variant $env:VARIANT --half 2 --require-signed
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
@@ -209,24 +248,30 @@ jobs:
 
   publish:
     needs: [build, sign]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.sign.result != 'failure'
-    runs-on: ubuntu-24.04
+    # 9d (V-72): signed artefacts only -- a skipped or failed sign job means no release.
+    if: startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.sign.result == 'success'
+    runs-on: windows-2022
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
-          pattern: installer-*
+          pattern: installer-*-signed
           path: out
-      - name: Pick the signed build when there is one
-        shell: bash
+      - name: Only Authenticode-Valid installers
+        shell: pwsh
         run: |
-          mkdir release
-          for v in cpu gpu; do
-            src="out/installer-$v-signed"; [ -d "$src" ] || src="out/installer-$v-unsigned"
-            cp "$src"/installer_output/* release/
-          done
-          ls -l release
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          foreach ($v in 'cpu', 'gpu') {
+            $src = "out/installer-$v-signed/installer_output"
+            $exe = @(Get-ChildItem -Path $src -Filter "WindowsFaceUnlock-Setup-*-$v.exe" -ErrorAction SilentlyContinue)
+            if ($exe.Count -ne 1) { Write-Error "no signed $v installer"; exit 1 }
+            $sig = Get-AuthenticodeSignature -LiteralPath $exe[0].FullName
+            if ($sig.Status -ne 'Valid') { Write-Error "$($exe[0].Name): signature $($sig.Status)"; exit 1 }
+            Copy-Item -Path (Join-Path $src '*') -Destination release
+          }
+          Get-ChildItem release
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
           files: release/*

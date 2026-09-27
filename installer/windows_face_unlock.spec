@@ -43,7 +43,8 @@ HIDDEN += collect_submodules(
     "insightface",
     filter=lambda name: ".gui" not in name and ".thirdparty" not in name,
 )
-HIDDEN += collect_submodules("onnxruntime")
+# 9d (V-69): onnxruntime.datasets is sample models for the library's own tutorials -- not shipped.
+HIDDEN += collect_submodules("onnxruntime", filter=lambda name: not name.startswith("onnxruntime.datasets"))
 
 # numpy's C extension imports Python modules BY NAME, and modulegraph cannot read
 # inside a .pyd, so those imports are invisible to analysis -- they do not even
@@ -175,7 +176,7 @@ DATAS = []
 # Stage 9 (D-152, F-51): no sample media. insightface's data/images (a celebrity photo, a group
 # photo) and gui assets, and skimage's data/ (LFW face crops and more) are never read by the product.
 DATAS += collect_data_files("insightface", excludes=["data/images/**", "gui/**"])
-DATAS += collect_data_files("onnxruntime")
+DATAS += collect_data_files("onnxruntime", excludes=["datasets/**", "datasets"])   # 9d (V-69)
 DATAS += collect_data_files("skimage", excludes=["data/**"])
 DATAS += collect_data_files("cv2")
 

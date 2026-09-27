@@ -108,7 +108,8 @@ def test_taskreg():
             fake = FakeSched(existing=[("FaceUnlock-Other", "Somebody", r"C:\Other\x.exe"),
                                        ("FaceUnlock-Legacy", "", str(Path(td, "face_service.exe")))])
             ok_sid = lambda sid: ("alice", "PC1")
-            rc = T.register(td, "S-1-5-21-11-22-33-1001", sched=fake, resolve=ok_sid)
+            here = lambda n, d: True             # the owner is signed in (V-71 below covers not)
+            rc = T.register(td, "S-1-5-21-11-22-33-1001", sched=fake, resolve=ok_sid, logged_on=here)
             check("register: 0 after verification", rc == 0, fake.calls)
             check("register: all three registered, then started",
                   [c for c in fake.calls if c[0] == "register"] == [("register", t.name) for t in T.TASKS]
@@ -118,16 +119,46 @@ def test_taskreg():
             check("register: a bad SID touches nothing", T.register(td, "S-1-5-18", sched=FakeSched(), resolve=ok_sid) == 1)
             fake2 = FakeSched()
             fake2.state_of = {"FaceUnlock-Watchdog": 1}
-            check("register: a task that is not ready fails the run (F-233)", T.register(td, "S-1-5-21-11-22-33-1001", sched=fake2, resolve=ok_sid) == 1)
+            check("register: a task that is not ready fails the run (F-233)", T.register(td, "S-1-5-21-11-22-33-1001", sched=fake2, resolve=ok_sid, logged_on=here) == 1)
             Path(td, "face_unlock_watchdog.exe").unlink()
             f3 = FakeSched()
             check("phase A: a missing exe -> 1, nothing registered (F-232)",
-                  T.register(td, "S-1-5-21-11-22-33-1001", sched=f3, resolve=ok_sid) == 1 and not f3.calls)
+                  T.register(td, "S-1-5-21-11-22-33-1001", sched=f3, resolve=ok_sid, logged_on=here) == 1
+                  and not f3.calls)
+            Path(td, "face_unlock_watchdog.exe").write_bytes(b"MZ")
+            # 9d (V-71): /OWNER= names a user who is not signed in -- registered, not started, 0
+            f5 = FakeSched()
+
+            def _no_run(name):
+                raise RuntimeError("0x80070520: a specified logon session does not exist")
+            f5.run = _no_run
+            rc5 = T.register(td, "S-1-5-21-11-22-33-1001", sched=f5, resolve=ok_sid,
+                             logged_on=lambda n, d: False)
+            check("V-71: owner without a session -> tasks registered, not started, Ready accepted, 0",
+                  rc5 == 0 and [c[0] for c in f5.calls].count("register") == len(T.TASKS)
+                  and all(f5.state(t.name) == T.TASK_STATE_READY for t in T.TASKS), (rc5, f5.calls))
+            f6 = FakeSched()
+            f6.run = _no_run
+            check("V-71: owner signed in and a start fails -> still 1",
+                  T.register(td, "S-1-5-21-11-22-33-1001", sched=f6, resolve=ok_sid,
+                             logged_on=lambda n, d: True) == 1)
             f4 = FakeSched(existing=[(t.name, "WindowsFaceUnlock", str(Path(td, t.exe))) for t in T.TASKS])
             check("unregister removes ours and counts survivors", T.unregister(td, sched=f4) == 0
                   and not f4.reg)
     finally:
         T.stack_processes, T.kill_and_wait, T.graceful_shutdown, T.time.sleep = orig
+    # 9d (V-70): the call form proven by the S-1 probe is pinned
+    calls = []
+
+    class _Root:
+        def RegisterTask(self, *a):
+            calls.append(a)
+    sch = T.Scheduler.__new__(T.Scheduler)
+    sch._root = _Root()
+    sch.register("FaceUnlock-Service", "<xml/>")
+    check("V-70: RegisterTask(name, xml, TASK_CREATE_OR_UPDATE=6, userId None, password None, "
+          "TASK_LOGON_INTERACTIVE_TOKEN=3)", calls == [("FaceUnlock-Service", "<xml/>", 6, None, None, 3)],
+          calls)
     psd1 = read("tools/tasks.psd1")
     for t in T.TASKS:
         check(f"dev declaration lists {t.name} with {t.exe} and {t.dev_args}",
@@ -141,6 +172,36 @@ def test_iss():
     print("[2] installer.iss (R17, R7, R14)")
     s = read("installer/installer.iss")
     code = "\n".join(ln for ln in s.splitlines() if not ln.lstrip().startswith(";"))
+    # 9d (V-62..V-66)
+    prep = code.split("function PrepareToInstall", 1)[1].split("\nend;", 1)[0]
+    nbc = code.split("function NextButtonClick", 1)[1].split("\nend;", 1)[0]
+    check("V-62: the interactive download runs only when not silent (NextButtonClick runs silent too)",
+          "and not WizardSilent()" in nbc and "DownloadPage.Download" in nbc)
+    check("V-62: the silent download lives in PrepareToInstall and returns no error string",
+          "and WizardSilent()" in prep and "ModelsDownloadError := GetExceptionMessage" in prep
+          and "Result := FmtMessage(CustomMessage('ModelsDownloadFailed')" not in prep)
+    check("V-62: a failed silent download ends with 23 through Fail (no message box when silent)",
+          "if ModelsDownloadError <> '' then\n      Fail(23," in code
+          and "if not WizardSilent() then\n    MsgBox(Msg" in code)
+    reg = code.split("procedure RegisterProvider", 1)[1].split("\nend;", 1)[0]
+    acl = reg.split("if not AclOk then", 1)[1].split("exit;", 1)[0]
+    check("V-63: an ACL failure unregisters the old provider (regsvr32 /u + keys) BEFORE code 22",
+          acl.find("/u /s") < acl.find("RegDeleteKeyIncludingSubkeys") < acl.find("Fail(22")
+          and "Credential Providers\\{#CPClsid}" in acl and "CLSID\\{#CPClsid}" in acl)
+    step = code.split("procedure CurStepChanged", 1)[1].split("if CurStep = ssPostInstall", 1)[0]
+    check("V-64: {app} is checked against the fixed folder at ssInstall (covers /LOADINF Dir=)",
+          "CurStep = ssInstall" in step and "ExpandConstant('{app}')" in step and "ExpectedAppDir()" in step
+          and "Abort;" in step)
+    check("V-66: the 0.1.x Start-menu shortcuts are removed",
+          all(f'Type: files; Name: "{{group}}\\{{#MyAppName}}{x}.lnk"' in s
+              for x in ("", " - Uninstall", " — Uninstall")))
+    for ps_rel in ("tools/uninstall.ps1", "tools/clean_restart.ps1"):
+        ps = read(ps_rel)
+        check(f"V-65: {ps_rel} runs the windowed tray exe with Start-Process -Wait -PassThru",
+              "-Wait -PassThru" in ps and not re.search(r"^\s*&\s*\$fu(Tray)?Exe\b", ps, re.M))
+    ins = read("INSTALL.md")
+    check("V-62: INSTALL.md lists the exit codes (1, 3, 7, 21, 22, 23)",
+          all(f"| {c} |" in ins for c in (1, 3, 7, 21, 22, 23)))
     check("no PowerShell in install or uninstall", "powershell.exe" not in code.lower()
           and "-executionpolicy" not in code.lower()
           and not re.search(r"(Filename|Exec\w*)\W[^\n]*\.ps1", code))
@@ -263,6 +324,32 @@ def test_locks_ci():
           and "contents: write" in jobs.split("\n  publish:", 1)[1])
     check("no persisted checkout credentials", y.count("actions/checkout@") == y.count("persist-credentials: false"))
     check("installs are hash-checked", y.count("--require-hashes") >= 4)
+    # 9d (A-6, V-60): the CPU lock carries onnxruntime, the GPU lock onnxruntime-gpu with --no-deps,
+    # and every install is followed by tools/lock_check.py
+    cpu, gpu = read("requirements.lock"), read("requirements-gpu.lock")
+    check("V-60: requirements.lock pins onnxruntime (CPU), not onnxruntime-gpu",
+          re.search(r"^onnxruntime==1\.26\.0 ", cpu, re.M) and "onnxruntime-gpu" not in cpu)
+    check("V-60: requirements-gpu.lock pins onnxruntime-gpu, not onnxruntime",
+          re.search(r"^onnxruntime-gpu==1\.26\.0 ", gpu, re.M) and not re.search(r"^onnxruntime==", gpu, re.M))
+    check("V-60: the GPU installs use --no-deps and every job runs lock_check",
+          y.count("--no-deps -r $lock") == 2 and y.count("tools.lock_check") == 3)
+    ps = read("setup.ps1")
+    check("V-60: setup.ps1 -Gpu installs with --no-deps and checks with lock_check",
+          "--no-deps -r $lock" in ps and "tools.lock_check" in ps)
+    # 9d (V-72): signing only with every Azure variable, never an unsigned "signed" artefact, and
+    # publish takes signed + Valid installers only
+    sign = jobs.split("\n  sign:", 1)[1].split("\n  publish:", 1)[0]
+    pub = jobs.split("\n  publish:", 1)[1]
+    check("V-72: the sign job runs only with every Azure variable set",
+          all(f"vars.{v} != ''" in sign for v in ("AZURE_CLIENT_ID", "AZURE_TENANT_ID",
+                                                  "AZURE_CODESIGN_ENDPOINT", "AZURE_CODESIGN_ACCOUNT",
+                                                  "AZURE_CODESIGN_PROFILE")))
+    check("V-72: the sign job installs the pinned Inno Setup (SHA-256) and uses --require-signed",
+          "Install Inno Setup (pinned)" in sign and "INNO_SHA256" in sign
+          and sign.count("--require-signed") == 2)
+    check("V-72: publish needs a successful sign job, downloads signed artefacts only, checks Valid",
+          "needs.sign.result == 'success'" in pub and "installer-*-signed" in pub
+          and "unsigned" not in pub and "Get-AuthenticodeSignature" in pub and "'Valid'" in pub)
     check("draft release, not latest (F-223, F-195)", "draft: true" in y and "make_latest: false" in y)
     check("no SignPath", "signpath" not in y.lower())
     check("the tag reaches the shell through the environment (F-222)", "REF_NAME: ${{ github.ref_name }}" in y
@@ -303,10 +390,27 @@ def test_notices_and_docs():
     import notices
     root = Path(tempfile.mkdtemp(prefix="faceunlock_notices_"))
     try:
-        problems = notices.stage(root, "cpu", None)
-        # without ISCC only Inno Setup's text can be missing
-        check("stage(): every runtime package, Python, YuNet get their texts (cpu)",
-              [p_ for p_ in problems if "Inno" not in p_ and "inno-setup" not in p_] == [], problems)
+        # 9d (A-6): stage for the variant THIS interpreter is (the CPU lock names onnxruntime, the
+        # GPU lock onnxruntime-gpu); without ISCC only Inno Setup's text can be missing, and without a
+        # bundle the GPU variant has no NVIDIA DLL to take texts for.
+        from importlib import metadata as _md
+        try:
+            _md.version("onnxruntime-gpu")
+            var = "gpu"
+        except _md.PackageNotFoundError:
+            var = "cpu"
+        problems = notices.stage(root, var, None)
+        check(f"stage(): every runtime package, Python, YuNet get their texts ({var})",
+              [p_ for p_ in problems if "Inno" not in p_ and "inno-setup" not in p_
+               and "NVIDIA" not in p_ and "nvidia" not in p_] == [], problems)
+        check("V-37: the pywinrt packages get the MIT text of pywinrt",
+              all((lic_ := root / "licenses" / f).is_dir() and "pywinrt" in (lic_ / "LICENSE.txt").read_text(
+                  encoding="utf-8") for f in ("winrt-runtime", "winrt-windows-ui-notifications",
+                                              "winrt-windows-data-xml-dom", "winrt-windows-foundation")))
+        check("V-60: the lock follows the variant", notices.lock_for("cpu").name == "requirements.lock"
+              and notices.lock_for("gpu").name == "requirements-gpu.lock"
+              and not any(n_.startswith("nvidia") for n_ in notices.expected_folders("gpu")
+                          if n_ != "nvidia"))
         lic = root / "licenses"
         check("pystray's LGPL + GPL texts are staged", (lic / "pystray" / "COPYING.LGPL").is_file()
               and (lic / "pystray" / "COPYING").is_file())

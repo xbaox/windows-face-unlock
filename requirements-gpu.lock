@@ -1,5 +1,8 @@
 # GENERATED from requirements.txt by resolving the tested venv (Stage 9, act 9b R18).
-# Install with hashes enforced:   pip install --require-hashes -r requirements-gpu.lock
+# Install (9d, A-6):   pip install --require-hashes --no-deps -r requirements-gpu.lock
+#                      python -m tools.lock_check --lock requirements-gpu.lock
+# --no-deps because insightface names onnxruntime and this lock carries onnxruntime-gpu in its
+# place; tools/lock_check.py then proves the lock complete (every non-extra dependency met).
 # Every version is the one the selftests and the frozen gate ran against; every hash is a file
 # PyPI publishes for that exact version. Regenerate only together with a re-test.
 # GPU variant: requirements.lock plus the NVIDIA CUDA / cuDNN wheels onnxruntime-gpu names.

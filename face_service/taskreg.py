@@ -147,9 +147,13 @@ class Scheduler:
         self._svc.Connect()
         self._root = self._svc.GetFolder("\\")
 
+    # 9d (V-70): the exact call form -- userId and password None (the principal comes from the XML,
+    # logon type interactive token). Proven by the 9d S-1 probe (a task registered with this form
+    # by a non-elevated user, then deleted) and pinned by tools/installer_selftest.py.
+    REGISTER_ARGS = (TASK_CREATE_OR_UPDATE, None, None, TASK_LOGON_INTERACTIVE_TOKEN)
+
     def register(self, name: str, xml: str) -> None:
-        self._root.RegisterTask(name, xml, TASK_CREATE_OR_UPDATE, None, None,
-                                TASK_LOGON_INTERACTIVE_TOKEN)
+        self._root.RegisterTask(name, xml, *self.REGISTER_ARGS)
 
     def tasks(self) -> "list[tuple[str, str, str]]":
         """(name, author, first action path) of every task in the root folder."""
@@ -264,14 +268,39 @@ def _stop_stack(sched, install_dir: str) -> int:
     return kill_and_wait(install_dir)
 
 
+def _owner_logged_on(name: str, domain: str) -> bool:
+    """9d (V-71): does the owner have a session on this PC right now (active or disconnected)?
+    An interactive-token task of a user who is not signed in cannot start -- it starts at their
+    next sign-in. True when it cannot be told (the stricter check then applies)."""
+    try:
+        import win32ts  # type: ignore
+        for s in win32ts.WTSEnumerateSessions(win32ts.WTS_CURRENT_SERVER_HANDLE):
+            sid = s["SessionId"]
+            u = win32ts.WTSQuerySessionInformation(win32ts.WTS_CURRENT_SERVER_HANDLE, sid,
+                                                   win32ts.WTSUserName)
+            d = win32ts.WTSQuerySessionInformation(win32ts.WTS_CURRENT_SERVER_HANDLE, sid,
+                                                   win32ts.WTSDomainName)
+            if u and u.lower() == (name or "").lower() and (d or "").lower() == (domain or "").lower():
+                return True
+        return False
+    except Exception as e:
+        log.debug("session check failed: %r", e)
+        return True
+
+
 def _account_of(user_sid: str) -> "tuple[str, str]":
     import win32security  # type: ignore
     name, domain, _t = win32security.LookupAccountSid(None, win32security.ConvertStringSidToSid(user_sid))
     return name, domain
 
 
-def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of) -> int:
-    """--register. 0 on success; 1 when anything could not be done or verified."""
+def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of,
+             logged_on=_owner_logged_on) -> int:
+    """--register. 0 on success; 1 when anything could not be done or verified.
+
+    9d (V-71): an owner named with /OWNER= who is not signed in right now: the tasks are
+    registered but cannot start (interactive token) -- they start at that user's next sign-in.
+    Then a failed start is not a failure and "Ready" verifies; exit 0."""
     install_dir = norm(install_dir)
     # ---- phase A: build and validate, touch nothing ----
     if not _SID_RE.match(user_sid or ""):
@@ -280,6 +309,7 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of) -
     try:
         name, domain = resolve(user_sid)
         log.info("tasks run for %s\\%s (%s)", domain, name, user_sid)
+        present = logged_on(name, domain)
     except Exception as e:
         log.error("the owner SID %s does not resolve to an account: %r", user_sid, e)
         return 1
@@ -312,7 +342,12 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of) -
     left = _stop_stack(sched, install_dir)
     if left:
         log.warning("%d old process(es) survived the stop; the new ones may exit as duplicates", left)
+    if not present:
+        log.info("the owner %s\\%s is not signed in: the tasks are registered and start at the "
+                 "next sign-in (V-71)", domain, name)
     for t, _xml in plan:
+        if not present:
+            break
         try:
             sched.run(t.name)
             log.info("started %s", t.name)
@@ -322,7 +357,8 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of) -
     time.sleep(1.0)
     for t, _xml in plan:
         st = sched.state(t.name)
-        if st not in (TASK_STATE_READY, TASK_STATE_RUNNING):
+        ok_states = (TASK_STATE_READY, TASK_STATE_RUNNING)
+        if st not in ok_states:
             log.error("verification: %s is in state %r", t.name, st)
             failed = True
     log.info("register: %s", "FAILED" if failed else "ok")

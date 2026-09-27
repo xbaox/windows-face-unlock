@@ -17,8 +17,10 @@ from pathlib import Path
 
 PACK_NAME = "buffalo_l"
 
-# Source of the archive: insightface.utils.storage.BASE_REPO_URL + "/buffalo_l.zip" (insightface
-# 0.7.x, pinned in requirements). Bytes and SHA-256 of the archive as published.
+# Source of the archive: insightface.utils.storage.BASE_REPO_URL + "/buffalo_l.zip" -- "v0.7" is the
+# tag of InsightFace's MODEL release on GitHub, which the pinned library (insightface 1.0.1,
+# requirements*.lock) still downloads from; it is not the library's version (9d, V-67). Bytes and
+# SHA-256 of the archive as published.
 BUFFALO_ZIP_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
 BUFFALO_ZIP_BYTES = 288_621_354
 BUFFALO_ZIP_SHA256 = "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f"

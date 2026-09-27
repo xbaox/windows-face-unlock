@@ -31,8 +31,16 @@ see [SECURITY.md](SECURITY.md#reporting-a-vulnerability), not the issue tracker.
 ## Setting up a checkout
 
 ```powershell
-.\setup.ps1 -SkipAutostart          # .venv + requirements.lock, hash-checked; -Gpu for requirements-gpu.lock
+.\setup.ps1 -SkipAutostart          # .venv + requirements.lock (CPU, onnxruntime), hash-checked
+.\setup.ps1 -SkipAutostart -Gpu     # .venv + requirements-gpu.lock (onnxruntime-gpu + NVIDIA wheels)
 ```
+
+The two locks install differently (9d): the CPU lock with pip's resolver
+(`pip install --require-hashes -r requirements.lock`), the GPU lock with `--no-deps`
+(`pip install --require-hashes --no-deps -r requirements-gpu.lock`) -- insightface names
+`onnxruntime` and the GPU lock carries `onnxruntime-gpu` in its place. After either,
+`python -m tools.lock_check --lock <the lock>` proves the environment complete; `setup.ps1` and CI
+run it. A venv holds ONE of the two ONNX Runtime packages, never both.
 
 **Models.** A source checkout reads the InsightFace `buffalo_l` models from
 `%USERPROFILE%\.insightface\models\buffalo_l\` and never downloads them. Put the five files there
@@ -115,7 +123,8 @@ C++ tests before any build.
   installer's `installer/lang/*.isl`). `tools/presence_guards_selftest.py` checks the parity.
 - **PowerShell files are ASCII-only** and must work in Windows PowerShell 5.1.
 - **Dependencies** are pinned with hashes. To change one, regenerate the lock files from a tested
-  environment and install with `--require-hashes`.
+  environment, install with `--require-hashes` (`--no-deps` for the GPU lock) and run
+  `python -m tools.lock_check --lock <lock>`.
 - **Third-party licenses:** a new runtime dependency must come with its license text; `installer/notices.py`
   copies it from the package's dist-info, and the build gate fails if a package's folder is empty.
   Add a row to [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
@@ -126,4 +135,8 @@ C++ tests before any build.
 ## Building the installer
 
 See [installer/README.md](installer/README.md): `installer\build.py --variant cpu|gpu`, the gate,
-signing (Azure Trusted Signing, skipped loudly without credentials) and CI.
+signing (Azure Trusted Signing, skipped loudly without credentials) and CI. Each variant is built
+from its own venv: the CPU variant from one made with `requirements.lock` (e.g. `.venv-cpu`), the
+GPU variant from one made with `requirements-gpu.lock`; `build.py` refuses the wrong one. With
+`FU_GATE_MODELS=<a buffalo_l folder>` the gate also runs the frozen engine on the variant's
+providers (never copied into the bundle); without it that step is a loud SKIP.

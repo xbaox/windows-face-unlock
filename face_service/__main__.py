@@ -19,6 +19,14 @@ if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck-custody":
         raise SystemExit(2)
     from face_service.selfcheck import selfcheck_custody_main
     raise SystemExit(selfcheck_custody_main(sys.argv[1:]))
+# 9d (V-61): the engine as FROZEN -- the model pack at <models_dir>, the variant's providers, three
+# runs on a synthetic frame. Same gate-only rule: FU_BUILD_GATE=1 or nothing happens. No data
+# directory, no pipe, no camera.
+if len(sys.argv) > 1 and sys.argv[1] == "--selfcheck-engine":
+    if os.environ.get("FU_BUILD_GATE") != "1":
+        raise SystemExit(2)
+    from face_service.selfcheck import selfcheck_engine_main
+    raise SystemExit(selfcheck_engine_main(sys.argv[1:]))
 
 # ABSOLUTE, and it must stay absolute. This file is an entry point in both
 # layouts, and the two layouts disagree about what package it belongs to.
