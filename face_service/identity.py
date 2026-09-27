@@ -24,12 +24,36 @@ OWNER_REG_VALUE = "OriginalUserSid"
 SYSTEM_SID = "S-1-5-18"
 
 # S-1-5-21-a-b-c-RID (local/domain) or S-1-12-1-a-b-c-d (Entra ID). Nothing else is a person.
-_USER_SID_RE = re.compile(r"^S-1-(?:5-21|12-1)(?:-\d{1,10}){4,}$")
+# 9d (V-05): leading zeros are allowed (a record may carry them; canonical_sid removes them).
+_USER_SID_RE = re.compile(r"^S-1-(?:5-21|12-1)(?:-0*\d{1,10}){4,}$")
 
 
 def is_user_sid(sid: object) -> bool:
     """True only for a SID that can belong to a person: S-1-5-21-* or S-1-12-1-*."""
     return isinstance(sid, str) and bool(_USER_SID_RE.match(sid))
+
+
+def canonical_sid(sid: str) -> "str | None":
+    """9d (V-05): the canonical string form of a SID string (what ConvertSidToStringSid prints:
+    no leading zeros), or None when it is not a SID. "S-1-5-21-0123-..." and "S-1-5-21-123-..."
+    are one account; the owner check compares canonical forms, never raw strings."""
+    if not isinstance(sid, str) or not sid:
+        return None
+    try:
+        import win32security
+        return win32security.ConvertSidToStringSid(win32security.ConvertStringSidToSid(sid))
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    # No pywin32 (a plain interpreter): the same normalisation for the decimal forms above.
+    m = re.match(r"^S-(\d+)((?:-\d+)+)$", sid.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    parts = [int(m.group(1))] + [int(p) for p in m.group(2).split("-")[1:]]
+    if parts[0] != 1 or any(p > 0xFFFFFFFF for p in parts[2:]) or parts[1] >= 1 << 48:
+        return None
+    return "S-" + "-".join(str(p) for p in parts)
 
 
 @functools.lru_cache(maxsize=1)
@@ -62,7 +86,7 @@ def owner_sid() -> "str | None":
     if kind not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
         return None
     value = str(value).strip()
-    return value if is_user_sid(value) else None
+    return canonical_sid(value) if is_user_sid(value) else None
 
 
 def owner_check(recorded: "str | None" = None, me: "str | None" = None) -> "str | None":
@@ -77,6 +101,7 @@ def owner_check(recorded: "str | None" = None, me: "str | None" = None) -> "str 
         me = current_user_sid() if me is None else me
     except Exception as e:
         return "own SID unreadable (%r)" % (e,)
-    if me != recorded:
+    # 9d (V-05): canonical comparison -- a record written with leading zeros is the same account.
+    if canonical_sid(me) is None or canonical_sid(me) != canonical_sid(recorded):
         return "this process runs as %s, the owner is %s" % (me, recorded)
     return None

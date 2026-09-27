@@ -358,6 +358,7 @@ std::wstring SanitizePromptText(const std::wstring& text) {
     for (wchar_t c : text) {
         if (c < 0x20 || c == 0x7F) continue;                     // C0 controls and DEL
         if (c >= 0x80 && c <= 0x9F) continue;                    // C1 controls (U+0085 NEL too)
+        if (c == 0x061C) continue;                               // ALM (9d V-07)
         if (c == 0x200E || c == 0x200F) continue;                // LRM / RLM
         if (c >= 0x202A && c <= 0x202E) continue;                // LRE RLE PDF LRO RLO
         if (c >= 0x2066 && c <= 0x2069) continue;                // LRI RLI FSI PDI
@@ -503,8 +504,19 @@ const TextPair& TextFor(Text id) {
                                           L"Вход по лицу временно заблокирован. Войдите по PIN-коду или паролю." };
     static const TextPair kLockedSecs   { L"Face sign-in is locked for %u s. Use PIN or password.",
                                           L"Вход по лицу заблокирован на %u с. Войдите по PIN-коду или паролю." };
-    static const TextPair kUnavailable  { L"Face Unlock service is not running. Use PIN or password.",
-                                          L"Служба Face Unlock не запущена. Войдите по PIN-коду или паролю." };
+    // 9d (V-04): "unavailable" is said only when the pipe is really not there; a slow, busy or
+    // unverifiable service has its own text.
+    static const TextPair kUnavailable  { L"Face Unlock service is unavailable. Use PIN or password.",
+                                          L"Служба Face Unlock недоступна. Войдите по PIN-коду или паролю." };
+    static const TextPair kSvcTimeout   { L"Face Unlock service did not answer in time. Try again or use PIN or password.",
+                                          L"Служба Face Unlock не ответила вовремя. Попробуйте ещё раз или войдите по PIN-коду или паролю." };
+    static const TextPair kSvcBusy      { L"Face Unlock service is busy. Try again in a moment or use PIN or password.",
+                                          L"Служба Face Unlock занята. Повторите чуть позже или войдите по PIN-коду или паролю." };
+    static const TextPair kSvcUntrusted { L"Could not verify the Face Unlock service — reinstall Face Unlock. Use PIN or password.",
+                                          L"Не удалось проверить службу Face Unlock — переустановите Face Unlock. Войдите по PIN-коду или паролю." };
+    // 9d (V-03): Windows refused the sign-in, but not because of the password.
+    static const TextPair kSignInFailed { L"Sign-in failed — use PIN or password.",
+                                          L"Вход не выполнен — используйте PIN или пароль." };
     static const TextPair kNoPassword   { L"No Windows password is saved in Face Unlock. Sign in with PIN and save it in Face Unlock.",
                                           L"В Face Unlock не сохранён пароль Windows. Войдите по PIN-коду и сохраните его в Face Unlock." };
     static const TextPair kNoEnrollment { L"No face is set up yet. Sign in with PIN and set it up in Face Unlock.",
@@ -533,6 +545,10 @@ const TextPair& TextFor(Text id) {
         case Text::LockedOut:        return kLocked;
         case Text::LockedOutSecs:    return kLockedSecs;
         case Text::Unavailable:      return kUnavailable;
+        case Text::ServiceTimeout:   return kSvcTimeout;
+        case Text::ServiceBusy:      return kSvcBusy;
+        case Text::ServiceUntrusted: return kSvcUntrusted;
+        case Text::SignInFailed:     return kSignInFailed;
         case Text::NoPassword:       return kNoPassword;
         case Text::NoEnrollment:     return kNoEnrollment;
         case Text::CameraBusy:       return kCameraBusy;
@@ -564,7 +580,11 @@ Text FailureClass(const std::string& r) {
         r == "motion-before-prompt" || r == "screen-suspected")
         return Text::NotRecognised;
     if (r == "locked-out") return Text::LockedOut;
-    if (r == "pipe-unavailable" || r == "server-untrusted") return Text::Unavailable;
+    // 9d (V-04): one text per transport failure.
+    if (r == "pipe-unavailable") return Text::Unavailable;
+    if (r == "pipe-timeout") return Text::ServiceTimeout;
+    if (r == "pipe-busy") return Text::ServiceBusy;
+    if (r == "server-untrusted" || r == "pipe-access-denied") return Text::ServiceUntrusted;
     if (r == "no-credentials") return Text::NoPassword;
     if (r == "no-enrollment") return Text::NoEnrollment;
     if (r == "camera-busy" || r == "camera-error" || r == "no-frames") return Text::CameraBusy;
@@ -726,9 +746,36 @@ bool IsPersonSid(const std::wstring& sidStr) {
     return ok;
 }
 
+bool CanonicalSidString(const std::wstring& sidStr, std::wstring& out) {
+    PSID sid = nullptr;
+    if (sidStr.empty() || !ConvertStringSidToSidW(sidStr.c_str(), &sid)) return false;
+    const bool ok = IsValidSid(sid) && SidString(sid, out);
+    LocalFree(sid);
+    return ok;
+}
+
+bool SidStringsEqual(const std::wstring& a, const std::wstring& b) {
+    PSID sa = nullptr, sb = nullptr;
+    if (a.empty() || b.empty() || !ConvertStringSidToSidW(a.c_str(), &sa)) return false;
+    bool eq = false;
+    if (ConvertStringSidToSidW(b.c_str(), &sb)) {
+        eq = IsValidSid(sa) && IsValidSid(sb) && EqualSid(sa, sb);
+        LocalFree(sb);
+    }
+    LocalFree(sa);
+    return eq;
+}
+
+// 9d (V-05): the recorded owner is returned in CANONICAL form (the installer may have written
+// "S-1-5-21-0123-..."), so GetUserSid hands LogonUI the SID it knows; PipeCall and SetUserArray
+// compare with EqualSid anyway.
 bool ReadOwnerSid(std::wstring& out) {
+    std::wstring raw;
 #ifdef FACEUNLOCK_TESTING
-    if (!g_testOwner.empty()) { out = g_testOwner; return IsPersonSid(out); }
+    if (!g_testOwner.empty()) {
+        raw = g_testOwner;
+        return IsPersonSid(raw) && CanonicalSidString(raw, out);
+    }
 #endif
     wchar_t buf[256] = {};
     DWORD cb = sizeof(buf) - sizeof(wchar_t);
@@ -737,8 +784,8 @@ bool ReadOwnerSid(std::wstring& out) {
                                     L"OriginalUserSid", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
                                     &type, buf, &cb);
     if (st != ERROR_SUCCESS) return false;
-    out = buf;
-    return IsPersonSid(out);
+    raw = buf;
+    return IsPersonSid(raw) && CanonicalSidString(raw, out);
 }
 
 bool ServicePipeExists() {
@@ -756,7 +803,7 @@ void TestSetPipeName(const std::wstring& name) { g_testPipe = name; }
 CallStatus PipeCall(const wchar_t* pipeName, const std::wstring& ownerSid,
                     RequestBuilder buildRequest, const void* ctx,
                     std::string& response, DWORD timeoutMs, HANDLE cancelEvent,
-                    ServerTrust* trust) {
+                    ServerTrust* trust, DWORD notFoundMs) {
     const DWORD startTick = GetTickCount();
     auto remaining = [&]() -> DWORD {
         const DWORD elapsed = GetTickCount() - startTick;     // wrap-safe unsigned difference
@@ -784,14 +831,26 @@ CallStatus PipeCall(const wchar_t* pipeName, const std::wstring& ownerSid,
         } else {
             err = GetLastError();
         }
+        // 9d (V-04): the pipe refused the open -- that is not "not running": it cannot be verified.
+        if (err == ERROR_ACCESS_DENIED) return CallStatus::AccessDenied;
         // 8b F-03: read the budget once; every wait below is capped by it and never 0.
         const DWORD rem = remaining();
-        if (rem == 0) return CallStatus::Unavailable;
+        // 9d (V-04): a budget spent entirely on busy instances is "busy", not "unavailable".
+        if (rem == 0) return (err == ERROR_PIPE_BUSY) ? CallStatus::Busy : CallStatus::Unavailable;
         if (err == ERROR_PIPE_BUSY) {
-            // WaitNamedPipe cannot watch the cancel event: keep each wait short.
+            // WaitNamedPipe cannot watch the cancel event: keep each wait short (<= 200 ms) and
+            // look at the event after every slice (9d V-07).
             WaitNamedPipeW(pipeName, (rem < 200) ? rem : 200);
+            if (Cancelled(cancelEvent)) return CallStatus::Cancelled;
         } else if (err == ERROR_FILE_NOT_FOUND) {
-            if (SleepOrCancel(cancelEvent, (rem < 200) ? rem : 200)) return CallStatus::Cancelled;
+            // 9d (A-2): a caller may give a missing pipe less than the whole budget.
+            DWORD slice = (rem < 200) ? rem : 200;
+            if (notFoundMs != INFINITE) {
+                const DWORD spent = timeoutMs - rem;
+                if (spent >= notFoundMs) return CallStatus::Unavailable;
+                if (notFoundMs - spent < slice) slice = notFoundMs - spent;
+            }
+            if (SleepOrCancel(cancelEvent, slice)) return CallStatus::Cancelled;
         } else {
             return CallStatus::Unavailable;
         }
@@ -801,8 +860,10 @@ CallStatus PipeCall(const wchar_t* pipeName, const std::wstring& ownerSid,
     std::wstring serverSid, pipeOwner;
     const bool haveSid = ServerProcessSid(h.get(), serverSid);
     const bool haveOwner = PipeObjectOwnerSid(h.get(), pipeOwner);
+    // 9d (V-05): EqualSid, not string equality -- an owner recorded with leading zeros is still
+    // the same account.
     const bool trusted = haveSid && haveOwner && !ownerSid.empty() &&
-                         serverSid == ownerSid && pipeOwner == ownerSid;
+                         SidStringsEqual(serverSid, ownerSid) && SidStringsEqual(pipeOwner, ownerSid);
     if (trust) {
         trust->checked = true;
         trust->trusted = trusted;
@@ -823,6 +884,7 @@ CallStatus PipeCall(const wchar_t* pipeName, const std::wstring& ownerSid,
         return CallStatus::Unavailable;
     WaitResult w = OverlappedWait(h.get(), ov, remaining(), cancelEvent, transferred, err);
     if (w == WaitResult::Cancelled) return CallStatus::Cancelled;
+    if (w == WaitResult::Timeout) return CallStatus::Timeout;      // 9d (V-04)
     if (w != WaitResult::Done || transferred != request.size()) return CallStatus::Unavailable;
 
     ResetEvent(ev.get());
@@ -840,6 +902,7 @@ CallStatus PipeCall(const wchar_t* pipeName, const std::wstring& ownerSid,
     }
     w = OverlappedWait(h.get(), ov, remaining(), cancelEvent, transferred, err);
     if (w == WaitResult::Cancelled) return CallStatus::Cancelled;
+    if (w == WaitResult::Timeout) return CallStatus::Timeout;      // 9d (V-04)
     if (w == WaitResult::Failed && err == ERROR_MORE_DATA) return CallStatus::Oversize;
     if (w != WaitResult::Done || transferred == 0) return CallStatus::Unavailable;
     response.assign(buf.data(), transferred);
@@ -860,15 +923,6 @@ struct ReportCtx { const std::string* grantId; bool ok; };
 std::string BuildReportCb(DWORD, const void* ctx) {
     const auto* c = static_cast<const ReportCtx*>(ctx);
     return BuildReportRequest(*c->grantId, c->ok);
-}
-
-const char* ReasonFor(CallStatus st) {
-    switch (st) {
-        case CallStatus::Untrusted: return "server-untrusted";
-        case CallStatus::Oversize:  return "malformed-response";
-        case CallStatus::Cancelled: return "cancelled";
-        default:                    return "pipe-unavailable";
-    }
 }
 
 bool Exchange(RequestBuilder build, const void* ctx, DWORD budget, HANDLE cancel,
@@ -892,6 +946,18 @@ bool Exchange(RequestBuilder build, const void* ctx, DWORD budget, HANDLE cancel
 
 }  // anonymous namespace
 
+const char* ReasonFor(CallStatus st) {
+    switch (st) {
+        case CallStatus::Untrusted:    return "server-untrusted";
+        case CallStatus::AccessDenied: return "pipe-access-denied";   // 9d (V-04)
+        case CallStatus::Timeout:      return "pipe-timeout";         // 9d (V-04)
+        case CallStatus::Busy:         return "pipe-busy";            // 9d (V-04)
+        case CallStatus::Oversize:     return "malformed-response";
+        case CallStatus::Cancelled:    return "cancelled";
+        default:                       return "pipe-unavailable";
+    }
+}
+
 bool RequestUnlock(UnlockReply& out, HANDLE cancelEvent, ServerTrust* trust) {
     return Exchange(&BuildUnlockCb, nullptr, kUnlockTimeoutMs, cancelEvent, trust, out);
 }
@@ -912,8 +978,9 @@ bool SendReportResult(const std::string& grantId, bool ok, HANDLE cancelEvent) {
     if (!ReadOwnerSid(owner)) return false;
     std::string resp;
     ReportCtx ctx{ &grantId, ok };
+    // 9d (A-2): one bounded call (kReportTimeoutMs overall); a missing pipe gives up early.
     if (PipeCall(PipeNameInUse(), owner, &BuildReportCb, &ctx, resp, kReportTimeoutMs,
-                 cancelEvent, nullptr) != CallStatus::Ok)
+                 cancelEvent, nullptr, kReportNotFoundMs) != CallStatus::Ok)
         return false;
     return ParseReportReply(resp);
 }

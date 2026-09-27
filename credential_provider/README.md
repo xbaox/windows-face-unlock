@@ -67,8 +67,13 @@ tile should appear.
    is released.
 5. The CP packs those into a `KERB_INTERACTIVE_UNLOCK_LOGON` and returns
    `CPGSR_RETURN_CREDENTIAL_FINISHED`. LogonUI performs the actual logon; `ReportResult` then
-   sends `report_result {grant_id, ok}` so the service counts only an accepted sign-in (protocol
-   v2). A verified result is kept for at most 10 s, used once, and wiped.
+   sends `report_result {grant_id, ok}` itself, synchronously, within 750 ms (connect, server
+   check and write; the acknowledgement only in what is left), so the service counts only an
+   accepted sign-in (protocol v2) and the report cannot be lost with LogonUI.exe exiting after the
+   sign-in. A verified result is kept for at most 10 s and used once; it survives the tile being
+   deselected or unadvised during LogonUI's re-enumeration (the order of those calls is not
+   documented) and is wiped by `ReportResult`, the TTL, a new scan, a refused sign-in and the
+   destructor.
 
 ## Important caveats
 
@@ -87,7 +92,9 @@ tile should appear.
   (`{8414D7B6-…}`, generated in Stage 0). A fork of this repository must generate
   its own (`uuidgen.exe`) before publishing builds.
 - A failed scan never blocks LogonUI: the tile shows a fixed message per cause (not recognised,
-  locked for N s, no password saved, no face set up, camera busy, too dark, service not running,
-  saved password rejected, components do not match, needs attention) and the PIN and password
-  tiles stay available. After Windows rejects the stored password, the service keeps a "password
-  rejected" flag until a new password is saved, and the tile says so.
+  locked for N s, no password saved, no face set up, camera busy, too dark, service unavailable /
+  did not answer in time / busy / could not be verified (9d: four texts, one per transport
+  failure), saved password rejected, sign-in failed for another reason, components do not match,
+  needs attention) and the PIN and password tiles stay available. After Windows rejects the
+  stored password, the service keeps a "password rejected" flag until a new password is saved,
+  and the tile says so.

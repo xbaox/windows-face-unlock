@@ -16,11 +16,12 @@
 //
 // Test vectors are SYNTHETIC -- not real credentials -- so decoded values are printed on failure.
 //
+//   9d            the credential itself (credential_9d.inc): A-1 result lifetime, A-2 synchronous
+//                 report, V-03 latch class, V-04 transport reasons, V-05 SID form, V-08 fields
+//
 // Build via tests/CMakeLists.txt (it passes /utf-8, which the UTF-8 literals below need; D-61):
 //   cmake -B build-tests -S credential_provider/tests -A x64
 //   cmake --build build-tests --config Release
-// or by hand from a VS2022 x64 prompt:
-//   cl /EHsc /std:c++17 /utf-8 /DFACEUNLOCK_TESTING test_parser.cpp ..\PipeClient.cpp advapi32.lib user32.lib
 // Exit code 0 = all pass, 1 = at least one failure.
 
 #include "../PipeClient.h"
@@ -454,6 +455,8 @@ static void SecretWipeTests() {
     Check("wipe: the password sits in the reply's own storage (SSO) before destruction", inline_ && before);
     Check("wipe: no byte of the password remains after ~UnlockReply (N-07)", !after);
 }
+
+#include "credential_9d.inc"
 
 static void KerbPackTests() {
     using namespace FaceUnlock;
@@ -947,9 +950,9 @@ int main() {
           FailureClass("insecure-data-dir") == Text::NeedsAttention &&
           FailureClass("no-models") == Text::NeedsAttention &&
           FailureClass("lockout-store-error") == Text::NeedsAttention);
-    Check("class: 'unavailable' only for an unreachable / untrusted service",
+    Check("class: 'unavailable' only for a pipe that is not there (9d V-04: untrusted has its own)",
           FailureClass("pipe-unavailable") == Text::Unavailable &&
-          FailureClass("server-untrusted") == Text::Unavailable &&
+          FailureClass("server-untrusted") == Text::ServiceUntrusted &&
           FailureClass("deadline-exceeded") == Text::Failed && FailureClass("engine-error") == Text::Failed &&
           FailureClass("malformed-response") == Text::Failed && FailureClass("") == Text::Failed &&
           FailureClass("internal-error") == Text::Failed && FailureClass("gesture-token-invalid") == Text::Failed);
@@ -994,10 +997,17 @@ int main() {
     TransportShapes();
     KerbPackTests();
     SecretWipeTests();
-
     const int total9 = g_pass + g_fail - pre9Count;
+
+    // --- 9d: the credential itself (A-1, A-2, V-03) and the split transport outcomes ---
+    const int pre9dCount = g_pass + g_fail;
+    t9d::StaticTests9d();
+    t9d::TransportTests9d(SelfSid());
+    t9d::CredentialTests(SelfSid());
+    const int total9d = g_pass + g_fail - pre9dCount;
+
     std::printf("-----------------------------\n");
-    std::printf("PASS=%d  FAIL=%d  (baseline 16 + Stage 7-i %d + 8b %d + Stage 9 %d)\n",
-                g_pass, g_fail, stage7iTotal, total8b, total9);
+    std::printf("PASS=%d  FAIL=%d  (baseline 16 + Stage 7-i %d + 8b %d + Stage 9 %d + 9d %d)\n",
+                g_pass, g_fail, stage7iTotal, total8b, total9, total9d);
     return g_fail == 0 ? 0 : 1;
 }

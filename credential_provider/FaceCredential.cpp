@@ -94,41 +94,6 @@ struct FaceCredential::WorkerCtx {
     unsigned gen;
 };
 
-namespace {
-struct ReportCtx {
-    std::string grantId;
-    bool ok;
-    HMODULE module;
-};
-
-DWORD WINAPI ReportThreadProc(LPVOID p) {
-    ReportCtx* c = static_cast<ReportCtx*>(p);
-    HMODULE mod = c->module;
-    try {
-        // Not cancellable on purpose: LogonUI tears the provider down right after a successful
-        // sign-in, and the report must still reach the service. Bounded by kReportTimeoutMs.
-        SendReportResult(c->grantId, c->ok, nullptr);
-    } catch (...) {
-    }
-    delete c;
-    if (mod) FreeLibraryAndExitThread(mod, 0);
-    return 0;
-}
-
-void StartReporter(const std::string& grantId, bool ok) {
-    if (!IsHexToken(grantId)) return;
-    ReportCtx* c = new (std::nothrow) ReportCtx{ grantId, ok, PinThisModule() };
-    if (!c) return;
-    HANDLE t = CreateThread(nullptr, 0, ReportThreadProc, c, 0, nullptr);
-    if (!t) {
-        if (c->module) FreeLibrary(c->module);
-        delete c;
-        return;
-    }
-    CloseHandle(t);   // detached: it owns its context and its module reference
-}
-}  // anonymous namespace
-
 // ---------------------------------------------------------------------------
 // FaceCredential
 // ---------------------------------------------------------------------------
@@ -138,8 +103,8 @@ FaceCredential::FaceCredential(std::shared_ptr<ProviderEvents> providerEvents,
     : m_cRef(1), m_cpus(CPUS_INVALID), m_providerEvents(std::move(providerEvents)),
       m_ownerSid(ownerSid), m_pEvents(nullptr),
       m_haveResult(false), m_resultTick(0), m_scanning(false), m_selected(false),
-      m_aborted(false), m_gen(0), m_scansDisabled(false),
-      m_thread(nullptr), m_threadId(0), m_cancel(nullptr) {
+      m_aborted(false), m_gen(0), m_scansDisabled(false), m_disabledText(Text::SignInFailed),
+      m_workerInTtl(false), m_thread(nullptr), m_threadId(0), m_cancel(nullptr) {
     DllAddRef();   // 8b F-24: the DLL must stay mapped while this object lives
 }
 
@@ -211,13 +176,13 @@ IFACEMETHODIMP FaceCredential::UnAdvise() {
     try {
         // Unhook the sink under the lock, then stop the worker (bounded). Once this returns no
         // thread of ours calls into LogonUI: the sink is gone and an abandoned worker never
-        // publishes. R3: the published result is wiped here too.
+        // publishes. 9d (A-1): a FRESH published result is kept -- LogonUI may UnAdvise and
+        // Advise again inside the re-enumeration that is about to consume it; TTL still applies.
         ICredentialProviderCredentialEvents* doomed = nullptr;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             doomed = m_pEvents;
             m_pEvents = nullptr;
-            ClearSecretsLocked();
         }
         if (doomed) doomed->Release();
         StopWorker();
@@ -235,13 +200,17 @@ IFACEMETHODIMP FaceCredential::SetSelected(BOOL* pbAutoLogon) {
     try {
         bool ready = false;
         bool disabled = false;
+        Text why = Text::SignInFailed;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_selected = true;
             ready = ResultFreshLocked();
             disabled = m_scansDisabled;
+            why = m_disabledText;
         }
-        if (disabled) SetStatus(TileText(Text::PasswordRejected, Lang()));
+        // 9d (V-03): the latch says what really happened -- the password only for a password
+        // NTSTATUS.
+        if (disabled) SetStatus(TileText(why, Lang()));
         else if (!ready) SetStatus(TileText(Text::PressArrow, Lang()));
         return S_OK;
     } catch (...) {
@@ -250,16 +219,17 @@ IFACEMETHODIMP FaceCredential::SetSelected(BOOL* pbAutoLogon) {
 }
 
 IFACEMETHODIMP FaceCredential::SetDeselected() {
-    // Raise the flags, cancel the scan, wipe any result -- and return AT ONCE (no join on the
-    // LogonUI thread). Stage 9 (R3, F-80 / F-82 / F-90): the cancel makes the old worker leave
-    // within milliseconds, so coming back and pressing the arrow starts a fresh scan instead of
-    // being swallowed; and a verified result can no longer outlive the user's attention.
+    // Raise the flags, cancel the scan -- and return AT ONCE (no join on the LogonUI thread).
+    // Stage 9 (R3, F-80 / F-82): the cancel makes a running worker leave within milliseconds, so
+    // coming back and pressing the arrow starts a fresh scan instead of being swallowed.
+    // 9d (A-1): a FRESH verified result is NOT wiped here any more. LogonUI's call order around
+    // the CredentialsChanged re-enumeration is not documented and may deselect the tile before it
+    // asks for the credential; the result keeps its TTL (10 s) and its one use.
     try {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_selected = false;
         m_aborted = true;
         if (m_cancel) SetEvent(m_cancel);
-        ClearSecretsLocked();
         return S_OK;
     } catch (...) {
         return HResultFromCurrentException();
@@ -277,7 +247,8 @@ IFACEMETHODIMP FaceCredential::GetFieldState(DWORD dwFieldID,
 
 IFACEMETHODIMP FaceCredential::GetStringValue(DWORD dwFieldID, PWSTR* ppwsz) {
     try {
-        if (dwFieldID == FIELD_LABEL) return AllocStr(TileText(Text::Label, Lang()).c_str(), ppwsz);
+        if (dwFieldID == FIELD_LABEL || dwFieldID == FIELD_PROVIDER_LABEL)
+            return AllocStr(TileText(Text::Label, Lang()).c_str(), ppwsz);
         std::lock_guard<std::mutex> lk(m_mtx);
         if (dwFieldID == FIELD_STATUS) {
             if (m_status.empty()) m_status = TileText(Text::PressArrow, m_lang.empty() ? ResolveLang("") : m_lang);
@@ -315,8 +286,9 @@ bool FaceCredential::ResultFreshLocked() {
 
 bool FaceCredential::HasResult() {
     std::lock_guard<std::mutex> lk(m_mtx);
-    // F-90: a result waiting while the user moved to another tile does not autologon.
-    return m_selected && !m_scansDisabled && ResultFreshLocked();
+    // 9d (A-1): fresh and not latched off -- selection is no longer required (F-90 reversed by
+    // the architect: LogonUI may re-enumerate before it re-selects the tile).
+    return !m_scansDisabled && ResultFreshLocked();
 }
 
 std::string FaceCredential::Lang() {
@@ -372,6 +344,7 @@ HRESULT FaceCredential::StartWorker() {
         // 8b F-04: after a rejected logon a new scan would resubmit the rejected password.
         if (m_scansDisabled) return S_OK;
         if (m_scanning && !m_aborted) return S_OK;   // a live scan is running: the click is a no-op
+        ClearSecretsLocked();                         // 9d (A-1): a new scan wipes any old result
     }
     // A cancelled predecessor (the user left and came back) is let go of first -- bounded.
     StopWorker();
@@ -391,6 +364,7 @@ HRESULT FaceCredential::StartWorker() {
         gen = ++m_gen;
         m_aborted = false;
         m_scanning = true;
+        m_workerInTtl = false;
         m_cancel = cancel;
     }
     SetStatus(TileText(Text::Scanning, Lang()));
@@ -429,12 +403,14 @@ void FaceCredential::StopWorker() {
     HANDLE t = nullptr;
     DWORD tid = 0;
     HANDLE cancel = nullptr;
+    bool inTtl = false;
     {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_aborted = true;
         t = m_thread;
         tid = m_threadId;
         cancel = m_cancel;
+        inTtl = m_workerInTtl;
         m_thread = nullptr;
         m_threadId = 0;
         m_cancel = nullptr;
@@ -442,9 +418,10 @@ void FaceCredential::StopWorker() {
     }
     // The destructor can run ON the worker (its reference was the last one): never wait on
     // yourself. Anywhere else wait at most kJoinBoundMs, then let go -- the worker owns its
-    // reference on us, its cancel handle and its module reference.
+    // reference on us, its cancel handle and its module reference. 9d (A-1): a worker that only
+    // waits out a published result's TTL is not waited for at all.
     if (t) {
-        if (tid != GetCurrentThreadId()) WaitForSingleObject(t, kJoinBoundMs);
+        if (!inTtl && tid != GetCurrentThreadId()) WaitForSingleObject(t, kJoinBoundMs);
         CloseHandle(t);
     }
     if (cancel) CloseHandle(cancel);
@@ -543,19 +520,47 @@ void FaceCredential::RunScan(unsigned gen, HANDLE cancel) {
     // registered, this is the only thing that tells the user a second click will sign them in.
     WorkerSetStatus(gen, TileText(Text::Verified, lang));
     if (m_providerEvents) m_providerEvents->NotifyCredentialsChanged();
+    WaitOutResult(gen, stamp);
+}
 
-    // R3: an unused result is wiped when its TTL runs out, not left for the next access.
-    if (WaitForSingleObject(cancel, kResultTtlMs) == WAIT_TIMEOUT) {
-        bool expired = false;
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            if (m_haveResult && m_resultTick == stamp && m_gen == gen) {
-                ClearSecretsLocked();
-                expired = true;
-            }
-        }
-        if (expired) WorkerSetStatus(gen, TileText(Text::PressArrow, lang));
+void FaceCredential::WaitOutResult(unsigned gen, DWORD stamp) {
+    // 9d (A-1): the scan is over; from here on the worker only enforces the TTL. It no longer
+    // watches the cancel event (a deselect or an UnAdvise must not end the result's life early),
+    // and it tells StopWorker not to wait for it.
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_gen != gen) return;              // a newer scan owns the flags (and wiped us)
+        m_scanning = false;
+        m_workerInTtl = true;
     }
+    // R3: an unused result is wiped when its TTL runs out, not left for the next access.
+    Sleep(kResultTtlMs);
+    ICredentialProviderCredentialEvents* e = nullptr;
+    std::wstring text;
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (!(m_haveResult && m_resultTick == stamp)) return;   // consumed, replaced or wiped
+        ClearSecretsLocked();
+        // Refresh the tile only if it is still ours and on screen; the current sink (possibly a
+        // new one after UnAdvise / Advise) is the only way into LogonUI.
+        if (m_gen == gen && m_selected && !m_scansDisabled) {
+            text = TileText(Text::PressArrow, ResolveLang(m_lang));
+            m_status = text;
+            e = m_pEvents;
+            if (e) e->AddRef();
+        }
+    }
+    if (e) {
+        e->SetFieldString(this, FIELD_STATUS, text.c_str());
+        e->Release();
+    }
+}
+
+void FaceCredential::LatchScansOff(Text why) {
+    std::lock_guard<std::mutex> lk(m_mtx);
+    m_scansDisabled = true;
+    m_disabledText = why;
+    ClearSecretsLocked();                      // 9d (A-1): the latch wipes a waiting result
 }
 
 IFACEMETHODIMP FaceCredential::GetSerialization(
@@ -579,9 +584,11 @@ IFACEMETHODIMP FaceCredential::GetSerialization(
         std::string grantId;
         bool haveResult = false;
         bool disabled = false;
+        Text why = Text::SignInFailed;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             disabled = m_scansDisabled;
+            why = m_disabledText;
             haveResult = !disabled && ResultFreshLocked();
             if (disabled) ClearSecretsLocked();
             if (haveResult) {
@@ -593,8 +600,9 @@ IFACEMETHODIMP FaceCredential::GetSerialization(
         }
 
         // 8b F-04: a logon with our credential was rejected earlier in this LogonUI session.
+        // 9d (V-03): with the text of what was actually rejected.
         if (disabled) {
-            SetStatus(TileText(Text::PasswordRejected, Lang()));
+            SetStatus(TileText(why, Lang()));
             return S_OK;
         }
 
@@ -651,14 +659,21 @@ IFACEMETHODIMP FaceCredential::ReportResult(NTSTATUS ntsStatus, NTSTATUS ntsSubs
         // adaptation); a password failure makes the service refuse until a new password is
         // saved. Any other failure (account locked, restrictions) is not reported: the grant is
         // then abandoned and nothing is committed.
-        if (!grantId.empty() && (success || pwBad)) StartReporter(grantId, success);
+        // 9d (A-2): sent HERE, synchronously, bounded by kReportTimeoutMs (750 ms) for connect,
+        // identity check and write together; the acknowledgement is awaited only in what is left.
+        // A detached reporter could be killed with LogonUI.exe right after a successful sign-in.
+        if (IsHexToken(grantId) && (success || pwBad)) {
+            try {
+                SendReportResult(grantId, success, nullptr);
+            } catch (...) {
+            }
+        }
         if (success) return S_OK;
         // 8b F-04: never resubmit a credential Windows refused, for the rest of this session.
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            m_scansDisabled = true;
-        }
-        SetStatus(pwBad ? TileText(Text::PasswordRejected, Lang()) : TileText(Text::Failed, Lang()));
+        // 9d (V-03): the latch keeps the failure class for its text.
+        const Text why = pwBad ? Text::PasswordRejected : Text::SignInFailed;
+        LatchScansOff(why);
+        SetStatus(TileText(why, Lang()));
         return S_OK;
     } catch (...) {
         return HResultFromCurrentException();

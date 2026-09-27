@@ -19,11 +19,14 @@ static const GUID kCpfgProviderLabel =
     { 0x286bbff3, 0xbad4, 0x438f, { 0xb0, 0x07, 0x79, 0xb7, 0x26, 0x7c, 0x3d, 0x48 } };
 
 // Static field layout for our tile.
+// 9d (V-08): the label GUID moved off the visible large text onto a hidden small text, exactly
+// as Microsoft's V2 sample does it (SFI_LABEL: CPFT_SMALL_TEXT + CPFS_HIDDEN).
 const CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR s_FieldDescriptors[FIELD_COUNT] = {
-    { FIELD_TILE_IMAGE, CPFT_TILE_IMAGE,    const_cast<PWSTR>(L"Face Unlock"), kCpfgProviderLogo },
-    { FIELD_LABEL,      CPFT_LARGE_TEXT,    const_cast<PWSTR>(L"Face Unlock"), kCpfgProviderLabel },
-    { FIELD_SUBMIT,     CPFT_SUBMIT_BUTTON, const_cast<PWSTR>(L"Submit"), GUID_NULL },
-    { FIELD_STATUS,     CPFT_SMALL_TEXT,    const_cast<PWSTR>(L"Status"), GUID_NULL },
+    { FIELD_TILE_IMAGE,     CPFT_TILE_IMAGE,    const_cast<PWSTR>(L"Face Unlock"), kCpfgProviderLogo },
+    { FIELD_LABEL,          CPFT_LARGE_TEXT,    const_cast<PWSTR>(L"Face Unlock"), GUID_NULL },
+    { FIELD_SUBMIT,         CPFT_SUBMIT_BUTTON, const_cast<PWSTR>(L"Submit"), GUID_NULL },
+    { FIELD_STATUS,         CPFT_SMALL_TEXT,    const_cast<PWSTR>(L"Status"), GUID_NULL },
+    { FIELD_PROVIDER_LABEL, CPFT_SMALL_TEXT,    const_cast<PWSTR>(L"Face Unlock"), kCpfgProviderLabel },
 };
 
 const FIELD_STATE_PAIR s_FieldStatePairs[FIELD_COUNT] = {
@@ -31,7 +34,11 @@ const FIELD_STATE_PAIR s_FieldStatePairs[FIELD_COUNT] = {
     { CPFS_DISPLAY_IN_SELECTED_TILE,  CPFIS_NONE },
     { CPFS_DISPLAY_IN_SELECTED_TILE,  CPFIS_NONE },
     { CPFS_DISPLAY_IN_SELECTED_TILE,  CPFIS_NONE },
+    { CPFS_HIDDEN,                    CPFIS_NONE },
 };
+
+const GUID& ProviderLogoFieldGuid()  { return kCpfgProviderLogo; }
+const GUID& ProviderLabelFieldGuid() { return kCpfgProviderLabel; }
 
 // Copy `src` into buffer at cursor, set UNICODE_STRING fields so that
 // Buffer is an OFFSET (in bytes) from the start of the serialization

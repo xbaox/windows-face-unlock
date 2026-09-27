@@ -12,17 +12,20 @@ project(FaceCPTests LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Offline parser unit test (camera-free, pipe-free, service-free).
+# Offline unit test (camera-free, service-free; the transport cases use a private in-process pipe).
+# 9d: FaceCredential.cpp is compiled in too, so the credential's own lifecycle (A-1 / A-2 / V-03)
+# is exercised against the fake server; dll.cpp is not (the test stubs DllAddRef / DllRelease).
 add_executable(test_parser
     test_parser.cpp
     ../PipeClient.cpp
     ../helpers.cpp
+    ../FaceCredential.cpp
 )
 # FACEUNLOCK_TESTING: the owner / pipe-name overrides the Stage 9 transport cases use. It is
 # defined for this test executable only -- never for the DLL.
 target_compile_definitions(test_parser PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN FACEUNLOCK_TESTING)
 target_compile_options(test_parser PRIVATE /utf-8)
-target_link_libraries(test_parser PRIVATE advapi32 user32 secur32)
+target_link_libraries(test_parser PRIVATE advapi32 user32 secur32 ole32)
 
 # Live unlock harness (talks to a running FaceService; prints only a safe,
 # password-masked summary). Guarded so this file also configures before the

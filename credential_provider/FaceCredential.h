@@ -3,6 +3,7 @@
 #include <credentialprovider.h>
 #include <atomic>
 #include <memory>
+#include "PipeClient.h"   // Text
 #include <mutex>
 #include <string>
 
@@ -34,6 +35,13 @@ private:
 
 // The face tile. Stage 9 (R1): an ICredentialProviderCredential2 tied to the product's owner --
 // GetUserSid returns the owner SID, so LogonUI shows it only under the owner's user tile.
+//
+// 9d (A-1): a FRESH verified result survives SetDeselected and UnAdvise. The order in which LogonUI
+// calls those around the re-enumeration that CredentialsChanged triggers is not documented, and
+// the live 7-i runs proved the semantics where the result lives through it; wiping it there could
+// leave autologon never completing and the tile scanning in a loop. The result still lives at
+// most kResultTtlMs and is used once; it is wiped by ReportResult, by the TTL, by the start of a
+// new scan, by the destructor and by the m_scansDisabled latch.
 //
 // Stage 9 (R3) worker model. Each scan runs on a CreateThread worker that holds (a) a reference
 // on this credential and (b) a loader reference on this DLL, released with
@@ -83,9 +91,9 @@ public:
     // ICredentialProviderCredential2
     IFACEMETHODIMP GetUserSid(PWSTR* sid) override;
 
-    // Provider-facing: has a finished scan left a FRESH credential waiting (TTL, one-shot) while
-    // the tile is still selected? Drives pbAutoLogonWithDefault on the re-enumeration that
-    // CredentialsChanged triggers.
+    // Provider-facing: has a finished scan left a FRESH credential waiting (TTL, one-shot) and is
+    // the tile not latched off? 9d (A-1): selection is no longer required. Drives
+    // pbAutoLogonWithDefault on the re-enumeration that CredentialsChanged triggers.
     bool HasResult();
 
     // A verified result lives at most this long (R3), and is used once.
@@ -102,6 +110,8 @@ private:
     void RunScan(unsigned gen, HANDLE cancel);            // worker thread
     void SetStatus(const std::wstring& text);             // unconditional (LogonUI thread)
     bool WorkerSetStatus(unsigned gen, const std::wstring& text);   // skipped once abandoned
+    void WaitOutResult(unsigned gen, DWORD stamp);        // worker: the TTL half after a publish
+    void LatchScansOff(Text why);                         // 9d (V-03): the latch + its text
     // True once scan `gen`'s output must be thrown away -- aborted, superseded, or the tile is no
     // longer selected. The caller MUST hold m_mtx.
     bool AbandonedLocked(unsigned gen) const;
@@ -133,6 +143,13 @@ private:
     // object. Stage 9 (§2.1): the service now also keeps a persistent flag, so the next lock
     // screen refuses too until a new password is saved.
     bool m_scansDisabled;
+    // 9d (V-03): WHY the latch is set -- PasswordRejected only for a password NTSTATUS, else
+    // SignInFailed. Shown by SetSelected and GetSerialization.
+    Text m_disabledText;
+    // 9d (A-1): the current worker has published and only waits out the TTL. It watches no cancel
+    // event and calls LogonUI only through the current sink, so UnAdvise / a new scan need not
+    // wait for it.
+    bool m_workerInTtl;
     HANDLE m_thread;             // current worker, or null
     DWORD m_threadId;
     HANDLE m_cancel;             // our copy of the current worker's cancel event, or null

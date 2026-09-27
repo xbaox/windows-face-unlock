@@ -14,7 +14,14 @@ inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\FaceUnlock";
 // ("budget_ms", measured after the connect), and the service stops 500 ms short of that.
 constexpr DWORD kUnlockTimeoutMs  = 12000;   // phase 1: passive burst
 constexpr DWORD kGestureTimeoutMs = 18000;   // phase 2: two head movements (R4: 12.4 s round)
-constexpr DWORD kReportTimeoutMs  = 3000;    // report_result after ReportResult
+// 9d (A-2): report_result is sent SYNCHRONOUSLY inside ReportResult, on the LogonUI thread --
+// connect, identity check and write all inside this cap; the acknowledgement is awaited only in
+// what is left of it. A detached reporter thread could be killed with LogonUI.exe right after a
+// successful sign-in, before the report left.
+constexpr DWORD kReportTimeoutMs  = 750;
+// 9d (A-2): with no pipe at all the report stops retrying after this long (the service is not
+// running; there is nobody to tell), instead of spending the whole cap on the LogonUI thread.
+constexpr DWORD kReportNotFoundMs = 250;
 
 // Outcome of the pipe-server identity check, for callers that want to observe it.
 struct ServerTrust {
@@ -67,7 +74,7 @@ enum class Text {
     NotRecognised,    // no-match, no-face, gesture-failed, motion-before-prompt, screen-suspected
     LockedOut,        // locked-out without a usable retry_after_s
     LockedOutSecs,    // locked-out with seconds: contains one %u
-    Unavailable,      // the service really is not reachable (no pipe, untrusted server)
+    Unavailable,      // pipe-unavailable: no pipe (the service is not running) or a dead connection
     NoPassword,       // no-credentials
     NoEnrollment,     // no-enrollment
     CameraBusy,       // camera-busy, camera-error, no-frames
@@ -76,6 +83,12 @@ enum class Text {
     UpdateNeeded,     // version-mismatch
     NeedsAttention,   // refusing service: not-owner, custody, no-models, lockout-store-error
     Failed,           // anything else: timeouts, engine faults, malformed replies, unknown reasons
+    // 9d (V-04): the transport failures no longer share one "service is not running" text.
+    ServiceTimeout,   // pipe-timeout: connected, but no reply inside the budget
+    ServiceBusy,      // pipe-busy: every instance stayed busy for the whole budget
+    ServiceUntrusted, // server-untrusted / pipe-access-denied: reinstall
+    // 9d (V-03): Windows refused the sign-in for a reason other than the password.
+    SignInFailed,
     GestureFallback,  // needs-gesture without a prompt: "Move your head as asked"
 };
 
@@ -97,8 +110,8 @@ std::wstring FailureText(const std::string& reason, double retryAfterS, const st
 // The class a reason falls into (exposed so the offline test can pin the map).
 Text FailureClass(const std::string& reason);
 
-// R2: drop C0 (< 0x20), DEL, C1 (U+0080..U+009F), the bidi controls U+200E..U+200F,
-// U+202A..U+202E, U+2066..U+2069, and U+2028 / U+2029; then cap at kMaxPromptChars without
+// R2: drop C0 (< 0x20), DEL, C1 (U+0080..U+009F), the bidi controls U+061C (ALM, 9d V-07),
+// U+200E..U+200F, U+202A..U+202E, U+2066..U+2069, and U+2028 / U+2029; then cap at kMaxPromptChars without
 // splitting a surrogate pair.
 std::wstring SanitizePromptText(const std::wstring& text);
 
@@ -134,23 +147,38 @@ bool ReadOwnerSid(std::wstring& out);
 // True for S-1-5-21-* and S-1-12-1-* (a person's account: local, domain or Entra ID).
 bool IsPersonSid(const std::wstring& sid);
 
+// 9d (V-05): the canonical string form of a SID string (ConvertStringSidToSid, then back), so
+// "S-1-5-21-0123-..." and "S-1-5-21-123-..." are one account. False when it is not a SID.
+bool CanonicalSidString(const std::wstring& sid, std::wstring& out);
+
+// 9d (V-05): true iff both strings parse as SIDs and EqualSid says they are the same.
+bool SidStringsEqual(const std::wstring& a, const std::wstring& b);
+
 // Instant check that the service pipe exists (no connection is made).
 bool ServicePipeExists();
 
-enum class CallStatus { Ok, Unavailable, Untrusted, Oversize, Cancelled };
+// 9d (V-04): Timeout (connected, no reply in the budget), Busy (all instances busy for the whole
+// budget) and AccessDenied (the pipe refused the open) are their own outcomes now.
+enum class CallStatus { Ok, Unavailable, Untrusted, Oversize, Cancelled, Timeout, Busy, AccessDenied };
 
 // One request/reply on `pipeName`. `buildRequest(remainingMs)` is called after the connect and the
 // identity check, with the budget left at that moment. The server must run as `ownerSid` and the
 // pipe object must be owned by it -- checked BEFORE anything is written. Every wait watches
 // `cancelEvent` (may be null). The reply may carry a password: the caller must wipe `response`.
+// A missing pipe is retried for at most `notFoundMs` of the budget (INFINITE = the whole budget).
 using RequestBuilder = std::string (*)(DWORD remainingMs, const void* ctx);
 CallStatus PipeCall(const wchar_t* pipeName, const std::wstring& ownerSid,
                     RequestBuilder buildRequest, const void* ctx,
                     std::string& response, DWORD timeoutMs, HANDLE cancelEvent,
-                    ServerTrust* trust);
+                    ServerTrust* trust, DWORD notFoundMs = INFINITE);
+
+// The reason token a transport outcome is reported as (exposed for the offline test):
+// Untrusted -> server-untrusted, AccessDenied -> pipe-access-denied, Timeout -> pipe-timeout,
+// Busy -> pipe-busy, Oversize -> malformed-response, Cancelled -> cancelled, else pipe-unavailable.
+const char* ReasonFor(CallStatus st);
 
 // Phase 1 / phase 2 / report. Any trust, transport or parse error -> false with out.reason set
-// ("server-untrusted", "pipe-unavailable", "cancelled", "no-owner", or the service's reason).
+// (a ReasonFor() token, "no-owner", or the service's reason).
 bool RequestUnlock(UnlockReply& out, HANDLE cancelEvent, ServerTrust* trust = nullptr);
 bool RequestUnlockGesture(const std::string& token, UnlockReply& out, HANDLE cancelEvent,
                           ServerTrust* trust = nullptr);

@@ -111,7 +111,11 @@ If it does not work, the tile says why, and the PIN and password tiles are alway
 | No face is set up yet. | Run the setup wizard (3.2). |
 | The camera is busy or not responding. | Close apps using the camera (Teams, Zoom, Camera) or reconnect it. |
 | Too dark to recognise your face. | Add light. |
-| Face Unlock service is not running. | See 6.1. |
+| Face Unlock service is unavailable. | The service is not running in your session. See 6.1. |
+| Face Unlock service did not answer in time. | Try again; if it repeats, see 6.1. |
+| Face Unlock service is busy. | Another request was being answered. Try again in a moment. |
+| Could not verify the Face Unlock service — reinstall Face Unlock. | The lock screen could not confirm the service is the one installed for you. Run the installer again. |
+| Sign-in failed — use PIN or password. | Windows refused this sign-in for a reason other than the password (for example an account restriction). Use your PIN; the face tile stays off until the next lock. |
 | Face Unlock components do not match. Update Face Unlock. | Run the latest installer again. |
 | Face Unlock needs attention. | Sign in with your PIN and open the tray icon: Status shows the reason. |
 
@@ -194,7 +198,7 @@ Settings → Basic → **Face sign-in check**:
 
 ## 6. Troubleshooting
 
-### 6.1 "Face Unlock service is not running"
+### 6.1 "Face Unlock service is unavailable" or "did not answer in time"
 
 - Right after you sign in, the service needs a few seconds to start. Try again.
 - Open the tray icon → Status. If the tray is gone, sign out and in again.

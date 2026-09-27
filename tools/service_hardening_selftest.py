@@ -384,6 +384,25 @@ def test_deadline_and_delivery():
         check("client gone: no ERROR / traceback logged (F-43)", errors == [],
               [r.getMessage() for r in errors])
 
+        # (c2) 9d (A-2): the CP writes report_result and goes away without reading the reply --
+        # the grant is committed on the parsed request, before (and regardless of) the reply write.
+        name = r"\\.\pipe\FaceUnlockSelftest-" + uuid.uuid4().hex
+        s = _svc()
+        s._capture_and_verify = lambda: VerifyOutcome(True, 0.05, True, {"verdict": "PASS"})
+        s._maybe_adapt_gallery = lambda r: None
+        th = threading.Thread(target=_serve_on, args=(s, name, 2), daemon=True)
+        th.start()
+        rep = _client(name, b'{"cmd":"unlock","v":2}')
+        _client(name, json.dumps({"cmd": "report_result", "v": 2, "grant_id": rep.get("grant_id"),
+                                  "ok": True}).encode(), read=False)
+        th.join(5)
+        check("9d A-2: report_result written, client gone at once -> grant committed (reset)",
+              s._lockout.records == [True], s._lockout.records)
+        check("9d A-2: ... audited granted",
+              s._audit.records and s._audit.records[-1][1].get("outcome") == "granted",
+              s._audit.records[-1:] if s._audit.records else None)
+        check("9d A-2: ... and the slot is spent (one-shot)", getattr(s, "_report_slot", None) is None)
+
         # (d) F-42 bad bodies
         name = r"\\.\pipe\FaceUnlockSelftest-" + uuid.uuid4().hex
         s = _svc()

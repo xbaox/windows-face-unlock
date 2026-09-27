@@ -230,6 +230,9 @@ function ConvertSidToStringSidW(Sid: AnsiString; var StringSid: Cardinal): Boole
   external 'ConvertSidToStringSidW@advapi32.dll stdcall';
 function ConvertStringSidToSidW(StringSid: string; var Sid: Cardinal): Boolean;
   external 'ConvertStringSidToSidW@advapi32.dll stdcall';
+// The same export, taking the SID by pointer (the LocalAlloc'ed one ConvertStringSidToSidW returns).
+function ConvertSidPtrToStringSidW(Sid: Cardinal; var StringSid: Cardinal): Boolean;
+  external 'ConvertSidToStringSidW@advapi32.dll stdcall';
 function LocalFree(Mem: Cardinal): Cardinal;
   external 'LocalFree@kernel32.dll stdcall';
 
@@ -311,6 +314,26 @@ begin
   end;
 end;
 
+// 9d (V-05): a SID string in CANONICAL form -- ConvertStringSidToSid, then back -- so
+// "S-1-5-21-0123-..." is recorded as "S-1-5-21-123-...", the form LogonUI, the service and the
+// Credential Provider compare against. '' when it is not a SID at all.
+function CanonicalSid(const S: string): string;
+var
+  Bin, StrPtr: Cardinal;
+begin
+  Result := '';
+  Bin := 0;
+  if not ConvertStringSidToSidW(S, Bin) then
+    exit;
+  StrPtr := 0;
+  if ConvertSidPtrToStringSidW(Bin, StrPtr) then
+  begin
+    Result := PtrToString(StrPtr);
+    LocalFree(StrPtr);
+  end;
+  LocalFree(Bin);
+end;
+
 // String SID -> DOMAIN\user for display; the SID itself when it cannot be resolved.
 function AccountOfSid(const S: string): string;
 var
@@ -361,7 +384,7 @@ begin
   if Arg <> '' then
   begin
     if IsUserSid(Arg) then
-      Result := Arg
+      Result := CanonicalSid(Arg)       // 9d (V-05): recorded canonically
     else
       Result := SidOfAccount(Arg);
     if not IsUserSid(Result) then
@@ -652,7 +675,7 @@ begin
   OwnerName := AccountOfSid(OwnerSid);
   Log('Owner: ' + OwnerName + ' (' + OwnerSid + ')');
   if RegQueryStringValue(HKLM, 'Software\{#MyAppShortName}', 'OriginalUserSid', Recorded)
-     and IsUserSid(Recorded) and (CompareText(Recorded, OwnerSid) <> 0) then
+     and IsUserSid(Recorded) and (CompareText(CanonicalSid(Recorded), OwnerSid) <> 0) then
   begin
     if WizardSilent() then
     begin

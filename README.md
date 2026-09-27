@@ -38,7 +38,7 @@ before you rely on this.
 - **Lock-screen tile** (a Windows Credential Provider). Press the arrow, look at the camera, do the
   two movements shown on the tile. Clear messages when something is wrong: no password saved, no
   face set up, camera busy, too dark, locked for N seconds, password rejected by Windows, service
-  not running.
+  unavailable, slow, busy or not verifiable.
 - **Setup wizard** with a live camera preview, camera choice by name, automatic capture, a quality
   check, a one-person check, and a short calibration of the turn direction for your camera.
 - **Password dialog** that checks the password with Windows before saving it (the same kind of

@@ -14,16 +14,24 @@ struct FIELD_STATE_PAIR {
 };
 
 // Field indices for our single-tile UI.
+// 9d (V-08), as in Microsoft's V2 sample: the provider NAME for "Sign-in options" is a hidden
+// CPFT_SMALL_TEXT carrying CPFG_CREDENTIAL_PROVIDER_LABEL; the visible large "Face Unlock" text
+// carries no field GUID.
 enum FIELD_ID : DWORD {
-    FIELD_TILE_IMAGE = 0,
-    FIELD_LABEL      = 1,
-    FIELD_SUBMIT     = 2,
-    FIELD_STATUS     = 3,
+    FIELD_TILE_IMAGE     = 0,
+    FIELD_LABEL          = 1,
+    FIELD_SUBMIT         = 2,
+    FIELD_STATUS         = 3,
+    FIELD_PROVIDER_LABEL = 4,
     FIELD_COUNT
 };
 
 extern const CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR s_FieldDescriptors[FIELD_COUNT];
 extern const FIELD_STATE_PAIR s_FieldStatePairs[FIELD_COUNT];
+
+// CPFG_CREDENTIAL_PROVIDER_LOGO / _LABEL as used in the table (exposed for the offline test).
+const GUID& ProviderLogoFieldGuid();
+const GUID& ProviderLabelFieldGuid();
 
 // Wraps username/password/domain into a KERB_INTERACTIVE_UNLOCK_LOGON that the
 // LogonUI expects in CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION.rgbSerialization.

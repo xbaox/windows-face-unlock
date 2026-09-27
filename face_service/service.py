@@ -2061,6 +2061,9 @@ class FaceService:
             slot["audit"]("grant-abandoned")
 
     def _report_result(self, req: dict) -> dict:
+        # 9d (A-2): the grant is settled HERE, on the parsed request, before the reply is written;
+        # _serve_connection's write may fail (the CP sends synchronously inside ReportResult and
+        # may be gone -- LogonUI exits after a successful sign-in) and that never undoes it.
         self._expire_report_slot()
         gid, ok = req.get("grant_id"), req.get("ok")
         slot = getattr(self, "_report_slot", None)
@@ -2403,11 +2406,13 @@ class FaceService:
             except pywintypes.error as e:
                 if e.winerror == winerror.ERROR_NO_DATA:
                     # F-59: a client connected and closed before we got here (a client that failed
-                    # its own pre-write check, the stop self-connect) -- nothing to serve.
+                    # its own pre-write check, the stop self-connect). 9d (A-2): what it WROTE
+                    # before closing is still readable -- the CP sends report_result inside a
+                    # 750 ms cap and may be gone by now -- so the request is still served; a client
+                    # that wrote nothing ends in _serve_connection's quiet read-error path.
                     log.debug("client came and went before the connect (ERROR_NO_DATA)")
-                    return
                 # ERROR_PIPE_CONNECTED: a client connected between Create and Connect -> fine.
-                if e.winerror != winerror.ERROR_PIPE_CONNECTED:
+                elif e.winerror != winerror.ERROR_PIPE_CONNECTED:
                     raise
             # We may have been woken by stop()'s self-connect (Ctrl+C / shutdown) rather than a real
             # request -> just return so the loop re-checks _stop.

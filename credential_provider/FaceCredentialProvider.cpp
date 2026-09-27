@@ -121,7 +121,8 @@ IFACEMETHODIMP FaceCredentialProvider::SetUserArray(ICredentialProviderUserArray
             if (FAILED(users->GetAt(i, &u)) || !u) continue;
             PWSTR sid = nullptr;
             if (SUCCEEDED(u->GetSid(&sid)) && sid) {
-                if (_wcsicmp(sid, m_ownerSid.c_str()) == 0) m_ownerListed = true;
+                // 9d (V-05): EqualSid, not a string compare.
+                if (SidStringsEqual(sid, m_ownerSid)) m_ownerListed = true;
                 CoTaskMemFree(sid);
             }
             u->Release();

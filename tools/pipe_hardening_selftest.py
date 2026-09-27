@@ -394,6 +394,13 @@ def test_owner():
           I.owner_check("S-1-5-21-1-2-3-1001", me) is not None)
     check("owner_check: nothing recorded -> refused", I.owner_check("", me) is not None)
     check("owner_check: SYSTEM recorded -> refused", I.owner_check("S-1-5-18", me) is not None)
+    # 9d (V-05): the record may carry leading zeros ("S-1-5-21-0123-..."): still the same owner.
+    padded = me.replace("S-1-5-21-", "S-1-5-21-00", 1) if me.startswith("S-1-5-21-") else me
+    check("9d V-05: owner recorded with leading zeros -> same owner (canonical compare)",
+          padded != me and I.owner_check(padded, me) is None, padded)
+    check("9d V-05: canonical_sid drops leading zeros; junk -> None",
+          I.canonical_sid("S-1-5-21-0001-02-3-01001") == "S-1-5-21-1-2-3-1001"
+          and I.canonical_sid("nope") is None and I.canonical_sid("") is None)
     check("is_user_sid: local / domain / Entra accepted",
           I.is_user_sid("S-1-5-21-1-2-3-1001") and I.is_user_sid("S-1-12-1-111-222-333-444"))
     check("is_user_sid: service SIDs and junk refused",

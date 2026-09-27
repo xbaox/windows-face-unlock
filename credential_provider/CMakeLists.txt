@@ -3,9 +3,16 @@ project(FaceCredentialProvider LANGUAGES CXX RC)
 
 # Stage 9 (R3, F-96): x64 only. LogonUI on the supported Windows builds is x64, the installer is
 # x64-only, and an ARM64 or Win32 build of this DLL would register and then never load.
-if(NOT CMAKE_GENERATOR_PLATFORM STREQUAL "x64" AND NOT CMAKE_VS_PLATFORM_NAME STREQUAL "x64")
-    message(FATAL_ERROR "FaceCredentialProvider builds for x64 only: configure with -A x64 "
-                        "(got platform '${CMAKE_GENERATOR_PLATFORM}${CMAKE_VS_PLATFORM_NAME}')")
+# 9d (V-06): decided by what the COMPILER targets, not by the generator's platform name -- a
+# Ninja / NMake build from an ARM64 or x86 prompt has no generator platform at all. 64-bit
+# pointers AND an x64 (AMD64) compiler target are both required; ARM64 and ARM64EC are refused.
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "FaceCredentialProvider builds for x64 only: the compiler targets "
+                        "${CMAKE_SIZEOF_VOID_P}-byte pointers (use an x64 toolchain / -A x64)")
+endif()
+if(NOT MSVC_CXX_ARCHITECTURE_ID STREQUAL "x64")
+    message(FATAL_ERROR "FaceCredentialProvider builds for x64 only: the compiler targets "
+                        "'${MSVC_CXX_ARCHITECTURE_ID}' (use an x64 toolchain / -A x64)")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)

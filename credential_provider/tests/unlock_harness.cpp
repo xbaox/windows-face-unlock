@@ -67,6 +67,8 @@ int main() {
     std::printf("round-trip       : %llu ms\n", (unsigned long long)dt);
 
     const bool answered = ok || (r.reason != "pipe-unavailable" && r.reason != "server-untrusted" &&
+                                 r.reason != "pipe-access-denied" && r.reason != "pipe-timeout" &&
+                                 r.reason != "pipe-busy" &&
                                  r.reason != "no-owner" && r.reason != "cancelled");
     return answered ? 0 : 1;   // UnlockReply's destructor wipes the password copy
 }
