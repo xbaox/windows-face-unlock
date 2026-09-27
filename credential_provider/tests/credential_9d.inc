@@ -8,6 +8,7 @@
 //   V-05        an owner SID with leading zeros is the same account (EqualSid)
 //   V-07        U+061C is sanitized; a busy-pipe wait sees the cancel event within 200 ms slices
 //   V-08        field table: the provider label GUID sits on a hidden small text
+//   W-05 (r2)   an UnAdvise right after the publish (inside CredentialsChanged) does not wait
 
 #include "../FaceCredential.h"
 
@@ -97,6 +98,27 @@ FaceCredential* Published(const std::wstring& pipe, const std::wstring& owner, b
     return c;
 }
 
+// 9d-r2 (W-05): a provider-events sink whose CredentialsChanged -- called by the worker right
+// after the publish, before the TTL wait -- runs UnAdvise on ANOTHER thread (as LogonUI would)
+// and times it. Before W-05 the worker still counted as scanning there, so StopWorker waited
+// kJoinBoundMs for a worker that was itself blocked in this call.
+struct TimingSink : ICredentialProviderEvents {
+    FaceCredential* cred = nullptr;
+    DWORD unadviseMs = MAXDWORD;
+    IFACEMETHODIMP QueryInterface(REFIID, void** ppv) override { *ppv = nullptr; return E_NOINTERFACE; }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return 2; }
+    IFACEMETHODIMP_(ULONG) Release() override { return 1; }
+    IFACEMETHODIMP CredentialsChanged(UINT_PTR) override {
+        std::thread t([this] {
+            const DWORD t0 = GetTickCount();
+            cred->UnAdvise();
+            unadviseMs = GetTickCount() - t0;
+        });
+        t.join();
+        return S_OK;
+    }
+};
+
 // Stop a scan that a GetSerialization without a result started (no server behind it).
 void Quiet(FaceCredential* c) {
     c->SetDeselected();
@@ -165,6 +187,30 @@ void CredentialTests(const std::wstring& self) {
               s1.r == CPGSR_RETURN_CREDENTIAL_FINISHED && s1.cs.rgbSerialization);
         GetSer(c, s2);
         Check("9d V-01: ... exactly once", s2.r != CPGSR_RETURN_CREDENTIAL_FINISHED);
+        Quiet(c);
+        c->Release();
+    }
+    {   // W-05: UnAdvise between the publish and the TTL wait
+        auto events = std::make_shared<ProviderEvents>();
+        TimingSink sink;
+        events->Set(&sink, 0);
+        FaceCredential* c = new FaceCredential(events, self);
+        sink.cred = c;
+        c->Initialize(CPUS_UNLOCK_WORKSTATION);
+        BOOL al = FALSE;
+        c->SetSelected(&al);
+        bool ok = false;
+        {
+            Serving sv(pipe, kGrant);
+            Ser s;
+            GetSer(c, s);
+            ok = WaitUntil([&] { return sink.unadviseMs != MAXDWORD; }, 5000);
+        }
+        Check("9d-r2 W-05: CredentialsChanged ran after the publish", ok && c->HasResult());
+        Check("9d-r2 W-05: UnAdvise right after the publish does not wait for the worker (< 300 ms)",
+              ok && sink.unadviseMs < 300);
+        std::printf("        (UnAdvise inside CredentialsChanged: %lu ms)\n", sink.unadviseMs);
+        events->Clear();
         Quiet(c);
         c->Release();
     }

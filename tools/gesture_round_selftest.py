@@ -540,6 +540,19 @@ def test_9d():
         check(f"V-10: {label} -> too-dark, NO strike, audited",
               r.get("reason") == "too-dark" and s._lockout.records == []
               and rec is not None and rec.get("reason") == "too-dark", (r, s._lockout.records, rec))
+    # 9d-r2 (A-7 revised, W-03): gesture-order is an active signature -- it strikes in the dark
+    for label, luma in (("sceneL 20", 20.0), ("no light reading", None)):
+        s, tok = _armed(_round_result(passed=False, identity_frames=5, reason="gesture-order", luma=luma))
+        r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+        rec = s._audit.last("unlock_gesture")
+        check(f"W-03: gesture-order in the dark ({label}) -> gesture-failed WITH a strike",
+              r.get("reason") == "gesture-failed" and s._lockout.records == [False]
+              and rec is not None and rec.get("reason") == "gesture-failed", (r, s._lockout.records, rec))
+    for label, reason in (("gesture-timeout", "gesture-timeout"), ("round-timeout", "round-timeout")):
+        s, tok = _armed(_round_result(passed=False, identity_frames=5, reason=reason, luma=20.0))
+        r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+        check(f"W-03: {label} in the dark stays too-dark without a strike",
+              r.get("reason") == "too-dark" and s._lockout.records == [], (r, s._lockout.records))
     s, tok = _armed(_round_result(passed=False, identity_frames=5, luma=floor))
     r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
     check("V-10: at the floor itself (not below) a failed round still strikes",

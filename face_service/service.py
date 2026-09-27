@@ -2056,10 +2056,12 @@ class FaceService:
         # could not be measured -- is too-dark, without a strike: head pose and identity are not
         # trustworthy in the dark, and a strike there could lock the owner out. (No boost in phase
         # 2: that is for the 9e dusk measurements to decide.)
+        # 9d-r2 (A-7 revised, W-03): except gesture-order -- a later movement performed before an
+        # earlier one is an active signature, not pose noise, so it strikes in the dark too.
         dark = luma is None or luma < self.cfg.low_light_luma_min
         failed = (resp.get("reason") == "motion-before-prompt"
                   or not (bool(resp.get("passed")) and frames >= self.cfg.verify_required))
-        if failed and dark:
+        if failed and dark and resp.get("reason") != "gesture-order":
             # audited as the round's outcome; gesture_telemetry above already holds scene_luma
             # and the sequence's own reason
             _audit_round("too-dark", passed=False)
@@ -2489,6 +2491,7 @@ class FaceService:
         if getattr(self, "_listen", None) is None and not self._bind():
             return
         handle = self._listen
+        gone = False
         try:
             try:
                 win32pipe.ConnectNamedPipe(handle, None)
@@ -2497,8 +2500,12 @@ class FaceService:
                     # F-59: a client connected and closed before we got here (a client that failed
                     # its own pre-write check, the stop self-connect). 9d (A-2): what it WROTE
                     # before closing is still readable -- the CP sends report_result inside a
-                    # 750 ms cap and may be gone by now -- so the request is still served; a client
-                    # that wrote nothing ends in _serve_connection's quiet read-error path.
+                    # 750 ms cap and may be gone by now. 9d-r2 (W-04): on this path only
+                    # report_result is served (its SYSTEM gate reads the caller from the pipe --
+                    # still possible after the client closed, probed on Windows); every other
+                    # command is logged and dropped. A client that wrote nothing ends in
+                    # _serve_connection's quiet read-error path.
+                    gone = True
                     log.debug("client came and went before the connect (ERROR_NO_DATA)")
                 # ERROR_PIPE_CONNECTED: a client connected between Create and Connect -> fine.
                 elif e.winerror != winerror.ERROR_PIPE_CONNECTED:
@@ -2507,7 +2514,7 @@ class FaceService:
             # request -> just return so the loop re-checks _stop.
             if self._stop.is_set():
                 return
-            self._serve_connection(handle)
+            self._serve_connection(handle, client_gone=gone)
         finally:
             nxt = None
             if not self._stop.is_set():
@@ -2534,8 +2541,10 @@ class FaceService:
             except pywintypes.error:
                 pass
 
-    def _serve_connection(self, handle) -> None:
-        """Read one request, answer it, settle the grant bookkeeping, wait for the client to close."""
+    def _serve_connection(self, handle, client_gone: bool = False) -> None:
+        """Read one request, answer it, settle the grant bookkeeping, wait for the client to close.
+        ``client_gone`` (9d-r2, W-04): the client closed before the connect -- only report_result
+        is handled then; anything else is logged and dropped, never run."""
         try:
             _hr, data = win32file.ReadFile(handle, 65536)
         except pywintypes.error as e:
@@ -2560,6 +2569,11 @@ class FaceService:
             req = json.loads(data.decode("utf-8"))
         except Exception:
             req = None
+        if client_gone and not (isinstance(req, dict) and req.get("cmd") == "report_result"):
+            cmd = req.get("cmd") if isinstance(req, dict) else None
+            log.info("request cmd=%s from a client that closed before the connect: dropped "
+                     "(only report_result is served then)", repr(cmd)[:LOG_CMD_MAX])
+            return
         if not isinstance(req, dict):
             log.info("request rejected: not a JSON object (%d bytes)", len(data))
             resp = {"ok": False, "reason": "bad-request"}

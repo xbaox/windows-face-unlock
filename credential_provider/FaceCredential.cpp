@@ -511,6 +511,11 @@ void FaceCredential::RunScan(unsigned gen, HANDLE cancel) {
             m_grantId = grantId;
             m_haveResult = true;
             m_resultTick = stamp = GetTickCount();
+            // 9d-r2 (W-05): the scan is over the moment the result is published -- in the SAME
+            // critical section, so an UnAdvise/StopWorker between the publish and the TTL wait
+            // never sees a scanning worker and never blocks LogonUI for kJoinBoundMs.
+            m_scanning = false;
+            m_workerInTtl = true;
             publish = true;
         }
     }
@@ -525,14 +530,9 @@ void FaceCredential::RunScan(unsigned gen, HANDLE cancel) {
 
 void FaceCredential::WaitOutResult(unsigned gen, DWORD stamp) {
     // 9d (A-1): the scan is over; from here on the worker only enforces the TTL. It no longer
-    // watches the cancel event (a deselect or an UnAdvise must not end the result's life early),
-    // and it tells StopWorker not to wait for it.
-    {
-        std::lock_guard<std::mutex> lk(m_mtx);
-        if (m_gen != gen) return;              // a newer scan owns the flags (and wiped us)
-        m_scanning = false;
-        m_workerInTtl = true;
-    }
+    // watches the cancel event (a deselect or an UnAdvise must not end the result's life early).
+    // m_scanning / m_workerInTtl were already set under the publish lock (9d-r2, W-05), so
+    // StopWorker does not wait for this thread.
     // R3: an unused result is wiped when its TTL runs out, not left for the next access.
     Sleep(kResultTtlMs);
     ICredentialProviderCredentialEvents* e = nullptr;

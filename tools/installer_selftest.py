@@ -225,6 +225,10 @@ def test_iss():
     check("busy files handled", "uninsrestartdelete" in s and "restartreplace" in s)
     check("Start-menu AUMID", 'AppUserModelID: "WindowsFaceUnlock.Tray"' in s)
     check("no data removal without a recorded owner (F-216)", "(UninstallUserSid <> '')" in s)
+    unst = code.split("procedure CurUninstallStepChanged", 1)[1].split("\nend;", 1)[0]
+    check("W-06: the uninstaller finds the owner's data by the CANONICAL SID (leading zeros)",
+          "DataDirFor(CanonicalSid(UninstallUserSid))" in unst
+          and "DataDirFor(UninstallUserSid)" not in unst)
     check("enroll offered unchecked when a profile exists (F-192)", "EnrollmentExists" in s)
     en = read("installer/lang/en.isl")
     ru = read("installer/lang/ru.isl")

@@ -300,24 +300,61 @@ def main() -> int:
         clk.tick(0.1)
     check("V-12: no step counts while the window is open", not seq.still_done
           and seq.steps_done == 0 and not seq.done)
-    seq.feed(OPEN, pose())                        # 0.4 s: still inside (<= window)
-    clk.tick(0.1)
-    seq.feed(OPEN, pose())                        # 0.5 s: closes the window
-    check("V-12: the first pose after a complete window closes it; neutral = the window's mean",
-          seq.still_done and seq.neutral is not None
-          and abs(seq.neutral[1] - NEUTRAL[POSE_YAW]) < 1e-3)
+    clk.tick(0.05)
+    seq.feed(OPEN, pose(yaw=NEUTRAL[POSE_YAW] + 1.0))  # 0.45 s: the first pose past the window
+    check("V-12: the first pose past 0.4 s closes a window of >= 2 poses; neutral = the "
+          "window's mean", seq.still_done and abs(seq.neutral[1] - NEUTRAL[POSE_YAW]) < 1e-3)
+
+    print("\n9d-r2 (W-01, W-02): the window never restarts; a slow drift is motion too")
     clk = FakeClock()
     seq = GestureSequence((Challenge.TURN_LEFT, Challenge.NOD), clock=clk)
     seq.feed(OPEN, pose())                        # one pose ...
     clk.tick(0.6)                                 # ... then 0.6 s without one
+    seq.feed(OPEN, pose())
+    check("W-01: one pose in 0.4 s -> the window waits for the second and closes on it",
+          seq.still_done and not seq.done and seq._task is not None)
+    clk = FakeClock()
+    seq = GestureSequence((Challenge.TURN_LEFT, Challenge.NOD), clock=clk)
+    seq.feed(OPEN, pose())
+    clk.tick(0.6)
     seq.feed(OPEN, pose(yaw=NEUTRAL[POSE_YAW] + 10.0))
-    check("V-12: a window that ended with < 2 poses restarts at the next pose (no motion failure)",
-          not seq.done and not seq.still_done)
-    for _ in range(5):
-        clk.tick(0.1)
-        seq.feed(OPEN, pose(yaw=NEUTRAL[POSE_YAW] + 10.0))
-    check("V-12: ... and completes from there, neutral at the new pose", seq.still_done
-          and abs(seq.neutral[1] - (NEUTRAL[POSE_YAW] + 10.0)) < 1e-3)
+    check("W-01: ... and its delta is checked: a moved second pose -> motion-before-prompt "
+          "(before r2 the window silently restarted there)", seq.reason == "motion-before-prompt")
+    for interval in (0.45, 0.8):
+        live = run_seq((Challenge.TURN_LEFT, Challenge.NOD),
+                       [pose(), pose(yaw=NEUTRAL[POSE_YAW] + 1.0)] + [pose(yaw=left_yaw)] * 4
+                       + [pose(yaw=left_yaw, pitch=down_pitch)] * 4, step=interval)
+        check(f"W-01: a still live user with a pose every {interval} s passes (no round-timeout)",
+              live.passed and live.steps_done == 2)
+        rr = run_seq((Challenge.TURN_RIGHT, Challenge.TURN_LEFT),
+                     [pose(), pose()] + [pose(yaw=right_yaw)] * 2 + [pose(yaw=left_yaw)] * 2,
+                     step=interval)
+        check(f"W-01: right then left across the centre, a pose every {interval} s -> PASSED",
+              rr.passed)
+        rep = run_seq((Challenge.TURN_LEFT, Challenge.NOD),
+                      [pose(), pose(yaw=NEUTRAL[POSE_YAW] + STILLNESS_MAX_DEG + 1.0)]
+                      + [pose(yaw=left_yaw)] * 4, step=interval)
+        check(f"W-01: a replay moving in the window, a pose every {interval} s -> "
+              "motion-before-prompt", rep.reason == "motion-before-prompt")
+    # W-02: 3.9 deg per frame at 30 fps passes every frame-to-frame check but covers ~47 deg in
+    # 0.4 s; before r2 its mean became the neutral pose and "left, then back to where the drift
+    # started" counted as left -> right.
+    fps = 1.0 / 30.0
+    drift = [pose(yaw=NEUTRAL[POSE_YAW] - 23.4 + i * 3.9) for i in range(13)]
+    back = [pose(yaw=NEUTRAL[POSE_YAW] + 23.4)] * 10 + [pose(yaw=NEUTRAL[POSE_YAW] - 23.4)] * 10
+    dr = run_seq((Challenge.TURN_LEFT, Challenge.TURN_RIGHT), drift + back, step=fps)
+    check("W-02: a 3.9 deg/frame yaw drift at 30 fps -> motion-before-prompt, not left -> right",
+          dr.reason == "motion-before-prompt" and not dr.passed and not dr.still_done)
+    dp = run_seq((Challenge.NOD, Challenge.TURN_LEFT),
+                 [pose(pitch=NEUTRAL[POSE_PITCH] + i * 3.9) for i in range(13)], step=fps)
+    check("W-02: the same drift in pitch -> motion-before-prompt", dp.reason == "motion-before-prompt")
+    ok_span = run_seq((Challenge.TURN_LEFT, Challenge.NOD),
+                      [pose(yaw=NEUTRAL[POSE_YAW] + i * 1.0) for i in range(5)]
+                      + [pose(yaw=NEUTRAL[POSE_YAW] + 4.0)] * 12
+                      + [pose(yaw=left_yaw + 4.0)] * 4 + [pose(yaw=left_yaw + 4.0, pitch=down_pitch)] * 4,
+                      step=fps)
+    check("W-02: a span of exactly STILLNESS_MAX_DEG is still (<=), the round passes",
+          ok_span.passed)
     # V-13: two opposite turns -- the second is measured from the neutral pose
     back = run_seq((Challenge.TURN_LEFT, Challenge.TURN_RIGHT),
                    still + [pose(yaw=left_yaw)] * 4 + [pose()] * 60)

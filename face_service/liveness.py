@@ -332,11 +332,15 @@ class GestureSequence:
     there, not at issue time -- a cold camera no longer eats the user's window (F-140). Then:
       * still start (9d, A-3): the stillness window opens at the FIRST POSE FED -- the service
         feeds only frames whose face matched the owner -- not at the first camera frame, so a
-        replay kept off-camera for the first 0.4 s is still checked. The window lasts
-        STILLNESS_WINDOW_S and must hold at least 2 poses with every frame-to-frame |d yaw| and
-        |d pitch| within STILLNESS_MAX_DEG; motion fails the round with ``motion-before-prompt``.
-        A window that ends with fewer than 2 poses starts again at the next pose. The first pose
-        after a complete window closes it; its mean pose is the round's NEUTRAL pose;
+        replay kept off-camera for the first 0.4 s is still checked. It is never restarted
+        (9d-r2, W-01). The poses of its first STILLNESS_WINDOW_S are checked: frame-to-frame
+        |d yaw| and |d pitch| within STILLNESS_MAX_DEG, and (W-02) the window's span, max-min yaw
+        and max-min pitch over all its poses, within STILLNESS_MAX_DEG too, so a slow drift is
+        motion as well; motion fails the round with ``motion-before-prompt``. The first pose past
+        STILLNESS_WINDOW_S closes the window when it already holds 2 poses (that pose is the
+        first of the steps, as before); when poses come slower than one per STILLNESS_WINDOW_S
+        (a slow CPU, a VM) and it holds only one, that pose is its second: it is checked the
+        same way and closes it. The window's mean pose is the round's NEUTRAL pose;
       * steps count only after the window: the first step (with its own GESTURE_TIMEOUT_S)
         starts when the window closes and is measured from the neutral pose (before 9d: from the
         round's first poses, i.e. the same still frames); each step is the existing pose
@@ -424,24 +428,29 @@ class GestureSequence:
         return self.state
 
     def _still_step(self, now: float, pitch: float, yaw: float) -> bool:
-        """9d (A-3): account one pose to the still window. True when this pose CLOSED a complete
-        window (it then also counts for the first step); False while the window is open. Fails
-        the round on motion inside the window."""
-        if self._still_t0 is None or (now - self._still_t0 > STILLNESS_WINDOW_S
-                                      and len(self._still) < 2):
-            self._still_t0, self._still = now, [(pitch, yaw)]      # (re)open the window
+        """9d (A-3) / 9d-r2 (W-01, W-02): account one pose to the still window. True when this
+        pose CLOSED the window (it then also counts for the first step); False while the window
+        is open. Fails the round on motion inside the window: a frame-to-frame jump or a span
+        (max-min over the window) above STILLNESS_MAX_DEG, in yaw or in pitch. Never restarts."""
+        if self._still_t0 is None:
+            self._still_t0, self._still = now, [(pitch, yaw)]      # open the window, once
             return False
-        if now - self._still_t0 > STILLNESS_WINDOW_S:
+        past = now - self._still_t0 > STILLNESS_WINDOW_S
+        if not (past and len(self._still) >= 2):                   # a pose OF the window
+            prev = self._still[-1]
+            self._still.append((pitch, yaw))
             arr = np.asarray(self._still, dtype=np.float32)
-            self.neutral = (float(arr[:, 0].mean()), float(arr[:, 1].mean()))
-            self._task = self._step_task(0)
-            return True
-        prev = self._still[-1]
-        if abs(yaw - prev[1]) > STILLNESS_MAX_DEG or abs(pitch - prev[0]) > STILLNESS_MAX_DEG:
-            self._fail("motion-before-prompt")
-            return False
-        self._still.append((pitch, yaw))
-        return False
+            span = arr.max(axis=0) - arr.min(axis=0)
+            if (abs(yaw - prev[1]) > STILLNESS_MAX_DEG or abs(pitch - prev[0]) > STILLNESS_MAX_DEG
+                    or float(span[0]) > STILLNESS_MAX_DEG or float(span[1]) > STILLNESS_MAX_DEG):
+                self._fail("motion-before-prompt")
+                return False
+            if not past:
+                return False
+        arr = np.asarray(self._still, dtype=np.float32)            # >= 2 poses: close it
+        self.neutral = (float(arr[:, 0].mean()), float(arr[:, 1].mean()))
+        self._task = self._step_task(0)
+        return True
 
     def feed(self, landmark, pose) -> ChallengeState:
         if self.done:

@@ -1141,7 +1141,9 @@ var
 begin
   if (CurUninstallStep = usPostUninstall) and (UninstallUserSid <> '') then
   begin
-    DataDir := DataDirFor(UninstallUserSid);
+    // 9d-r2 (W-06): ProfileList is keyed by the CANONICAL SID; a record with leading zeros
+    // ("S-1-5-21-0123-...", accepted as the same owner since V-05) must find the same profile.
+    DataDir := DataDirFor(CanonicalSid(UninstallUserSid));
     if (DataDir <> '') and DirExists(DataDir) and WantsDataRemoved(DataDir) then
     begin
       if IsReparsePoint(DataDir) then

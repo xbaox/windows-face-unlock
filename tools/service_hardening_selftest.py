@@ -17,6 +17,10 @@
   [10] F-44  a frame scene_luma cannot read does not abort the burst.
   [11] F-45  config / adaptive writes are write-then-rename (no .tmp left, content round-trips).
   [12] D-26  the validate() SID lookup is cached.
+  [r2] W-04  a client that wrote and closed BEFORE the connect (ERROR_NO_DATA): the caller is
+             still readable from the pipe (the real _caller_sid, never stubbed here); only
+             report_result is handled on that path -- its SYSTEM gate refuses a SELF caller and
+             commits nothing; pause_camera / shutdown / verify / status are dropped unrun.
 
 Private FACE_UNLOCK_HOME under %TEMP%, private pipe names; the real service and data are untouched.
 Run:  python -m tools.service_hardening_selftest
@@ -603,6 +607,110 @@ def test_9d():
     check("V-20: nothing dropped -> other_person 0", r.get("other_person") == 0, r)
 
 
+_SQOS_IDENTIFICATION = 0x00100000 | (1 << 16)   # SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+
+
+def _write_and_close(name, payload: bytes):
+    """A client like the CP (identification-level QoS) that writes and closes without reading --
+    run BEFORE the server reaches ConnectNamedPipe, so the connect ends in ERROR_NO_DATA."""
+    h = win32file.CreateFile(name, win32file.GENERIC_READ | win32file.GENERIC_WRITE, 0, None,
+                             win32file.OPEN_EXISTING, _SQOS_IDENTIFICATION, None)
+    try:
+        win32pipe.SetNamedPipeHandleState(h, win32pipe.PIPE_READMODE_MESSAGE, None, None)
+        win32file.WriteFile(h, payload)
+    finally:
+        win32file.CloseHandle(h)
+
+
+def test_r2_no_data_path():
+    print("[r2] W-04 the ERROR_NO_DATA path: only report_result, with the REAL caller identity")
+    from face_service import identity as I
+    me = I.current_user_sid()
+    patch(S, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
+    name = r"\\.\pipe\FaceUnlockSelftest-" + uuid.uuid4().hex
+    orig_name, S.PIPE_NAME = S.PIPE_NAME, name
+    s = _svc()
+    s._capture_and_verify = lambda: VerifyOutcome(True, 0.05, True, {"verdict": "PASS"})
+    s._maybe_adapt_gallery = lambda r: None
+    records: list = []
+
+    class _H(logging.Handler):
+        def emit(self, rec):
+            records.append(rec.getMessage())
+
+    hdl = _H(level=logging.DEBUG)
+    S.log.addHandler(hdl)
+    old_level = S.log.level
+    S.log.setLevel(logging.DEBUG)
+    try:
+        # arm a report slot the ordinary way (a connected SYSTEM stand-in on the NORMAL path)
+        th = threading.Thread(target=s._serve_one, daemon=True)
+        s._bind()
+        th.start()
+        rep = _client(name, b'{"cmd":"unlock","v":2}')
+        th.join(5)
+        gid = rep.get("grant_id", "")
+        check("setup: a delivered grant arms the report slot",
+              len(gid) == 32 and getattr(s, "_report_slot", None) is not None, rep)
+        # from here on the caller is read from the pipe for real -- no stand-in
+        del s._caller_sid
+        check("the instance now uses the class' real _caller_sid",
+              type(s)._caller_sid is FaceService._caller_sid and "_caller_sid" not in vars(s))
+
+        seen: list = []
+        real_handle = s._handle
+        s._handle = lambda req, h=None: seen.append(req.get("cmd")) or real_handle(req, h)
+
+        # the mechanism itself: a NO_DATA handle still yields the caller's SID
+        h, s._listen = s._listen, None             # the ONLY instance: the client lands on it
+        _write_and_close(name, b'{"cmd":"status"}')
+        try:
+            win32pipe.ConnectNamedPipe(h, None)
+            nodata = False
+        except pywintypes.error as e:
+            nodata = e.winerror == 232
+        win32file.ReadFile(h, 65536)
+        sid = S._pipe_client_sid_string(h)
+        s._listen = s._create_instance(first=False)
+        win32file.CloseHandle(h)
+        check("W-04: the connect of a closed client ends in ERROR_NO_DATA", nodata)
+        check("W-04: ... and the caller's SID is STILL readable (the gates' own mechanism)",
+              sid == me, (sid, me))
+
+        s._camera_paused_until = 0.0
+        for label, body in (("pause_camera", b'{"cmd":"pause_camera","seconds":60}'),
+                            ("resume_camera", b'{"cmd":"resume_camera"}'),
+                            ("shutdown", b'{"cmd":"shutdown"}'),
+                            ("verify", b'{"cmd":"verify"}'),
+                            ("status", b'{"cmd":"status"}'),
+                            ("not JSON", b"hello")):
+            del records[:]
+            s._camera_paused_until = 0.0 if label != "resume_camera" else 1e18
+            _write_and_close(name, body)
+            s._serve_one()
+            check(f"W-04: {label} from a client gone before the connect -> never run",
+                  seen == [] and not s._stop.is_set()
+                  and s._camera_paused_until == (0.0 if label != "resume_camera" else 1e18),
+                  (seen, s._stop.is_set(), s._camera_paused_until))
+            check(f"W-04: ... and logged as dropped",
+                  any("closed before the connect: dropped" in m for m in records), records)
+
+        del records[:]
+        _write_and_close(name, json.dumps({"cmd": "report_result", "v": 2, "grant_id": gid,
+                                           "ok": True}).encode())
+        s._serve_one()
+        check("W-04: report_result on that path IS handled", seen == ["report_result"], seen)
+        check("W-04: ... its SYSTEM gate read the real caller (SELF) and refused: nothing committed",
+              s._lockout.records == [] and getattr(s, "_report_slot", None) is not None
+              and any("report_result rejected" in m and me in m for m in records),
+              (s._lockout.records, records))
+        s._close_listen()
+    finally:
+        S.log.removeHandler(hdl)
+        S.log.setLevel(old_level)
+        S.PIPE_NAME = orig_name
+
+
 def main() -> int:
     try:
         run_restoring(
@@ -616,6 +724,7 @@ def main() -> int:
             test_scene_luma,
             test_atomic_and_cache,
             test_9d,
+            test_r2_no_data_path,
         )
     finally:
         subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", str(_ROOT)], capture_output=True)
