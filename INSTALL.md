@@ -16,8 +16,9 @@ This guide is for people who install the program. Building from source is in
 | Smart App Control **off** | Until a signed release exists. With Smart App Control on, the unsigned programs are blocked and the lock-screen tile does not load. |
 
 **Which installer?** `WindowsFaceUnlock-Setup-0.2.0-cpu.exe` works on every x64 PC and is the one
-to pick if unsure. `...-gpu.exe` adds NVIDIA's CUDA libraries and uses an NVIDIA graphics card for
-recognition; it is much larger. Each installer has a `.sha256` file next to it -- you can compare it
+to pick if unsure: it runs recognition with the CPU build of ONNX Runtime and contains no NVIDIA
+file. `...-gpu.exe` adds NVIDIA's CUDA libraries and uses an NVIDIA graphics card for recognition;
+it is much larger. Each installer has a `.sha256` file next to it -- you can compare it
 with `Get-FileHash <file> -Algorithm SHA256` in PowerShell.
 
 **One Windows user per PC.** Face Unlock belongs to one account: the user signed in at the
@@ -39,7 +40,8 @@ before and never see the face tile.
    models are already installed, this page is skipped.
 4. **"Sign in to Windows with your face"** is ticked by default. It registers the
    lock-screen tile. Your PIN and password tiles stay; untick it if you only want walk-away lock.
-5. Setup registers three background tasks for you (service, tray, watchdog) and starts them.
+5. Setup registers three background tasks for you (service, notification-area icon, auto-restart)
+   and starts them.
 6. On the last page, keep both boxes ticked:
    - **Save your Windows password** -- type it once; Windows checks it before it is saved (see
      [3.1](#31-your-windows-password)).
@@ -148,7 +150,7 @@ numbers are in Settings → Basic).
 ### 4.3 The tray menu
 
 - **Status…** -- whether the service is running and serving, face profile, password, camera,
-  presence, watchdog, recent events and messages.
+  presence, auto-restart, recent events and messages.
 - **Settings…** -- *Basic*: language, walk-away lock and its interval and strike count, the face
   sign-in check (4.4), camera, notifications, update check. *Advanced* (collapsed): the match
   threshold, the screen check, attempts before the face lockout and its length, presence details,
@@ -162,11 +164,14 @@ numbers are in Settings → Basic).
   Settings.
 - **Help…**, **Quit Face Unlock** (asks first).
 
-**Quit** stops the tray and the service. The walk-away lock stays off until you sign in again; the
-watchdog brings the service back after 5 minutes so the lock-screen tile keeps working.
+**Quit** stops Face Unlock: face sign-in and the walk-away lock stay off until you sign in to Windows
+again or start **Face Unlock** from the Start menu (that also starts the service again). PIN and
+password keep working. Nothing restarts it behind your back in the meantime.
 
-Notifications (update found, face sign-in locked, service stopped) appear as Windows notifications
-from "Windows Face Unlock", and also in Status → recent events.
+Notifications (update found, face sign-in paused, service stopped) appear as Windows notifications
+from "Face Unlock" -- shown through Windows' own notification interface, with no helper program --
+and always in Status → recent events, also when Windows does not show them (Focus assist,
+notifications turned off).
 
 ### 4.4 Liveness modes
 
@@ -213,7 +218,8 @@ Settings → Basic → **Face sign-in check**:
 
 - Right after you sign in, the service needs a few seconds to start. Try again.
 - Open the tray icon → Status. If the tray is gone, sign out and in again.
-- The watchdog restarts a service that stopped answering, with growing pauses if it keeps failing.
+- Auto-restart starts a service that stopped answering again, with growing pauses if it keeps
+  failing (not after **Quit**).
 
 ### 6.2 Status says "Face sign-in is off: …"
 

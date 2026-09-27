@@ -47,7 +47,9 @@ before you rely on this.
   the PC after your face has been missing for a few checks. It never locks while you are being
   helped over Remote Desktop, TeamViewer, Chrome Remote Desktop, Quick Assist or Windows Remote
   Assistance, and it treats "camera busy / covered / unplugged" as *unknown*, never as "present".
-- **Tray icon** with Status, Settings (Basic and Advanced), pause/resume, update check and help.
+- **Notification-area icon** with Status, Settings (Basic and Advanced), pause/resume, update check
+  and help. Windows notifications are shown natively (no helper process); **Quit** keeps face
+  sign-in off until the next Windows sign-in or until Face Unlock is started again.
 - **The camera is used only when needed**: during a sign-in attempt, the setup wizard, or a
   presence check. When you lock the PC the camera is warmed up for up to 60 seconds so the unlock
   is quick, then released.
@@ -97,7 +99,7 @@ ONNX Runtime's own telemetry is switched off. Full details: [SECURITY.md -- Priv
 |---|---|---|
 | `face_service.exe` (`face_service`) | you, in your session | camera, face recognition and the movement check; answers the lock-screen tile over a local pipe |
 | `face_unlock_tray.exe` (`presence_monitor`) | you, in your session | tray icon, Settings, setup wizard, password dialog, optional walk-away lock |
-| `face_unlock_watchdog.exe` | you, in your session | restarts the service if it stops answering |
+| `face_unlock_watchdog.exe` | you, in your session | auto-restart: starts the service again if it stops answering (not after Quit) |
 | `FaceCredentialProvider.dll` | Windows' sign-in screen (SYSTEM) | the lock-screen tile; asks the service and submits your saved password to Windows |
 
 The lock screen runs as SYSTEM in a separate session and cannot open your camera, so the tile is a
