@@ -277,6 +277,75 @@ def main() -> int:
     check("the clocks start at the first frame (F-140): nothing expires before it",
           not seq.started and seq.tick() == ChallengeState.AWAITING)
 
+    print("\n9d (A-3): the still window starts at the first pose fed; opposite turns cross the centre")
+    # V-12: a replay kept off camera (or showing a non-matching face) for the first 0.4 s: no pose
+    # is fed then. Before 9d the window had already run out by the time the moving face arrived.
+    clk = FakeClock()
+    seq = GestureSequence((Challenge.NOD, Challenge.TURN_RIGHT), clock=clk)
+    seq.start()                                   # the first camera frame
+    for _ in range(5):                            # 0.5 s of frames, nothing fed
+        clk.tick(0.1)
+        seq.tick()
+    for i in range(4):                            # then a head already moving 5 deg per frame
+        seq.feed(OPEN, pose(yaw=NEUTRAL[POSE_YAW] + i * (STILLNESS_MAX_DEG + 1.0)))
+        clk.tick(0.1)
+        if seq.done:
+            break
+    check("V-12: 0.5 s with no pose fed, then motion -> motion-before-prompt", seq.reason ==
+          "motion-before-prompt")
+    clk = FakeClock()
+    seq = GestureSequence((Challenge.TURN_LEFT, Challenge.NOD), clock=clk)
+    for _ in range(4):                            # 0.0 .. 0.3 s: inside the window
+        seq.feed(OPEN, pose())
+        clk.tick(0.1)
+    check("V-12: no step counts while the window is open", not seq.still_done
+          and seq.steps_done == 0 and not seq.done)
+    seq.feed(OPEN, pose())                        # 0.4 s: still inside (<= window)
+    clk.tick(0.1)
+    seq.feed(OPEN, pose())                        # 0.5 s: closes the window
+    check("V-12: the first pose after a complete window closes it; neutral = the window's mean",
+          seq.still_done and seq.neutral is not None
+          and abs(seq.neutral[1] - NEUTRAL[POSE_YAW]) < 1e-3)
+    clk = FakeClock()
+    seq = GestureSequence((Challenge.TURN_LEFT, Challenge.NOD), clock=clk)
+    seq.feed(OPEN, pose())                        # one pose ...
+    clk.tick(0.6)                                 # ... then 0.6 s without one
+    seq.feed(OPEN, pose(yaw=NEUTRAL[POSE_YAW] + 10.0))
+    check("V-12: a window that ended with < 2 poses restarts at the next pose (no motion failure)",
+          not seq.done and not seq.still_done)
+    for _ in range(5):
+        clk.tick(0.1)
+        seq.feed(OPEN, pose(yaw=NEUTRAL[POSE_YAW] + 10.0))
+    check("V-12: ... and completes from there, neutral at the new pose", seq.still_done
+          and abs(seq.neutral[1] - (NEUTRAL[POSE_YAW] + 10.0)) < 1e-3)
+    # V-13: two opposite turns -- the second is measured from the neutral pose
+    back = run_seq((Challenge.TURN_LEFT, Challenge.TURN_RIGHT),
+                   still + [pose(yaw=left_yaw)] * 4 + [pose()] * 60)
+    check("V-13: left, then back to the centre, for 'left then right' -> FAILED",
+          not back.passed and back.steps_done == 1)
+    across = run_seq((Challenge.TURN_LEFT, Challenge.TURN_RIGHT),
+                     still + [pose(yaw=left_yaw)] * 4 + [pose()] * 2
+                     + [pose(yaw=NEUTRAL[POSE_YAW] - (YAW_DELTA + 1.0))] * 3)
+    check("V-13: left, then right past the neutral pose by more than YAW_DELTA -> PASSED",
+          across.passed and across.steps_done == 2)
+    short = run_seq((Challenge.TURN_LEFT, Challenge.TURN_RIGHT),
+                    still + [pose(yaw=left_yaw)] * 4
+                    + [pose(yaw=NEUTRAL[POSE_YAW] - (YAW_DELTA - 2.0))] * 60)
+    check("V-13: right by less than YAW_DELTA past the neutral pose is not enough", not short.passed)
+    back_r = run_seq((Challenge.TURN_RIGHT, Challenge.TURN_LEFT),
+                     still + [pose(yaw=right_yaw)] * 4 + [pose()] * 60)
+    check("V-13: right, then back to the centre, for 'right then left' -> FAILED", not back_r.passed)
+    across_r = run_seq((Challenge.TURN_RIGHT, Challenge.TURN_LEFT),
+                       still + [pose(yaw=right_yaw)] * 4 + [pose(yaw=left_yaw)] * 3)
+    check("V-13: right, then left past the neutral pose -> PASSED", across_r.passed)
+    nod_turn = run_seq((Challenge.NOD, Challenge.TURN_LEFT),
+                       still + [pose(pitch=down_pitch)] * 4 + [pose(pitch=down_pitch, yaw=left_yaw)] * 4)
+    check("V-13: pairs with a nod keep their own baselines (nod, then left from the nodded pose)",
+          nod_turn.passed)
+    check("V-13: constants unchanged (YAW_DELTA 20, PITCH_DOWN_DELTA 10, window 0.4 s / 4 deg)",
+          YAW_DELTA == 20.0 and PITCH_DOWN_DELTA == 10.0 and STILLNESS_WINDOW_S == 0.4
+          and STILLNESS_MAX_DEG == 4.0)
+
     if FAILED:
         print(f"\nLIVENESS SELFTEST FAILED: {len(FAILED)} check(s): " + "; ".join(FAILED))
         return 1

@@ -13,18 +13,21 @@ Credential Provider inside LogonUI) and protocol v2; verify requires SELF. No co
 any of this. A service that does not run as the recorded owner, or cannot secure its data
 directory, is "refusing": ping says so and every face function answers the refusal reason.
 
-Refusal reasons shared by the face functions: "not-owner" (R1) | "custody" (R9, was
-"insecure-data-dir").
+Refusal reasons shared by the face functions, in this order: "not-owner" (R1) | "custody" (R9,
+was "insecure-data-dir") | "no-models" (R7) | "lockout-store-error" (R9, F-112; ends as soon as
+the lockout state can be saved again). reload_config refuses "custody" too (9d, V-16).
 
   {"cmd":"ping"}
       -> {"ok":true,"pong":true,"state":"serving"}
-      -> {"ok":true,"pong":true,"state":"refusing","why":"not-owner|custody"}
+      -> {"ok":true,"pong":true,"state":"refusing",
+          "why":"not-owner|custody|no-models|lockout-store-error"}
   {"cmd":"status"}
       -> {"ok":true,"uptime_s":float,"config":{...},"enrollment":bool,"lockout":{...},
           "audit":{...},"data_dir_secure":bool,"state":str[,"why":str],
           "password_rejected":bool,"protocol":2}
   {"cmd":"reload_config"}
-      -> {"ok":true,"config":{...}} | {"ok":false,"reason":"invalid-config: ...|reload-failed: ..."}
+      -> {"ok":true,"config":{...}}
+      -> {"ok":false,"reason":"custody"|"invalid-config: ..."|"reload-failed: ..."}
   {"cmd":"shutdown"}
       -> {"ok":true,"shutting_down":true}
   {"cmd":"pause_camera","seconds":120}   # release the webcam to the enrollment wizard
@@ -33,7 +36,8 @@ Refusal reasons shared by the face functions: "not-owner" (R1) | "custody" (R9, 
   {"cmd":"resume_camera"}
       -> {"ok":true}
   {"cmd":"build_enrollment"[,"replace":true]}
-      -> {"ok":true,"count":int[,"replaced":true][,"pose":{...}]} | {"ok":false,"reason":str}
+      -> {"ok":true,"count":int,"other_person":int[,"replaced":true][,"pose":{...}]}
+         | {"ok":false,"reason":str}       # other_person: photos dropped as another face (9d)
   {"cmd":"clear_enrollment"}
       -> {"ok":true,"removed":int} | {"ok":false,"reason":"partial","removed":int}
   {"cmd":"verify"}             # SELF only; diagnostic: grants nothing, no strike, no secret
@@ -51,11 +55,13 @@ Refusal reasons shared by the face functions: "not-owner" (R1) | "custody" (R9, 
       -> {"ok":false,"reason":"locked-out","retry_after_s":float}
       -> {"ok":false,"reason":"no-match"|"too-dark","distance":float,"real":bool}
       -> {"ok":false,"reason":"not-authorized"|"version-mismatch"|"bad-request"|"not-owner"
-          |"custody"|"password-rejected"|"camera-busy"|"no-frames"|"no-enrollment"
-          |"engine-error"|"deadline-exceeded"|"no-credentials"}
+          |"custody"|"no-models"|"lockout-store-error"|"password-rejected"|"camera-busy"
+          |"camera-error"|"no-frames"|"no-face"|"no-enrollment"|"engine-error"
+          |"deadline-exceeded"|"no-credentials"}
   {"cmd":"unlock_gesture","v":2,"token":"<32 hex>","budget_ms":int}   # SYSTEM only. Phase 2.
       -> {"ok":true,"username":str,"password":str,"domain":str,"grant_id":"<32 hex>"}
       -> {"ok":false,"reason":"gesture-failed","challenge":str,"state":str,"identity_frames":int}
+      -> {"ok":false,"reason":"motion-before-prompt"|"screen-suspected"|"too-dark",...}
       -> {"ok":false,"reason":"gesture-token-invalid"|"locked-out"(+retry_after_s)|...as unlock}
   {"cmd":"report_result","v":2,"grant_id":"<32 hex>","ok":bool}   # SYSTEM only.
       -> {"ok":true} | {"ok":false,"reason":"grant-unknown"}
@@ -65,7 +71,9 @@ Refusal reasons shared by the face functions: "not-owner" (R1) | "custody" (R9, 
          abandoned and nothing is committed.
 
 Deadlines: the service counts from the moment it READ the request and fails closed after
-min(11 s / 14 s, budget_ms - 500 ms) for unlock / unlock_gesture.
+min(11 s / 17 s, budget_ms - 500 ms) for unlock / unlock_gesture -- below the Credential
+Provider's own budgets of 12 s / 18 s (Stage 9, R4: the phase-2 round is 12.4 s).
+no-credentials never resets the lockout (9d, A-8): only report_result ok=true does.
 (reset_lockout was removed in Stage 8b, F-21; the dev-only challenge command in Stage 9, F-67.)
 """
 from __future__ import annotations
@@ -495,15 +503,11 @@ class FaceService:
         # Stage 9 (act 9b R7): the model pack is checked ONCE, at start -- exactly the five pinned
         # files with their pinned SHA-256 (~1-2 s for 340 MB). Anything else and every face
         # function answers "no-models"; ping says {"state":"refusing","why":"no-models"}.
+        # 9d (V-15): the hashing runs in serve_forever AFTER _bind() -- the pipe name is taken
+        # first (F-54) -- and a failure of the check itself (an antivirus lock, an OSError) is
+        # "no-models", never a crash of the service.
         self._models_problem = None
-        if not self._not_owner and custody.ok:
-            from .recognizer import model_problems
-            problems = model_problems(hashes=True)
-            if problems:
-                self._models_problem = "; ".join(problems[:3])
-                log.error("model pack not usable: %s -- face functions refused (no-models). "
-                          "Run the Face Unlock installer again to download it.",
-                          self._models_problem)
+        self._models_pending = not self._not_owner and custody.ok
         # Stage 9 (R6): the per-camera turn-sign calibration (calibration.json).
         self._calibration = self._load_calibration() if custody.ok else {}
         # Persistent consecutive-failure lockout for the face path (PIN stays available).
@@ -1116,7 +1120,8 @@ class FaceService:
           {"ok": False, "reason": "camera-busy" | "no-frames" | "no-enrollment" | "engine-error"
                                   | "deadline-exceeded" | "bad-request"}
           {"ok": True, "challenge", "prompt", "passed", "state", "reason" (the sequence's failure
-           or None), "identity_frames", "distance_best", "faces", "frames_ok", "screen_flagged",
+           or None), "identity_frames", "distance_best", "faces", "frames_ok", "engine_errors",
+           "screen_flagged",
            "screen_checked", "scene_luma", "fps", "_embedding" (best identity frame, never sent)}
         """
         from .liveness import Challenge, GestureSequence
@@ -1142,6 +1147,7 @@ class FaceService:
         luma_max: "float | None" = None
         t_first: "float | None" = None
         n = 0
+        engine_errors = 0
 
         def request_late() -> bool:
             t0 = getattr(self, "_req_started", None)
@@ -1187,6 +1193,7 @@ class FaceService:
                         a = self.recog.analyze_frame(frame)
                     except EngineError as e:
                         log.warning("gesture round: engine error on a frame: %s", e)
+                        engine_errors += 1                # 9d (V-14)
                         seq.tick()
                         continue
                     except RuntimeError as e:
@@ -1244,6 +1251,7 @@ class FaceService:
             "distance_best": None if distance_best is None else round(distance_best, 4),
             "faces": faces,
             "frames_ok": frames_ok,
+            "engine_errors": engine_errors,
             "screen_flagged": screen_flagged,
             "screen_checked": screen_checked,
             "scene_luma": None if luma_max is None else round(luma_max, 2),
@@ -1564,6 +1572,22 @@ class FaceService:
                        "boost_disabled": self._boost_disabled},
         }
 
+    def _check_models(self) -> None:
+        """9d (V-15): the one start-up check of the model pack (see __init__). Idempotent."""
+        if not getattr(self, "_models_pending", False):
+            return
+        self._models_pending = False
+        try:
+            from .recognizer import model_problems
+            problems = model_problems(hashes=True)
+        except Exception as e:                       # OSError (AV lock, I/O), anything else
+            problems = [f"model check failed: {_scrub(e)}"]
+        if problems:
+            self._models_problem = "; ".join(problems[:3])
+            log.error("model pack not usable: %s -- face functions refused (no-models). "
+                      "Run the Face Unlock installer again to download it.",
+                      self._models_problem)
+
     def _refusal(self) -> "str | None":
         """Stage 9 (R1 / R11): why this process refuses face functions, or None when it serves.
         One token per cause, in a fixed order; later stages add their causes here."""
@@ -1591,6 +1615,11 @@ class FaceService:
         # defaults behind the user's back. Both the read/parse and validate() now sit inside the
         # try: a TOMLDecodeError used to escape as the generic "exception: ..." reply, and a
         # wrong-TYPED value raises TypeError out of the range comparisons rather than ValueError.
+        # 9d (V-16): a data directory whose custody could not be secured may hold a config.toml
+        # someone else wrote -- it is not read at all.
+        if getattr(self, "_data_dir_insecure", False):
+            log.warning("reload_config refused: the data directory is not secured (custody)")
+            return {"ok": False, "reason": "custody"}
         try:
             new_cfg = Config.load(strict=True)
         except (ValueError, TypeError) as e:
@@ -1853,7 +1882,11 @@ class FaceService:
         # could not judge enough frames, or in which no face appeared at all is not a failed
         # attempt -- an honest reason, lockout-neutral.
         fault = self._burst_fault(r)
-        if fault is not None:
+        # 9d (V-11): "no face" in a scene below the light floor is the darkness talking -- the
+        # boost (and then too-dark) decides, not no-face.
+        dark_no_face = (fault == "no-face" and r.scene_luma is not None
+                        and r.scene_luma < self.cfg.low_light_luma_min)
+        if fault is not None and not dark_no_face:
             self._audit.write("unlock", {**r.detail, "outcome": fault})
             return {"ok": False, "reason": fault}
         # Stage 3.3 gated exposure boost: if the burst came back below the floor, try to raise
@@ -1872,7 +1905,10 @@ class FaceService:
             # that delivered nothing, or that the engine could not judge, is not a face verdict:
             # keep the dark burst (and its lockout-neutral too-dark answer) instead of turning a
             # device fault in a dim room into a strike.
-            if r is not r_dark and self._burst_fault(r) is not None:
+            if r is not r_dark and self._burst_fault(r) is not None and not (
+                    dark_no_face and self._burst_fault(r) == "no-face"
+                    and r.scene_luma is not None
+                    and r.scene_luma >= self.cfg.low_light_luma_min):
                 log.info("low-light boost re-capture was faulty (%s); keeping the dark burst",
                          self._burst_fault(r))
                 boost_audit = {**boost_audit, "boost_recapture_fault": self._burst_fault(r)}
@@ -1886,6 +1922,11 @@ class FaceService:
         if too_dark:
             self._audit.write("unlock", {**r.detail, "outcome": "too-dark"})
             return {"ok": False, "reason": ll_reason, "distance": r.distance, "real": r.real}
+        # 9d (V-11): the boost lit the scene but there is still nobody: now it is no-face.
+        post = self._burst_fault(r) if dark_no_face else None
+        if post is not None:
+            self._audit.write("unlock", {**r.detail, "outcome": post})
+            return {"ok": False, "reason": post}
         # Stage 7-i phase 1. NEEDS_GESTURE means "recognized, but liveness wants an active
         # gesture". .get() is deliberate: a detail dict WITHOUT a verdict falls through to the old
         # no-match path -- fail closed, never into the gesture path.
@@ -1917,7 +1958,7 @@ class FaceService:
             return {"ok": False, "reason": "deadline-exceeded"}
         granted = self._release_credentials()
         if granted is None:
-            self._lockout.record(True)     # the face matched: same reset as before 8b
+            # 9d (A-8): no reset and no strike -- only report_result ok=true resets the lockout.
             self._audit.write("unlock", {**r.detail, "outcome": "no-credentials"})
             return {"ok": False, "reason": "no-credentials"}
 
@@ -1968,6 +2009,17 @@ class FaceService:
             self._audit_gesture(challenge=resp.get("challenge"), passed=passed,
                                 identity_frames=frames, distance_best=best, reason=reason)
 
+        # 9d (V-14, as _burst_fault / F-134 for phase 1): frames the engine could not judge are a
+        # fault, not an attempt. A round of nothing but faults is engine-error (not no-face);
+        # faults that dominate the round, or leave too few judged frames to pass, are
+        # engine-error too -- lockout-neutral.
+        errors = int(resp.get("engine_errors") or 0)
+        frames_ok = int(resp.get("frames_ok") or 0)
+        if errors > 0 and not resp.get("passed") and (
+                errors >= frames_ok or errors * 2 > frames_ok
+                or (frames_ok - errors) < int(self.cfg.verify_required)):
+            _audit_round("engine-error", passed=False)
+            return {"ok": False, "reason": "engine-error"}
         if faces == 0:
             # R5: nobody in front of the camera for the whole round -- no attempt was made.
             _audit_round("no-face", passed=False)
@@ -1983,6 +2035,19 @@ class FaceService:
             self._lockout.record(False)
             _audit_round("screen-suspected", passed=False)
             return {"ok": False, "reason": "screen-suspected", "challenge": resp.get("challenge"),
+                    "identity_frames": frames}
+        # 9d (A-7, V-10): a phase-2 failure in a scene below the light floor -- or one whose light
+        # could not be measured -- is too-dark, without a strike: head pose and identity are not
+        # trustworthy in the dark, and a strike there could lock the owner out. (No boost in phase
+        # 2: that is for the 9e dusk measurements to decide.)
+        dark = luma is None or luma < self.cfg.low_light_luma_min
+        failed = (resp.get("reason") == "motion-before-prompt"
+                  or not (bool(resp.get("passed")) and frames >= self.cfg.verify_required))
+        if failed and dark:
+            # audited as the round's outcome; gesture_telemetry above already holds scene_luma
+            # and the sequence's own reason
+            _audit_round("too-dark", passed=False)
+            return {"ok": False, "reason": "too-dark", "challenge": resp.get("challenge"),
                     "identity_frames": frames}
         if resp.get("reason") == "motion-before-prompt":
             # R4: moving before the prompt could be read is what a replay does -- a strike.
@@ -2005,7 +2070,7 @@ class FaceService:
             return {"ok": False, "reason": "deadline-exceeded"}
         granted = self._release_credentials()
         if granted is None:
-            self._lockout.record(True)     # the round passed: same reset as before 8b
+            # 9d (A-8): no reset and no strike -- only report_result ok=true resets the lockout.
             _audit_round("no-credentials", passed=True)
             return {"ok": False, "reason": "no-credentials"}
 
@@ -2154,7 +2219,15 @@ class FaceService:
             raise
         self._audit.write("enroll_build", {"mode": "add", "ok": True, "accepted": n,
                                            **self._enroll_telemetry()})
-        return {"ok": True, "count": n}
+        return {"ok": True, "count": n, "other_person": self._other_person()}
+
+    def _other_person(self) -> int:
+        """9d (V-20): photos of the build just done that were dropped as another face."""
+        info = getattr(self.recog, "last_enroll_info", {}) or {}
+        try:
+            return max(0, int(info.get("other_person") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _enroll_telemetry(self) -> dict:
         info = dict(getattr(self.recog, "last_enroll_info", {}) or {})
@@ -2232,7 +2305,7 @@ class FaceService:
                                            "promoted": len(moved_new),
                                            "cleanup_problems": len(problems),
                                            **self._enroll_telemetry()})
-        resp = {"ok": True, "count": n, "replaced": True}
+        resp = {"ok": True, "count": n, "replaced": True, "other_person": self._other_person()}
         if problems:
             resp["partial"] = True
         return resp
@@ -2655,6 +2728,8 @@ class FaceService:
         # and the old order left the name free for all of them. A client that connects meanwhile
         # simply waits for the first answer.
         bound = self._bind()
+        if bound:
+            self._check_models()          # 9d (V-15): hashed with the name already ours
         if bound and self._refusal() is None:
             # Stage 9 (R6, D-40): the gallery -- and with it the adaptive ring -- loads at start
             # whatever warmup_on_start says; only the model/camera warmup stays optional.

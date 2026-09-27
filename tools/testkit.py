@@ -31,6 +31,25 @@ def deliver_and_report(svc, ok: bool = True) -> dict:
                        None)
 
 
+# 9d (V-18): the selftests' own private pipes are hardened like the product's: remote clients
+# refused (PIPE_REJECT_REMOTE_CLIENTS) and an explicit descriptor -- owner and only ACE the test
+# process itself, NETWORK denied first -- instead of the default DACL (None).
+PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+
+
+def private_pipe_sa():
+    """SECURITY_ATTRIBUTES for a selftest's private pipe: O:SELF, D:(deny NETWORK)(allow SELF)."""
+    import win32security
+    from face_service.identity import current_user_sid
+    me = current_user_sid()
+    sd = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+        f"O:{me}D:P(D;;GA;;;NU)(A;;GA;;;{me})", win32security.SDDL_REVISION_1)
+    sa = win32security.SECURITY_ATTRIBUTES()
+    sa.SECURITY_DESCRIPTOR = sd
+    sa.bInheritHandle = 0
+    return sa
+
+
 def skip_is_failure(what: str, e: BaseException) -> bool:
     """Stage 9 (D-141, B14-08): a section that cannot run is a FAILURE unless the run was started
     with ``--allow-skip`` -- a regression that breaks an import must not vanish as "skip" under an

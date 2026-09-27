@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
 testhome.isolate("faceunlock_watchdog_ping_")
+from tools.testkit import PIPE_REJECT_REMOTE_CLIENTS, private_pipe_sa  # noqa: E402  (9d V-18)
 
 import pywintypes    # type: ignore
 import win32file     # type: ignore
@@ -99,9 +100,10 @@ class _Server:
         try:
             h = win32pipe.CreateNamedPipe(
                 self.name, win32pipe.PIPE_ACCESS_DUPLEX,
-                win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+                win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT
+                | PIPE_REJECT_REMOTE_CLIENTS,            # 9d (V-18)
                 1,                     # ONE instance -- see the class docstring
-                65536, 65536, 0, None,
+                65536, 65536, 0, private_pipe_sa(),
             )
             self.ready.set()
             try:

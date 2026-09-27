@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
 _ROOT = testhome.own_root("faceunlock_svchard_")
 from tools.testkit import patch, run_restoring  # noqa: E402  (D-142)
+from tools.testkit import PIPE_REJECT_REMOTE_CLIENTS, private_pipe_sa  # noqa: E402  (9d V-18)
 
 import numpy as np
 import pywintypes    # type: ignore
@@ -438,7 +439,8 @@ def test_perimeter_clients():
     def server(reply: bool):
         h = win32pipe.CreateNamedPipe(name, win32pipe.PIPE_ACCESS_DUPLEX,
                                       win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE
-                                      | win32pipe.PIPE_WAIT, 1, 65536, 65536, 0, None)
+                                      | win32pipe.PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
+                                      65536, 65536, 0, private_pipe_sa())
         try:
             win32pipe.ConnectNamedPipe(h, None)
             try:
@@ -552,6 +554,55 @@ def test_atomic_and_cache():
           info)
 
 
+def test_9d():
+    print("[9d] V-16 reload_config under custody; V-19 lockout-store-error refusal")
+    s = _svc()
+    s._data_dir_insecure = True
+    read = []
+    patch(S.Config, "load", classmethod(lambda cls, strict=False: read.append(1) or Config()))
+    r = s._handle({"cmd": "reload_config"}, None)
+    check("V-16: reload_config with an unsecured data directory -> custody",
+          r == {"ok": False, "reason": "custody"}, r)
+    check("V-16: ... and config.toml is not even read", read == [], read)
+    s2 = _svc()
+    s2._data_dir_insecure = False
+    s2._lockout.reconfigure = lambda *a: None
+    s2._audit.reconfigure = lambda *a: None
+    s2.recog = type("R", (), {"_refresh_refs": lambda self: None, "cfg": None})()
+    r2 = s2._handle({"cmd": "reload_config"}, None)
+    check("V-16: a secured directory still reloads", r2.get("ok") is True and read == [1], (r2, read))
+
+    class _BrokenStore(_LockoutSpy):
+        store_ok = False
+        retries = 0
+
+        def retry_save(self):
+            self.retries += 1
+            return False
+    s3 = _svc()
+    s3._lockout = _BrokenStore()
+    s3._capture_and_verify = lambda: (_ for _ in ()).throw(AssertionError("no camera on a refusal"))
+    r = s3._handle({"cmd": "ping"}, None)
+    check("V-19: ping -> refusing / lockout-store-error",
+          r.get("state") == "refusing" and r.get("why") == "lockout-store-error", r)
+    r = s3._handle({"cmd": "unlock", "v": 2}, None)
+    check("V-19: unlock -> lockout-store-error, no camera, no strike",
+          r == {"ok": False, "reason": "lockout-store-error"} and s3._lockout.records == [], r)
+    s3._lockout.retry_save = lambda: True
+    check("V-19: the refusal ends as soon as the state can be saved again", s3._refusal() is None)
+
+    print("[9d] V-20 the build reply carries the photos dropped as another person")
+    s4 = _svc()
+    s4.recog = type("R", (), {"enroll_from_dir": lambda self, d: 9, "last_enroll_pose": None,
+                              "last_enroll_info": {"other_person": 2, "rejected": 2}})()
+    r = s4._handle({"cmd": "build_enrollment"}, None)
+    check("V-20: build_enrollment (add) -> other_person 2",
+          r.get("ok") is True and r.get("count") == 9 and r.get("other_person") == 2, r)
+    s4.recog.last_enroll_info = {}
+    r = s4._handle({"cmd": "build_enrollment"}, None)
+    check("V-20: nothing dropped -> other_person 0", r.get("other_person") == 0, r)
+
+
 def main() -> int:
     try:
         run_restoring(
@@ -564,6 +615,7 @@ def main() -> int:
             test_small,
             test_scene_luma,
             test_atomic_and_cache,
+            test_9d,
         )
     finally:
         subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", str(_ROOT)], capture_output=True)

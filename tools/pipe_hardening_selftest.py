@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools import testhome  # noqa: E402  (Stage 9, R20: isolation before any product import)
 testhome.isolate("faceunlock_pipehard_")
 from tools.testkit import patch, run_restoring  # noqa: E402  (D-142)
+from tools.testkit import PIPE_REJECT_REMOTE_CLIENTS, private_pipe_sa  # noqa: E402  (9d V-18)
 
 import pywintypes     # type: ignore
 import win32con       # type: ignore
@@ -129,7 +130,8 @@ def test_descriptor():
     sa = svc._build_pipe_sa()
     name = _private("sd")
     h = win32pipe.CreateNamedPipe(name, win32pipe.PIPE_ACCESS_DUPLEX,
-                                  win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_WAIT, 1,
+                                  win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_WAIT
+                                  | PIPE_REJECT_REMOTE_CLIENTS, 1,
                                   4096, 4096, 0, sa)
     info = (win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
             | win32security.LABEL_SECURITY_INFORMATION)
@@ -240,7 +242,8 @@ def test_sid_helpers():
     def _server():
         try:
             sh = win32pipe.CreateNamedPipe(name, win32pipe.PIPE_ACCESS_DUPLEX,
-                                           win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_WAIT, 1,
+                                           win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_WAIT
+                                           | PIPE_REJECT_REMOTE_CLIENTS, 1,
                                            4096, 4096, 0, svc._build_pipe_sa())
             created.set()
             win32pipe.ConnectNamedPipe(sh, None)
@@ -283,7 +286,8 @@ def test_sid_helpers():
     def _srv2():
         h = win32pipe.CreateNamedPipe(name, win32pipe.PIPE_ACCESS_DUPLEX,
                                       win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE
-                                      | win32pipe.PIPE_WAIT, 1, 4096, 4096, 0, None)
+                                      | win32pipe.PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
+                                      4096, 4096, 0, private_pipe_sa())
         try:
             win32pipe.ConnectNamedPipe(h, None)
             try:
@@ -455,9 +459,45 @@ def test_internal_error_and_scrub():
           "<data>" in out and str(APP_DIR) not in out and os.path.expanduser("~") not in out, out)
 
 
+def test_private_pipes():
+    print("[9d] V-18: every pipe a selftest creates rejects remote clients and has an explicit SD")
+    import re
+    tools = Path(__file__).resolve().parent
+    bad = []
+    for f in sorted(tools.glob("*.py")):
+        src = f.read_text(encoding="utf-8")
+        for m in re.finditer(r"CreateNamedPipe\(", src):
+            if src[max(0, m.start() - 20):m.start()].rstrip().endswith("finditer(r\""):
+                continue                               # this scanner's own pattern
+            depth, i = 0, m.end() - 1                  # the call's text up to its closing paren
+            while i < len(src):
+                depth += {"(": 1, ")": -1}.get(src[i], 0)
+                if depth == 0:
+                    break
+                i += 1
+            call = src[m.start():i + 1]
+            if "PIPE_REJECT_REMOTE_CLIENTS" not in call or re.search(r",\s*None\s*,?\s*\)$", call):
+                bad.append(f"{f.name}:{src.count(chr(10), 0, m.start()) + 1}")
+    check("no selftest pipe without PIPE_REJECT_REMOTE_CLIENTS or with a default (None) SD",
+          bad == [], bad)
+    sa = private_pipe_sa()
+    name = _private("v18")
+    h = win32pipe.CreateNamedPipe(name, win32pipe.PIPE_ACCESS_DUPLEX,
+                                  win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_WAIT
+                                  | PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 4096, 0, sa)
+    sddl = _read_sddl(h, win32security.OWNER_SECURITY_INFORMATION
+                      | win32security.DACL_SECURITY_INFORMATION)
+    win32file.CloseHandle(h)
+    me = I.current_user_sid()
+    check("the private pipe SD: owner SELF, NETWORK denied first, SELF only",
+          sddl.startswith(f"O:{me}") and re.match(r"P?\((D;;(GA|FA);;;NU)\)", sddl.split("D:", 1)[1])
+          and "WD" not in sddl, sddl)
+
+
 def main() -> int:
     run_restoring(
         test_descriptor,
+        test_private_pipes,
         test_instances,
         test_always_listening,
         test_sid_helpers,

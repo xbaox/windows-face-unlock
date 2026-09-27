@@ -305,6 +305,18 @@ def test_wizard():
     set_language("en")
     check("rejection reasons localised (det = hard to make out, not 'recognised')",
           h and "распознано" not in h and "различимо" in h, h)
+    # 9d (V-20): the photos dropped as another person are shown after a successful build
+    txt, lvl = E.built_message({"ok": True, "count": 12, "other_person": 3})
+    check("V-20: a build that dropped 3 photos of another person says so (EN), as a warning",
+          "3 photo(s) showed a different person" in txt and "12 photos used" in txt and lvl == "warn",
+          (txt, lvl))
+    set_language("ru")
+    txt_ru, _l = E.built_message({"ok": True, "count": 12, "other_person": 3})
+    set_language("en")
+    check("V-20: ... and in Russian", "другим человеком не использованы: 3" in txt_ru, txt_ru)
+    txt0, lvl0 = E.built_message({"ok": True, "count": 12, "other_person": 0})
+    check("V-20: nothing dropped -> the plain success line", "different person" not in txt0
+          and lvl0 == "ok", (txt0, lvl0))
     for fn in (E.camera_worker, E.build_worker, E.readiness_worker, E.calibrate_worker,
                E.service_wait_worker, E.release_and_check_worker, E.wipe_worker):
         src = inspect.getsource(fn)

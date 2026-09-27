@@ -104,6 +104,24 @@ _COACH_KEY_BY_TOKEN = {"dark": "enroll.coach.dark", "bright": "enroll.coach.brig
                        "blur": "enroll.coach.blur"}
 
 
+def built_message(resp: dict) -> "tuple[str, str]":
+    """The wizard's line after a SUCCESSFUL build: (text, level). 9d (V-20): photos dropped as
+    another person's face are reported, not silently absorbed."""
+    n = int(resp.get("count", 0) or 0)
+    try:
+        others = max(0, int(resp.get("other_person", 0) or 0))
+    except (TypeError, ValueError):
+        others = 0
+    pose = resp.get("pose") or {}
+    if n > 0 and pose and pose_warning(float(pose.get("pitch", 0.0)), float(pose.get("yaw", 0.0))):
+        text, level = t("enroll.guide.pose_warn", n=n), "warn"
+    else:
+        text, level = t("enroll.guide.done", n=n), "ok"
+    if others:
+        text, level = text + " " + t("enroll.guide.other_person", k=others), "warn"
+    return text, level
+
+
 def count_images(directory=None) -> int:
     try:
         return sum(1 for p in (directory or ENROLL_DIR).iterdir()
@@ -916,13 +934,8 @@ class EnrollWindow:
         self.building = False
         self._refresh_existing()
         if resp and resp.get("ok"):
-            n = int(resp.get("count", 0))
             self.mode = None                        # F-187: the next Start asks again
-            pose = resp.get("pose") or {}
-            if n > 0 and pose and pose_warning(float(pose.get("pitch", 0.0)), float(pose.get("yaw", 0.0))):
-                self._set_line(t("enroll.guide.pose_warn", n=n), "warn")
-            else:
-                self._set_line(t("enroll.guide.done", n=n), "ok")
+            self._set_line(*built_message(resp))    # 9d (V-20): + photos of another person
             self._show_ready_panel()
             self._offer_calibration()
         else:

@@ -521,6 +521,128 @@ def test_audit_and_adaptation():
           tele is not None and tele.get("fps") == 20.0 and tele.get("screen_flagged") == 1, tele)
 
 
+def test_9d():
+    print("[9d] A-7 dark phase 2, V-11 dark no-face, V-14 engine faults, A-8 no-credentials")
+    patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
+    floor = Config().low_light_luma_min
+    # V-10 (A-7): a failed phase 2 in the dark (or with no light reading) -> too-dark, no strike
+    for label, runner in (
+            ("gesture-failed at sceneL 30", _round_result(passed=False, identity_frames=5, luma=30.0)),
+            ("gesture-failed without a light reading", _round_result(passed=False, identity_frames=5,
+                                                                      luma=None)),
+            ("too few identity frames in the dark", _round_result(passed=True, identity_frames=1,
+                                                                   luma=floor - 0.1)),
+            ("motion-before-prompt in the dark", _round_result(passed=False, reason="motion-before-prompt",
+                                                                luma=20.0))):
+        s, tok = _armed(runner)
+        r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+        rec = s._audit.last("unlock_gesture")
+        check(f"V-10: {label} -> too-dark, NO strike, audited",
+              r.get("reason") == "too-dark" and s._lockout.records == []
+              and rec is not None and rec.get("reason") == "too-dark", (r, s._lockout.records, rec))
+    s, tok = _armed(_round_result(passed=False, identity_frames=5, luma=floor))
+    r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+    check("V-10: at the floor itself (not below) a failed round still strikes",
+          r.get("reason") == "gesture-failed" and s._lockout.records == [False], (r, s._lockout.records))
+    s, tok = _armed(_round_result(passed=True, identity_frames=5, luma=20.0))
+    r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+    check("V-10: a PASSED round in the dark is not turned into too-dark", r.get("ok") is True, r)
+
+    # V-14: engine faults in phase 2
+    for label, runner, frames_ok, errors, want in (
+            ("a round of nothing but engine faults", _round_result(passed=False, identity_frames=0, faces=0,
+                                                                   checked=0), 6, 6, "engine-error"),
+            ("faults dominate the round", _round_result(passed=False, identity_frames=2, faces=3),
+             7, 4, "engine-error")):
+        def with_errors(k, *, identity=True, runner=runner, frames_ok=frames_ok, errors=errors):
+            return {**runner(k, identity=identity), "frames_ok": frames_ok, "engine_errors": errors}
+        s, tok = _armed(with_errors)
+        r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+        check(f"V-14: {label} -> {want}, NO strike (not no-face)",
+              r.get("reason") == want and s._lockout.records == [], (r, s._lockout.records))
+    s, tok = _armed(lambda k, *, identity=True: {**_round_result(passed=False, identity_frames=5)(k),
+                                                  "engine_errors": 1, "frames_ok": 12})
+    r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+    check("V-14: one stray fault in a judged round -> the face verdict stands (strike)",
+          r.get("reason") == "gesture-failed" and s._lockout.records == [False], (r, s._lockout.records))
+    # ... and the real round counts EngineError frames
+    from face_service.recognizer import EngineError
+
+    class _Faulty:
+        def analyze_frame(self, frame):
+            raise EngineError("synthetic fault")
+    orig_luma = svc.scene_luma
+    svc.scene_luma = lambda frame: 90.0
+    try:
+        s2 = _svc(Config(persistent_camera=False))
+        cam = _StubCam([_WARMUP, _WARMUP] + [_f(True, _BASE)] * 6, 0)
+        s2.recog = _Faulty()
+        s2._acquire_camera = lambda: (cam, False)
+        s2._camera_leased_out = lambda: False
+        s2._note_camera_health = lambda *a: False
+        s2._calibration = {}
+        real = svc.time
+        svc.time = _Clock(cam)
+        try:
+            out = s2._run_challenge("turn_left,nod", identity=True)
+        finally:
+            svc.time = real
+    finally:
+        svc.scene_luma = orig_luma
+    check("V-14: the real round reports engine_errors for EngineError frames",
+          out.get("ok") is True and out.get("engine_errors") == 6 and out.get("faces") == 0, out)
+
+    # V-12 (A-3) through the real round: 0.5 s of frames with no matching face, then a face that
+    # is already moving -- the still window opens at the first FED pose, so it is still checked.
+    svc.scene_luma = lambda frame: 90.0
+    try:
+        moving = [_f(True, (_BASE[0], _BASE[1] + i * (STILLNESS_MAX_DEG + 1.0))) for i in range(6)]
+        late = _round("turn_left,nod", [_f(False, _BASE, face=False)] * 5 + moving)
+        check("V-12: replay kept off camera for the first 0.5 s, then moving -> motion-before-prompt",
+              late.get("reason") == "motion-before-prompt", late)
+        imp = _round("turn_left,nod", [_f(False, _LEFT)] * 5 + moving)
+        check("V-12: ... also when the first 0.5 s showed a NON-matching face",
+              imp.get("reason") == "motion-before-prompt", imp)
+    finally:
+        svc.scene_luma = orig_luma
+
+    # V-11: phase 1, a dark burst with no face -> the boost, then too-dark (not no-face)
+    def dark_burst(faces=0, luma=12.0):
+        return VerifyOutcome(False, 1.0, False, {"verdict": "NOT_LIVE", "frames_ok": 5,
+                                                 "engine_errors": 0, "faces": faces}, None, luma)
+    d = _svc()
+    d._capture_and_verify = lambda: dark_burst()
+    boosted = []
+    d._maybe_boost = lambda r: (boosted.append(1) or (dark_burst(luma=14.0), {"boost": "tried"}))
+    r = d._handle({"cmd": "unlock", "v": 2}, None)
+    check("V-11: dark burst without a face -> boost tried, then too-dark, no strike",
+          boosted == [1] and r.get("reason") == "too-dark" and d._lockout.records == [],
+          (boosted, r, d._lockout.records))
+    b = _svc()
+    b._capture_and_verify = lambda: dark_burst()
+    b._maybe_boost = lambda r: (dark_burst(luma=90.0), {"boost": "lit"})
+    r = b._handle({"cmd": "unlock", "v": 2}, None)
+    check("V-11: the boost lit the scene and still nobody -> no-face, no strike",
+          r.get("reason") == "no-face" and b._lockout.records == [], (r, b._lockout.records))
+    n = _svc()
+    n._capture_and_verify = lambda: dark_burst(luma=90.0)
+    n._maybe_boost = lambda r: (_ for _ in ()).throw(AssertionError("no boost in a lit scene"))
+    r = n._handle({"cmd": "unlock", "v": 2}, None)
+    check("V-11: a LIT burst without a face is still no-face at once", r.get("reason") == "no-face", r)
+
+    # V-17 (A-8): no-credentials neither resets nor strikes, in both phases
+    patch(svc, "load_password", lambda: None)
+    p1 = _svc()
+    p1._capture_and_verify = lambda: VerifyOutcome(True, 0.05, True, {"verdict": "PASS"}, None, 90.0)
+    r = p1._handle({"cmd": "unlock", "v": 2}, None)
+    check("V-17: phase 1 match without a stored password -> no-credentials, no reset",
+          r.get("reason") == "no-credentials" and p1._lockout.records == [], (r, p1._lockout.records))
+    s, tok = _armed(_round_result())
+    r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+    check("V-17: phase 2 passed without a stored password -> no-credentials, no reset",
+          r.get("reason") == "no-credentials" and s._lockout.records == [], (r, s._lockout.records))
+
+
 def main() -> int:
     run_restoring(
         test_phase1,
@@ -529,6 +651,7 @@ def main() -> int:
         test_round,
         test_strikes,
         test_audit_and_adaptation,
+        test_9d,
     )
     if FAILS:
         print(f"\nGESTURE-ROUND SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")

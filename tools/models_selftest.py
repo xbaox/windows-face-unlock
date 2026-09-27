@@ -179,12 +179,52 @@ def test_frozen_layout():
             sys.frozen = real_frozen
 
 
+def test_models_after_bind():
+    print("[9d] V-15: the pack is hashed after the pipe name is ours; a failing check is no-models")
+    import inspect
+    from face_service import recognizer as R
+    from face_service.service import FaceService
+    init_src = inspect.getsource(FaceService.__init__)
+    serve_src = inspect.getsource(FaceService.serve_forever)
+    check("__init__ no longer hashes the pack", "model_problems(" not in init_src
+          and "_models_pending" in init_src)
+    check("serve_forever: _bind() first, then _check_models()",
+          0 <= serve_src.find("self._bind()") < serve_src.find("self._check_models()"))
+    real = R.model_problems
+    try:
+        def locked(hashes=True):
+            raise PermissionError(13, "The process cannot access the file (antivirus)")
+        R.model_problems = locked
+        s = FaceService.__new__(FaceService)
+        s._models_pending, s._models_problem = True, None
+        try:
+            s._check_models()
+            raised = None
+        except Exception as e:           # the old code let this escape out of __init__
+            raised = e
+        check("an OSError from the check -> no crash", raised is None, raised)
+        check("... the service refuses with no-models", s._refusal() == "no-models"
+              and "model check failed" in (s._models_problem or ""), s._models_problem)
+        R.model_problems = lambda hashes=True: []
+        s2 = FaceService.__new__(FaceService)
+        s2._models_pending, s2._models_problem = True, None
+        s2._check_models()
+        check("a good pack -> serving", s2._refusal() is None and s2._models_pending is False)
+        calls = []
+        R.model_problems = lambda hashes=True: calls.append(1) or []
+        s2._check_models()
+        check("the check runs once", calls == [])
+    finally:
+        R.model_problems = real
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="fu-models-"))
     try:
         test_check_pack(tmp)
         test_single_source()
         test_service_refusal()
+        test_models_after_bind()
         test_yunet(tmp)
         test_frozen_layout()
     finally:

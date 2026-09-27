@@ -51,7 +51,9 @@ def service_reasons(src: str) -> set:
     reasons = set(re.findall(r'"reason":\s*"([a-z0-9-]+)"', src))
     reasons |= set(re.findall(r'return "((?:not-owner|custody|no-models|lockout-store-error))"', src))
     # _burst_fault / low-light helpers return tokens by name
-    reasons |= set(re.findall(r'return "(no-frames|no-enrollment|engine-error)"', src))
+    # 9d (V-19): no-face (_burst_fault) and camera-error (_camera_reason) are returned by name too
+    reasons |= set(re.findall(r'return "(no-frames|no-enrollment|engine-error|no-face|camera-error)"',
+                              src))
     reasons.add("too-dark")          # lowlight.TOO_DARK_REASON, returned as ll_reason
     return reasons
 

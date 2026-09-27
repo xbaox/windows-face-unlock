@@ -234,14 +234,17 @@ def kind_met(kind: Challenge, baseline: tuple[float, float], pitch: float, yaw: 
 
 
 class _PoseTask:
-    """Reach a yaw/pitch deviation from a captured baseline before timeout."""
+    """Reach a yaw/pitch deviation from a captured baseline before timeout. ``baseline`` fixes the
+    reference up front (9d, A-3: the second of two opposite turns is measured from the neutral
+    pose of the still window); without it the first GESTURE_BASELINE_FRAMES poses set it."""
 
-    def __init__(self, kind: Challenge, timeout_s: float, clock, left_sign: float | None = None):
+    def __init__(self, kind: Challenge, timeout_s: float, clock, left_sign: float | None = None,
+                 baseline: "tuple[float, float] | None" = None):
         self.kind = kind
         self._clock = clock
         self._deadline = clock() + timeout_s
         self._samples: list[tuple[float, float]] = []
-        self._baseline: tuple[float, float] | None = None
+        self._baseline: tuple[float, float] | None = baseline
         self._resolved = False
         self._passed = False
         self._left_sign = default_left_sign() if left_sign is None else float(left_sign)
@@ -325,14 +328,23 @@ class GestureSequence:
     """Stage 9 (act 9b R4): the lock screen's phase 2.
 
     ``kinds`` is GESTURE_SEQUENCE_LEN DIFFERENT movements from GESTURE_KINDS, to be performed in
-    that order. Nothing runs until the first frame arrives: the round clock (ROUND_CAP_S), the
-    stillness window and the first step's own GESTURE_TIMEOUT_S all start there, not at issue time
-    -- a cold camera no longer eats the user's window (F-140). Then:
-      * still start: during the first STILLNESS_WINDOW_S of frames, frame-to-frame |d yaw| and
-        |d pitch| must stay within STILLNESS_MAX_DEG, else the round fails with
-        ``motion-before-prompt`` (a replay that is already moving when the prompt appears);
-      * each step is the existing pose detector with its own baseline and GESTURE_TIMEOUT_S; the
-        next step starts when the previous one passes;
+    that order. Nothing runs until the first frame arrives: the round clock (ROUND_CAP_S) starts
+    there, not at issue time -- a cold camera no longer eats the user's window (F-140). Then:
+      * still start (9d, A-3): the stillness window opens at the FIRST POSE FED -- the service
+        feeds only frames whose face matched the owner -- not at the first camera frame, so a
+        replay kept off-camera for the first 0.4 s is still checked. The window lasts
+        STILLNESS_WINDOW_S and must hold at least 2 poses with every frame-to-frame |d yaw| and
+        |d pitch| within STILLNESS_MAX_DEG; motion fails the round with ``motion-before-prompt``.
+        A window that ends with fewer than 2 poses starts again at the next pose. The first pose
+        after a complete window closes it; its mean pose is the round's NEUTRAL pose;
+      * steps count only after the window: the first step (with its own GESTURE_TIMEOUT_S)
+        starts when the window closes and is measured from the neutral pose (before 9d: from the
+        round's first poses, i.e. the same still frames); each step is the existing pose
+        detector, and the next step starts when the previous one passes with its own baseline;
+      * two OPPOSITE turns (left then right, right then left, A-3): the second target is measured
+        from the NEUTRAL pose, so the head must cross the centre by YAW_DELTA the other way --
+        "turn left and come back to the centre" no longer passes as "turn right". Pairs with a nod
+        keep their own baselines;
       * the order is checked: reaching a LATER step's target while an earlier step is still open
         fails the round with ``gesture-order``;
       * the whole round ends by ROUND_CAP_S (``round-timeout``).
@@ -354,11 +366,20 @@ class GestureSequence:
         self.steps_done = 0
         self._t0: float | None = None
         self._task: _PoseTask | None = None
-        self._prev: tuple[float, float] | None = None
+        # 9d (A-3): the still window -- its start (first pose fed), its poses, and when complete
+        # the neutral pose (their mean).
+        self._still_t0: float | None = None
+        self._still: list[tuple[float, float]] = []
+        self.neutral: tuple[float, float] | None = None
 
     @property
     def started(self) -> bool:
         return self._t0 is not None
+
+    @property
+    def still_done(self) -> bool:
+        """The still window has been completed (steps count from here on)."""
+        return self.neutral is not None
 
     @property
     def done(self) -> bool:
@@ -373,10 +394,21 @@ class GestureSequence:
         return self.state
 
     def start(self) -> None:
-        """Start the clocks (the first frame arrived). Idempotent."""
+        """Start the round clock (the first frame arrived). Idempotent."""
         if self._t0 is None:
             self._t0 = self._clock()
-            self._task = _PoseTask(self.kinds[0], GESTURE_TIMEOUT_S, self._clock, self._left_sign)
+
+    def _opposite_turns(self) -> bool:
+        return set(self.kinds) == {Challenge.TURN_LEFT, Challenge.TURN_RIGHT}
+
+    def _step_task(self, i: int) -> _PoseTask:
+        # 9d (A-3): the first step is measured from the neutral pose of the still window (before
+        # 9d its baseline was the first poses of the round -- the same still frames); the second
+        # of two OPPOSITE turns too, so it must cross the centre. A step after a nod, or a nod
+        # after a turn, keeps its own baseline as before.
+        base = self.neutral if (i == 0 or self._opposite_turns()) else None
+        return _PoseTask(self.kinds[i], GESTURE_TIMEOUT_S, self._clock, self._left_sign,
+                         baseline=base)
 
     def tick(self) -> ChallengeState:
         """Account for time passing without a usable frame (no face, a dropped frame)."""
@@ -384,10 +416,32 @@ class GestureSequence:
             return self.state
         if self._clock() - self._t0 >= ROUND_CAP_S:
             return self._fail("round-timeout")
-        resolved, passed = self._task.feed(None, None)   # type: ignore[union-attr]
+        if self._task is None:                 # still window not complete: only the round cap
+            return self.state
+        resolved, passed = self._task.feed(None, None)
         if resolved and not passed:
             return self._fail("gesture-timeout")
         return self.state
+
+    def _still_step(self, now: float, pitch: float, yaw: float) -> bool:
+        """9d (A-3): account one pose to the still window. True when this pose CLOSED a complete
+        window (it then also counts for the first step); False while the window is open. Fails
+        the round on motion inside the window."""
+        if self._still_t0 is None or (now - self._still_t0 > STILLNESS_WINDOW_S
+                                      and len(self._still) < 2):
+            self._still_t0, self._still = now, [(pitch, yaw)]      # (re)open the window
+            return False
+        if now - self._still_t0 > STILLNESS_WINDOW_S:
+            arr = np.asarray(self._still, dtype=np.float32)
+            self.neutral = (float(arr[:, 0].mean()), float(arr[:, 1].mean()))
+            self._task = self._step_task(0)
+            return True
+        prev = self._still[-1]
+        if abs(yaw - prev[1]) > STILLNESS_MAX_DEG or abs(pitch - prev[0]) > STILLNESS_MAX_DEG:
+            self._fail("motion-before-prompt")
+            return False
+        self._still.append((pitch, yaw))
+        return False
 
     def feed(self, landmark, pose) -> ChallengeState:
         if self.done:
@@ -396,19 +450,18 @@ class GestureSequence:
         now = self._clock()
         if now - self._t0 >= ROUND_CAP_S:                          # type: ignore[operator]
             return self._fail("round-timeout")
-        if pose is not None:
-            p = np.asarray(pose, dtype=np.float32).ravel()
-            pitch, yaw = float(p[POSE_PITCH]), float(p[POSE_YAW])
-            if now - self._t0 <= STILLNESS_WINDOW_S and self._prev is not None:   # type: ignore[operator]
-                if (abs(yaw - self._prev[1]) > STILLNESS_MAX_DEG
-                        or abs(pitch - self._prev[0]) > STILLNESS_MAX_DEG):
-                    return self._fail("motion-before-prompt")
-            self._prev = (pitch, yaw)
-            base = self._task.baseline                              # type: ignore[union-attr]
-            if base is not None:
-                for later in self.kinds[self.steps_done + 1:]:
-                    if kind_met(later, base, pitch, yaw, self._left_sign):
-                        return self._fail("gesture-order")
+        if pose is None:
+            return self.tick()
+        p = np.asarray(pose, dtype=np.float32).ravel()
+        pitch, yaw = float(p[POSE_PITCH]), float(p[POSE_YAW])
+        if self._task is None:
+            if not self._still_step(now, pitch, yaw):
+                return self.state
+        base = self._task.baseline                                  # type: ignore[union-attr]
+        if base is not None:
+            for later in self.kinds[self.steps_done + 1:]:
+                if kind_met(later, base, pitch, yaw, self._left_sign):
+                    return self._fail("gesture-order")
         resolved, passed = self._task.feed(landmark, pose)         # type: ignore[union-attr]
         if not resolved:
             return self.state
@@ -418,8 +471,7 @@ class GestureSequence:
         if self.steps_done >= len(self.kinds):
             self.state = ChallengeState.PASSED
             return self.state
-        self._task = _PoseTask(self.kinds[self.steps_done], GESTURE_TIMEOUT_S, self._clock,
-                               self._left_sign)
+        self._task = self._step_task(self.steps_done)
         return self.state
 
 
