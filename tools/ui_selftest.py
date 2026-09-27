@@ -422,6 +422,26 @@ def test_toast():
               and len(warns) == 1 and "Recent events" in warns[0], warns)
     finally:
         toast._api, toast._unavailable_warned, toast._WinRt = saved
+    # 9d-build: pywinrt's own msvcp140.dll (14.29) must never be the process's C++ runtime
+    saved_rt = (toast.msvcp_runtime, toast._api, toast._unavailable_warned)
+    try:
+        toast._api, toast._unavailable_warned = None, False
+        toast.msvcp_runtime = lambda: (r"C:\x\winrt\msvcp140.dll", (14, 29, 30157, 0))
+        check("9d-build: an older-than-14.40 C++ runtime -> no WinRT, toasts off",
+              toast._load_api() is None)
+    finally:
+        toast.msvcp_runtime, toast._api, toast._unavailable_warned = saved_rt
+    import subprocess as _sp
+    r = _sp.run([sys.executable, "-c", "import sys; sys.path.insert(0, r'%s'); "
+                 "from presence_monitor import toast; assert toast._load_api() is not None; "
+                 "import onnx.reference; print('ok')" % str(Path(__file__).resolve().parents[1])],
+                capture_output=True, text=True, timeout=300)
+    check("9d-build: WinRT loaded first, then onnx.reference -> no crash (the build's crash)",
+          r.returncode == 0 and "ok" in r.stdout, (r.returncode, r.stderr[-300:]))
+    src_toast = Path(toast.__file__).read_text(encoding="utf-8")
+    check("9d-build: winrt is imported by name only (never through PyInstaller's module graph)",
+          not re.search(r"^\s*(import winrt|from winrt)", src_toast, re.M)
+          and 'importlib.import_module("winrt.windows' in src_toast)
     import re as _re
     root = Path(__file__).resolve().parents[1]
     hits = []

@@ -341,15 +341,26 @@ service_analysis = Analysis(
     noarchive=False,
 )
 
+# 9d-build: winrt as plain files under _internal\winrt (importable from there, like pystray's
+# sources), WITHOUT its own msvcp140.dll -- the process's newer runtime (_internal\msvcp140.dll) is
+# the one every module uses; presence_monitor.toast loads it before winrt and checks its version.
+import winrt as _winrt_pkg
+_WINRT_DIR = Path(_winrt_pkg.__path__[0])
+WINRT_FILES = [(src, dest) for src, dest in collect_data_files(
+    "winrt", include_py_files=True, excludes=["**/msvcp140.dll", "**/*.pyi", "**/__pycache__/**"])]
+WINRT_FILES += [(str(p), "winrt") for p in sorted(_WINRT_DIR.glob("*.pyd"))]
+
 tray_analysis = Analysis(
     [str(REPO_ROOT / "presence_monitor" / "__main__.py")],
     pathex=[str(REPO_ROOT)],
     binaries=BINARIES,
-    datas=DATAS,
-    # 9d (A-5, V-37): the tray shows its toasts through pywinrt (MIT) -- the projection modules are
-    # imported lazily (presence_monitor.toast), so the whole winrt package is named here.
-    hiddenimports=HIDDEN + ["tkinter", "tkinter.ttk", "tkinter.messagebox", "pystray._win32"]
-    + collect_submodules("winrt"),
+    datas=DATAS + WINRT_FILES,
+    # 9d (A-5, V-37): pywinrt is shipped as FILES (WINRT_FILES below), not through the module graph:
+    # PyInstaller imports every graph package in one process to find DLL folders, and winrt's own
+    # msvcp140.dll (14.29) loaded there crashes onnx (built with MSVC 14.40+). Its pure-Python
+    # imports are named here instead.
+    hiddenimports=HIDDEN + ["tkinter", "tkinter.ttk", "tkinter.messagebox", "pystray._win32",
+                            "asyncio", "uuid", "enum", "typing_extensions"],
     hookspath=[],
     runtime_hooks=[],
     excludes=EXCLUDES,

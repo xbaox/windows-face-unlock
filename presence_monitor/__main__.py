@@ -80,6 +80,14 @@ def main(argv: "list[str] | None" = None) -> int:
         from face_service.taskreg import main as taskreg_main
         return int(taskreg_main(args))
 
+    if flag == "--selfcheck-toast":
+        # 9d-build: the build gate proves the frozen tray loads WinRT on a new C++ runtime.
+        import os
+        if os.environ.get("FU_BUILD_GATE") != "1":
+            return 2
+        from presence_monitor.toast import selfcheck_main
+        return int(selfcheck_main(args))
+
     if flag == "--pipe-shutdown":
         # Same request the dev path sends, through the same client, so the SID checks and the
         # server-identity verification are identical in both layouts.

@@ -556,6 +556,37 @@ def gate_engine(variant: str, dist_root: Path) -> dict:
     return {"state": "passed", **{k: data.get(k) for k in keep}}
 
 
+def gate_cpp_runtime_and_toast(dist_root: Path) -> dict:
+    """9d-build: exactly one msvcp140.dll in the bundle (numpy's renamed private copy aside), in
+    _internal, 14.40 or newer -- pywinrt's own 14.29 copy must not ship -- and the FROZEN tray loads
+    WinRT on it (face_unlock_tray.exe --selfcheck-toast; nothing is shown)."""
+    import tempfile
+    internal = dist_root / "_internal"
+    copies = [p for p in internal.rglob("msvcp140.dll")]
+    if [p.relative_to(internal).as_posix() for p in copies] != ["msvcp140.dll"]:
+        raise BuildAbort(f"GATE FAILED: msvcp140.dll copies in the bundle: "
+                         f"{[str(p.relative_to(dist_root)) for p in copies]} (exactly _internal\\msvcp140.dll expected)")
+    tray = dist_root / "face_unlock_tray.exe"
+    with tempfile.TemporaryDirectory(prefix="fu_gate_toast_") as tmp:
+        out = Path(tmp) / "toast.json"
+        try:
+            proc = subprocess.run([str(tray), "--selfcheck-toast", "--out", str(out)],
+                                  env=child_env(FU_BUILD_GATE="1"), capture_output=True, timeout=120)
+        except subprocess.TimeoutExpired as e:
+            raise BuildAbort("GATE FAILED: the toast self-check hung") from e
+        try:
+            data = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else {}
+        except ValueError:
+            data = {}
+    log(f"gate: frozen toast rc={proc.returncode} {data}")
+    ver = str((data.get("msvcp140") or {}).get("version") or "0.0")
+    major_minor = tuple(int(x) for x in ver.split(".")[:2])
+    if proc.returncode != 0 or data.get("ok") is not True or data.get("frozen") is not True \
+            or major_minor < (14, 40):
+        raise BuildAbort(f"GATE FAILED: the frozen tray cannot load WinRT safely: rc={proc.returncode} {data}")
+    return {"msvcp140": data.get("msvcp140"), "toast": "ok"}
+
+
 def step_gate(variant: str, dist_root: Path, signing: dict) -> dict:
     step(6, "GATE (on the signed bundle) + stamp")
     if not dist_root.is_dir():
@@ -569,6 +600,7 @@ def step_gate(variant: str, dist_root: Path, signing: dict) -> dict:
     gate_no_models(dist_root)
     gate_variant(variant, dist_root)
     engine = gate_engine(variant, dist_root)                       # 9d (V-61)
+    toast = gate_cpp_runtime_and_toast(dist_root)                  # 9d-build (V-37)
     sys.path.insert(0, str(INSTALLER_DIR))
     import notices
     lic_problems = notices.check(dist_root, variant)
@@ -589,6 +621,7 @@ def step_gate(variant: str, dist_root: Path, signing: dict) -> dict:
         "python": sys.version.split()[0],
         "frozen_custody": custody,
         "engine": engine,
+        "toast": toast,
     }
     GATE_STAMP.write_text(json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
     log(f"GATE PASSED: {manifest['files']} files, {manifest['bytes'] / 2**30:.2f} GiB, "
