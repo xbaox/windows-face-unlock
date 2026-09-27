@@ -258,6 +258,52 @@ def main(argv=None) -> int:
     finally:
         TW.ping, TW.restart_service, TW.time.monotonic = saved7
     t.ok("clear_pause" not in src.split("def _iteration", 1)[1], "F-250: no clear_pause after a restart")
+
+    # --- 8) 9d: the tray's Quit (A-9) and the heartbeat at start (V-36) ------------------------
+    print("\n[8] 9d A-9: Quit = off until the next sign-in; V-36: heartbeat at start")
+    qp = Path(os.environ["FACE_UNLOCK_HOME"]) / "quit_until_logon.json"
+    C.QUIT_PAUSE_PATH = qp
+    me = W.logon_id()
+    t.ok(bool(me), "the logon session id is readable")
+    W.write_quit(qp, me, 1.0)
+    t.ok(W.quit_active(qp, me) is True and qp.exists(), "Quit of THIS sign-in -> active")
+    t.ok(W.quit_active(qp, "dead-beef") is False and not qp.exists(),
+         "a Quit of another sign-in is stale -> not active, removed")
+    try:
+        W.write_quit(qp, None, 1.0)
+        t.ok(False, "a Quit pause without a logon id is refused")
+    except ValueError:
+        t.ok(True, "a Quit pause without a logon id is refused")
+    qp.write_text("{broken", encoding="utf-8")
+    t.ok(W.quit_active(qp, me) is False and not qp.exists(), "a broken Quit marker -> removed")
+    saved8 = (TW.ping, TW.restart_service, TW.time.monotonic)
+    restarts8 = []
+    clock8 = {"t": 5000.0}
+    TW.ping = lambda _t: (False, "no-pipe")
+    TW.restart_service = lambda _timeout: restarts8.append(1) or (1, True)
+    TW.time.monotonic = lambda: clock8["t"]
+    try:
+        W.clear_pause(pause)
+        st8 = TW.State(clock8["t"])
+        W.write_quit(qp, me, 1.0)
+        for _ in range(20):                        # 10 minutes of failed pings after Quit
+            TW._iteration(st8, 2.0, 3, 300.0)
+            clock8["t"] += 30
+        t.ok(restarts8 == [] and st8.fails == 0 and qp.exists(),
+             "A-9: after Quit the watchdog never restarts the service (no TTL: 10 min, still off)")
+        W.clear_pause(qp)                          # the tray started again
+        for _ in range(3):
+            TW._iteration(st8, 2.0, 3, 300.0)
+        t.ok(len(restarts8) == 1, "A-9: the Quit pause cleared -> supervision resumes (restart at 3)")
+    finally:
+        TW.ping, TW.restart_service, TW.time.monotonic = saved8
+    hb = pause.with_name("watchdog_heartbeat.json")
+    hb.unlink(missing_ok=True)
+    main_src = src.split("def main", 1)[1].split("def _iteration", 1)[0]
+    t.ok(main_src.find("_heartbeat(st, time.monotonic(), force=True)") < main_src.find("while True"),
+         "V-36: main() writes the heartbeat BEFORE the first interval")
+    TW._heartbeat(TW.State(0.0), 0.0, force=True)
+    t.ok(hb.exists(), "V-36: a forced heartbeat writes the heartbeat file")
     h1 = TW._single_instance()
     h2 = TW._single_instance()
     t.ok(h1 not in (None, True) and h2 is None, "N-23: a second watchdog in the session is refused")

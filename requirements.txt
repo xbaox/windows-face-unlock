@@ -15,5 +15,10 @@ pywin32>=306
 psutil>=5.9
 pystray>=0.19
 Pillow>=10.0
+# 9d (A-5): native WinRT toasts (MIT) -- no PowerShell child for a notification.
+winrt-runtime>=3.2
+winrt-Windows.UI.Notifications>=3.2
+winrt-Windows.Data.Xml.Dom>=3.2
+winrt-Windows.Foundation>=3.2
 tomli>=2.0 ; python_version < "3.11"
 tomli-w>=1.0

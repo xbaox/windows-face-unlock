@@ -99,6 +99,59 @@ def clear_pause(path) -> None:
         log.warning("watchdog pause marker %s could not be removed: %r", path, e)
 
 
+# ---- 9d (A-9): Quit = off until the next sign-in to Windows ---------------------------------
+
+def logon_id() -> "str | None":
+    """This process's LOGON session: the token's AuthenticationId LUID as "hi-lo" hex. Every
+    process of one Windows sign-in (the tray, the watchdog, the service -- all started with the
+    interactive token) shares it; the next sign-in gets a new one. None when unreadable."""
+    try:
+        import win32api  # type: ignore
+        import win32con  # type: ignore
+        import win32security  # type: ignore
+        th = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        try:
+            stats = win32security.GetTokenInformation(th, win32security.TokenStatistics)
+        finally:
+            win32api.CloseHandle(th)
+        luid = stats["AuthenticationId"]
+        if isinstance(luid, int):
+            return "%x" % luid
+        return "%x-%x" % (int(luid.HighPart), int(luid.LowPart))   # pragma: no cover (old pywin32)
+    except Exception as e:
+        log.debug("logon id unreadable: %r", e)
+        return None
+
+
+def write_quit(path, logon: "str | None", now: float) -> None:
+    """The tray's Quit: face sign-in and walk-away lock stay off for the rest of THIS logon
+    session. No TTL -- the session itself bounds it."""
+    if not logon:
+        raise ValueError("no logon id: a Quit pause cannot be bound to the session")
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(p, json.dumps({"kind": "quit", "logon": str(logon), "created": float(now)}))
+
+
+def quit_active(path, logon: "str | None") -> bool:
+    """True iff a Quit pause of THIS logon session exists. A marker of another session (stale:
+    Windows was signed in again), an unreadable one, or no logon id to compare with -> not
+    active, and the marker is removed. Never raises."""
+    p = Path(path)
+    try:
+        if not p.exists():
+            return False
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if (isinstance(data, dict) and data.get("kind") == "quit" and logon
+                and str(data.get("logon")) == str(logon)):
+            return True
+        log.info("quit pause %s is from another sign-in (or unreadable) -- removed", p)
+    except Exception as e:
+        log.warning("quit pause %s unusable (%r) -- ignored and removed", p, e)
+    clear_pause(p)
+    return False
+
+
 def is_paused(path, now: float, ttl_s: float = MAX_PAUSE_TTL_S) -> bool:
     """True iff a NON-expired pause marker exists. Never raises.
 

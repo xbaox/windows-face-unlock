@@ -122,6 +122,54 @@ def main(argv=None) -> int:
     t.ok(rec.calls == 1 and cap.exposure == -6.0 and cap.sets[-1] == -6.0,
          "exposure RESTORED via finally even when re-capture raised")
 
+    # (c2) 9d (V-38): the boosted read HUNG (CameraReadTimeout): re-raised, and no set is sent to
+    # the abandoned capture.
+    from face_service.camera import CameraReadTimeout
+    cap = FakeCap(-6.0, honor=True)
+
+    def hung():
+        raise CameraReadTimeout("camera read exceeded 3.0s")
+    try:
+        CB.try_exposure_boost(cap, 2.0, hung)
+        raised = False
+    except CameraReadTimeout:
+        raised = True
+    t.ok(raised, "V-38: CameraReadTimeout from the re-capture is re-raised (not swallowed)")
+    t.ok(cap.sets == [-4.0], "V-38: no restore is attempted on the abandoned capture (only the boost set)")
+    import threading as _th
+    from face_service import service as S
+    s = S.FaceService.__new__(S.FaceService)
+    s.cfg = Config()
+    s._cam_lock = _th.Lock()
+    s._boost_disabled = False
+    s._camera_problem = None
+    s._req_started = None
+
+    class _Cam:
+        _cap = FakeCap(-6.0, honor=True)
+
+        def close(self):
+            pass
+    cam = _Cam()
+    s._cam = cam
+    s._acquire_camera = lambda: (cam, False)
+    s._done_with = lambda c: None
+    s._analyze_burst = lambda c: hung()
+    dark = S.VerifyOutcome(False, 1.0, False, {"verdict": "NOT_LIVE", "frames_ok": 5,
+                                               "engine_errors": 0, "faces": 3}, None, 12.0)
+    recs = []
+    s._audit = type("A", (), {"write": lambda self, e, r: recs.append((e, r))})()
+    s._lockout = type("L", (), {"records": [], "record": lambda self, ok: self.records.append(ok),
+                                "remaining": lambda self: 0.0, "store_ok": True})()
+    s._capture_and_verify = lambda: dark
+    s._caller_sid = lambda h: "S-1-5-18"
+    s._camera_paused_until = 0.0
+    s._refusal = lambda: None
+    r = s._handle({"cmd": "unlock", "v": 2}, None)
+    t.ok(r == {"ok": False, "reason": "camera-error"} and s._lockout.records == []
+         and s._camera_problem == "camera-error" and s._cam is None,
+         "V-38: unlock whose boosted read hung -> camera-error, no strike, capture dropped")
+
     # (d) audit() shape is additive telemetry.
     aud = CB.try_exposure_boost(FakeCap(-6.0, honor=True), 2.0, Rec()).audit()
     t.ok(aud.get("boost_applied") is True and aud.get("boost_honored") is True

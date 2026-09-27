@@ -20,9 +20,12 @@ alive instance looks like from outside. See ``ping`` for the failure classes.
 
 The failure counter does not grow while a pause is active and restarts from zero when it lifts
 (F-247), so a pause that ends never triggers an instant restart of a service that is simply still
-starting. A second watchdog in the same session exits at once (``Local\\FaceUnlockWatchdog``,
-F-249). A heartbeat line (and a small heartbeat file beside the pause marker) is written every hour,
-so a healthy watchdog can be told from one that is not running (D-126).
+starting. Two pauses count: the self-expiring one (a deliberate stop, the wizard's build) and --
+9d (A-9) -- the tray's Quit, bound to this Windows logon session with no TTL (it ends at the next
+sign-in or when the tray is started again). A second watchdog in the same session exits at once
+(``Local\\FaceUnlockWatchdog``, F-249). A heartbeat line (and a small heartbeat file beside the
+pause marker) is written at start (9d, V-36) and then every hour, so a healthy watchdog can be told
+from one that is not running (D-126).
 
 Process work (kill, wait, count) is psutil, in-process -- no PowerShell child whose failures read as
 "zero processes" (F-251).
@@ -347,6 +350,7 @@ def main() -> int:
              interval, timeout, threshold, WATCHDOG_PAUSE_PATH)
 
     st = State(time.monotonic())
+    _heartbeat(st, time.monotonic(), force=True)     # 9d (V-36): alive from the first second
     try:
         while True:
             # Stage 8b (F-29): one failing iteration is logged with its traceback and the loop
@@ -363,9 +367,9 @@ def main() -> int:
 
 def _iteration(st: State, timeout: float, threshold: int, pause_ttl: float) -> None:
     """One ping / decide / (restart) step on ``st``."""
-    from face_service.config import WATCHDOG_PAUSE_PATH
-    from face_service.watchdog import (HEALTHY_RESET_S, is_paused, restart_backoff_s,
-                                       restart_outcome, should_restart)
+    from face_service.config import QUIT_PAUSE_PATH, WATCHDOG_PAUSE_PATH
+    from face_service.watchdog import (HEALTHY_RESET_S, is_paused, logon_id, quit_active,
+                                       restart_backoff_s, restart_outcome, should_restart)
 
     now = time.monotonic()
     ok, reason = ping(timeout)
@@ -391,6 +395,13 @@ def _iteration(st: State, timeout: float, threshold: int, pause_ttl: float) -> N
 
     st.n_fail += 1
     st.healthy_since = None
+    # 9d (A-9): the tray's Quit holds until the next sign-in / the next tray start.
+    if quit_active(QUIT_PAUSE_PATH, logon_id()):
+        if not st.was_paused:
+            log.info("ping failed (%s) after Quit -- off until the next sign-in or tray start", reason)
+        st.was_paused = True
+        st.fails = 0
+        return
     if is_paused(WATCHDOG_PAUSE_PATH, time.time(), pause_ttl):
         # F-247: a deliberate stop is not a failure run -- nothing is counted while it lasts.
         if not st.was_paused:

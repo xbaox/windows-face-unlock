@@ -10,7 +10,11 @@ Stage 9 (act 9b R10; F-142, F-148). Only a session that someone is actually driv
 
 What no longer counts: a remote tool's tray or service process holding an ESTABLISHED TCP
 connection. Idle tools keep keep-alive connections to their relays all day, and that switched the
-walk-away lock off for hours (F-142). Tools with no known per-connection marker are simply not
+walk-away lock off for hours (F-142). 9d (V-45): nor does a running Quick Assist (quickassist.exe) or
+Remote Assistance (msra.exe) process by itself -- both stay open without anyone connected, and
+nothing about the process tells a live session apart. Remote Assistance is still detected when
+Windows reports the console as remotely controlled (SM_REMOTECONTROL); Quick Assist is not
+recognised (INSTALL.md says so). Tools with no known per-connection marker are simply not
 detected; presence then treats the session as local.
 
 Also here, unrelated to remoting but the same kind of ambient session probe: whether the
@@ -42,9 +46,9 @@ log = logging.getLogger(__name__)
 SESSION_MARKERS = {
     "teamviewer_desktop.exe",      # TeamViewer: spawned into the session on connect
     "remoting_desktop.exe",        # Chrome Remote Desktop: per-connection desktop agent
-    "quickassist.exe",             # Microsoft Quick Assist
-    "msra.exe",                    # Windows Remote Assistance
 }
+# 9d (V-45): NOT markers -- they run with nobody connected (see the module docstring).
+NOT_SESSION_MARKERS = frozenset({"quickassist.exe", "msra.exe"})
 # Kept as a public alias for older callers.
 ALWAYS_REMOTE_PROCS = SESSION_MARKERS
 

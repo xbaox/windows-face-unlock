@@ -100,15 +100,86 @@ def watchdog_line(now: "float | None" = None) -> str:
     return t("status.val.heartbeat", age=_format_age(at))
 
 
-def password_line(status: "dict | None") -> str:
-    from face_service.credentials import password_state
-    try:
-        state, _info = password_state()
-    except Exception:
-        state = "unreadable"
+def password_line(status: "dict | None", presence: "str | None" = None) -> str:
+    """The Password row. 9d (V-39): from ``presence`` -- credentials.password_presence(), taken
+    off the Tk thread and only when the files change -- never by decrypting the password here."""
+    state = {"saved": "ok", "none": "none", "unreadable": "unreadable"}.get(presence or "", "")
+    if not state:
+        return "…"
     if state == "ok" and status and status.get("password_rejected"):
         return t("status.val.pwd_rejected")
     return t(f"status.val.pwd_{state}")
+
+
+def status_poll(prev_sig):
+    """9d (V-39): the Status window's background poll -- the service status, and the password
+    presence only when its files changed since ``prev_sig``. Runs on a worker, never on Tk."""
+    from face_service.credentials import password_presence, password_signature
+    status = pipe_call({"cmd": "status"}, timeout_s=2.0)
+    try:
+        sig = password_signature()
+    except Exception:
+        sig = None
+    presence = None
+    if sig != prev_sig or sig is None:
+        try:
+            presence = password_presence()[0]
+        except Exception:
+            presence = "unreadable"
+    return status, sig, presence
+
+
+# ---- 9d (V-35): codes -> words. The technical string goes to the log and to the collapsed
+# "Details for support" block only.
+CAMERA_WHY = ("leased", "busy", "not-found", "camera-error", "zero-frames", "black")
+
+
+def camera_why_text(why: str) -> str:
+    """Why the camera could not see, in words (EN/RU)."""
+    why = str(why or "")
+    return t(f"camera.why.{why}") if why in CAMERA_WHY else t("camera.why.other")
+
+
+def reason_text(snap: dict) -> str:
+    """The Status "Details" row: what the last presence check means, in words."""
+    result = snap.get("last_result") or "-"
+    reason = str(snap.get("last_reason") or "")
+    if result == "unknown":
+        return t("status.val.camera_why", why=camera_why_text(snap.get("last_why") or ""))
+    if result == "skipped":
+        if reason.startswith("rdp") or reason.startswith("remote-tool"):
+            return t("detail.remote")
+        key = {"session-locked": "detail.locked", "paused": "detail.paused",
+               "auto-lock-off": "detail.auto_lock_off"}.get(reason)
+        return t(key) if key else t("detail.skipped")
+    if result == "present":
+        if reason.startswith("src=input"):
+            return t("detail.present_input")
+        if "retracted" in reason:
+            return t("detail.present_second_look")
+        return t("detail.present_camera")
+    if result == "uncertain":
+        return t("detail.uncertain")
+    if result == "absent":
+        return t("detail.absent", n=snap.get("strikes", 0), limit=snap.get("absent_strikes", 0))
+    if result == "error":
+        if reason.startswith("service-unavailable"):
+            return t("detail.service_unavailable")
+        if reason.startswith("service-error"):
+            return t("detail.service_error")
+        if reason == "lock-failed":
+            return t("detail.lock_failed")
+        return t("detail.error")
+    return "—"
+
+
+def probe_why_text(reason: str) -> str:
+    """A refused presence probe's reason, in words."""
+    reason = str(reason or "")
+    key = {"engine-error": "probe.why.engine", "not-owner": "why.not-owner", "custody": "why.custody",
+           "no-models": "why.no-models", "lockout-store-error": "why.lockout-store-error",
+           "unknown-command": "probe.why.version", "internal-error": "probe.why.internal"}.get(reason)
+    return t(key) if key else t("probe.why.other")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -137,6 +208,8 @@ class StatusWindow:
         self.ui, self.monitor = ui, monitor
         self.alive = True
         self._polling = False
+        self._pwd_sig = None                      # 9d (V-39): last password-files fingerprint
+        self._pwd_presence: "str | None" = None
         self._key_poll = ui.new_key("status-poll")
         self._key_ping = ui.new_key("status-ping")
         self._key_probe = ui.new_key("status-probe")
@@ -165,13 +238,24 @@ class StatusWindow:
         self.events = tk.Listbox(frm, height=6, activestyle="none")
         self.events.grid(row=r + 1, column=0, columnspan=3, sticky="nsew")
         frm.rowconfigure(r + 1, weight=1)
+        # 9d (V-35): the technical line of the last check, collapsed until asked for.
+        sup = ttk.Frame(frm)
+        sup.grid(row=r + 2, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        self._support_shown = False
+        self.support_btn = ttk.Button(sup, text=t("status.support.show"), command=self._toggle_support)
+        self.support_btn.pack(anchor="w")
+        self.support_var = tk.StringVar(master=top, value="")
+        self.support_lbl = ttk.Label(sup, textvariable=self.support_var, foreground="#555",
+                                     wraplength=px(top, 480), justify="left")
         btns = ttk.Frame(frm)
-        btns.grid(row=r + 2, column=0, columnspan=3, sticky="we", pady=(10, 0))
+        btns.grid(row=r + 3, column=0, columnspan=3, sticky="we", pady=(10, 0))
+        self.buttons: dict = {}
         for label_key, fn in (("status.btn.ping", self._ping), ("status.btn.probe", self._probe),
                               ("status.btn.open_log", open_log_folder)):
             b = ttk.Button(btns, text=t(label_key), command=fn)
             b.pack(side="left", padx=4)
             attach_tooltip(b, label_key + ".desc")
+            self.buttons[label_key] = b
         ttk.Button(btns, text=t("status.btn.close"), command=self.close).pack(side="right", padx=4)
         bind_standard_keys(top, cancel=self.close)
         top.minsize(px(top, 520), px(top, 420))
@@ -183,13 +267,27 @@ class StatusWindow:
             return
         if not self._polling:
             self._polling = True
-            self.ui.run_bg(pipe_call, {"cmd": "status"}, 2.0, reply=self._key_poll)
+            self.ui.run_bg(status_poll, self._pwd_sig, reply=self._key_poll)
         self.top.after(2000, self._tick)
 
-    def _refresh(self, status) -> None:
+    def _toggle_support(self) -> None:
+        self._support_shown = not self._support_shown
+        if self._support_shown:
+            self.support_lbl.pack(anchor="w", pady=(2, 0))
+            self.support_btn.configure(text=t("status.support.hide"))
+        else:
+            self.support_lbl.pack_forget()
+            self.support_btn.configure(text=t("status.support.show"))
+
+    def _refresh(self, polled) -> None:
         self._polling = False
         if not self.alive:
             return
+        status, sig, presence = polled if isinstance(polled, tuple) and len(polled) == 3 \
+            else (polled, self._pwd_sig, None)
+        self._pwd_sig = sig
+        if presence is not None:
+            self._pwd_presence = presence
         status = status if isinstance(status, dict) and status.get("ok") else None
         snap = self.monitor.snapshot()
         v = self.vars
@@ -198,17 +296,27 @@ class StatusWindow:
             v["enroll"].set("—")
         else:
             v["enroll"].set(t("status.val.yes") if status.get("enrollment") else t("status.val.no_enroll"))
-        v["pwd"].set(password_line(status))
+        v["pwd"].set(password_line(status, self._pwd_presence))
         v["auto"].set(t("status.val.on") if snap.get("auto_lock") else t("status.val.off"))
         v["last"].set(_format_age(snap.get("last_at", 0)))
         v["result"].set(result_text(snap.get("last_result", "-")))
-        why = snap.get("last_why") or ""
-        v["reason"].set((t("status.val.camera_why", why=why) if snap.get("last_result") == "unknown"
-                         else snap.get("last_reason", "")) or "—")
+        v["reason"].set(reason_text(snap))                  # 9d (V-35): words, not codes
+        tech = snap.get("last_reason") or ""
+        if snap.get("last_why"):
+            tech = f"{tech} why={snap.get('last_why')}".strip()
+        self.support_var.set(tech or "—")
         v["strikes"].set(strikes_text(snap))
         v["locks"].set(str(snap.get("lock_count", 0)))
         v["paused"].set(t("status.val.yes") if snap.get("paused") else t("status.val.no"))
         v["watchdog"].set(watchdog_line())
+        # 9d (V-40): like the tray item -- no presence check while walk-away lock is off, or
+        # while the service refuses face functions.
+        refusing = bool(status and status.get("state") == "refusing")
+        probe_ok = bool(snap.get("auto_lock")) and not refusing
+        try:
+            self.buttons["status.btn.probe"].configure(state="normal" if probe_ok else "disabled")
+        except (KeyError, tk.TclError):
+            pass
         self.events.delete(0, "end")
         for at, msg in snap.get("events", []):
             self.events.insert("end", f"{time.strftime('%H:%M', time.localtime(at))}  {msg}")
@@ -251,10 +359,10 @@ def probe_text(resp) -> str:
     if not isinstance(resp, dict):
         return t("status.val.not_reachable")
     if not resp.get("ok"):
-        return t("probe.error", reason=str(resp.get("reason") or "?"))
+        return t("probe.error", reason=probe_why_text(resp.get("reason")))   # 9d (V-35)
     state = str(resp.get("state") or ("present" if resp.get("present") else "absent"))
     if state == "unknown":
-        return t("probe.unknown", why=str(resp.get("why") or "?"))
+        return t("probe.unknown", why=camera_why_text(resp.get("why")))   # 9d (V-35)
     return t(f"probe.{state}") if state in ("present", "absent", "uncertain") else state
 
 
@@ -323,6 +431,7 @@ class SettingsWindow:
         self.alive = True
         self.cfg = Config.load()
         self.vars: dict = {}
+        self._shown: dict = {}
         self._camera_names: list = []
         self._key_reload = ui.new_key("settings-reload")
         self._key_cams = ui.new_key("settings-cams")
@@ -399,14 +508,15 @@ class SettingsWindow:
                 w = ttk.Combobox(parent, textvariable=var, state="readonly", width=46)
                 if kind == "choice":
                     labels = [t(f"choice.{name}.{c}") for c in extras]
-                    w.configure(values=labels)
+                    # 9d (V-48): as wide as the longest label -- nothing cut off in any language
+                    w.configure(values=labels, width=max(46, max(len(x) for x in labels) + 2))
                     var.set(t(f"choice.{name}.{cur}") if cur in extras else str(cur))
                 elif kind == "lang":
                     langs = list(shown_languages())
                     w.configure(values=[n for _c, n in langs])
                     var.set(dict(langs).get(cur, dict(langs).get("en", "English")))
                 else:
-                    var.set(cur if cur else t("settings.camera.by_index", i=self.cfg.camera_index))
+                    var.set(cur if cur else self._no_name_label())
                     self.camera_combo = w
             elif kind in ("int", "float"):
                 lo, hi, step, fmt = extras
@@ -419,6 +529,7 @@ class SettingsWindow:
             InfoButton(parent, i18n_key=label_key + ".desc").grid(row=i, column=2, sticky="w", padx=4)
             attach_tooltip(w, label_key + ".desc")
             self.vars[name] = (kind, extras, var)
+            self._shown[name] = var.get()     # 9d (V-44): what the field showed when it opened
 
     def _toggle_adv(self) -> None:
         if self.adv_shown.get():
@@ -434,11 +545,19 @@ class SettingsWindow:
         if not self.alive or not isinstance(devices, list):
             return
         self._camera_names = [d.name for d in devices if getattr(d, "name", "")]
-        values = [t("settings.camera.by_index", i=self.cfg.camera_index)] + self._camera_names
+        values = [self._no_name_label()] + self._camera_names
         cur = self.cfg.camera_name
         if cur and cur not in self._camera_names:
             values.append(cur)                      # configured but not connected right now
         self.camera_combo.configure(values=values)
+
+    def _no_name_label(self) -> str:
+        """9d (V-34): the entry for "no camera chosen by name": "(older setting)" only when
+        config.toml itself carries camera_index; otherwise the default camera."""
+        from .enroll_gui import camera_index_explicit
+        if camera_index_explicit():
+            return t("settings.camera.by_index", i=self.cfg.camera_index)
+        return t("settings.camera.default")
 
     # ---- collect / validate ----
     def _collect(self) -> "tuple[Config | None, str]":
@@ -446,6 +565,12 @@ class SettingsWindow:
         new = Config.load()
         for name, (kind, extras, var) in self.vars.items():
             raw = var.get()
+            if kind != "bool" and raw == self._shown.get(name):
+                # 9d (V-44): a field the user did not touch keeps the value it stands for -- a
+                # hidden language code shown as "English", or a number rounded for display, is
+                # not a change.
+                setattr(new, name, getattr(self.cfg, name))
+                continue
             if kind == "bool":
                 val = bool(raw)
             elif kind == "choice":
@@ -476,7 +601,17 @@ class SettingsWindow:
         return new, ""
 
     def _changed(self, new: Config) -> "list[str]":
-        return [n for n in self.vars if getattr(new, n) != getattr(self.cfg, n)]
+        """Changed keys. 9d (V-44): numbers compare by value (60 == 60.0)."""
+        out = []
+        for n in self.vars:
+            a, b = getattr(new, n), getattr(self.cfg, n)
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)) \
+                    and not isinstance(a, bool) and not isinstance(b, bool):
+                if float(a) != float(b):
+                    out.append(n)
+            elif a != b:
+                out.append(n)
+        return out
 
     # ---- actions ----
     def save(self) -> None:
@@ -582,13 +717,18 @@ class HelpWindow:
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill="both", expand=True)
         ttk.Label(frm, text=t("help.intro"), font=("", 10, "bold")).pack(anchor="w", pady=(0, 8))
+        # 9d (V-48): the UI's proportional font, not the Text widget's fixed-width default
         text = tk.Text(frm, wrap="word", height=24, width=70, relief="flat",
-                       background=top.cget("background"))
+                       background=top.cget("background"), font="TkDefaultFont")
         sb = ttk.Scrollbar(frm, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         text.pack(side="left", fill="both", expand=True)
-        text.tag_configure("h", font=("", 9, "bold"))
+        from tkinter import font as _tkfont
+        _bold = _tkfont.nametofont("TkDefaultFont").copy()
+        _bold.configure(weight="bold")
+        text._fu_bold = _bold
+        text.tag_configure("h", font=_bold)
         for label_key, desc_key in HELP_ENTRIES:
             text.insert("end", t(label_key).rstrip("…") + "\n", "h")
             text.insert("end", t(desc_key) + "\n\n")

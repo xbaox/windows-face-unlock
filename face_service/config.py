@@ -46,6 +46,9 @@ LOCKOUT_PATH = APP_DIR / "lockout.json"
 AUDIT_PATH = APP_DIR / "audit.jsonl"
 ADAPTIVE_PATH = APP_DIR / "adaptive.npz"   # Stage 3: adaptive gallery (separate from embeddings.npz)
 WATCHDOG_PAUSE_PATH = APP_DIR / "watchdog.pause"   # Stage 3 Step 5: deliberate-stop pause (self-expiring)
+# 9d (A-9): the tray's Quit -- a pause bound to the Windows LOGON session, no TTL. The watchdog
+# honours it; a tray start clears it; a new sign-in to Windows makes it stale.
+QUIT_PAUSE_PATH = APP_DIR / "quit_until_logon.json"
 # Stage 9 (act 9b R6): the per-camera turn-sign calibration, and the folder the wizard hands its
 # calibration frames over in (deleted by the service right after measuring them).
 CALIBRATION_PATH = APP_DIR / "calibration.json"

@@ -178,6 +178,16 @@ def main(argv=None) -> int:
         t.ok(SVC.CAMERA_WARM_HOLD_S == 60.0, "hold ceiling is 60 s")
         s._lock_watch_step(None, False)
         t.ok(s._cam is None, "a lock probe with no opinion changes nothing")
+        # 9d (V-32): locked, warmed -- then WTS has no opinion any more; the hold still ends
+        s._lock_watch_step(True, False)
+        held2 = s._cam
+        was = s._lock_watch_step(None, True)
+        t.ok(was is True and s._cam is held2 and held2.closed == 0,
+             "V-32: 'no opinion' inside the hold keeps the warm camera and the lock state")
+        s._warm_until = time.monotonic() - 1           # 60 s later, the probe still silent
+        was = s._lock_watch_step(None, True)
+        t.ok(was is True and s._cam is None and held2.closed == 1 and s._warm_until == 0.0,
+             "V-32: WTS 'no opinion' -> the camera is still released when the 60 s hold runs out")
         s._camera_paused_until = time.monotonic() + 60
         s._lock_watch_step(True, False)
         t.ok(s._cam is None, "no warming while the wizard holds the lease")
@@ -460,6 +470,22 @@ def main(argv=None) -> int:
          "an established connection of an idle remote tool no longer counts")
     t.ok("anydesk.exe" not in RS.SESSION_MARKERS and "teamviewer_desktop.exe" in RS.SESSION_MARKERS,
          "only per-connection helpers are markers")
+    t.ok("quickassist.exe" not in RS.SESSION_MARKERS and "msra.exe" not in RS.SESSION_MARKERS,
+         "V-45: a running Quick Assist / msra process alone is not a remote session")
+    saved_iter = RS.psutil.process_iter if RS.psutil else None
+    if RS.psutil is not None:
+        class _P:
+            def __init__(self, name):
+                self.info = {"name": name, "pid": __import__("os").getpid()}
+        try:
+            RS.psutil.process_iter = lambda attrs=None: [_P("QuickAssist.exe"), _P("msra.exe")]
+            t.ok(RS.active_remote_tools() == [], "V-45: quickassist.exe + msra.exe in this session -> not remote")
+            RS.psutil.process_iter = lambda attrs=None: [_P("TeamViewer_Desktop.exe")]
+            t.ok(RS.active_remote_tools() == ["teamviewer_desktop.exe"], "V-45: a real marker still counts")
+        finally:
+            RS.psutil.process_iter = saved_iter
+    ins = (Path(__file__).resolve().parents[1] / "INSTALL.md").read_text(encoding="utf-8")
+    t.ok("Quick Assist is not recognised" in ins, "V-45: INSTALL.md says Quick Assist is not recognised")
 
     print()
     if t.fail:

@@ -176,11 +176,12 @@ class PasswordWindow:
     traceback, so every failure becomes a status line."""
 
     def __init__(self) -> None:
-        from .ui import apply_scaling, bind_standard_keys, px
+        from .ui import apply_scaling, bind_standard_keys, px, set_app_icon
         self.root = tk.Tk()
         self.root.title(t("pwd.title"))
         self.root.resizable(False, False)
         apply_scaling(self.root)
+        set_app_icon(self.root)                      # 9d (V-48)
         self._q: "queue.Queue" = queue.Queue()
         self._busy = False
         self._custody_failed = False
@@ -194,7 +195,8 @@ class PasswordWindow:
 
         self.user, self.domain, kind = account_identity()
         shown = self.user if not self.domain else f"{self.domain}\\{self.user}"
-        ttk.Label(frm, text=t("pwd.account")).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
+        # 9d (V-48): labels end with a colon, like every other window
+        ttk.Label(frm, text=t("pwd.account") + ":").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
         ttk.Label(frm, text=shown).grid(row=1, column=1, sticky="w", pady=3)
         row = 2
         if kind == "entra-sam":
@@ -210,10 +212,10 @@ class PasswordWindow:
 
         self.pw1 = tk.StringVar(master=self.root)
         self.pw2 = tk.StringVar(master=self.root)
-        ttk.Label(frm, text=t("pwd.password")).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
+        ttk.Label(frm, text=t("pwd.password") + ":").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
         self.pw1_entry = ttk.Entry(frm, textvariable=self.pw1, width=34, show=_MASK)
         self.pw1_entry.grid(row=row, column=1, sticky="ew", pady=3)
-        ttk.Label(frm, text=t("pwd.confirm")).grid(row=row + 1, column=0, sticky="w", padx=(0, 10), pady=3)
+        ttk.Label(frm, text=t("pwd.confirm") + ":").grid(row=row + 1, column=0, sticky="w", padx=(0, 10), pady=3)
         ttk.Entry(frm, textvariable=self.pw2, width=34, show=_MASK).grid(
             row=row + 1, column=1, sticky="ew", pady=3)
 
@@ -255,6 +257,16 @@ class PasswordWindow:
             self._set_status(t("pwd.status.unreadable"), "warn")
         else:
             self._set_status(t("pwd.status.none"), "warn")
+        self._refresh_clear()
+
+    def _refresh_clear(self) -> None:
+        """9d (V-48): "Delete saved password" is off while nothing is saved."""
+        from face_service.credentials import CREDS_PATH
+        try:
+            self.clear_btn.configure(state="normal" if (CREDS_PATH.exists() and not self._busy)
+                                     else "disabled")
+        except tk.TclError:
+            pass
 
     def _open_signin_options(self) -> None:
         import os
@@ -301,7 +313,7 @@ class PasswordWindow:
     def _on_saved(self, level: str, text: str) -> None:
         self._busy = False
         self.save_btn.configure(state="disabled" if self._custody_failed else "normal")
-        self.clear_btn.configure(state="normal")
+        self._refresh_clear()
         if level != "err":
             self.pw1.set("")
             self.pw2.set("")
@@ -322,6 +334,7 @@ class PasswordWindow:
         self.pw1.set("")
         self.pw2.set("")
         self._set_status(t("pwd.status.cleared"), "warn")
+        self._refresh_clear()
 
     def _close(self) -> None:
         if self._busy:
@@ -336,7 +349,9 @@ def main() -> int:
     from face_service.config import LOG_PATH
     from face_service.logging_setup import setup_logging
     from .ui import enable_dpi_awareness
-    setup_logging(LOG_PATH.with_name("enroll.log"))
+    # 9d (V-46): its own file -- the wizard runs as another process at the same time with its own,
+    # and two processes rotating one file lose lines.
+    setup_logging(LOG_PATH.with_name("password.log"))
     try:
         # i18n state is per-process: this window is its own process (spawned by the tray, or the
         # frozen exe re-execing itself), so the language has to be applied here too.

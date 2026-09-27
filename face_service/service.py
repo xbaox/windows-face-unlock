@@ -995,10 +995,18 @@ class FaceService:
                     cap = getattr(cam, "_cap", None)
                     if cap is None:
                         return r_dark, boost_audit
-                    out = try_exposure_boost(
-                        cap, self.cfg.low_light_exposure_step,
-                        lambda: self._analyze_burst(cam),
-                    )
+                    try:
+                        out = try_exposure_boost(
+                            cap, self.cfg.low_light_exposure_step,
+                            lambda: self._analyze_burst(cam),
+                        )
+                    except CameraReadTimeout:
+                        # 9d (V-38): the boosted re-capture hung; the capture is abandoned (no
+                        # restore was attempted on it). The caller answers camera-error.
+                        self._camera_problem = "camera-error"
+                        if self._cam is cam:
+                            self._cam = None
+                        raise
                     if not out.restored:
                         # F-129: EXPOSURE / AUTO_EXPOSURE did not read back as before. Drop the
                         # capture (the next open starts from the driver's defaults) and keep the
@@ -1011,6 +1019,8 @@ class FaceService:
                                   "settings -- capture dropped, boost off until restart")
                 finally:
                     self._done_with(cam)
+        except CameraReadTimeout:
+            raise                                  # 9d (V-38): the caller answers camera-error
         except Exception as e:   # pragma: no cover - defensive; boost must never break unlock
             log.warning("low-light boost skipped: %s", e)
             return r_dark, boost_audit
@@ -1900,7 +1910,13 @@ class FaceService:
         if (r.scene_luma is not None and r.scene_luma < self.cfg.low_light_luma_min
                 and self.cfg.low_light_boost):
             r_dark = r
-            r, boost_audit = self._maybe_boost(r)
+            try:
+                r, boost_audit = self._maybe_boost(r)
+            except CameraReadTimeout:
+                # 9d (V-38): the boosted read hung -- a device fault, lockout-neutral.
+                self._audit.write("unlock", {**r_dark.detail, "outcome": "camera-error",
+                                             "boost_error": "read-timeout"})
+                return {"ok": False, "reason": "camera-error"}
             # Stage 9 (F-130): the fault gate applies to the boosted re-capture too. A re-capture
             # that delivered nothing, or that the engine could not judge, is not a face verdict:
             # keep the dark burst (and its lockout-neutral too-dark answer) instead of turning a
@@ -2657,10 +2673,18 @@ class FaceService:
         """One poll of the lock watcher; returns the new ``was_locked``. On the lock edge the camera
         is opened and held warm (at most CAMERA_WARM_HOLD_S); on the unlock edge -- or when the
         hold runs out -- it is released unless persistent_camera keeps it anyway. ``locked=None``
-        (the probe has no opinion) changes nothing."""
-        if locked is None:
-            return was_locked
+        (the probe has no opinion) changes nothing -- except that a warm hold still ends when it
+        runs out (9d, V-32: a probe that goes silent must not keep the camera open for good)."""
         now = time.monotonic()
+        if locked is None:
+            if self._warm_until and now >= self._warm_until:
+                self._warm_until = 0.0
+                if not self.cfg.persistent_camera:
+                    with self._cam_lock:
+                        if self._cam is not None:
+                            self._release_camera()
+                            log.info("camera released (warm hold expired; lock state unknown)")
+            return was_locked
         if locked and not was_locked:
             if (self._refusal() is None and not self._camera_leased_out()
                     and not self.cfg.persistent_camera):

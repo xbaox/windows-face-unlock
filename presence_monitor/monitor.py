@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import ctypes
 
 from face_service.config import APP_DIR, Config
-from face_service.i18n import t
+from face_service.i18n import Msg, t
 
 from face_service.session_state import session_locked_wts
 
@@ -367,7 +367,7 @@ class PresenceMonitor:
         if prev is not None and prev != reachable:
             self._notify(
                 "notify_service_state",
-                t("notify.service_up") if reachable else t("notify.service_down"),
+                Msg("notify.service_up") if reachable else Msg("notify.service_down"),
             )
         if reachable:
             lock = resp.get("lockout") or {}
@@ -381,7 +381,7 @@ class PresenceMonitor:
             elif not self._lockout_notified and not _is_session_locked():
                 self._notify(
                     "notify_lockout",
-                    t("notify.lockout", s=int(lock.get("remaining_s", 0))),
+                    Msg("notify.lockout", s=int(lock.get("remaining_s", 0))),
                 )
                 self._lockout_notified = True
             # else: the episode is live but the workstation is locked. Do NOT latch

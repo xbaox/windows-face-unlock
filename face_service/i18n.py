@@ -78,7 +78,7 @@ _EN: dict[str, str] = {
     "tray.language.desc": "Switch between English and Russian.",
     "tray.check_update.desc": "Ask GitHub whether a newer release exists. Face Unlock does not install updates by itself yet; it opens the releases page.",
     "tray.help.desc": "This list.",
-    "tray.quit.desc": "Stops the Face Unlock service and closes the tray. Face sign-in and walk-away lock are off until the next sign-in to Windows (the watchdog starts the service again after 5 minutes).",
+    "tray.quit.desc": "Stops the Face Unlock service and closes Face Unlock. Face sign-in and walk-away lock stay off until you sign in to Windows again or start Face Unlock from the Start menu. PIN and password keep working.",
     "tray.state.no_service": "The Face Unlock service is not running",
     "tray.state.starting": "Starting…",
     "tray.state.refusing": "Face sign-in is off: {why}",
@@ -93,7 +93,7 @@ _EN: dict[str, str] = {
     "why.no-models": "the face recognition models are missing or damaged -- run the installer again",
     "why.lockout-store-error": "the sign-in attempt counter cannot be saved",
     "quit.confirm.title": "Quit Face Unlock?",
-    "quit.confirm.body": "Face sign-in and walk-away lock stop now and stay off until you sign in to Windows again. PIN and password keep working.\n\nQuit?",
+    "quit.confirm.body": "Face sign-in and walk-away lock stop now and stay off until you sign in to Windows again or start Face Unlock from the Start menu. PIN and password keep working.\n\nQuit?",
 
     # ---- Status window ----
     "status.title": "Face Unlock -- Status",
@@ -107,7 +107,7 @@ _EN: dict[str, str] = {
     "status.strikes": "Absences in a row",
     "status.lock_count": "PC locks since start",
     "status.paused": "Paused",
-    "status.watchdog": "Watchdog",
+    "status.watchdog": "Auto-restart",
     "status.events": "Recent events:",
     "status.events.none": "(none yet)",
     "status.service.desc": "Running = the Face Unlock service answers. Not reachable = it is not running, or it is busy for longer than 2 s. Running but face sign-in off = it refuses face functions, with the reason.",
@@ -118,9 +118,9 @@ _EN: dict[str, str] = {
     "status.result.desc": "present, absent, not sure (a face that looked like a screen), cannot see (the camera was busy, not connected or dark), skipped (paused, locked, remote session, walk-away lock off), error.",
     "status.reason.desc": "Technical details of the last check, for troubleshooting.",
     "status.strikes.desc": "Checks in a row without you. When the count reaches the limit on the right, the PC is locked. Shown only while walk-away lock is on.",
-    "status.lock_count.desc": "How many times walk-away lock locked the PC since the tray started.",
-    "status.paused.desc": "Yes = presence checks are paused from the tray; nothing locks the PC until you resume.",
-    "status.watchdog.desc": "The watchdog restarts the Face Unlock service if it stops answering. It notes that it is running once an hour.",
+    "status.lock_count.desc": "How many times walk-away lock locked the PC since Face Unlock started.",
+    "status.paused.desc": "Yes = presence checks are paused from the Face Unlock icon in the notification area; nothing locks the PC until you resume.",
+    "status.watchdog.desc": "Auto-restart starts the Face Unlock service again if it stops answering. It notes that it is running once an hour.",
     "status.btn.ping": "Ping service",
     "status.btn.probe": "Check presence now",
     "status.btn.open_log": "Open log folder",
@@ -161,6 +161,34 @@ _EN: dict[str, str] = {
     "probe.unknown": "The camera could not see ({why}).",
     "probe.error": "The check did not run: {reason}",
     "event.probe": "Presence check: {result}",
+    # 9d (V-35): codes in words; the technical line only under "Details for support"
+    "camera.why.leased": "the setup wizard is using the camera",
+    "camera.why.busy": "another app is using the camera",
+    "camera.why.not-found": "the chosen camera is not connected",
+    "camera.why.camera-error": "the camera stopped responding",
+    "camera.why.zero-frames": "the camera sent no picture",
+    "camera.why.black": "the picture is completely dark (is the camera covered?)",
+    "camera.why.other": "the reason is not known",
+    "detail.locked": "The PC is locked -- no check while it is.",
+    "detail.paused": "Presence checks are paused.",
+    "detail.auto_lock_off": "Walk-away lock is off -- no presence checks.",
+    "detail.remote": "The session is controlled remotely -- no check.",
+    "detail.skipped": "Skipped.",
+    "detail.present_input": "The keyboard or mouse is in use.",
+    "detail.present_second_look": "Your face was seen on the second look.",
+    "detail.present_camera": "Your face was seen.",
+    "detail.uncertain": "A face was seen, but it looked like a screen.",
+    "detail.absent": "No one recognised ({n} of {limit} before the PC locks).",
+    "detail.service_unavailable": "The Face Unlock service did not answer.",
+    "detail.service_error": "The Face Unlock service could not run the check.",
+    "detail.lock_failed": "Windows did not lock the PC.",
+    "detail.error": "The check failed -- see the log.",
+    "probe.why.engine": "the face recognition could not run -- see the log",
+    "probe.why.version": "Face Unlock components do not match -- run the installer again",
+    "probe.why.internal": "an internal error -- see the log",
+    "probe.why.other": "the Face Unlock service refused it -- see the log",
+    "status.support.show": "Details for support ▸",
+    "status.support.hide": "Details for support ▾",
 
     # ---- Settings ----
     "settings.title": "Face Unlock -- Settings",
@@ -185,8 +213,9 @@ _EN: dict[str, str] = {
     "settings.confirm_weaken.title": "Lower the protection?",
     "settings.confirm_weaken.body": "These changes make face sign-in easier to fool:\n\n{fields}\n\nSave anyway?",
     "settings.camera.by_index": "Camera number {i} (older setting)",
+    "settings.camera.default": "Default camera (the first one Windows lists)",
     "field.language": "Language",
-    "field.language.desc": "The language of the tray, the windows and the sign-in prompts: English or Russian.",
+    "field.language.desc": "The language of the Face Unlock menu in the notification area, the windows and the sign-in prompts: English or Russian.",
     "field.auto_lock": "Walk-away lock",
     "field.auto_lock.desc": "On = the camera checks from time to time whether you are at the PC, and locks it after the set number of absences in a row. Off = no presence checks at all; the camera is used only for face sign-in. Face sign-in works either way.",
     "field.presence_interval_s": "Check every (seconds)",
@@ -199,9 +228,9 @@ _EN: dict[str, str] = {
     "choice.liveness_mode.fast": "Head movements only when in doubt (faster)",
     "field.camera_name": "Camera",
     "field.camera_name.desc": "The camera Face Unlock uses. If it is not connected, face sign-in says so -- another camera is never used instead. The setup wizard chooses it too.",
-    "field.notify_lockout": "Notify: face sign-in paused",
+    "field.notify_lockout": "Notify when face sign-in is paused",
     "field.notify_lockout.desc": "A notification when face sign-in is paused after several failed attempts.",
-    "field.notify_service_state": "Notify: service stopped / started",
+    "field.notify_service_state": "Notify when the service stops or starts",
     "field.notify_service_state.desc": "A notification when the Face Unlock service stops answering or answers again. Off by default: restarts during updates are normal.",
     "field.update_check": "Look for updates",
     "field.update_check.desc": "Ask GitHub about a newer release in the background, at most once a day. The menu item Check for updates always works.",
@@ -226,7 +255,7 @@ _EN: dict[str, str] = {
 
     # ---- Help ----
     "help.title": "Face Unlock -- Help",
-    "help.intro": "What each tray menu item does:",
+    "help.intro": "What each item of the Face Unlock menu in the notification area does:",
     "help.close": "Close",
     "help.custody": "If face sign-in is off because the data folder could not be secured",
     "help.custody.desc": "Face Unlock keeps your face profile and the sealed password in %USERPROFILE%\\.face-unlock and allows only your account and the system to open it. When the service cannot restore that -- usually because another account or a program changed the folder's permissions or owner -- every face function stays off. Restart the PC first. If it stays off, delete the folder (you then set up your face and save the password again), or restore its permissions so that only you and SYSTEM have access. The service log names the file it could not secure.",
@@ -265,6 +294,8 @@ _EN: dict[str, str] = {
     "enroll.btn.wipe": "Delete face profile",
     "enroll.btn.close": "Close",
     "enroll.btn.retry": "Retry",
+    "enroll.btn.camera_on": "Turn the camera on again",
+    "enroll.btn.cancel_calib": "Cancel calibration",
     "enroll.btn.cancel": "Cancel",
     "enroll.btn.calibrate": "Calibrate head turn",
     "enroll.btn.set_password": "Save Windows password…",
@@ -305,6 +336,7 @@ _EN: dict[str, str] = {
     "enroll.error.service_down": "The Face Unlock service is not answering. Face sign-in cannot be set up until it runs. Waiting for it… If this does not change, sign out of Windows and sign in again.",
     "enroll.error.refusing": "The Face Unlock service refuses face functions: {why}.",
     "enroll.error.lease": "The Face Unlock service did not hand over the camera. Try again in a moment.",
+    "enroll.error.no_frame": "The camera opened but sent no picture within 5 seconds. Check that it is not covered or used by another app, then press Retry.",
     "enroll.error.wipe_failed": "The Face Unlock service did not confirm the deletion. Try again; if it keeps failing, sign out of Windows and sign in again.",
     "enroll.confirm.mode.title": "Replace or add?",
     "enroll.confirm.mode.body": "You already have a face profile.\n\nReplace: build a new profile from these photos (recommended). The old one is removed only after the new one is built.\n\nAdd: add these photos to the existing profile.",
@@ -325,6 +357,8 @@ _EN: dict[str, str] = {
     "enroll.calib.too_small": "The turn was too small to measure. Try again and turn your head further.",
     "enroll.calib.no_face": "No face was found in the calibration photos. Try again.",
     "enroll.calib.failed": "Calibration did not work ({reason}). The default direction is used.",
+    "enroll.calib.cancelled": "Calibration cancelled. The default direction is used.",
+    "enroll.calib.stalled": "Calibration stopped: no progress for 30 seconds (was your face in the oval?). The default direction is used; you can try again later.",
     "enroll.ready.title": "Is face sign-in ready?",
     "enroll.ready.all_ok": "All set. Close this window and try it: press Win+L, then look at the camera.",
     "enroll.ready.service.ok": "The Face Unlock service is running.",
@@ -350,7 +384,7 @@ _EN: dict[str, str] = {
 
     # ---- Windows password dialog ----
     "pwd.title": "Face Unlock -- Windows password",
-    "pwd.intro": "After your face is recognised, face sign-in signs you in with this password. It is stored encrypted for your Windows account only and never leaves this PC.",
+    "pwd.intro": "Face Unlock signs in to Windows with this password after it recognises your face. It is stored encrypted for your Windows account only and never leaves this PC.",
     "pwd.account": "Account",
     "pwd.password": "Windows password",
     "pwd.confirm": "Repeat",
@@ -382,7 +416,7 @@ _EN: dict[str, str] = {
 }
 
 _RU: dict[str, str] = {
-    # ---- меню в трее ----
+    # ---- меню в области уведомлений ----
     "tray.title": "Face Unlock",
     "tray.status": "Состояние…",
     "tray.settings": "Настройки…",
@@ -407,7 +441,7 @@ _RU: dict[str, str] = {
     "tray.language.desc": "Переключить язык: английский или русский.",
     "tray.check_update.desc": "Спросить у GitHub, есть ли более новый выпуск. Сам Face Unlock обновления пока не устанавливает — он открывает страницу выпусков.",
     "tray.help.desc": "Этот список.",
-    "tray.quit.desc": "Останавливает сервис Face Unlock и закрывает значок в трее. Вход по лицу и блокировка при уходе выключены до следующего входа в Windows (сторож запустит сервис снова через 5 минут).",
+    "tray.quit.desc": "Останавливает сервис Face Unlock и закрывает Face Unlock. Вход по лицу и блокировка при уходе остаются выключенными до следующего входа в Windows или до запуска Face Unlock из меню «Пуск». PIN-код и пароль продолжают работать.",
     "tray.state.no_service": "Сервис Face Unlock не запущен",
     "tray.state.starting": "Запуск…",
     "tray.state.refusing": "Вход по лицу выключен: {why}",
@@ -422,7 +456,7 @@ _RU: dict[str, str] = {
     "why.no-models": "модели распознавания лица отсутствуют или повреждены — запустите установщик снова",
     "why.lockout-store-error": "не удаётся сохранить счётчик попыток входа",
     "quit.confirm.title": "Выйти из Face Unlock?",
-    "quit.confirm.body": "Вход по лицу и блокировка при уходе остановятся сейчас и останутся выключенными до следующего входа в Windows. PIN-код и пароль продолжат работать.\n\nВыйти?",
+    "quit.confirm.body": "Вход по лицу и блокировка при уходе остановятся сейчас и останутся выключенными до следующего входа в Windows или до запуска Face Unlock из меню «Пуск». PIN-код и пароль продолжат работать.\n\nВыйти?",
 
     # ---- окно «Состояние» ----
     "status.title": "Face Unlock — Состояние",
@@ -436,7 +470,7 @@ _RU: dict[str, str] = {
     "status.strikes": "Отсутствий подряд",
     "status.lock_count": "Блокировок с запуска",
     "status.paused": "Пауза",
-    "status.watchdog": "Сторож",
+    "status.watchdog": "Автоперезапуск",
     "status.events": "Недавние события:",
     "status.events.none": "(пока нет)",
     "status.service.desc": "Работает — сервис Face Unlock отвечает. Недоступен — он не запущен или занят дольше 2 с. Работает, но вход по лицу выключен — сервис отказывает в функциях лица, с причиной.",
@@ -447,9 +481,9 @@ _RU: dict[str, str] = {
     "status.result.desc": "на месте, нет на месте, не уверен (лицо было похоже на экран), не видит (камера занята, не подключена или темно), пропущено (пауза, блокировка, удалённый сеанс, блокировка при уходе выключена), ошибка.",
     "status.reason.desc": "Технические подробности последней проверки — для поиска неполадок.",
     "status.strikes.desc": "Проверки подряд без вас. Когда счётчик доходит до предела справа, компьютер блокируется. Показывается только при включённой блокировке при уходе.",
-    "status.lock_count.desc": "Сколько раз блокировка при уходе заблокировала компьютер с запуска трея.",
-    "status.paused.desc": "Да — проверки присутствия приостановлены из трея; компьютер не блокируется, пока вы их не возобновите.",
-    "status.watchdog.desc": "Сторож перезапускает сервис Face Unlock, если тот перестаёт отвечать. Раз в час он отмечает, что работает.",
+    "status.lock_count.desc": "Сколько раз блокировка при уходе заблокировала компьютер с запуска Face Unlock.",
+    "status.paused.desc": "Да — проверки присутствия приостановлены через значок Face Unlock в области уведомлений; компьютер не блокируется, пока вы их не возобновите.",
+    "status.watchdog.desc": "Автоперезапуск снова запускает сервис Face Unlock, если тот перестаёт отвечать. Раз в час он отмечает, что работает.",
     "status.btn.ping": "Опросить сервис",
     "status.btn.probe": "Проверить присутствие",
     "status.btn.open_log": "Открыть папку журналов",
@@ -490,6 +524,33 @@ _RU: dict[str, str] = {
     "probe.unknown": "Камера не смогла посмотреть ({why}).",
     "probe.error": "Проверка не выполнена: {reason}",
     "event.probe": "Проверка присутствия: {result}",
+    "camera.why.leased": "камерой пользуется мастер настройки",
+    "camera.why.busy": "камерой пользуется другое приложение",
+    "camera.why.not-found": "выбранная камера не подключена",
+    "camera.why.camera-error": "камера перестала отвечать",
+    "camera.why.zero-frames": "камера не передала изображение",
+    "camera.why.black": "изображение полностью тёмное (камера закрыта?)",
+    "camera.why.other": "причина неизвестна",
+    "detail.locked": "Компьютер заблокирован — проверок нет.",
+    "detail.paused": "Проверки присутствия приостановлены.",
+    "detail.auto_lock_off": "Блокировка при уходе выключена — проверок нет.",
+    "detail.remote": "Сеансом управляют удалённо — проверки нет.",
+    "detail.skipped": "Пропущено.",
+    "detail.present_input": "Используются клавиатура или мышь.",
+    "detail.present_second_look": "Ваше лицо распознано со второй попытки.",
+    "detail.present_camera": "Ваше лицо распознано.",
+    "detail.uncertain": "Лицо видно, но похоже на экран.",
+    "detail.absent": "Никто не распознан ({n} из {limit} до блокировки).",
+    "detail.service_unavailable": "Сервис Face Unlock не ответил.",
+    "detail.service_error": "Сервис Face Unlock не смог выполнить проверку.",
+    "detail.lock_failed": "Windows не заблокировала компьютер.",
+    "detail.error": "Проверка не удалась — см. журнал.",
+    "probe.why.engine": "распознавание лица не запустилось — см. журнал",
+    "probe.why.version": "компоненты Face Unlock разных версий — запустите установщик снова",
+    "probe.why.internal": "внутренняя ошибка — см. журнал",
+    "probe.why.other": "сервис Face Unlock отказал — см. журнал",
+    "status.support.show": "Подробности для поддержки ▸",
+    "status.support.hide": "Подробности для поддержки ▾",
 
     # ---- настройки ----
     "settings.title": "Face Unlock — Настройки",
@@ -514,8 +575,9 @@ _RU: dict[str, str] = {
     "settings.confirm_weaken.title": "Ослабить защиту?",
     "settings.confirm_weaken.body": "Эти изменения облегчают обман входа по лицу:\n\n{fields}\n\nВсё равно сохранить?",
     "settings.camera.by_index": "Камера номер {i} (старая настройка)",
+    "settings.camera.default": "Камера по умолчанию (первая в списке Windows)",
     "field.language": "Язык",
-    "field.language.desc": "Язык трея, окон и подсказок на экране входа: английский или русский.",
+    "field.language.desc": "Язык меню Face Unlock в области уведомлений, окон и подсказок на экране входа: английский или русский.",
     "field.auto_lock": "Блокировка при уходе",
     "field.auto_lock.desc": "Включена — камера время от времени проверяет, что вы у компьютера, и после заданного числа отсутствий подряд блокирует его. Выключена — проверок присутствия нет совсем; камера нужна только для входа по лицу. Вход по лицу работает в обоих случаях.",
     "field.presence_interval_s": "Проверять каждые (секунд)",
@@ -528,9 +590,9 @@ _RU: dict[str, str] = {
     "choice.liveness_mode.fast": "Движения головой только при сомнении (быстрее)",
     "field.camera_name": "Камера",
     "field.camera_name.desc": "Камера, которой пользуется Face Unlock. Если она не подключена, вход по лицу так и сообщает — другая камера вместо неё не используется. Её же выбирает мастер настройки.",
-    "field.notify_lockout": "Уведомлять: пауза входа по лицу",
+    "field.notify_lockout": "Уведомлять о паузе входа по лицу",
     "field.notify_lockout.desc": "Уведомление, когда вход по лицу приостановлен после нескольких неудачных попыток.",
-    "field.notify_service_state": "Уведомлять: сервис остановлен / запущен",
+    "field.notify_service_state": "Уведомлять об остановке и запуске сервиса",
     "field.notify_service_state.desc": "Уведомление, когда сервис Face Unlock перестаёт отвечать или снова отвечает. По умолчанию выключено: перезапуски при обновлении — это нормально.",
     "field.update_check": "Искать обновления",
     "field.update_check.desc": "В фоне спрашивать у GitHub о новом выпуске, не чаще раза в сутки. Пункт меню «Проверить обновления» работает всегда.",
@@ -555,7 +617,7 @@ _RU: dict[str, str] = {
 
     # ---- справка ----
     "help.title": "Face Unlock — Справка",
-    "help.intro": "Что делает каждый пункт меню в трее:",
+    "help.intro": "Что делает каждый пункт меню Face Unlock в области уведомлений:",
     "help.close": "Закрыть",
     "help.custody": "Если вход по лицу выключен, потому что папку данных не удалось защитить",
     "help.custody.desc": "Face Unlock хранит профиль лица и зашифрованный пароль в %USERPROFILE%\\.face-unlock и разрешает открывать эту папку только вашей учётной записи и системе. Если сервис не может это восстановить — обычно потому, что другая учётная запись или программа изменила права или владельца папки, — все функции лица остаются выключенными. Сначала перезагрузите компьютер. Если не помогло, удалите папку (тогда лицо и пароль нужно будет настроить заново) или верните её права так, чтобы доступ был только у вас и SYSTEM. Журнал сервиса называет файл, который не удалось защитить.",
@@ -594,6 +656,8 @@ _RU: dict[str, str] = {
     "enroll.btn.wipe": "Удалить профиль лица",
     "enroll.btn.close": "Закрыть",
     "enroll.btn.retry": "Повторить",
+    "enroll.btn.camera_on": "Снова включить камеру",
+    "enroll.btn.cancel_calib": "Отменить настройку",
     "enroll.btn.cancel": "Отмена",
     "enroll.btn.calibrate": "Настроить поворот головы",
     "enroll.btn.set_password": "Сохранить пароль Windows…",
@@ -634,6 +698,7 @@ _RU: dict[str, str] = {
     "enroll.error.service_down": "Сервис Face Unlock не отвечает. Пока он не работает, вход по лицу не настроить. Ожидание… Если ничего не меняется, выйдите из Windows и войдите снова.",
     "enroll.error.refusing": "Сервис Face Unlock отказывает в функциях лица: {why}.",
     "enroll.error.lease": "Сервис Face Unlock не передал камеру. Попробуйте ещё раз через минуту.",
+    "enroll.error.no_frame": "Камера открылась, но за 5 секунд не передала изображение. Проверьте, что она не закрыта и не занята другим приложением, и нажмите «Повторить».",
     "enroll.error.wipe_failed": "Сервис Face Unlock не подтвердил удаление. Попробуйте ещё раз; если не помогает, выйдите из Windows и войдите снова.",
     "enroll.confirm.mode.title": "Заменить или добавить?",
     "enroll.confirm.mode.body": "Профиль лица у вас уже есть.\n\nЗаменить: построить новый профиль из этих снимков (рекомендуется). Старый удаляется только после того, как новый построен.\n\nДобавить: добавить эти снимки к имеющемуся профилю.",
@@ -654,6 +719,8 @@ _RU: dict[str, str] = {
     "enroll.calib.too_small": "Поворот слишком мал, чтобы его измерить. Повторите и поверните голову сильнее.",
     "enroll.calib.no_face": "На снимках для настройки не найдено лицо. Повторите.",
     "enroll.calib.failed": "Настройка не удалась ({reason}). Используется направление по умолчанию.",
+    "enroll.calib.cancelled": "Настройка отменена. Используется направление по умолчанию.",
+    "enroll.calib.stalled": "Настройка остановлена: 30 секунд без продвижения (было ли лицо в овале?). Используется направление по умолчанию; можно попробовать позже.",
     "enroll.ready.title": "Готов ли вход по лицу?",
     "enroll.ready.all_ok": "Всё готово. Закройте это окно и попробуйте: нажмите Win+L и посмотрите в камеру.",
     "enroll.ready.service.ok": "Сервис Face Unlock работает.",
@@ -679,7 +746,7 @@ _RU: dict[str, str] = {
 
     # ---- диалог пароля Windows ----
     "pwd.title": "Face Unlock — Пароль Windows",
-    "pwd.intro": "После того как лицо узнано, вход по лицу входит в систему этим паролем. Он хранится зашифрованным только для вашей учётной записи Windows и не покидает этот компьютер.",
+    "pwd.intro": "Этим паролем Face Unlock входит в Windows после распознавания лица. Он хранится зашифрованным только для вашей учётной записи Windows и не покидает этот компьютер.",
     "pwd.account": "Учётная запись",
     "pwd.password": "Пароль Windows",
     "pwd.confirm": "Повторите",
@@ -711,6 +778,44 @@ _RU: dict[str, str] = {
 }
 
 TRANSLATIONS: dict[str, dict[str, str]] = {"en": _EN, "ru": _RU}
+
+
+class Msg:
+    """9d (V-48): a text rendered in the CURRENT language every time it is shown. The Status
+    window's "Recent events" kept the text of the language that was on when the event happened
+    (an English "Presence check: present" in a Russian window). Arguments may be Msg objects or
+    zero-argument callables; both are rendered at display time too."""
+
+    __slots__ = ("key", "kwargs")
+
+    def __init__(self, key: str, **kwargs):
+        self.key, self.kwargs = key, kwargs
+
+    def __str__(self) -> str:
+        def one(v):
+            if isinstance(v, Msg):
+                return str(v)
+            if callable(v):
+                try:
+                    return str(v())
+                except Exception:
+                    return "?"
+            return v
+        return t(self.key, **{k: one(v) for k, v in self.kwargs.items()})
+
+    def __eq__(self, other) -> bool:
+        return str(self) == str(other)
+
+    def __contains__(self, item) -> bool:        # reads like the text it renders
+        return item in str(self)
+
+    def __format__(self, spec: str) -> str:
+        return format(str(self), spec)
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return f"Msg({self.key!r})"
 
 # ---------------------------------------------------------------------------
 # Public API

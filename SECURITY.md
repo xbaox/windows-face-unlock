@@ -146,7 +146,7 @@ All in `%USERPROFILE%\.face-unlock\` (the owner's profile):
 | `config.toml` | settings you changed |
 | `lockout.json`, `watchdog.pause`, `presence_paused.json`, `update_state.json`, `password_rejected.flag` | small state files |
 | `audit.jsonl` | one line per sign-in attempt and per setup action: time, result, match distance, the liveness measurements, the movements asked. No images, no password. On by default (`audit_log`), rotated by size. |
-| `logs\` | `service.log`, `presence.log`, `enroll.log`, `watchdog.log`: technical logs, rotated at 5 MB. They contain file paths (which include your Windows user name), match distances, presence results, the names of detected remote-support programs, and which local program connected to the pipe. No images and no password. |
+| `logs\` | `service.log`, `presence.log`, `enroll.log` (setup wizard), `password.log` (password dialog), `watchdog.log`: technical logs, rotated at 5 MB. They contain file paths (which include your Windows user name), match distances, presence results, the names of detected remote-support programs, and which local program connected to the pipe. No images and no password. |
 | `debug_frames\` | raw camera frames -- **only** if the diagnostic switch `debug_dump_frames` is turned on (off by default) |
 
 The installation folder holds the program and the face-recognition models, nothing personal.

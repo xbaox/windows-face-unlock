@@ -6,7 +6,8 @@
     hooks are inside each exe): the license / copying / notice files its dist-info declares;
   * packages whose wheel carries no such file get the text from where it really is
     (onnxruntime: its package folder) or a written statement (insightface: MIT per its README;
-    flatbuffers: Apache-2.0, text taken from another Apache-2.0 package);
+    flatbuffers: Apache-2.0, text taken from another Apache-2.0 package; pywinrt: the MIT LICENSE
+    of its repository, verbatim -- 9d, V-37);
   * the CPython LICENSE.txt (it also covers OpenSSL, bzip2, libffi, xz, zlib, Tcl/Tk, expat and the
     Microsoft Distributable Code conditions of the MSVC runtime);
   * the YuNet model's MIT text (models/LICENSE-yunet) and Inno Setup's license (the uninstaller);
@@ -56,6 +57,36 @@ NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPO
 NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
 OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
+
+# 9d (V-37): the pywinrt wheels (winrt-runtime, winrt-Windows.*) declare MIT but carry no license
+# file. The text below is the LICENSE of github.com/pywinrt/pywinrt, verbatim.
+PYWINRT_TEXT = """pywinrt (winrt-runtime and the winrt-Windows.* projection packages) -- MIT License
+The wheels declare "License-Expression: MIT" and carry no license file; this is the LICENSE of
+https://github.com/pywinrt/pywinrt, verbatim:
+
+MIT License
+
+Copyright (c) Microsoft Corporation. All rights reserved.
+Copyright (c) 2021-2025 David Lechner <david@pybricks.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE
 """
 
 FLATBUFFERS_HEAD = """flatbuffers -- Apache License 2.0
@@ -140,6 +171,9 @@ def stage(dist_root: Path, variant: str, iscc: "str | None", lock: Path = LOCK) 
         if _norm(name) == "insightface":
             folder.mkdir(parents=True, exist_ok=True)
             (folder / "LICENSE.txt").write_text(INSIGHTFACE_TEXT, encoding="utf-8")
+        if _norm(name).startswith("winrt-") and not files:      # 9d (V-37)
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "LICENSE.txt").write_text(PYWINRT_TEXT, encoding="utf-8")
         index.append(f"{_norm(name):28} {dist.version:16} {declared}")
 
     fb = lic / "flatbuffers"

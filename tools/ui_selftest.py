@@ -146,7 +146,7 @@ def test_settings(ui, mon):
                                            "field.liveness_mode"} <= set(w), w)
     check("a stricter change is not", GUI.weakened(old, Config(threshold=0.30)) == [])
     msg = GUI.field_error("presence_interval_s", "int", (10, 3600, 10, "%.0f"))
-    from face_service.i18n import t
+    from face_service.i18n import set_language, t
     check("a range error names the field as shown", t("field.presence_interval_s") in msg and "3600" in msg, msg)
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text("# mine\nlanguage = \"en\"\nthreshold = 0.32\n", encoding="utf-8")
@@ -187,11 +187,110 @@ def test_settings(ui, mon):
     ui.post(lambda: ui._windows["settings"].close())
 
 
+def test_9d_windows(ui, mon):
+    print("[9d] Status: V-39 no decryption, V-40 probe button; Settings: V-44; tray: V-33 resume")
+    import threading as _th
+    import presence_monitor.gui as GUI
+    from face_service import credentials as CR
+    from face_service.config import CONFIG_PATH, Config
+    from face_service.i18n import t
+    decrypts = []
+    real_state = CR.password_state
+    CR.password_state = lambda: decrypts.append(_th.current_thread().name) or ("ok", "x")
+    presence_threads = []
+    real_presence = CR.password_presence
+    CR.password_presence = lambda: presence_threads.append(_th.current_thread().name) or ("none", "")
+    GUI.pipe_call = FakePipe(replies={"status": {"ok": True, "state": "serving", "enrollment": True}})
+
+    class _Mon:
+        auto = False
+
+        def snapshot(self):
+            return {"auto_lock": self.auto, "events": [], "last_result": "skipped",
+                    "last_reason": "auto-lock-off"}
+    m = _Mon()
+    out = queue.Queue()
+    try:
+        def open_status():
+            ui.show("status", lambda u: GUI.StatusWindow(u, m))
+            ui._windows["status"].top.withdraw()
+        ui.post(open_status)
+        time.sleep(2.6)
+        ui.post(lambda: out.put((ui._windows["status"].vars["pwd"].get(),
+                                 str(ui._windows["status"].buttons["status.btn.probe"].cget("state")),
+                                 ui._windows["status"].vars["reason"].get(),
+                                 _th.current_thread().name)))
+        pwd, probe_state, reason, tk_thread = out.get(timeout=10)
+        check("V-39: the Status window never decrypts the password", decrypts == [], decrypts)
+        check("V-39: presence is read off the Tk thread", presence_threads
+              and tk_thread not in presence_threads, (presence_threads, tk_thread))
+        check("V-39: ... and only when the files change (one read over several polls)",
+              len(presence_threads) == 1, presence_threads)
+        check("V-39: the row says 'not saved'", pwd == t("status.val.pwd_none"), pwd)
+        check("V-40: walk-away lock off -> 'Check presence now' is disabled", probe_state == "disabled",
+              probe_state)
+        check("V-35: Details in words", reason == t("detail.auto_lock_off"), reason)
+        m.auto = True
+        time.sleep(2.3)
+        ui.post(lambda: out.put(str(ui._windows["status"].buttons["status.btn.probe"].cget("state"))))
+        check("V-40: walk-away lock on -> enabled", out.get(timeout=10) == "normal")
+        ui.post(lambda: ui._windows["status"].close())
+    finally:
+        CR.password_state, CR.password_presence = real_state, real_presence
+
+    # V-44: a hidden language code and a number rounded for display are not changes
+    CONFIG_PATH.write_text('language = "de"' + chr(10) + 'presence_input_idle_s = 45.5' + chr(10)
+                           + 'threshold = 0.32' + chr(10),
+                           encoding="utf-8")
+
+    def run():
+        ui.show("settings", lambda u: GUI.SettingsWindow(u, mon))
+        s = ui._windows["settings"]
+        s.top.withdraw()
+        new, err = s._collect()
+        out.put((new, err, s._changed(new) if new else None, s.vars["language"][2].get()))
+        s.close()
+    ui.post(run)
+    new, err, changed, shown = out.get(timeout=10)
+    check("V-44: untouched Settings with language=de and idle 45.5 -> no unsaved change",
+          new is not None and changed == [] and new.language == "de"
+          and new.presence_input_idle_s == 45.5, (err, changed, shown))
+
+    # V-48: an event is shown in the language of the moment, not of when it happened
+    from face_service.i18n import Msg, set_language
+    set_language("en")
+    ev = Msg("event.probe", result=lambda: GUI.probe_text({"ok": True, "state": "present"}))
+    set_language("ru")
+    ru_text = str(ev)
+    set_language("en")
+    check("V-48: 'Presence check: present' recorded in English reads in Russian after a switch",
+          "Проверка присутствия" in ru_text and "Presence" not in ru_text, ru_text)
+
+    # V-33 (A-9): the tray start ends a Quit of this sign-in and starts the service
+    from presence_monitor import tray as TR
+    from face_service import watchdog as W
+    from face_service import config as C
+    started = []
+    W.write_quit(C.QUIT_PAUSE_PATH, W.logon_id(), time.time())
+    was = TR.resume_after_quit(_start=lambda: started.append(1))
+    check("V-33: tray start after a Quit of this sign-in -> pause cleared, service started",
+          was is True and started == [1] and not C.QUIT_PAUSE_PATH.exists())
+    check("V-33: no Quit -> nothing started", TR.resume_after_quit(_start=lambda: started.append(2)) is False
+          and started == [1])
+    W.write_quit(C.QUIT_PAUSE_PATH, "dead-beef", time.time())
+    check("V-33: a Quit of an earlier sign-in -> removed, nothing started",
+          TR.resume_after_quit(_start=lambda: started.append(3)) is False and started == [1]
+          and not C.QUIT_PAUSE_PATH.exists())
+    src = open(TR.__file__, encoding="utf-8").read()
+    check("V-33: Quit writes the logon-bound pause BEFORE stopping anything",
+          src.find("write_quit(QUIT_PAUSE_PATH") < src.find("monitor.stop()", src.find("def _do_quit")))
+
+
 def test_tray_state():
     print("[4] tray state")
     from presence_monitor.tray import icon_image, tray_state
     from presence_monitor.gui import probe_text, strikes_text
-    from face_service.i18n import t
+    from face_service.i18n import set_language, t
     ok = {"ok": True, "state": "serving", "enrollment": True}
     check("ready", tray_state(ok, {"auto_lock": False})[0] == "ok")
     check("service down -> off", tray_state(None, {})[0] == "off")
@@ -203,7 +302,31 @@ def test_tray_state():
     check("camera cannot see -> off", tray_state(ok, {"last_result": "unknown", "last_why": "busy"})[0] == "off")
     img = icon_image("ok")
     check("the icon is transparent (no white square)", img.mode == "RGBA" and img.getpixel((0, 0))[3] == 0)
-    check("probe text carries unknown + why", "busy" in probe_text({"ok": True, "state": "unknown", "why": "busy"}))
+    check("probe text carries unknown + why (9d V-35: in words, not the code)",
+          probe_text({"ok": True, "state": "unknown", "why": "busy"}) == t("probe.unknown", why=t("camera.why.busy"))
+          and "busy)" not in probe_text({"ok": True, "state": "unknown", "why": "busy"}))
+    # 9d (V-35): no raw code in the tray line, the Status details or the probe dialogs
+    from presence_monitor.gui import reason_text, probe_text as _pt, camera_why_text
+    raw = ("busy", "leased", "zero-frames", "black", "not-found", "camera-error", "auto-lock-off",
+           "src=", "streak=", "d4=", "engine-error", "service-unavailable")
+    samples = [tray_state(ok, {"last_result": "unknown", "last_why": w})[1]
+               for w in ("busy", "leased", "zero-frames", "black", "not-found", "camera-error", "?")]
+    snaps = [{"last_result": "skipped", "last_reason": "auto-lock-off"},
+             {"last_result": "skipped", "last_reason": "remote-tool:teamviewer_desktop.exe"},
+             {"last_result": "present", "last_reason": "src=camera real=True streak=0/3 strikes=0/2 d4=-"},
+             {"last_result": "present", "last_reason": "src=input idle=3s/45s"},
+             {"last_result": "absent", "last_reason": "src=camera streak=0/3 strikes=1/2 d4=confirmed",
+              "strikes": 1, "absent_strikes": 2},
+             {"last_result": "error", "last_reason": "service-error engine-error"},
+             {"last_result": "unknown", "last_why": "zero-frames", "last_reason": "src=camera why=zero-frames"}]
+    samples += [reason_text(s) for s in snaps]
+    samples += [_pt({"ok": False, "reason": "engine-error"}), _pt({"ok": True, "state": "unknown", "why": "leased"})]
+    for lang in ("en", "ru"):
+        set_language(lang)
+        texts = samples if lang == "en" else [reason_text(s) for s in snaps] + [camera_why_text("black")]
+        leaked = [x for x in texts if any(r in x for r in raw)]
+        check(f"V-35 ({lang}): no raw code in tray / Status details / probe dialogs", leaked == [], leaked)
+    set_language("en")
     check("probe text: uncertain", probe_text({"ok": True, "state": "uncertain"}) == t("probe.uncertain"))
     check("strikes with auto-lock off say so", strikes_text({"auto_lock": False}) == t("status.val.auto_lock_off"))
 
@@ -235,11 +358,79 @@ def test_toast():
     from presence_monitor import toast
     x = toast.toast_xml("A & B", "<script>")
     check("XML escaped", "&amp;" in x and "&lt;script&gt;" in x)
-    seen = {}
-    ok = toast.show_toast("T", "secret text", _run=lambda argv, **kw: seen.update(argv=argv, env=kw.get("env")))
-    check("started", ok)
-    check("the text is not in argv", "secret text" not in " ".join(seen["argv"]))
-    check("the text travels base64 in the environment", "FU_TOAST_XML" in seen["env"])
+    # 9d (A-5, V-37): native WinRT through pywinrt -- no PowerShell child.
+    shown = []
+
+    class _Doc:
+        def load_xml(self, x):
+            self.xml = x
+
+    class _Notifier:
+        def show(self, n):
+            shown.append(n)
+
+    class _Api:
+        XmlDocument = _Doc
+        ToastNotification = staticmethod(lambda doc: ("toast", doc.xml))
+
+        class ToastNotificationManager:
+            ids: list = []
+
+            @staticmethod
+            def create_toast_notifier_with_id(app_id):
+                _Api.ToastNotificationManager.ids.append(app_id)
+                return _Notifier()
+    ok = toast.show_toast("T", "secret & text", _api_for_test=_Api)
+    check("V-37: shown through the WinRT notifier under the product's AppUserModelID",
+          ok and _Api.ToastNotificationManager.ids == [toast.APP_ID]
+          and shown and "secret &amp; text" in shown[0][1], (ok, shown))
+
+    class _Broken(_Api):
+        class ToastNotificationManager:
+            @staticmethod
+            def create_toast_notifier_with_id(app_id):
+                raise OSError("notifications disabled")
+    check("V-37: a failing toast -> False, never raises", toast.show_toast("T", "m", _api_for_test=_Broken) is False)
+    api = toast._load_api()
+    check("V-37: the pywinrt bindings load in this environment", api is not None)
+    if api is not None:
+        doc = api.XmlDocument()
+        doc.load_xml(toast.toast_xml("Face Unlock", "selftest"))
+        n = api.ToastNotification(doc)
+        notifier = api.ToastNotificationManager.create_toast_notifier_with_id("WindowsFaceUnlock.SelftestNoShow")
+        check("V-37: a real XmlDocument / ToastNotification / notifier are built (not shown)",
+              n is not None and notifier is not None)
+    saved = (toast._api, toast._unavailable_warned, toast._WinRt)
+    try:
+        toast._api, toast._unavailable_warned = None, False
+        toast._WinRt = lambda: (_ for _ in ()).throw(ImportError("no winrt"))
+        import logging as _lg
+        warns = []
+
+        class _H(_lg.Handler):
+            def emit(self, rec):
+                if rec.levelno == _lg.WARNING:
+                    warns.append(rec.getMessage())
+        h = _H()
+        toast.log.addHandler(h)
+        try:
+            r1 = toast.show_toast("T", "m")
+            r2 = toast.show_toast("T", "m")
+        finally:
+            toast.log.removeHandler(h)
+        check("V-37: no WinRT -> False, and ONE warning for the process", r1 is False and r2 is False
+              and len(warns) == 1 and "Recent events" in warns[0], warns)
+    finally:
+        toast._api, toast._unavailable_warned, toast._WinRt = saved
+    import re as _re
+    root = Path(__file__).resolve().parents[1]
+    hits = []
+    for f in list((root / "face_service").glob("*.py")) + list((root / "presence_monitor").glob("*.py"))             + [root / "tools" / "watchdog.py"]:
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if _re.search(r"[\"'](powershell(\.exe)?|pwsh(\.exe)?)[\"']", line, _re.I):
+                hits.append(f"{f.name}:{n}")
+    check("V-37: no product module starts powershell / pwsh (face_service, presence_monitor, "
+          "tools/watchdog.py)", hits == [], hits)
 
 
 def test_release_caps():
@@ -326,6 +517,12 @@ def test_wizard():
 
 def test_misc():
     print("[11] entry points, custody")
+    import inspect as _insp
+    from presence_monitor import enroll_gui as _E, password_gui as _PG
+    check("V-46: the wizard logs to enroll.log, the password dialog to password.log (no shared file)",
+          'with_name("enroll.log")' in _insp.getsource(_E.main)
+          and 'with_name("password.log")' in _insp.getsource(_PG.main)
+          and "enroll.log" not in _insp.getsource(_PG.main))
     from presence_monitor.__main__ import main as router
     check("an unknown flag starts nothing", router(["--help"]) == 2)
     from presence_monitor import password_gui as P
@@ -363,6 +560,7 @@ def main() -> int:
     test_i18n()
     ui, mon = test_ui_thread()
     test_settings(ui, mon)
+    test_9d_windows(ui, mon)
     test_tray_state()
     test_notify_fallback()
     test_toast()
@@ -372,7 +570,30 @@ def main() -> int:
     test_wizard()
     test_misc()
     test_installer()
-    ui.stop()
+    # 9d (V-47): dialogs get an owner that dies WITH the dialog; Quit tears Tk down on its thread
+    got = queue.Queue()
+
+    def dlg():
+        # every Tk object stays on the Tk thread: only plain values go back to the test
+        seen = {}
+        r = ui.dialog(lambda p: seen.update(p=p, alive=bool(p.winfo_exists())) or "answer")
+        after = bool(seen["p"].winfo_exists())
+        during = bool(seen["alive"])
+        seen.clear()
+        got.put((r, during, after))
+    ui.post(dlg)
+    r, alive_during, after = got.get(timeout=10)
+    check("V-47: the dialog owner exists while the dialog runs and is gone right after it",
+          r == "answer" and alive_during and after is False)
+    import presence_monitor.tray as _TR
+    check("V-47: no fixed 60 s owner lifetime left in the tray",
+          "after(60000" not in open(_TR.__file__, encoding="utf-8").read())
+    import presence_monitor.gui as _G
+    ui.post(lambda: ui.show("help", lambda u: _G.HelpWindow(u)))
+    time.sleep(0.5)
+    finished = ui.stop(wait_s=5.0)
+    check("V-47: stop(wait) ends the Tk thread after closing its windows and destroying the root there",
+          finished and ui.root is None and ui._windows == {} and not ui._thread.is_alive())
     print()
     if FAILS:
         print(f"UI SELFTEST FAILED: {len(FAILS)} check(s): {FAILS}")

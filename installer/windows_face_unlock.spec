@@ -345,7 +345,10 @@ tray_analysis = Analysis(
     pathex=[str(REPO_ROOT)],
     binaries=BINARIES,
     datas=DATAS,
-    hiddenimports=HIDDEN + ["tkinter", "tkinter.ttk", "tkinter.messagebox", "pystray._win32"],
+    # 9d (A-5, V-37): the tray shows its toasts through pywinrt (MIT) -- the projection modules are
+    # imported lazily (presence_monitor.toast), so the whole winrt package is named here.
+    hiddenimports=HIDDEN + ["tkinter", "tkinter.ttk", "tkinter.messagebox", "pystray._win32"]
+    + collect_submodules("winrt"),
     hookspath=[],
     runtime_hooks=[],
     excludes=EXCLUDES,

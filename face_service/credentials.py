@@ -183,6 +183,39 @@ def save_password(username: str, password: str, domain: str = ".") -> None:
     clear_password_rejected()        # a new password answers the lock screen's rejection
 
 
+def password_signature() -> tuple:
+    """9d (V-39): a cheap fingerprint of the stored password's files (existence, size, mtime) --
+    what the Status window polls to notice a change, without reading or decrypting anything."""
+    out = []
+    for p in (CREDS_PATH, ENTROPY_PATH):
+        try:
+            st = p.stat()
+            out.append((True, st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append((False, 0, 0))
+    return tuple(out)
+
+
+def password_presence() -> "tuple[str, str]":
+    """9d (V-39): like password_state, WITHOUT decrypting: ``("none", "")``, ``("saved", "")`` or
+    ``("unreadable", why)`` for what can be told from the files alone (old format, the entropy
+    secret missing, a read error). Whether DPAPI can still open the blob is not asked here --
+    the Status window polls this every 2 s; the wizard and the password dialog ask password_state
+    once."""
+    if not CREDS_PATH.exists():
+        return "none", ""
+    try:
+        with open(CREDS_PATH, "rb") as f:
+            head = f.read(len(_V2_PREFIX))
+    except OSError as e:
+        return "unreadable", f"read failed ({e.__class__.__name__})"
+    if head != _V2_PREFIX:
+        return "unreadable", "old format"
+    if not ENTROPY_PATH.exists():
+        return "unreadable", "entropy missing"
+    return "saved", ""
+
+
 def password_state() -> "tuple[str, str]":
     """Stage 9 (F-108): ``("none", "")`` -- nothing stored; ``("unreadable", why)`` -- a blob exists
     but this account cannot open it (DPAPI key lost after a password reset, a profile restored on

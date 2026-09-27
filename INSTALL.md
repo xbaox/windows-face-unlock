@@ -141,7 +141,8 @@ numbers are in Settings → Basic).
 - A very dim room can be taken as "nobody there". Keep Windows' own screen-lock timeout as a
   backstop.
 - It never locks while the session is controlled remotely (Remote Desktop, TeamViewer, Chrome Remote
-  Desktop, Quick Assist, Windows Remote Assistance).
+  Desktop; Windows Remote Assistance when Windows reports the session as remotely controlled).
+  Quick Assist is not recognised: pause presence checks from the tray before a Quick Assist session.
 - **Pause presence checks** in the tray stops it until you resume (kept across restarts).
 
 ### 4.3 The tray menu

@@ -82,17 +82,22 @@ def try_exposure_boost(cap, step: float, recapture: Callable[[], object]) -> Boo
     (e.g. a VerifyOutcome). Behaviour:
       * driver ignores the set (roundtrip fails)  -> honored=False, NO re-capture (nothing changed);
       * driver honors it                          -> re-capture, applied=True;
-      * re-capture raises                          -> swallowed (unlock must never crash), error set.
-    In every case the ORIGINAL exposure is restored in the finally, so the camera is never left
-    boosted for the next unlock or the presence loop.
+      * re-capture raises                          -> swallowed (unlock must never crash), error set;
+      * 9d (V-38): re-capture raises CameraReadTimeout -> RE-RAISED. The capture was abandoned by
+        the read that hung (camera.Camera.read), so nothing is written to it any more -- a set on
+        a wedged driver could hang the request the same way.
+    In every other case the ORIGINAL exposure is restored in the finally, so the camera is never
+    left boosted for the next unlock or the presence loop.
     """
     import cv2
+    from .camera import CameraReadTimeout
     prop = cv2.CAP_PROP_EXPOSURE
     aprop = cv2.CAP_PROP_AUTO_EXPOSURE
     before = float(cap.get(prop))
     auto_before = float(cap.get(aprop))
     target = plan_exposure(before, step)
     out = None
+    abandoned = False
     try:
         cap.set(prop, target)
         readback = float(cap.get(prop))
@@ -102,13 +107,18 @@ def try_exposure_boost(cap, step: float, recapture: Callable[[], object]) -> Boo
             try:
                 rc = recapture()
                 out = BoostOutcome(True, True, before, target, readback, rc)
+            except CameraReadTimeout:
+                abandoned = True             # 9d (V-38): the capture is gone -- no restore on it
+                raise
             except Exception as e:   # boost must never crash unlock; fall back to the dark outcome
                 out = BoostOutcome(False, True, before, target, readback, None, error=repr(e))
     finally:
-        # GUARANTEED restore on every path: success / no-match / not-honored / exception -- the
-        # exposure value first, then the auto mode (which may take over from the value).
-        cap.set(prop, before)
-        cap.set(aprop, auto_before)
+        # GUARANTEED restore on every path but an abandoned capture: success / no-match /
+        # not-honored / exception -- the exposure value first, then the auto mode (which may take
+        # over from the value).
+        if not abandoned:
+            cap.set(prop, before)
+            cap.set(aprop, auto_before)
     # Conservative on purpose: anything not read back as it was counts as NOT restored -- the
     # price of a false alarm is one reopen and no boost until the next service start.
     # The auto mode is compared tightly: DSHOW reports it as 0.25 (manual) / 0.75 (auto), which

@@ -8,7 +8,9 @@
   presence now" are disabled.
 * **Notifications** (R14): WinRT toasts under the product's AppUserModelID (presence_monitor.toast);
   pystray balloons are not used. Every event also goes to the Status window's "Recent events".
-* **Quit asks first** (F-157): it switches face sign-in and walk-away lock off.
+* **Quit asks first** (F-157): it switches face sign-in and walk-away lock off until the next
+  sign-in to Windows or until Face Unlock is started again from Start (9d, A-9: a pause bound to
+  the logon session, no TTL; the watchdog honours it, a tray start clears it).
 * **Windows** run on the one Tk thread (presence_monitor.ui); a second click raises the open window
   (F-173). The password dialog and the wizard are their own processes, each with its own mutex;
   the dev layout opens the same password dialog as the installed one (F-162).
@@ -31,7 +33,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 from face_service.config import Config
-from face_service.i18n import get_language, set_language, shown_languages, t
+from face_service.i18n import Msg, get_language, set_language, shown_languages, t
 
 from .gui import open_help, open_log_folder, open_settings, open_status, probe_text
 from .monitor import PresenceMonitor, pipe_call
@@ -63,15 +65,10 @@ _COLOURS = {"ok": (46, 160, 67, 255), "attention": (214, 150, 20, 255), "off": (
 
 
 def icon_image(level: str) -> Image.Image:
-    """A transparent 64x64 face in the state colour (F-172: no white square on a dark taskbar)."""
-    colour = _COLOURS.get(level, _COLOURS["off"])
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.ellipse((6, 6, 58, 58), outline=colour, width=6)
-    d.ellipse((21, 22, 29, 30), fill=colour)
-    d.ellipse((35, 22, 43, 30), fill=colour)
-    d.arc((18, 28, 46, 50), start=20, end=160, fill=colour, width=5)
-    return img
+    """A transparent 64x64 face in the state colour (F-172: no white square on a dark taskbar).
+    9d (V-48): drawn by presence_monitor.ui, which also gives it to every window."""
+    from .ui import face_icon_image
+    return face_icon_image(level if level in _COLOURS else "off")
 
 
 def tray_state(status: "dict | None", snap: dict, reachable_known: bool = True) -> "tuple[str, str]":
@@ -88,7 +85,8 @@ def tray_state(status: "dict | None", snap: dict, reachable_known: bool = True) 
     if snap.get("paused"):
         return "attention", t("tray.state.paused")
     if snap.get("last_result") == "unknown":
-        return "off", t("tray.state.camera_unknown", why=snap.get("last_why") or "?")
+        from .gui import camera_why_text
+        return "off", t("tray.state.camera_unknown", why=camera_why_text(snap.get("last_why")))
     return "ok", (t("tray.state.ready_autolock") if snap.get("auto_lock") else t("tray.state.ready"))
 
 
@@ -161,8 +159,34 @@ def _save_language(code: str) -> None:
 
 # ---- the tray ---------------------------------------------------------------------------------
 
+def resume_after_quit(*, _start=None) -> bool:
+    """9d (A-9): a tray start ends a Quit of this sign-in -- the marker goes, and the service is
+    started again (it was stopped by Quit and the watchdog left it alone). Returns whether a Quit
+    pause was active. Never raises."""
+    try:
+        from face_service.config import QUIT_PAUSE_PATH
+        from face_service.watchdog import clear_pause, logon_id, quit_active
+        was = quit_active(QUIT_PAUSE_PATH, logon_id())
+        clear_pause(QUIT_PAUSE_PATH)
+    except Exception:
+        log.exception("could not check the Quit pause")
+        return False
+    if was:
+        log.info("started after a Quit in this sign-in: the pause is cleared, starting the service")
+        try:
+            if _start is not None:
+                _start()
+            else:
+                from face_service.taskreg import Scheduler
+                Scheduler().run("FaceUnlock-Service")
+        except Exception:
+            log.warning("could not start the service task; the watchdog starts it", exc_info=True)
+    return was
+
+
 def run_with_tray(cfg: Config) -> None:
     set_language(cfg.language)
+    threading.Thread(target=resume_after_quit, name="resume-after-quit", daemon=True).start()
     set_process_app_id()
     log.info("DPI awareness: %s", enable_dpi_awareness())
     ui = UiThread()
@@ -186,7 +210,7 @@ def run_with_tray(cfg: Config) -> None:
         """Monitor events: a toast when its gate is on (the monitor's config, not a file read per
         toast -- F-154), and a state refresh either way."""
         if bool(getattr(monitor.cfg, gate, True)):
-            show_toast(t("tray.title"), message)
+            show_toast(t("tray.title"), str(message))
         refresh_icon()
 
     monitor.on_event = on_event
@@ -230,19 +254,14 @@ def run_with_tray(cfg: Config) -> None:
             ui.off(key)
             from tkinter import messagebox
             text = probe_text(resp)
-            monitor.record_event(t("event.probe", result=text))
-            messagebox.showinfo(t("tray.probe").rstrip("…"), text, parent=_parent())
+            # 9d (V-48): rendered in the language of the moment it is shown
+            monitor.record_event(Msg("event.probe", result=lambda: probe_text(resp)))
+            ui.dialog(lambda p: messagebox.showinfo(t("tray.probe").rstrip("…"), text, parent=p))
         ui.post(ui.on, key, show)
         ui.run_bg(pipe_call, {"cmd": "presence"}, 20.0, reply=key)
 
-    def _parent():
-        """A throw-away topmost owner so a dialog of the hidden root comes to the front."""
-        import tkinter as tk
-        top = tk.Toplevel(ui.root)
-        top.withdraw()
-        top.attributes("-topmost", True)
-        top.after(60000, top.destroy)
-        return top
+    # 9d (V-47): dialogs of the hidden root get a throw-away topmost owner through ui.dialog(),
+    # destroyed when the dialog returns -- not after a fixed 60 s under a dialog still open.
 
     # ---- updates ----
     def check_updates(interactive: bool) -> None:
@@ -255,7 +274,7 @@ def run_with_tray(cfg: Config) -> None:
         current = current_version()
         if release is not None and release.is_newer_than(current):
             newer["tag"] = release.tag
-            monitor._notify("notify_update", t("notify.update_available", latest=release.tag))
+            monitor._notify("notify_update", Msg("notify.update_available", latest=release.tag))
             refresh_icon()
         if interactive:
             ui.post(_show_update_result, release, status, current)
@@ -265,10 +284,10 @@ def run_with_tray(cfg: Config) -> None:
         import webbrowser
         kind, text = update_result_text(release, status, current)
         if kind == "ask":
-            if messagebox.askyesno(t("update.title"), text, parent=_parent()):
+            if ui.dialog(lambda p: messagebox.askyesno(t("update.title"), text, parent=p)):
                 webbrowser.open(RELEASES_PAGE_URL)
         else:
-            messagebox.showinfo(t("update.title"), text, parent=_parent())
+            ui.dialog(lambda p: messagebox.showinfo(t("update.title"), text, parent=p))
 
     def on_check_update(icon, item):
         threading.Thread(target=check_updates, args=(True,), name="update-check", daemon=True).start()
@@ -299,17 +318,27 @@ def run_with_tray(cfg: Config) -> None:
 
     def _do_quit() -> None:
         log.info("Quit confirmed")
+        # 9d (A-9): first the pause, so the watchdog never sees a gap in which to restart.
+        try:
+            from face_service.config import QUIT_PAUSE_PATH
+            from face_service.watchdog import logon_id, write_quit
+            write_quit(QUIT_PAUSE_PATH, logon_id(), time.time())
+        except Exception:
+            log.exception("the Quit pause could not be written; the watchdog may restart the service")
         monitor.stop()
         _terminate_children()               # the wizard's camera lease first
         _stop_service_process()
+        # 9d (V-47): Tk is torn down on its own thread, and Quit waits for it (bounded) before the
+        # icon's loop ends and the process exits.
+        if not ui.stop(wait_s=5.0):
+            log.warning("the UI thread did not finish within 5 s")
         if icon_ref:
             icon_ref[0].stop()
-        ui.stop()
 
     def _confirm_quit() -> None:
         from tkinter import messagebox
-        if messagebox.askyesno(t("quit.confirm.title"), t("quit.confirm.body"), parent=_parent(),
-                               icon="warning", default="no"):
+        if ui.dialog(lambda p: messagebox.askyesno(t("quit.confirm.title"), t("quit.confirm.body"),
+                                                   parent=p, icon="warning", default="no")):
             threading.Thread(target=_do_quit, name="quit", daemon=True).start()
 
     def on_quit(icon, item):

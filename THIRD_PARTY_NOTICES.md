@@ -37,6 +37,7 @@ SHA-256. Whether your use is permitted by those terms is between you and Insight
 | Pillow | MIT-CMU | Portions of this software are copyright © The FreeType Project (www.freetype.org). All rights reserved. This software is based in part on the work of the Independent JPEG Group. Also includes libjpeg-turbo, libpng, libwebp, libtiff, OpenJPEG, lcms2, HarfBuzz, zlib, xz, brotli, libavif (see its LICENSE) |
 | **pystray** | **LGPL-3.0** | See [pystray and the LGPL](#pystray-and-the-lgpl) |
 | pywin32 | PSF-2.0 | |
+| pywinrt (`winrt-runtime`, `winrt-Windows.UI.Notifications`, `winrt-Windows.Data.Xml.Dom`, `winrt-Windows.Foundation`) | MIT | Native WinRT toast notifications. Copyright (c) Microsoft Corporation; Copyright (c) 2021-2025 David Lechner. The wheels carry no license file; `licenses\winrt-*\` holds the MIT text of https://github.com/pywinrt/pywinrt |
 | psutil | BSD-3-Clause | |
 | protobuf | BSD-3-Clause | |
 | ml_dtypes | Apache-2.0; includes Eigen headers under **MPL-2.0** | Eigen source: https://gitlab.com/libeigen/eigen |

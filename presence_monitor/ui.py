@@ -96,6 +96,38 @@ def px(widget, n: float) -> int:
     return int(round(n * window_dpi(widget) / 96.0))
 
 
+FACE_ICON_RGBA = {"ok": (46, 160, 67, 255), "attention": (214, 150, 20, 255),
+                  "off": (140, 140, 140, 255)}
+
+
+def face_icon_image(level: str = "ok", size: int = 64):
+    """The product's face icon on a transparent background (the tray icon, and -- 9d, V-48 --
+    the icon of every window instead of Tk's feather)."""
+    from PIL import Image, ImageDraw
+    colour = FACE_ICON_RGBA.get(level, FACE_ICON_RGBA["off"])
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((6, 6, 58, 58), outline=colour, width=6)
+    d.ellipse((21, 22, 29, 30), fill=colour)
+    d.ellipse((35, 22, 43, 30), fill=colour)
+    d.arc((18, 28, 46, 50), start=20, end=160, fill=colour, width=5)
+    return img if size == 64 else img.resize((size, size))
+
+
+def set_app_icon(root) -> bool:
+    """9d (V-48): the face icon for ``root`` and every Toplevel it owns (iconphoto default=True).
+    Never raises."""
+    try:
+        from PIL import ImageTk
+        photos = [ImageTk.PhotoImage(face_icon_image("ok", n), master=root) for n in (16, 32, 64)]
+        root.iconphoto(True, *photos)
+        root._fu_icon = photos          # keep the images alive with the window
+        return True
+    except Exception:
+        log.debug("window icon not set", exc_info=True)
+        return False
+
+
 def bind_standard_keys(win, *, ok: "Callable[[], None] | None" = None,
                        cancel: "Callable[[], None] | None" = None) -> None:
     """R12 keyboard: Enter runs the default action, Escape the close/cancel action."""
@@ -194,6 +226,7 @@ class UiThread:
             self.root = tk.Tk()
             self.root.withdraw()
             self.scale = apply_scaling(self.root)
+            set_app_icon(self.root)                  # 9d (V-48): every Toplevel inherits it
         except Exception:
             log.exception("Tk could not start; the tray windows are unavailable")
             self._ready.set()
@@ -204,6 +237,30 @@ class UiThread:
             self.root.mainloop()
         except Exception:
             log.exception("Tk main loop ended with an error")
+        self._finalize()
+
+    def _finalize(self) -> None:
+        """9d (V-47): tear Tk down HERE, on the Tk thread, after the loop ended -- every window
+        closed, the root destroyed and every reference dropped -- so nothing is left for the
+        interpreter's shutdown to finalize on the main thread (the Tcl_AsyncDelete abort of F-152).
+        """
+        for kind, win in list(self._windows.items()):
+            try:
+                if getattr(win, "alive", False):
+                    win.close()
+            except Exception:
+                log.debug("closing the %s window at stop failed", kind, exc_info=True)
+        self._windows.clear()
+        self._handlers.clear()
+        root, self.root = self.root, None
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                log.debug("destroying the Tk root failed", exc_info=True)
+        del root
+        import gc
+        gc.collect()                  # the last Tk objects go here, on this thread
 
     def _drain(self) -> None:
         try:
@@ -226,10 +283,35 @@ class UiThread:
         except Exception:
             pass
 
-    def stop(self) -> None:
+    def stop(self, wait_s: float = 0.0) -> bool:
+        """End the Tk loop; the thread then finalizes Tk itself (9d, V-47). With ``wait_s`` the
+        caller waits (bounded) until that is done -- Quit does, so the process cannot exit while
+        Tk is being torn down. Returns whether the thread has finished."""
         def _quit():
             try:
-                self.root.quit()
+                if self.root is not None:
+                    self.root.quit()
             except Exception:
                 pass
         self.post(_quit)
+        if wait_s > 0 and threading.current_thread() is not self._thread:
+            self._thread.join(wait_s)
+        return not self._thread.is_alive()
+
+    def dialog(self, fn: Callable):
+        """9d (V-47): run ``fn(parent)`` -- a messagebox -- with a throw-away topmost owner that is
+        destroyed right AFTER the dialog returns. The old owner destroyed itself after 60 s and
+        closed a dialog the user was still reading. Tk thread only."""
+        top = tk.Toplevel(self.root)
+        top.withdraw()
+        try:
+            top.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            return fn(top)
+        finally:
+            try:
+                top.destroy()
+            except Exception:
+                pass
