@@ -194,6 +194,24 @@ def main(argv=None) -> int:
     t.ok(not TW._is_service_proc({"pid": me, "name": "python.exe",
                                   "cmdline": ["python.exe", "-m", "face_service"]}, **dev),
          "dev: a debugging python.exe console instance is spared")
+    # 9e (F1-04): the installed watchdog runs with the install directory as its current directory;
+    # a process image that is not fully qualified must never resolve into it
+    here = os.getcwd()
+    with tempfile.TemporaryDirectory(prefix="fu_f1_wd_") as idir:
+        itgt = os.path.join(idir, "face_service.exe")
+        Path(itgt).write_bytes(b"MZ")
+        iinst = dict(installed=True, target=itgt, session=sess)
+        os.chdir(idir)
+        try:
+            for bad in ("face_service.exe", "Registry", "MemCompression", "", r".\face_service.exe",
+                        "C:face_service.exe" if idir[:2].upper() == "C:" else idir[:2] + "face_service.exe",
+                        "%CD%\\face_service.exe", '"' + itgt + '"'):
+                t.ok(not TW._is_service_proc({"pid": me, "exe": bad}, **iinst),
+                     f"F1-04: cwd = install dir, image {bad!r} is not the service")
+            t.ok(TW._is_service_proc({"pid": me, "exe": itgt}, **iinst),
+                 "F1-04: the fully qualified image still matches")
+        finally:
+            os.chdir(here)
     src = Path(TW.__file__).read_text(encoding="utf-8")
     t.ok("powershell" not in src.lower().replace("no powershell", ""),
          "the runner starts no PowerShell child")

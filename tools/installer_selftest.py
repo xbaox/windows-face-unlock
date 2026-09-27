@@ -244,6 +244,169 @@ def test_taskreg():
           all(f'"{f}"' in router for f in ("--register", "--unregister", "--stop", "--verify-acl")))
 
 
+class _FakeProc:
+    def __init__(self, world, pid, name, exe):
+        self.pid, self.info, self._w = pid, {"pid": pid, "name": name, "exe": exe}, world
+
+    def kill(self):
+        self._w.kills.append(self.info["exe"])
+        if self.info["name"] in ("Registry", "MemCompression"):
+            raise PermissionError(f"psutil.AccessDenied(pid={self.pid})")
+        self._w.alive.discard(self.pid)
+
+
+class _FakePsutil:
+    """Just what taskreg uses: process_iter (attrs ignored: every info key is there), wait_procs."""
+
+    def __init__(self, procs):
+        self.procs = [_FakeProc(self, *p) for p in procs]
+        self.alive = {p.pid for p in self.procs}
+        self.kills = []
+
+    def process_iter(self, attrs=None):
+        return [p for p in self.procs if p.pid in self.alive]
+
+    def wait_procs(self, procs, timeout=None):
+        return ([p for p in procs if p.pid not in self.alive], [p for p in procs if p.pid in self.alive])
+
+
+def test_f1_foreign():
+    """9e (F1-01..F1-05): Setup runs the tray exe with the install directory as its CURRENT
+    directory. Nothing that is not a fully qualified path inside it may be ours: not the OneDrive
+    tasks ("%localappdata%\\..."), not cmd.exe / powershell.exe / rundll32.exe, not "C:x.exe", not the
+    processes psutil reports as "Registry" / "MemCompression" (live 9e run on 325cb01)."""
+    print("[1b] F1: foreign tasks and processes with the install directory as the current directory")
+    import logging as _lg
+    import shutil
+    from face_service import taskreg as T
+    here = os.getcwd()
+    td = ""
+    saved = (T.graceful_shutdown, T.time.sleep, sys.modules.get("psutil"))
+    recs = []
+
+    class _H(_lg.Handler):
+        def emit(self, r):
+            recs.append(r.getMessage())
+    h = _H()
+    T.log.addHandler(h)
+    T.log.setLevel(_lg.INFO)
+    try:
+        td = tempfile.mkdtemp(prefix="fu_f1_inst_")
+        inst = os.path.join(td, "WindowsFaceUnlock")
+        os.makedirs(inst)
+        for t in T.TASKS:
+            Path(inst, t.exe).write_bytes(b"MZ")
+        ms = "Microsoft Corporation"
+        sid_tail = "S-1-5-21-11-22-33-1001"
+        drive_rel = inst[:2] + "x.exe"                  # "C:x.exe" -- drive-relative
+        foreign = [
+            (f"OneDrive Reporting Task-{sid_tail}", ms,
+             r"%localappdata%\Microsoft\OneDrive\OneDriveStandaloneUpdater.exe"),
+            (f"OneDrive Standalone Update Task-{sid_tail}", ms,
+             r"%localappdata%\Microsoft\OneDrive\OneDriveStandaloneUpdater.exe"),
+            ("F1 cmd", "", "cmd.exe"), ("F1 powershell", "", "powershell.exe"),
+            ("F1 rundll32", "", "rundll32.exe"), ("F1 parent", "", r"..\x.exe"),
+            ("F1 drive-relative", "", drive_rel), ("F1 root-relative", "", r"\Windows\x.exe"),
+            ("F1 unc", "", r"\\server\share\x.exe"), ("F1 empty", "", ""),
+            ("F1 dotdot", "", inst + r"\..\..\Windows\System32\cmd.exe"),
+            ("F1 foreign absolute", "Somebody", r"C:\Other\Tools\x.exe"),
+        ]
+        mine = [(t.name, T.AUTHOR, os.path.join(inst, t.exe)) for t in T.TASKS]
+        orphans = [("FaceUnlock-Old", T.AUTHOR, r"C:\gone\x.exe"),
+                   ("Mine-Renamed", "", os.path.join(inst, "face_service.exe"))]
+        every = foreign + mine + orphans
+        want_ours = sorted(n for n, _a, _p in mine + orphans)
+        base = 7_000_000
+        procs = [(base + 1, "Registry", "Registry"), (base + 2, "MemCompression", "MemCompression"),
+                 (base + 3, "System", ""), (base + 4, "face_service.exe", "face_service.exe"),
+                 (base + 5, "face_unlock_tray.exe", drive_rel.replace("x.exe", "face_unlock_tray.exe")),
+                 (base + 6, "face_service.exe", r"C:\Other\WindowsFaceUnlock\face_service.exe"),
+                 (base + 7, "unins000.exe", os.path.join(inst, "unins000.exe"))]
+        our_procs = [(base + 11 + i, t.exe, os.path.join(inst, t.exe)) for i, t in enumerate(T.TASKS)]
+        our_exes = sorted(p[2] for p in our_procs)
+        os.chdir(inst)                                  # as Setup runs the tray exe (WorkingDir={app})
+        check("F1-05: the current directory IS the install directory",
+              os.path.normcase(os.getcwd()) == os.path.normcase(inst))
+        got = sorted(T.ours(every, inst))
+        check("F1-01: ours() = our three + the two orphans (author tag / full path inside)",
+              got == want_ours, got)
+        for n, a, p in foreign:
+            check(f"F1-01: not ours: {n} -> {p!r}", n not in got)
+        fake_ps = _FakePsutil(procs + our_procs)
+        sys.modules["psutil"] = fake_ps
+        gotp = sorted(p.info["exe"] for p in T.stack_processes(inst, own_pid=1))
+        check("F1-02: stack processes = exactly our three (not Registry / MemCompression / empty / "
+              "relative / C:x / another folder's face_service.exe / unins000.exe)", gotp == our_exes, gotp)
+
+        def _graceful():                                # the service accepts the pipe shutdown
+            fake_ps.alive.discard(our_procs[0][0])
+            return True
+        T.graceful_shutdown = _graceful
+        T.time.sleep = lambda s: None
+        fake = FakeSched(existing=every)
+        del recs[:]
+        rc = T.register(inst, sid_tail, sched=fake, resolve=lambda s: ("alice", "PC1"),
+                        logged_on=lambda s: True)
+        deleted = sorted(c[1] for c in fake.calls if c[0] == "delete")
+        stopped = sorted(c[1] for c in fake.calls if c[0] == "stop")
+        check("F1-03: register() deletes only the two orphans", deleted == ["FaceUnlock-Old", "Mine-Renamed"],
+              deleted)
+        check("F1-03: register() stops only our three", stopped == sorted(t.name for t in T.TASKS), stopped)
+        check("F1-02: register() kills only our processes (never Registry / MemCompression)",
+              sorted(fake_ps.kills) == sorted(p[2] for p in our_procs[1:]), fake_ps.kills)
+        check("F1: register() -> 0, no survivor warning", rc == 0 and not any("survived" in m for m in recs),
+              (rc, [m for m in recs if "survived" in m or "kill" in m]))
+        check("F1: every foreign task is still registered after register()",
+              all(n in fake.reg for n, _a, _p in foreign))
+        check("F1-03: the orphan removal logs the task's author and action",
+              any("removed our orphan task FaceUnlock-Old" in m and r"C:\\gone\\x.exe" in m for m in recs)
+              and any("removed our orphan task Mine-Renamed" in m and "face_service.exe" in m for m in recs),
+              [m for m in recs if "orphan" in m])
+        check("F1-03: every stop logs the task and its action",
+              all(any(f"stopping task {t.name}" in m and t.exe in m for m in recs) for t in T.TASKS),
+              [m for m in recs if "stop" in m])
+        fake_ps2 = _FakePsutil(procs + our_procs)
+        sys.modules["psutil"] = fake_ps2
+        T.graceful_shutdown = lambda: (fake_ps2.alive.discard(our_procs[0][0]), True)[1]
+        fake2 = FakeSched(existing=every)
+        rc2 = T.unregister(inst, sched=fake2)
+        deleted2 = sorted(c[1] for c in fake2.calls if c[0] == "delete")
+        check("F1-03: unregister() deletes only ours (our three + the two orphans)",
+              deleted2 == want_ours, deleted2)
+        check("F1-03: unregister() stops only ours",
+              set(c[1] for c in fake2.calls if c[0] == "stop") <= set(want_ours),
+              [c for c in fake2.calls if c[0] == "stop"])
+        check("F1-02: unregister() kills only our processes", sorted(fake_ps2.kills)
+              == sorted(p[2] for p in our_procs[1:]) and rc2 == 0, (rc2, fake_ps2.kills))
+        fake_ps3 = _FakePsutil(procs + our_procs)
+        sys.modules["psutil"] = fake_ps3
+        T.graceful_shutdown = lambda: (fake_ps3.alive.discard(our_procs[0][0]), True)[1]
+        fake3 = FakeSched(existing=every)
+        rc3 = T.stop(inst, sched=fake3)
+        check("F1: stop() stops only ours and kills only our processes",
+              set(c[1] for c in fake3.calls if c[0] == "stop") <= set(want_ours) and rc3 == 0
+              and sorted(fake_ps3.kills) == sorted(p[2] for p in our_procs[1:]),
+              (rc3, fake3.calls, fake_ps3.kills))
+        # an install directory that is not a full path touches nothing (it would follow the cwd)
+        os.chdir(td)
+        f4 = FakeSched(existing=every)
+        rc4 = T.register("WindowsFaceUnlock", sid_tail, sched=f4, resolve=lambda s: ("alice", "PC1"),
+                         logged_on=lambda s: True)
+        rc5 = T.unregister("WindowsFaceUnlock", sched=f4)
+        check("F1-01: a relative install directory -> 1 and nothing registered, stopped or deleted",
+              rc4 == 1 and rc5 == 1 and not f4.calls, (rc4, rc5, f4.calls))
+    finally:
+        os.chdir(here)
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+        T.graceful_shutdown, T.time.sleep = saved[0], saved[1]
+        if saved[2] is None:
+            sys.modules.pop("psutil", None)
+        else:
+            sys.modules["psutil"] = saved[2]
+        T.log.removeHandler(h)
+
+
 def test_iss():
     print("[2] installer.iss (R17, R7, R14)")
     s = read("installer/installer.iss")
@@ -377,6 +540,150 @@ def test_iss_preprocessed():
         sect = out.split("[Code]", 1)[0]
         check("W-30: the [Registry] entries keep the escaped '{{' (a constant brace in a section)",
               sect.count("{{" + CP_CLSID[1:]) == 2, sect.count("{{" + CP_CLSID[1:]))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _pascal_function(src: str, name: str) -> "str | None":
+    """The text of ``function <name>(`` ... the first column-0 ``end;`` of installer.iss."""
+    m = re.search(r"^function " + re.escape(name) + r"\(.*?^end;[ \t]*$", src, re.M | re.S)
+    return m.group(0) if m else None
+
+
+def test_iss_pascal_paths():
+    """9e (F1-01 / F1-04): the installer's OWN Pascal path checks, executed: IsFullLocalPath,
+    PathUnder and DataDirRemovable are cut out of installer.iss verbatim, compiled by ISCC into a
+    probe whose InitializeSetup runs the cases, writes the answers and returns False (the probe
+    installs nothing: no files, no uninstaller, lowest privileges)."""
+    print("[2c] installer.iss path checks, compiled and run (F1-01, F1-04)")
+    import shutil
+    import subprocess
+    sys.path.insert(0, str(REPO / "installer"))
+    import build as B
+    src = read("installer/installer.iss")
+    code = src.split("[Code]", 1)[1]
+    names = ("IsFullLocalPath", "PathUnder", "DataDirRemovable")
+    funcs = {n: _pascal_function(code, n) for n in names}
+    for n in names:
+        check(f"F1: installer.iss defines {n}", funcs[n] is not None)
+    unst = code.split("procedure CurUninstallStepChanged", 1)[1].split("\nend;", 1)[0]
+    i_guard, i_ask, i_rm = unst.find("DataDirRemovable("), unst.find("WantsDataRemoved("), unst.find("rmdir")
+    i_exists = unst.find("DirExists(DataDir)")
+    check("F1-04: the uninstaller checks DataDirRemovable before it asks, looks (DirExists) or runs rmdir",
+          -1 < i_guard < min(i_ask, i_rm, i_exists), (i_guard, i_ask, i_exists, i_rm))
+    check("F1-04: ... and the profile it compares with is the owner's (canonical SID)",
+          "DataDirRemovable(DataDir, ProfileDirOf(CanonicalSid(UninstallUserSid)))" in unst)
+    try:
+        iscc = B.find_iscc()
+    except Exception as e:
+        print(f"  SKIP  ISCC not found ({e}) -- the compiled probe needs Inno Setup")
+        return
+    d = r"C:\Program Files\WindowsFaceUnlock"
+    under_cases = [  # (path, dir, expected)
+        (d + r"\face_service.exe", d, True), (d.lower() + r"\FACE_UNLOCK_TRAY.EXE", d, True),
+        ("", d, False), ("cmd.exe", d, False), (r"..\x.exe", d, False), ("C:x.exe", d, False),
+        (r"\Windows\x.exe", d, False), (r"\\server\share\x.exe", d, False),
+        ("\\\\?\\" + d + r"\face_service.exe", d, False),
+        (r"%localappdata%\Microsoft\OneDrive\OneDriveStandaloneUpdater.exe", d, False),
+        ('"' + d + r'\face_service.exe"', d, False), (d + r"\..\..\Windows\System32\cmd.exe", d, False),
+        (d + r"\.\face_service.exe", d, False), (d + r"\face_service.exe --x", d, False),
+        (d + "/face_service.exe", d, False), (d + r"X\a.exe", d, False), (d, d, False),
+        (r"WindowsFaceUnlock\face_service.exe", "WindowsFaceUnlock", False),
+        (r"C:WindowsFaceUnlock\face_service.exe", "C:WindowsFaceUnlock", False),
+    ]
+    data_cases = [  # (data dir, profile, expected)
+        (r"C:\Users\alice\.face-unlock", r"C:\Users\alice", True),
+        (r"D:\Profiles\O'Brien\.face-unlock", r"D:\Profiles\O'Brien", True),
+        ("", "", False), (r"Users\alice\.face-unlock", r"Users\alice", False),
+        (r"%USERPROFILE%\.face-unlock", "%USERPROFILE%", False),
+        (r"\\server\home\alice\.face-unlock", r"\\server\home\alice", False),
+        (r"C:\\.face-unlock", "C:\\", False), (r"C:\.face-unlock", "C:", False),
+        (r"C:\Users\alice\..\bob\.face-unlock", r"C:\Users\alice\..\bob", False),
+        (r"C:\Users\alice\.face-unlock", r"C:\Users\bob", False),
+        (r'C:\Users\al"ice\.face-unlock', r'C:\Users\al"ice', False),
+        (r"C:\Users\alice\Documents", r"C:\Users\alice", False),
+        (r"C:\Users\alice\.face-unlock", r"C:\Users\alice\\", False),
+    ]
+    work = Path(tempfile.mkdtemp(prefix="fu_f1_pas_"))
+    try:
+        out = work / "answers.txt"
+        q = lambda s: "'" + s.replace("'", "''") + "'"
+        lines = []
+        if funcs["PathUnder"]:
+            lines += [f"  S := S + 'U{i}=' + B(PathUnder({q(p)}, {q(dd)})) + #13#10;"
+                      for i, (p, dd, _w) in enumerate(under_cases)]
+        if funcs["DataDirRemovable"]:
+            lines += [f"  S := S + 'D{i}=' + B(DataDirRemovable({q(p)}, {q(pr)})) + #13#10;"
+                      for i, (p, pr, _w) in enumerate(data_cases)]
+        body = "\n\n".join(f for f in (funcs[n] for n in names) if f)
+        probe = (
+            "[Setup]\nAppName=F1PathProbe\nAppVersion=1\nCreateAppDir=no\nUninstallable=no\n"
+            "PrivilegesRequired=lowest\nOutputDir=" + str(work) + "\nOutputBaseFilename=f1probe\n"
+            "\n[Code]\n" + body + "\n\n"
+            "function B(V: Boolean): string;\nbegin\n  if V then Result := '1' else Result := '0';\nend;\n\n"
+            "function InitializeSetup(): Boolean;\nvar\n  S: string;\nbegin\n  S := '';\n"
+            + "\n".join(lines) + "\n"
+            "  SaveStringToFile(" + q(str(out)) + ", S, False);\n  Result := False;\nend;\n")
+        (work / "f1probe.iss").write_text(probe, encoding="utf-8-sig")
+        r = subprocess.run([iscc, "/Q", str(work / "f1probe.iss")], capture_output=True, text=True, timeout=300)
+        exe = work / "f1probe.exe"
+        check("F1: the probe compiles", exe.is_file(), (r.returncode, (r.stdout + r.stderr)[-800:]))
+        if not exe.is_file():
+            return
+        subprocess.run([str(exe), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"], timeout=120)
+        ans = dict(ln.split("=", 1) for ln in out.read_text(encoding="utf-8", errors="replace").split()
+                   if "=" in ln) if out.is_file() else {}
+        check("F1: the probe answered", bool(ans))
+        if funcs["PathUnder"]:
+            for i, (p, dd, w) in enumerate(under_cases):
+                check(f"F1-04: PathUnder({p!r}, {dd!r}) = {w}", ans.get(f"U{i}") == ("1" if w else "0"),
+                      ans.get(f"U{i}"))
+        if funcs["DataDirRemovable"]:
+            for i, (p, pr, w) in enumerate(data_cases):
+                check(f"F1-04: DataDirRemovable({p!r}, {pr!r}) = {w}", ans.get(f"D{i}") == ("1" if w else "0"),
+                      ans.get(f"D{i}"))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_uninstall_ps1_home():
+    """9e (F1-04): the dev uninstaller uses FACE_UNLOCK_HOME only when it is a full local path
+    (-RemoveData deletes what it names). Its own Test-FuFullPath is cut out of the script with the
+    PowerShell parser and run; the guard sits before the first use of the directory."""
+    print("[2d] tools/uninstall.ps1: FACE_UNLOCK_HOME must be a full local path (F1-04)")
+    import json
+    import shutil
+    import subprocess
+    s = read("tools/uninstall.ps1")
+    i_guard = s.find("-not (Test-FuFullPath $env:FACE_UNLOCK_HOME)")
+    i_use = s.find("$fuDataDir = ")
+    check("F1-04: the guard (exit 1) precedes the data directory's first use",
+          -1 < i_guard < i_use and "exit 1" in s[i_guard:i_use], (i_guard, i_use))
+    cases = [(r"C:\Users\alice\.face-unlock", True), (r"D:\x\home", True), ("", False), ("home", False),
+             (r".\home", False), (r"..\home", False), ("C:home", False), (r"\Users\x", False),
+             (r"\\server\share\home", False), (r"%TEMP%\home", False), (r'"C:\x"', False),
+             (r"C:\x\..\y", False), (r" C:\x", False), (r"C:\x -Force", False)]
+    work = Path(tempfile.mkdtemp(prefix="fu_f1_ps_"))
+    try:
+        (work / "cases.json").write_text(json.dumps([{"i": i, "p": p} for i, (p, _w) in enumerate(cases)]),
+                                         encoding="utf-8")
+        (work / "probe.ps1").write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+            + "'" + str(REPO / "tools" / "uninstall.ps1") + "', [ref]$null, [ref]$null)\n"
+            "$f = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst]"
+            " -and $n.Name -eq 'Test-FuFullPath' }, $true)\n"
+            "if (-not $f) { 'MISSING'; exit 3 }\n"
+            ". ([scriptblock]::Create($f.Extent.Text))\n"
+            "foreach ($c in (Get-Content -Raw -LiteralPath '" + str(work / "cases.json") + "' | ConvertFrom-Json)) {\n"
+            "    '{0}={1}' -f $c.i, [int](Test-FuFullPath $c.p)\n}\n", encoding="utf-8")
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                            "-File", str(work / "probe.ps1")], capture_output=True, text=True, timeout=120)
+        ans = dict(ln.split("=", 1) for ln in r.stdout.split() if "=" in ln)
+        check("F1-04: uninstall.ps1 defines Test-FuFullPath", r.returncode == 0 and "MISSING" not in r.stdout,
+              (r.returncode, r.stdout[-300:], r.stderr[-300:]))
+        for i, (p, w) in enumerate(cases):
+            check(f"F1-04: Test-FuFullPath({p!r}) = {w}", ans.get(str(i)) == ("1" if w else "0"), ans.get(str(i)))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -621,8 +928,11 @@ def test_notices_and_docs():
 
 def main() -> int:
     test_taskreg()
+    test_f1_foreign()
     test_iss()
     test_iss_preprocessed()
+    test_iss_pascal_paths()
+    test_uninstall_ps1_home()
     test_build()
     test_locks_ci()
     test_misc()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -45,6 +46,11 @@ def _norm(p: Path) -> Path:
 
 def check_home(home: "str | Path") -> "str | None":
     """Why ``home`` must not be used by a selftest, or None when it is safe."""
+    # 9e (F1-04): a relative home is completed from the CURRENT directory -- a test that changes
+    # it would move the product's data directory. Only a full local path (X:\...) is a home. (The
+    # product's criterion is face_service.taskreg.norm; this module imports nothing of the product.)
+    if not re.match(r"^[A-Za-z]:[\\/]", str(home)) or "%" in str(home):
+        return f"{home} is not a full local path (X:\\...)"
     h = _norm(Path(home))
     real = _norm(real_data_dir())
     if h == real or _within(h, real) or _within(real, h):

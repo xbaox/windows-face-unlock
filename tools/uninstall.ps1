@@ -140,6 +140,20 @@ if ($fuClsid) {
 # The data directory honours FACE_UNLOCK_HOME exactly as face_service/config.py
 # does. Every previous removal path hardcoded %USERPROFILE%\.face-unlock and
 # would therefore have missed a relocated directory entirely.
+# 9e (F1-04): a path from outside is used only when it is FULLY QUALIFIED (X:\...). A relative
+# FACE_UNLOCK_HOME would be completed from the current directory -- and -RemoveData deletes what it
+# names. Same criterion as face_service/taskreg.py norm().
+function Test-FuFullPath {
+    param([string]$Path)
+    if (-not $Path -or $Path -ne $Path.Trim()) { return $false }
+    if ($Path -cnotmatch '^[A-Za-z]:\\') { return $false }
+    if ($Path -match '[%"]' -or $Path -match '(^|\\)\.\.?(\\|$)' -or $Path -match '\s[-/]') { return $false }
+    return $true
+}
+if ($env:FACE_UNLOCK_HOME -and -not (Test-FuFullPath $env:FACE_UNLOCK_HOME)) {
+    Write-Host "ERROR: FACE_UNLOCK_HOME is not a full local path (X:\...): $env:FACE_UNLOCK_HOME -- nothing done." -ForegroundColor Red
+    exit 1
+}
 $fuDataDir = if ($env:FACE_UNLOCK_HOME) { $env:FACE_UNLOCK_HOME }
              else { Join-Path $env:USERPROFILE '.face-unlock' }
 $fuModelDir = Join-Path $env:USERPROFILE '.insightface'

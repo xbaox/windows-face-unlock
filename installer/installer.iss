@@ -542,9 +542,36 @@ end;
   The Task Scheduler and WMI over COM. Tasks and processes are "ours" by PATH: the task's action or
   the process image lies inside the install directory -- never by a name prefix (F-239), and in any
   session (F-227). }
+
+{ 9e (F1-01 / F1-04): a path is compared only when it is FULLY QUALIFIED -- a drive letter and a
+  root, X:\... Refused: empty, relative, drive-relative (C:x), root-relative (\x), UNC and \\?\,
+  anything with %, a double quote, a forward slash, a doubled backslash, a . or .. segment (a raw
+  prefix compare cannot resolve those) or an argument (" -x", " /x"). }
+function IsFullLocalPath(const Path: string): Boolean;
+var
+  C: Char;
+begin
+  Result := False;
+  if Length(Path) < 3 then
+    exit;
+  C := Path[1];
+  if not (((C >= 'A') and (C <= 'Z')) or ((C >= 'a') and (C <= 'z'))) then
+    exit;
+  if (Path[2] <> ':') or (Path[3] <> '\') or (Trim(Path) <> Path) then
+    exit;
+  if (Pos('%', Path) > 0) or (Pos('"', Path) > 0) or (Pos('/', Path) > 0) or (Pos('\\', Path) > 0) then
+    exit;
+  if (Pos('\.\', Path + '\') > 0) or (Pos('\..\', Path + '\') > 0) then
+    exit;
+  if (Pos(' -', Path) > 0) or (Pos(' /', Path) > 0) then
+    exit;
+  Result := True;
+end;
+
 function PathUnder(const Path, Dir: string): Boolean;
 begin
-  Result := (Path <> '') and (CompareText(Copy(Path, 1, Length(Dir) + 1), Dir + '\') = 0);
+  Result := IsFullLocalPath(Path) and IsFullLocalPath(Dir)
+    and (CompareText(Copy(Path, 1, Length(Dir) + 1), Dir + '\') = 0);
 end;
 
 function TaskActionPath(const Task: Variant): string;
@@ -1133,6 +1160,16 @@ begin
   end;
 end;
 
+{ 9e (F1-04): the data directory is removed only when it is exactly <the owner's profile>\.face-unlock
+  and both are fully qualified: a ProfileImagePath that is empty, relative, a share, a drive root,
+  or carries an unexpanded %VAR% (cmd expands it even inside the quotes of rmdir) or a quote is
+  refused -- nothing is offered and nothing deleted. }
+function DataDirRemovable(const DataDir, Profile: string): Boolean;
+begin
+  Result := IsFullLocalPath(Profile) and IsFullLocalPath(DataDir) and (Length(Profile) > 3)
+    and (CompareText(DataDir, Profile + '\.face-unlock') = 0);
+end;
+
 { The data directory is removed with rmdir /S /Q, which deletes a junction or a symbolic link as
   a link and never enters it (measured in 8b); a data directory that IS a reparse point is not
   touched at all (F-02, F-236). }
@@ -1146,7 +1183,9 @@ begin
     // 9d-r2 (W-06): ProfileList is keyed by the CANONICAL SID; a record with leading zeros
     // ("S-1-5-21-0123-...", accepted as the same owner since V-05) must find the same profile.
     DataDir := DataDirFor(CanonicalSid(UninstallUserSid));
-    if (DataDir <> '') and DirExists(DataDir) and WantsDataRemoved(DataDir) then
+    if (DataDir <> '') and not DataDirRemovable(DataDir, ProfileDirOf(CanonicalSid(UninstallUserSid))) then
+      Log('Data directory is not a full path in the owner''s profile, not offered, not removed: ' + DataDir)
+    else if (DataDir <> '') and DirExists(DataDir) and WantsDataRemoved(DataDir) then
     begin
       if IsReparsePoint(DataDir) then
         Log('Data directory is a reparse point, not removed: ' + DataDir)

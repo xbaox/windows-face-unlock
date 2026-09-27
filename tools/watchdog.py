@@ -76,11 +76,12 @@ _INSTALLED_SERVICE_EXE = "face_service.exe"
 
 
 def _norm(path: str) -> str:
-    """F-253: paths are compared as Windows compares them -- case-insensitive, resolved."""
-    try:
-        return os.path.normcase(os.path.realpath(path))
-    except Exception:
-        return os.path.normcase(str(path))
+    """F-253: paths are compared as Windows compares them -- case-insensitive, resolved. 9e (F1-04):
+    by the ONE criterion of face_service.taskreg.norm -- "" unless the path is fully qualified
+    (X:\\...); the watchdog runs with the install directory as its current directory, so a bare
+    "face_service.exe" (or an image psutil reports as "Registry") must never resolve into it."""
+    from face_service.taskreg import norm
+    return norm(path)
 
 
 def _session_of(pid: int) -> "int | None":
@@ -103,7 +104,8 @@ def _is_service_proc(info: dict, *, installed: bool, target: str, session: "int 
     """The ONE process-matching criterion, shared by kill / wait / count.
 
     INSTALLED: the executable path equals <our install dir>\\face_service.exe (compared with
-    normcase + realpath, F-253) and the process runs in OUR session (Stage 8b, F-36).
+    normcase + realpath, F-253; both fully qualified, 9e F1-04) and the process runs in OUR session
+    (Stage 8b, F-36).
 
     DEV: pythonw.exe whose argv carries ``-m face_service`` as arguments (not a substring of the
     interpreter path -- a checkout under a path containing "face_service" must not match the tray
@@ -116,8 +118,8 @@ def _is_service_proc(info: dict, *, installed: bool, target: str, session: "int 
     if session is not None and _session_of(info.get("pid") or 0) not in (session, None):
         return False
     if installed:
-        exe = info.get("exe") or ""
-        return bool(exe) and _norm(exe) == _norm(target)
+        exe = _norm(info.get("exe") or "")
+        return bool(exe) and exe == _norm(target)
     if (info.get("name") or "").lower() != "pythonw.exe":
         return False
     argv = [str(a).lower() for a in (info.get("cmdline") or [])]

@@ -21,7 +21,9 @@ Semantics kept from the PowerShell registrar (8b):
 Stage 9 changes: processes are matched by executable path inside the install directory
 (normcase + realpath, F-235) in ANY session -- an uninstall run from another user's session stops
 the owner's stack too (F-227); orphans are only tasks this product registered (author tag or an
-action inside the install directory), never any other "FaceUnlock-*" task (F-239); the task
+action inside the install directory), never any other "FaceUnlock-*" task (F-239); 9e (F1-01..03):
+ownership only by a FULLY QUALIFIED path (``norm``) -- nothing depends on the current directory --
+and processes by name too; every stop and removal logs the task's author and action; the task
 description is registered (D-118); the log goes to <install>\\logs\\register_tasks.log and is closed
 at the end (F-226); every step's result is checked (F-233).
 """
@@ -69,17 +71,52 @@ TASKS: "tuple[Task, ...]" = (
 )
 
 
+# 9e (F1-01): a path from outside -- a task action, a process image, a directory -- is compared
+# only when it is FULLY QUALIFIED: a drive letter and a root. realpath/abspath complete anything
+# else from the CURRENT directory, and Setup runs the tray exe with the install directory as its
+# current directory: "cmd.exe", "%localappdata%\...\OneDriveStandaloneUpdater.exe" or a process
+# image reported as "Registry" became "<install dir>\..." and so "ours" (live 9e run, 325cb01).
+_FULL_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_ARG_RE = re.compile(r"\s[-/]")
+# F1-02: the stack is these three images -- by name AND by path, as Pascal StackProcesses.
+STACK_EXES = frozenset(t.exe.lower() for t in TASKS)
+
+
 def norm(path: str) -> str:
+    """9e (F1-01): THE comparison form of a path: ``normcase(normpath)`` of a fully qualified local
+    path (``X:\\...``), or "" for anything else -- and "" is never inside anything. Refused: empty;
+    relative (``cmd.exe``, ``..\\x``); drive-relative (``C:x.exe``); root-relative
+    (``\\Windows\\x.exe``); UNC and device paths (``\\\\server\\...``, ``\\\\?\\...``); anything with
+    ``%`` (an unexpanded variable), a double quote, a control character or an argument (`` -x``,
+    `` /x``). realpath runs only on a string that already passed, and its result must pass again
+    (a link to a share is refused, not followed). Nothing here reads the current directory."""
+    if not isinstance(path, str) or not path or path != path.strip():
+        return ""
+    if ("%" in path or '"' in path or any(c in path for c in "\r\n\t\0")
+            or _ARG_RE.search(path) or not _FULL_RE.match(path)):
+        return ""
+    p = os.path.normpath(path)
     try:
-        return os.path.normcase(os.path.realpath(path))
-    except Exception:
-        return os.path.normcase(os.path.abspath(path))
+        r = os.path.realpath(p)
+    except (OSError, ValueError):
+        r = p
+    if not _FULL_RE.match(r):
+        return ""
+    return os.path.normcase(os.path.normpath(r))
 
 
 def under(path: str, root: str) -> bool:
-    """``path`` lies inside ``root`` (both canonical, case-insensitive)."""
-    p, r = norm(path), norm(root).rstrip("\\/")
-    return p.startswith(r + os.sep)
+    """``path`` lies inside ``root``: both fully qualified (F1-01), canonical, case-insensitive."""
+    p, r = norm(path), norm(root)
+    if not p or not r:
+        return False
+    return p.startswith(r.rstrip("\\/") + os.sep)
+
+
+def is_stack_exe(exe: str, install_dir: str) -> bool:
+    """9e (F1-02): a process image of THIS install's stack: one of the three names and a fully
+    qualified path inside the install directory."""
+    return os.path.basename(norm(exe)) in STACK_EXES and under(exe, install_dir)
 
 
 def task_xml(task: Task, install_dir: str, user_sid: str) -> str:
@@ -168,8 +205,9 @@ class Scheduler:
                 if d.Actions.Count:
                     a = d.Actions.Item(1)
                     path = str(getattr(a, "Path", "") or "")
-            except Exception:
+            except Exception as e:
                 author, path = "", ""
+                log.warning("task %s: definition unreadable (%r) -- not treated as ours", t.Name, e)
             out.append((str(t.Name), author, path))
         return out
 
@@ -192,26 +230,28 @@ class Scheduler:
         self._root.DeleteTask(name, 0)
 
 
+def owned(tasks, install_dir: str) -> "list[tuple[str, str, str]]":
+    """(name, author, action) of the tasks this product registered: our author tag, or a fully
+    qualified action inside the install directory (F1-01, F1-03). Never "any FaceUnlock-*" (F-239),
+    and a declared name alone is not ownership either: a same-named task of a developer checkout
+    runs from elsewhere and is not this copy's."""
+    return [(n, a, p) for n, a, p in tasks if a == AUTHOR or under(p, install_dir)]
+
+
 def ours(tasks, install_dir: str) -> "list[str]":
-    """The names of the tasks this product registered: declared names, or our author tag, or an
-    action inside the install directory. Never "any FaceUnlock-*" (F-239)."""
-    declared = {t.name for t in TASKS}
-    out = []
-    for name, author, path in tasks:
-        if name in declared or author == AUTHOR or (path and under(path, install_dir)):
-            out.append(name)
-    return out
+    """The names of :func:`owned`."""
+    return [n for n, _a, _p in owned(tasks, install_dir)]
 
 
 def stack_processes(install_dir: str, *, own_pid: "int | None" = None):
-    """Face Unlock processes of THIS install, in any session (F-227). Excludes this process."""
+    """Face Unlock processes of THIS install, in any session (F-227): the three images by name and
+    by fully qualified path (F1-02). Excludes this process."""
     import psutil  # type: ignore
     own = os.getpid() if own_pid is None else own_pid
     out = []
-    for p in psutil.process_iter(attrs=["pid", "exe"]):
+    for p in psutil.process_iter(attrs=["pid", "name", "exe"]):
         try:
-            exe = p.info.get("exe") or ""
-            if exe and p.info["pid"] != own and under(exe, install_dir):
+            if p.info["pid"] != own and is_stack_exe(p.info.get("exe") or "", install_dir):
                 out.append(p)
         except Exception:
             continue
@@ -256,14 +296,23 @@ def kill_and_wait(install_dir: str, wait_s: float = DEATH_WAIT_S) -> int:
     return len(left)
 
 
+def _install_root(install_dir: str) -> str:
+    """The canonical install directory, or "" (logged) when it is not a full local path (F1-01)."""
+    root = norm(install_dir)
+    if not root:
+        log.error("the install directory is not a full local path: %r -- nothing done", install_dir)
+    return root
+
+
 def _stop_stack(sched, install_dir: str) -> int:
     graceful_shutdown()
     t0 = time.monotonic()
     while time.monotonic() - t0 < GRACEFUL_WAIT_S and any(
-            p.info.get("exe", "").lower().endswith("face_service.exe")
+            os.path.basename(norm(p.info.get("exe") or "")) == "face_service.exe"
             for p in stack_processes(install_dir)):
         time.sleep(0.2)
-    for name in ours(sched.tasks(), install_dir):
+    for name, author, path in owned(sched.tasks(), install_dir):
+        log.info("stopping task %s (author %r, action %r)", name, author, path)      # F1-03
         sched.stop(name)
     return kill_and_wait(install_dir)
 
@@ -323,7 +372,9 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of,
     Then a failed start is not a failure and "Ready" verifies; exit 0.
     9d-r2 (W-37): presence is decided by SID; when it cannot be told, the tasks are started
     anyway and a failed start is logged and tolerated (exit 0 when "Ready" verifies)."""
-    install_dir = norm(install_dir)
+    install_dir = _install_root(install_dir)
+    if not install_dir:
+        return 1
     # ---- phase A: build and validate, touch nothing ----
     if not _SID_RE.match(user_sid or ""):
         log.error("not a person's SID: %r", user_sid)
@@ -354,13 +405,14 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of,
             log.error("registering %s failed: %r", t.name, e)
             failed = True
     declared = {t.name for t in TASKS}
-    for task_name in ours(sched.tasks(), install_dir):      # W-37: never shadows the owner's name
+    for task_name, author, path in owned(sched.tasks(), install_dir):   # W-37: no shadowing
         if task_name not in declared:
             try:
                 sched.delete(task_name)
-                log.info("removed our orphan task %s", task_name)
+                log.info("removed our orphan task %s (author %r, action %r)", task_name, author, path)
             except Exception as e:
-                log.warning("removing orphan %s failed: %r", task_name, e)
+                log.warning("removing orphan %s (author %r, action %r) failed: %r",
+                            task_name, author, path, e)
     left = _stop_stack(sched, install_dir)
     if left:
         log.warning("%d old process(es) survived the stop; the new ones may exit as duplicates", left)
@@ -396,16 +448,18 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of,
 
 def unregister(install_dir: str, sched=None) -> int:
     """--unregister: stop everything, remove our tasks, stop again, count survivors."""
-    install_dir = norm(install_dir)
+    install_dir = _install_root(install_dir)
+    if not install_dir:
+        return 1
     sched = sched or Scheduler()
     _stop_stack(sched, install_dir)
     failed = False
-    for name in ours(sched.tasks(), install_dir):
+    for name, author, path in owned(sched.tasks(), install_dir):
         try:
             sched.delete(name)
-            log.info("unregistered %s", name)
+            log.info("unregistered %s (author %r, action %r)", name, author, path)
         except Exception as e:
-            log.error("unregistering %s failed: %r", name, e)
+            log.error("unregistering %s (author %r, action %r) failed: %r", name, author, path, e)
             failed = True
     left = kill_and_wait(install_dir)       # second pass: nothing can start them again now
     if left:
@@ -414,7 +468,9 @@ def unregister(install_dir: str, sched=None) -> int:
 
 
 def stop(install_dir: str, sched=None) -> int:
-    install_dir = norm(install_dir)
+    install_dir = _install_root(install_dir)
+    if not install_dir:
+        return 1
     sched = sched or Scheduler()
     left = _stop_stack(sched, install_dir)
     log.info("stop: %d survivor(s); registrations kept", left)
@@ -503,7 +559,10 @@ def main(argv: "list[str]") -> int:
     if sys.maxsize <= 2 ** 32:
         print("a 64-bit process is required", file=sys.stderr)     # F-234
         return 2
-    install_dir = os.path.dirname(os.path.abspath(sys.executable))
+    install_dir = os.path.dirname(sys.executable)           # F1-01: no abspath (the current dir)
+    if not norm(install_dir):
+        print(f"the install directory is not a full local path: {install_dir!r}", file=sys.stderr)
+        return 2
     logs = os.path.join(install_dir, "logs")
     handler = None
     try:

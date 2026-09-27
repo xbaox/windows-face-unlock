@@ -1768,3 +1768,33 @@ Unicode-безопасный cv2 (R8), custody fail-closed и поключева
 | X-03 | каждый раунд фазы 2 пишет в `gesture_telemetry` поле `stillness`: число поз окна, медианный интервал (мс), максимальные межкадровые \|Δyaw\| и \|Δpitch\|, размах yaw/pitch, исход окна (`closed` / `motion` / `open`) и сработавшее правило (`frame` / `span`; при обоих — `frame`). Только числа. Логика окна и константы не менялись; чтение телеметрии вердикт не меняет (тест) |
 
 Для 9e: X-03 даёт живой шум позы (ПК-1 и VM) — по нему решается, верны ли `STILLNESS_MAX_DEG` 4° и окно 0,4 с.
+
+### 9e-f1 — инсталлятор удалял и останавливал чужие задачи (2026-09-27; находка живого прогона 9e, RED)
+
+**Находка.** Чистая установка CPU 0.2.0 (`325cb01`) в VM `WFU-9e` под MSA: `register_tasks.log` —
+«removed our orphan task OneDrive Reporting Task-<SID>», «… OneDrive Standalone Update Task-<SID>»,
+затем «kill of pid … failed: AccessDenied» для процессов `Registry` и `MemCompression` и «2 old
+process(es) survived the stop».
+
+**Причина.** `taskreg.norm()` = `normcase(realpath(path))`: у неполного пути `realpath` достраивает
+путь от **текущей папки**. Setup запускает `face_unlock_tray.exe --register` с `WorkingDir={app}`,
+деинсталлятор (`--unregister`) — тоже из `{app}`. Действие задачи `%localappdata%\…\OneDriveStandaloneUpdater.exe`,
+`cmd.exe`, `C:x.exe` превращалось в `C:\Program Files\WindowsFaceUnlock\…` → «наше»: `register`
+удалял его как сироту, `_stop_stack` останавливал, `unregister` удалял. Процессы с `exe` = `Registry`
+/ `MemCompression` считались стеком — спас только AccessDenied. Pascal-копия сравнивает сырые строки
+по префиксу и фильтрует процессы по имени — дефекта с текущей папкой в ней нет, но `..` в пути она не
+разрешала.
+
+**Решение архитектора (фиксирую):** принадлежность — только по полному абсолютному пути; процессы —
+ещё и по имени; ничто не зависит от текущей папки.
+
+| пункт | суть |
+|---|---|
+| F1-01 | одна функция `taskreg.norm()`: путь сравним, только если он полностью квалифицирован (`X:\…`); иначе `""`, а `""` ни в чём не лежит. Отвергаются пустой, относительный, `C:x`, `\x`, UNC и `\\?\`, любой путь с `%`, кавычкой или аргументом. Сравнение — `normcase(normpath)`; `realpath` — только для уже прошедшей строки, и его результат проверяется снова. Применено в `norm`, `under`, `ours`/`owned`, `stack_processes`, `kill_and_wait`, `_stop_stack`, `register`, `unregister`, `stop`, `main` (без `abspath`); неполная папка установки → 1, ничего не тронуто |
+| F1-02 | стек = basename ∈ {`face_service.exe`, `face_unlock_tray.exe`, `face_unlock_watchdog.exe`} **и** полный путь внутри папки установки (как Pascal `StackProcesses`). Dev-процессы флаги не ловят и не должны: `main()` отказывает в checkout |
+| F1-03 | своя задача = автор `WindowsFaceUnlock` **или** полное действие внутри папки установки; объявленное имя само по себе не «своё» (одноимённая задача dev-checkout запускается из другого места). Каждое удаление и остановка пишет в лог имя, автора и путь действия; нечитаемое определение задачи — WARNING и «не наша» |
+| F1-04 | тот же класс по репо: `tools/watchdog.py` (`_norm` = `taskreg.norm`; сторож работает с текущей папкой `{app}`); Pascal `IsFullLocalPath` + `PathUnder` (явно отвергает неполное, `%`, кавычку, `/`, `\\`, сегменты `.`/`..`, аргументы); удаление данных деинсталлятором — только если `DataDir` = `<профиль владельца>\.face-unlock` и оба полные (`DataDirRemovable`, до вопроса и до `rmdir`; `%VAR%` cmd раскрыл бы даже в кавычках); `tools/uninstall.ps1` — `FACE_UNLOCK_HOME` только полный (`-RemoveData` удаляет то, что он называет); `tools/testhome.py` — дом селфтеста только полный |
+| F1-05 | `installer_selftest` [1b]: `os.chdir()` в (временную) папку установки, фейковые планировщик и psutil — задачи OneDrive-вида, `cmd.exe`, `powershell.exe`, `rundll32.exe`, `..\x.exe`, `C:x.exe`, `\Windows\x.exe`, UNC, пустая, чужая абсолютная, наши три, две сироты; процессы `Registry`, `MemCompression`, пустой, относительный, чужой `face_service.exe`, `unins000.exe`, наши три. [2c]: Pascal-функции вырезаются из `installer.iss` как есть, компилируются ISCC в пробу и **исполняются**. [2d]: `Test-FuFullPath` из `uninstall.ps1` через парсер PowerShell. Плюс `watchdog_selftest`, `isolation_selftest`. На `325cb01` новые тесты красные (44 + 3 + 5 FAIL) и воспроизводят строки живого лога |
+
+Не менялись: `recognizer.py`, CP, протокол пайпа, константы распознавания. `WorkingDir={app}` у
+`RunTrayFlag` оставлен: после F1-01 текущая папка ни на что не влияет.

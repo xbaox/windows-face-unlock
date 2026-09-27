@@ -91,6 +91,17 @@ def test_check_home() -> None:
           testhome.check_home(REPO / "not-a-temp-home") is not None)
     check("a folder inside the temporary directory is accepted",
           testhome.check_home(tmp / "faceunlock_x" / "home") is None)
+    # 9e (F1-04): a relative home would follow the current directory -- refused even when the
+    # current directory is inside the temporary directory
+    here = os.getcwd()
+    os.chdir(tmp)
+    try:
+        for rel in ("faceunlock_rel_home", r".\faceunlock_rel_home", tmp.drive + "faceunlock_rel_home",
+                    "%TEMP%\\faceunlock_rel_home"):
+            check(f"F1-04: a home that is not a full local path is refused ({rel!r}, cwd = TEMP)",
+                  testhome.check_home(rel) is not None, testhome.check_home(rel))
+    finally:
+        os.chdir(here)
 
 
 def _child_env(temp: Path, **extra) -> dict:
