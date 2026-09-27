@@ -208,6 +208,12 @@ def _keep_binary(entry) -> bool:
     # D-151: the FFmpeg plugin serves files and URLs; the product opens cameras by index/name only.
     if name.startswith("opencv_videoio_ffmpeg"):
         return False
+    # 9d-build: pywinrt's own msvcp140.dll (14.29) -- PyInstaller's dependency scan of the winrt
+    # .pyd files brings it back as winrt\MSVCP140.dll even when the data list leaves it out. The
+    # process runtime is _internal\msvcp140.dll (>= 14.40; the gate checks both).
+    parent = Path(entry[0]).parent.name.lower()
+    if name == "msvcp140.dll" and parent == "winrt":
+        return False
     return True
 
 
