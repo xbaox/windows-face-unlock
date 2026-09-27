@@ -149,6 +149,12 @@ def selfcheck_engine_main(argv) -> int:
                 break
             except metadata.PackageNotFoundError:
                 continue
+        if variant == "unknown":
+            # 9d-build: a frozen bundle carries no dist-info -- the package tells by what it was
+            # COMPILED with: the GPU wheel lists the CUDA provider, the CPU wheel never does.
+            import onnxruntime as _ort
+            variant = "gpu" if "CUDAExecutionProvider" in _ort.get_available_providers() else "cpu"
+            result["onnxruntime_dist"] = f"onnxruntime {getattr(_ort, '__version__', '?')} ({variant} build)"
         result["variant"] = variant
         if not result["pack_problems"]:
             from face_service import recognizer as R
@@ -205,10 +211,16 @@ def selfcheck_engine_main(argv) -> int:
                 native = f.read()
         except Exception:
             pass
-        lines = [ln for ln in (native.splitlines() + log_lines.lines)
-                 if any(k in ln for k in ("LoadLibrary", "CUDA", "cudnn", "cublas", "Failed", "fell back"))]
-        result["provider_load_errors"] = lines[:40]
-        if result.get("variant") == "cpu" and any("CUDA" in ln or "cudnn" in ln for ln in lines):
+        # 9d-build: only what ONNX Runtime itself reports about loading a provider library (native
+        # stderr) and a session that fell back -- not the recognizer's own provider-selection
+        # messages, which name CUDA on every CPU machine.
+        low = [ln for ln in native.splitlines()
+               if any(k in ln.lower() for k in ("loadlibrary", "onnxruntime_providers_cuda", "cudnn",
+                                                  "cublas", "cudart", "error"))]
+        low += [ln for ln in log_lines.lines if "fell back" in ln or "LoadLibrary" in ln]
+        result["provider_load_errors"] = low[:40]
+        if result.get("variant") == "cpu" and any(("cuda" in ln.lower() or "cudnn" in ln.lower())
+                                                  for ln in low):
             result["errors"].append("CPU variant: a CUDA provider load was attempted / reported")
             rc = 1
         result["rc"] = rc
