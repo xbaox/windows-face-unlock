@@ -187,6 +187,54 @@ def test_settings(ui, mon):
     ui.post(lambda: ui._windows["settings"].close())
 
 
+def test_r2(ui, mon):
+    print("[r2] W-16 Settings without the wizard's imports; W-21 fonts, texts, widths")
+    import re
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    code = ("import sys, tkinter as tk; import presence_monitor.gui as G;"
+            "o = type('S', (), {})(); o.cfg = G.Config();"
+            "G.SettingsWindow._no_name_label(o);"
+            "bad = [m for m in ('presence_monitor.enroll_gui', 'cv2', 'face_service.detector') if m in sys.modules];"
+            "print('LOADED=' + ','.join(bad))")
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(root), capture_output=True, text=True,
+                       timeout=120)
+    check("W-16: Settings' camera entry needs neither the wizard, cv2 nor YuNet in the tray process",
+          r.returncode == 0 and "LOADED=\n" in r.stdout + "\n" and "LOADED=," not in r.stdout,
+          (r.stdout[-300:], r.stderr[-300:]))
+    srcs = {p.name: p.read_text(encoding="utf-8") for p in (root / "presence_monitor").glob("*.py")}
+    tuples = [n for n, s in srcs.items() if re.search(r"font=\(\s*[\"']", s)]
+    check("W-21: no anonymous font tuples in the UI (named fonts from TkDefaultFont)", tuples == [], tuples)
+    import presence_monitor.gui as GUI
+    snap = {"last_reason": "src=camera why=camera-busy (probe)", "last_why": "camera-busy"}
+    check("W-21: 'Details for support' names the why once",
+          GUI.support_text(snap).count("why=camera-busy") == 1, GUI.support_text(snap))
+    check("W-21: ... and adds it when the reason does not carry it",
+          GUI.support_text({"last_reason": "service-error", "last_why": "engine"}) == "service-error why=engine")
+    check("W-21: ... an empty snapshot is a dash", GUI.support_text({}) == "—")
+    from face_service.i18n import TRANSLATIONS
+    en, ru = TRANSLATIONS["en"], TRANSLATIONS["ru"]
+    check("W-21: RU Help 'Windows password' uses the password dialog's wording",
+          "не покидает этот компьютер" in ru["tray.set_password.desc"]
+          and "Этим паролем Face Unlock входит в Windows" in ru["tray.set_password.desc"],
+          ru["tray.set_password.desc"])
+    dashed = [k for k, v in en.items() if k.endswith(".title") and "--" in v]
+    check("W-21: EN window titles use an em dash, not '--'", dashed == [], dashed)
+    check("W-20: 'Cancel calibration' in both languages",
+          en["enroll.btn.cancel_calib"] == "Cancel calibration" and ru["enroll.btn.cancel_calib"] == "Отменить калибровку")
+    out = queue.Queue()
+
+    def run():
+        ui.show("settings", lambda u: GUI.SettingsWindow(u, mon))
+        s = ui._windows["settings"]
+        s.top.withdraw()
+        out.put(sorted({int(c.cget("width")) for c in s._combos}))
+        s.close()
+    ui.post(run)
+    widths = out.get(timeout=10)
+    check("W-21: every Settings combobox has the same width", len(widths) == 1, widths)
+
+
 def test_9d_windows(ui, mon):
     print("[9d] Status: V-39 no decryption, V-40 probe button; Settings: V-44; tray: V-33 resume")
     import threading as _th
@@ -580,6 +628,7 @@ def main() -> int:
     test_i18n()
     ui, mon = test_ui_thread()
     test_settings(ui, mon)
+    test_r2(ui, mon)
     test_9d_windows(ui, mon)
     test_tray_state()
     test_notify_fallback()

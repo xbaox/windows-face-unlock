@@ -12,6 +12,7 @@ Exit 0 = all green, 1 = any failure.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import tempfile
@@ -267,15 +268,38 @@ def main(argv=None) -> int:
     t.ok(bool(me), "the logon session id is readable")
     W.write_quit(qp, me, 1.0)
     t.ok(W.quit_active(qp, me) is True and qp.exists(), "Quit of THIS sign-in -> active")
-    t.ok(W.quit_active(qp, "dead-beef") is False and not qp.exists(),
-         "a Quit of another sign-in is stale -> not active, removed")
+    t.ok(W.quit_active(qp, "dead-beef") is False and qp.exists(),
+         "W-17: a Quit of another sign-in -> not a pause here, but the marker STAYS")
     try:
         W.write_quit(qp, None, 1.0)
         t.ok(False, "a Quit pause without a logon id is refused")
     except ValueError:
         t.ok(True, "a Quit pause without a logon id is refused")
     qp.write_text("{broken", encoding="utf-8")
-    t.ok(W.quit_active(qp, me) is False and not qp.exists(), "a broken Quit marker -> removed")
+    t.ok(W.quit_active(qp, me) is False and qp.exists(),
+         "W-17: a broken Quit marker -> not a pause, never deleted by the watchdog side")
+    # W-17: the watchdog loop itself never deletes it, whatever its session
+    W.write_quit(qp, "dead-beef", 1.0)
+    saved17 = (TW.ping, TW.restart_service)
+    TW.ping = lambda _t: (True, "serving")
+    TW.restart_service = lambda _timeout: (1, True)
+    try:
+        st17 = TW.State(0.0)
+        for _ in range(3):
+            TW._iteration(st17, 2.0, 3, 300.0)
+    finally:
+        TW.ping, TW.restart_service = saved17
+    t.ok(qp.exists(), "W-17: watchdog iterations with a foreign-LUID marker leave it in place")
+    t.ok("clear_pause(QUIT_PAUSE_PATH" not in src and "clear_pause(p)" not in inspect.getsource(W.quit_active),
+         "W-17: neither quit_active nor tools/watchdog.py deletes the Quit marker")
+    from presence_monitor import tray as TR
+    TR_started = []
+    t.ok(TR.resume_after_quit(_start=lambda: TR_started.append(1)) is False and not qp.exists()
+         and TR_started == [], "W-17: the tray start removes a foreign marker (no service start)")
+    W.write_quit(qp, me, 1.0)
+    t.ok(TR.resume_after_quit(_start=lambda: TR_started.append(1)) is True and not qp.exists()
+         and TR_started == [1], "W-17: the tray start removes its own session's marker and starts the service")
+    qp.unlink(missing_ok=True)
     saved8 = (TW.ping, TW.restart_service, TW.time.monotonic)
     restarts8 = []
     clock8 = {"t": 5000.0}

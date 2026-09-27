@@ -173,6 +173,16 @@ def reason_text(snap: dict) -> str:
     return "—"
 
 
+def support_text(snap: dict) -> str:
+    """The Status "Details for support" line: the last reason code, and its ``why`` -- once.
+    9d-r2 (W-21): the camera path already writes "why=..." into the reason; it is not repeated."""
+    tech = str(snap.get("last_reason") or "").strip()
+    why = snap.get("last_why")
+    if why and f"why={why}" not in tech:
+        tech = f"{tech} why={why}".strip()
+    return tech or "—"
+
+
 def probe_why_text(reason: str) -> str:
     """A refused presence probe's reason, in words."""
     reason = str(reason or "")
@@ -301,10 +311,7 @@ class StatusWindow:
         v["last"].set(_format_age(snap.get("last_at", 0)))
         v["result"].set(result_text(snap.get("last_result", "-")))
         v["reason"].set(reason_text(snap))                  # 9d (V-35): words, not codes
-        tech = snap.get("last_reason") or ""
-        if snap.get("last_why"):
-            tech = f"{tech} why={snap.get('last_why')}".strip()
-        self.support_var.set(tech or "—")
+        self.support_var.set(support_text(snap))
         v["strikes"].set(strikes_text(snap))
         v["locks"].set(str(snap.get("lock_count", 0)))
         v["paused"].set(t("status.val.yes") if snap.get("paused") else t("status.val.no"))
@@ -432,6 +439,7 @@ class SettingsWindow:
         self.cfg = Config.load()
         self.vars: dict = {}
         self._shown: dict = {}
+        self._combos: list = []
         self._camera_names: list = []
         self._key_reload = ui.new_key("settings-reload")
         self._key_cams = ui.new_key("settings-cams")
@@ -482,6 +490,10 @@ class SettingsWindow:
                   wraplength=px(top, 520), justify="left").grid(row=0, column=0, columnspan=3,
                                                                 sticky="w", pady=(0, 6))
         self._build_fields(self.adv, ADVANCED_FIELDS, first_row=1)
+        # 9d-r2 (W-21): every combobox as wide as the widest one needs -- one column edge
+        width = max(int(c.cget("width")) for c in self._combos) if self._combos else 46
+        for c in self._combos:
+            c.configure(width=width)
 
         bind_standard_keys(top, ok=self.save, cancel=self.cancel)
         # Initial height capped to the work area; the body scrolls beyond that.
@@ -506,6 +518,7 @@ class SettingsWindow:
             elif kind in ("choice", "lang", "camera"):
                 var = tk.StringVar(master=self.top)
                 w = ttk.Combobox(parent, textvariable=var, state="readonly", width=46)
+                self._combos.append(w)
                 if kind == "choice":
                     labels = [t(f"choice.{name}.{c}") for c in extras]
                     # 9d (V-48): as wide as the longest label -- nothing cut off in any language
@@ -554,7 +567,7 @@ class SettingsWindow:
     def _no_name_label(self) -> str:
         """9d (V-34): the entry for "no camera chosen by name": "(older setting)" only when
         config.toml itself carries camera_index; otherwise the default camera."""
-        from .enroll_gui import camera_index_explicit
+        from face_service.config import camera_index_explicit   # 9d-r2 (W-16): not the wizard
         if camera_index_explicit():
             return t("settings.camera.by_index", i=self.cfg.camera_index)
         return t("settings.camera.default")
@@ -716,7 +729,9 @@ class HelpWindow:
         top.protocol("WM_DELETE_WINDOW", self.close)
         frm = ttk.Frame(top, padding=12)
         frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text=t("help.intro"), font=("", 10, "bold")).pack(anchor="w", pady=(0, 8))
+        from .ui import derived_font
+        ttk.Label(frm, text=t("help.intro"), font=derived_font(top, "FuHelpIntro", delta=1)).pack(
+            anchor="w", pady=(0, 8))
         # 9d (V-48): the UI's proportional font, not the Text widget's fixed-width default
         text = tk.Text(frm, wrap="word", height=24, width=70, relief="flat",
                        background=top.cget("background"), font="TkDefaultFont")
@@ -724,11 +739,7 @@ class HelpWindow:
         text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         text.pack(side="left", fill="both", expand=True)
-        from tkinter import font as _tkfont
-        _bold = _tkfont.nametofont("TkDefaultFont").copy()
-        _bold.configure(weight="bold")
-        text._fu_bold = _bold
-        text.tag_configure("h", font=_bold)
+        text.tag_configure("h", font=derived_font(top, "FuHelpHeading"))   # W-21: named, bold
         for label_key, desc_key in HELP_ENTRIES:
             text.insert("end", t(label_key).rstrip("…") + "\n", "h")
             text.insert("end", t(desc_key) + "\n\n")

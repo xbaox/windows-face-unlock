@@ -673,6 +673,17 @@ class ConfigSaveRefused(RuntimeError):
 _KEY_LINE = r"(?m)^[ \t]*{key}[ \t]*=.*$"
 
 
+def camera_index_explicit(path=None) -> bool:
+    """9d (V-34): does config.toml carry camera_index itself (an older setup), rather than the
+    default? Only then is the "(older setting)" entry shown. 9d-r2 (W-16): lives here, not in the
+    wizard, so Settings in the tray process never imports the wizard (cv2, YuNet)."""
+    try:
+        raw = Path(path or CONFIG_PATH).read_text(encoding="utf-8")
+        return "camera_index" in tomllib.loads(raw)
+    except Exception:
+        return False
+
+
 def _merge_toml(raw: str, updates: dict) -> str:
     """Put ``updates`` into the TOML text ``raw``: replace each key's line in place (keeping a
     trailing comment when the old value was not a string), append keys the file does not have.

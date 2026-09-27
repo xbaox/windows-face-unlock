@@ -114,6 +114,123 @@ def face_icon_image(level: str = "ok", size: int = 64):
     return img if size == 64 else img.resize((size, size))
 
 
+def derived_font(widget, name: str, *, delta: int = 0, bold: bool = True):
+    """9d-r2 (W-21): a NAMED font derived from TkDefaultFont -- its family, its size plus ``delta``
+    points, bold by default -- instead of an anonymous ("", N, "bold") tuple that ignores the
+    system font. Created once per interpreter and kept alive with the root."""
+    from tkinter import font as tkfont
+    root = widget.winfo_toplevel()
+    store = getattr(root, "_fu_fonts", None)
+    if store is None:
+        store = {}
+        try:
+            root._fu_fonts = store
+        except Exception:
+            pass
+    if name in store:
+        return store[name]
+    try:
+        f = tkfont.Font(root=root, name=name, exists=True)
+    except tk.TclError:
+        base = tkfont.nametofont("TkDefaultFont", root=root).actual()
+        size = int(base.get("size", 9) or 9)
+        size = size - delta if size < 0 else size + delta      # negative = pixels in Tk
+        f = tkfont.Font(root=root, name=name, family=base.get("family", "TkDefaultFont"),
+                        size=size, weight="bold" if bold else "normal")
+    store[name] = f
+    return f
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", _RECT), ("rcWork", _RECT),
+                ("dwFlags", ctypes.c_ulong)]
+
+
+def clamp_window(x: int, y: int, w: int, h: int, work) -> "tuple[int, int]":
+    """9d-r2 (W-10): the top-left corner that puts a ``w`` x ``h`` window inside ``work``
+    (left, top, right, bottom); a window larger than the work area keeps its top-left edge
+    visible. Pure."""
+    left, top, right, bottom = work
+    return max(left, min(x, right - w)), max(top, min(y, bottom - h))
+
+
+def _frame_hwnd(win) -> int:
+    try:
+        return int(win.wm_frame(), 16)
+    except Exception:
+        return 0
+
+
+def work_area_of(win) -> "tuple[int, int, int, int]":
+    """The work area (screen minus the taskbar) of the monitor ``win`` is on, in physical pixels:
+    (left, top, right, bottom). Falls back to the screen size."""
+    try:
+        u = ctypes.windll.user32
+        u.MonitorFromWindow.restype = ctypes.c_void_p
+        u.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        mon = u.MonitorFromWindow(ctypes.c_void_p(_frame_hwnd(win) or None), 2)  # NEAREST
+        if not mon:
+            mon = u.MonitorFromWindow(None, 1)                                    # PRIMARY
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(mi)
+        if mon and u.GetMonitorInfoW(ctypes.c_void_p(mon), ctypes.byref(mi)):
+            r = mi.rcWork
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        log.debug("work area not readable", exc_info=True)
+    return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
+
+
+def frame_extra(win) -> "tuple[int, int]":
+    """Width and height the window frame (borders, title bar) adds to the client area at this
+    window's DPI."""
+    dpi = window_dpi(win)
+    try:
+        f = ctypes.windll.user32.GetSystemMetricsForDpi
+        border = int(f(32, dpi)) + int(f(92, dpi))       # SM_CXSIZEFRAME + SM_CXPADDEDBORDER
+        caption = int(f(4, dpi))                          # SM_CYCAPTION
+        if border > 0 and caption > 0:
+            return 2 * border, caption + 2 * border
+    except Exception:
+        pass
+    return px(win, 16), px(win, 39)
+
+
+def window_rect(win) -> "tuple[int, int, int, int] | None":
+    """The window's outer rectangle (left, top, right, bottom), or None."""
+    hwnd = _frame_hwnd(win)
+    r = _RECT()
+    try:
+        if hwnd and ctypes.windll.user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r)):
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return None
+
+
+def keep_in_work_area(win) -> bool:
+    """9d-r2 (W-10): move ``win`` back inside the work area of its monitor (never resizes it).
+    True when it was moved. Never raises."""
+    try:
+        win.update_idletasks()
+        rect = window_rect(win)
+        if rect is None:
+            return False
+        left, top, right, bottom = rect
+        nx, ny = clamp_window(left, top, right - left, bottom - top, work_area_of(win))
+        if (nx, ny) != (left, top):
+            win.geometry(f"+{nx}+{ny}")
+            return True
+    except Exception:
+        log.debug("keep_in_work_area failed", exc_info=True)
+    return False
+
+
 def set_app_icon(root) -> bool:
     """9d (V-48): the face icon for ``root`` and every Toplevel it owns (iconphoto default=True).
     Never raises."""

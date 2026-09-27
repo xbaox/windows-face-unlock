@@ -136,7 +136,11 @@ def write_quit(path, logon: "str | None", now: float) -> None:
 def quit_active(path, logon: "str | None") -> bool:
     """True iff a Quit pause of THIS logon session exists. A marker of another session (stale:
     Windows was signed in again), an unreadable one, or no logon id to compare with -> not
-    active, and the marker is removed. Never raises."""
+    active. Never raises.
+
+    9d-r2 (W-17): read-only -- the marker is never deleted here. The watchdog runs in every
+    sign-in of the owner and would otherwise remove the marker of another session that is still
+    quit; only the tray, at its start, removes it (``presence_monitor.tray.resume_after_quit``)."""
     p = Path(path)
     try:
         if not p.exists():
@@ -145,10 +149,9 @@ def quit_active(path, logon: "str | None") -> bool:
         if (isinstance(data, dict) and data.get("kind") == "quit" and logon
                 and str(data.get("logon")) == str(logon)):
             return True
-        log.info("quit pause %s is from another sign-in (or unreadable) -- removed", p)
+        log.debug("quit pause %s is from another sign-in (or not a Quit pause) -- not a pause here", p)
     except Exception as e:
-        log.warning("quit pause %s unusable (%r) -- ignored and removed", p, e)
-    clear_pause(p)
+        log.debug("quit pause %s unreadable (%r) -- not a pause", p, e)
     return False
 
 

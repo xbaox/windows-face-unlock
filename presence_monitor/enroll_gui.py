@@ -22,6 +22,11 @@ Stage 9 (act 9b R12) rebuilt it around four rules:
   within 5 s is reported as failed; Retry takes a fresh lease and opens it again.
 * **No pipe call on the Tk thread** (9d, V-42): the lease, the service calls and the close run on
   workers and report through the queue.
+* **9d-r2.** The lease is counted per holder (a camera session, a build) and asked for only once
+  the service has answered; one camera session at a time ("switching camera"); every camera
+  message carries its session's number, so a stale frame or failure is dropped; the first-frame
+  limit is kept on the Tk side; Build works with the camera off; failures are shown in words;
+  the preview is sized so the whole window fits the work area, and the window is kept inside it.
 * **A real end state.** After the build the wizard offers the head-turn calibration (R6, F-117),
   then checks what face sign-in needs -- a readable stored password the lock screen has not
   rejected, a secure data folder, the service seeing the new face profile, the camera given back
@@ -51,7 +56,7 @@ from PIL import Image, ImageTk
 
 from face_service import imio
 from face_service.config import (CALIBRATION_DIR, EMBED_PATH, ENROLL_DIR, ENROLL_PENDING_DIR,
-                                 WATCHDOG_PAUSE_PATH, Config)
+                                 WATCHDOG_PAUSE_PATH, Config, camera_index_explicit)
 from face_service.detector import FaceDetector
 from face_service.enroll_qc import frame_quality, qc_reasons
 from face_service.i18n import set_language, t
@@ -79,6 +84,22 @@ CALIB_SHOTS = 3
 CALIB_TURN_WAIT_S = 2.5
 FIRST_FRAME_S = 5.0          # 9d (A-4, V-30): no usable frame this long after the open -> failed
 CALIB_STALL_S = 30.0         # 9d (V-31): a calibration without progress this long is abandoned
+LEASE_CALL_S = 5.0           # one lease request / hand-back over the pipe
+CAMERA_JOIN_S = 5.0          # 9d-r2 (W-18): the end state waits this long for the camera thread
+PREVIEW_MAX_FRAC = 0.5       # 9d-r2 (W-10): the preview takes at most this share of the work-area height
+PREVIEW_MIN_K = 0.3          # ...and is never scaled below this share of its 96-dpi size
+READY_WRAP_PX = 300          # 9d-r2 (W-10): the readiness panel's text width (96-dpi pixels)
+
+# 9d-r2 (W-10): the readiness texts the layout is measured with (the longest one of the language)
+_READY_TEXT_KEYS = ("enroll.ready.password.none", "enroll.ready.password.unreadable",
+                    "enroll.ready.password.rejected", "enroll.ready.custody.bad",
+                    "enroll.ready.camera.bad", "enroll.ready.service.bad", "enroll.ready.enrollment.bad")
+# 9d-r2 (W-20): the one optional button slot of the button row
+_EXTRA_MODES = {"retry": "enroll.btn.retry", "camera_on": "enroll.btn.camera_on",
+                "cancel_calib": "enroll.btn.cancel_calib"}
+# 9d-r2 (W-12): camera-session messages carry the session's gen last; a stale one is dropped
+_CAMERA_MSGS = {"camera_switching", "camera_opened", "camera_failed", "camera_closed", "first_frame",
+                "coach", "captured", "done_capture", "calib_shots"}
 
 # ---- framing coach (wizard UX only -- not recognition, liveness or QC numbers) ----
 COACH_AREA_MIN_FRAC = 0.06
@@ -93,6 +114,32 @@ POSE_YAW_WARN_DEG = 15.0
 
 def pose_warning(pitch: float, yaw: float) -> bool:
     return pitch < POSE_PITCH_WARN_DEG or abs(yaw) > POSE_YAW_WARN_DEG
+
+
+def fit_preview(work_w: int, work_h: int, chrome_w: int, chrome_h: int,
+                scale: float) -> "tuple[int, int]":
+    """9d-r2 (W-10): the preview size, in physical pixels, that keeps the whole wizard inside a
+    work area of ``work_w`` x ``work_h``. ``chrome_w`` / ``chrome_h`` is the rest of the window
+    (its full size -- title bar, borders, readiness panel, buttons -- minus the preview) at this
+    ``scale``. The 96-dpi preview is scaled to ``scale``, kept to PREVIEW_MAX_FRAC of the work-area
+    height and to what the chrome leaves free, never below PREVIEW_MIN_K; 4:3 is kept. Pure."""
+    pw, ph = PREVIEW_W * scale, PREVIEW_H * scale
+    k = min(1.0, work_h * PREVIEW_MAX_FRAC / ph, (work_h - chrome_h) / ph, (work_w - chrome_w) / pw)
+    k = max(PREVIEW_MIN_K, k)
+    return int(pw * k), int(ph * k)
+
+
+def build_failure_text(raw: "str | None") -> str:
+    """9d-r2 (W-19): a failed build in words (the raw reason goes to the log only)."""
+    raw = (raw or "").strip()
+    if raw in ("", "timeout"):
+        return t("enroll.build.fail.timeout")
+    if raw == "lease":
+        return t("enroll.error.lease")
+    key = f"why.{raw}"
+    if t(key) != key:
+        return t("enroll.build.fail.refusing", why=t(key))
+    return t("enroll.build.fail.generic")
 
 
 _GUIDE_AREA_PX = (COACH_AREA_MIN_FRAC + COACH_AREA_MAX_FRAC) / 2 * PREVIEW_W * PREVIEW_H
@@ -292,9 +339,12 @@ def annotate(bgr, faces, level: str, size: "tuple[int, int] | None" = None):
 class Session:
     """State shared between the Tk thread and the camera worker. Plain Python, one lock."""
 
-    def __init__(self, cfg: Config, camera_name: str):
+    def __init__(self, cfg: Config, camera_name: str, gen: int = 0,
+                 service_up: "threading.Event | None" = None):
         self.cfg = cfg
         self.camera_name = camera_name
+        self.gen = gen                                  # 9d-r2 (W-12): tags its messages
+        self.service_up = service_up                    # 9d-r2 (W-13): lease only after this
         self.stop = threading.Event()
         self.armed = threading.Event()
         self.lock = threading.Lock()
@@ -343,57 +393,85 @@ def _open_capture(cfg: Config, camera_name: str):
     return None, "open-failed"
 
 
-def camera_worker(s: Session, q: "queue.Queue", lease: "LeaseKeeper | None" = None) -> None:
-    """Preview + capture + calibration shots. Posts: ("camera_failed", reason), ("frame", rgb),
-    ("first_frame",), ("coach", CoachState), ("captured", n), ("done_capture", n),
-    ("calib_shots", phase, names).
+def camera_worker(s: Session, q: "queue.Queue", lease: "LeaseKeeper | None" = None,
+                  prev: "threading.Thread | None" = None) -> None:
+    """Preview + capture + calibration shots. Every message ends with the session's ``gen``:
+    ("camera_switching", gen), ("camera_opened", gen), ("camera_failed", reason, gen),
+    ("frame", rgb, gen), ("first_frame", gen), ("coach", CoachState, gen), ("captured", n, gen),
+    ("done_capture", n, gen), ("calib_shots", phase, names, gen).
 
     9d (A-4, V-30): the camera lease is taken FIRST -- refused -> ("camera_failed", "lease") and the
-    device is never opened -- and given back when this worker lets the device go. No usable frame
-    within FIRST_FRAME_S -> ("camera_failed", "no-frame")."""
-    if lease is not None and not lease.acquire():
-        q.put(("camera_failed", "lease"))
+    device is never opened -- and given back when this worker lets the device go.
+    9d-r2: W-11 -- the worker does not start while the previous camera thread (``prev``) lives
+    (it says "camera_switching" and waits), and it gives back only ITS OWN lease token;
+    W-13 -- the lease is asked for only after the service has answered (``s.service_up``);
+    W-15 -- any exception in the session, the calibration shots included, is "camera_failed"."""
+    if prev is not None and prev.is_alive():
+        q.put(("camera_switching", s.gen))
+        log.info("enroll camera: waiting for the previous camera session to let the device go")
+        while prev.is_alive():
+            if s.stop.is_set():
+                return
+            prev.join(0.25)
+    if s.service_up is not None:
+        while not s.service_up.wait(0.25):
+            if s.stop.is_set():
+                return
+    if s.stop.is_set():
         return
+    token = None
+    if lease is not None:
+        token = lease.acquire("camera")
+        if token is None:
+            q.put(("camera_failed", "lease", s.gen))
+            return
     try:
         _camera_session(s, q)
+    except Exception:
+        log.exception("enroll camera session failed")
+        q.put(("camera_failed", "error", s.gen))
     finally:
         if lease is not None:
-            lease.release()                   # the device is gone: the service may use it
+            lease.release(token)              # the device is gone: this session's share only
 
 
 def _camera_session(s: Session, q: "queue.Queue") -> None:
+    gen = s.gen
     cap, why = _open_capture(s.cfg, s.camera_name)
     if cap is None:
-        q.put(("camera_failed", why))
+        q.put(("camera_failed", why, gen))
         return
-    detector = FaceDetector()
     try:
-        import importlib
-        importlib.import_module("insightface.utils.face_align")   # warm the one-off import
-    except Exception:
-        pass
-    frame_idx = 0
-    faces: list = []
-    coach = CoachState("enroll.status.waiting", False, "err")
-    last_coach = None
-    streak = 0
-    last_capture = 0.0
-    first = False
-    first_deadline = time.monotonic() + FIRST_FRAME_S
-    try:
+        q.put(("camera_opened", gen))          # W-15: the Tk side times the first frame from here
+        detector = FaceDetector()
+        try:
+            import importlib
+            importlib.import_module("insightface.utils.face_align")   # warm the one-off import
+        except Exception:
+            pass
+        frame_idx = 0
+        faces: list = []
+        coach = CoachState("enroll.status.waiting", False, "err")
+        last_coach = None
+        streak = 0
+        last_capture = 0.0
+        first = False
+        first_deadline = time.monotonic() + FIRST_FRAME_S
         while not s.stop.is_set():
             if not first and time.monotonic() >= first_deadline:
                 log.warning("enroll camera: no usable frame within %.0fs", FIRST_FRAME_S)
-                q.put(("camera_failed", "no-frame"))
+                q.put(("camera_failed", "no-frame", gen))
                 return
             ok, frame = cap.read()
+            if s.stop.is_set():
+                return
             if not ok or frame is None:
                 time.sleep(0.05)
                 continue
             frame_idx += 1
             if not first and float(frame.mean()) > BLACK_LUMA:
                 first = True
-                q.put(("first_frame",))
+                q.put(("first_frame", gen))
             if not first:
                 continue                      # black frames of a camera still starting up
             measured = frame_idx % DETECT_EVERY_N_FRAMES == 0
@@ -410,7 +488,7 @@ def _camera_session(s: Session, q: "queue.Queue") -> None:
                 streak = streak + 1 if faces else 0
             if coach.key != last_coach:
                 last_coach = coach.key
-                q.put(("coach", coach))
+                q.put(("coach", coach, gen))
             now = time.time()
             if measured and coach.ok and streak >= FACE_STABLE_FRAMES and now - last_capture >= CAPTURE_COOLDOWN_S:
                 with s.lock:
@@ -425,7 +503,7 @@ def _camera_session(s: Session, q: "queue.Queue") -> None:
                             s.calib_names[phase].append(name)
                             s.calib = (phase, left - 1) if left > 1 else None
                         if left <= 1:
-                            q.put(("calib_shots", phase, list(s.calib_names[phase])))
+                            q.put(("calib_shots", phase, list(s.calib_names[phase]), gen))
                 elif s.armed.is_set():
                     with s.lock:
                         target, d = s.target, s.capture_dir
@@ -439,15 +517,15 @@ def _camera_session(s: Session, q: "queue.Queue") -> None:
                                 n = s.captured
                                 done = n >= target
                             log.info("enroll: saved %s (%d/%d)", path.name, n, target)
-                            q.put(("captured", n))
+                            q.put(("captured", n, gen))
                             if done:
                                 s.armed.clear()
-                                q.put(("done_capture", n))
+                                q.put(("done_capture", n, gen))
                         else:
                             log.error("enroll: could not save %s -- not counted", path.name)
                     except Exception:
                         log.exception("failed to save an enrollment shot")
-            q.put(("frame", annotate(frame, faces, coach.level, s.preview_size)))
+            q.put(("frame", annotate(frame, faces, coach.level, s.preview_size), gen))
             time.sleep(0.03)
     finally:
         try:
@@ -472,49 +550,102 @@ def service_wait_worker(stop: threading.Event, q: "queue.Queue") -> None:
 
 
 class LeaseKeeper:
-    """The camera lease, held only while capture / build / calibration need it (R10)."""
+    """The camera lease (R10), counted per holder (9d-r2, W-11).
+
+    Every holder -- a camera session, a build -- gets its own token from ``acquire`` and gives
+    back exactly that token with ``release``. The service's lease (pause_camera) is asked for by
+    the first holder and handed back (resume_camera) with the last one, so the ``finally`` of an
+    old camera session can never hand back the lease a newer session or a build still needs.
+    Acquire and release are serialised with their pipe calls. W-13: a lease request that gets no
+    answer in time is followed by resume_camera -- the service may still act on it late -- and
+    counts as refused."""
 
     def __init__(self):
-        self._stop = threading.Event()
-        self._thread: "threading.Thread | None" = None
-        self.held = False
+        self._op = threading.Lock()
+        self._tokens: set = set()
+        self._renew_stop: "threading.Event | None" = None
 
-    def acquire(self) -> bool:
-        resp = pipe_call({"cmd": "pause_camera", "seconds": CAMERA_LEASE_S}, timeout_s=5.0)
-        if not (resp and resp.get("ok")):
-            log.warning("camera lease refused: %s", resp)
-            return False
-        self.held = True
-        self._stop.clear()
-        if self._thread is None or not self._thread.is_alive():
-            self._thread = threading.Thread(target=self._renew, name="enroll-lease", daemon=True)
-            self._thread.start()
-        return True
+    @property
+    def held(self) -> bool:
+        return bool(self._tokens)
 
-    def _renew(self) -> None:
-        while not self._stop.wait(LEASE_RENEW_S):
-            resp = pipe_call({"cmd": "pause_camera", "seconds": CAMERA_LEASE_S}, timeout_s=5.0)
+    def acquire(self, holder: str = "camera") -> "object | None":
+        with self._op:
+            if not self._tokens:
+                resp = pipe_call({"cmd": "pause_camera", "seconds": CAMERA_LEASE_S},
+                                 timeout_s=LEASE_CALL_S)
+                if not (resp and resp.get("ok")):
+                    if resp is None:
+                        log.warning("camera lease request (%s) got no answer -- taking it back "
+                                    "with resume_camera", holder)
+                        pipe_call({"cmd": "resume_camera"}, timeout_s=LEASE_CALL_S)
+                    else:
+                        log.warning("camera lease refused (%s): %s", holder, resp)
+                    return None
+                stop = threading.Event()
+                self._renew_stop = stop
+                threading.Thread(target=self._renew, args=(stop,), name="enroll-lease",
+                                 daemon=True).start()
+            token = (holder, object())
+            self._tokens.add(token)
+            log.info("camera lease: %s holds it (%d holder(s))", holder, len(self._tokens))
+            return token
+
+    def _renew(self, stop: threading.Event) -> None:
+        while not stop.wait(LEASE_RENEW_S):
+            resp = pipe_call({"cmd": "pause_camera", "seconds": CAMERA_LEASE_S}, timeout_s=LEASE_CALL_S)
             if not (resp and resp.get("ok")):
                 log.warning("camera lease renewal failed: %s", resp)
 
-    def release(self) -> None:
-        self._stop.set()
-        if self.held:
-            self.held = False
-            for _ in range(3):              # F-185: a busy server may need a second try
-                resp = pipe_call({"cmd": "resume_camera"}, timeout_s=5.0)
-                if resp and resp.get("ok"):
-                    return
-                time.sleep(1.0)
-            log.warning("resume_camera was not confirmed; the lease lapses by itself")
+    def release(self, token) -> bool:
+        """Give back ``token``. False (and nothing else happens) for a token that is not held --
+        already given back, or never given out."""
+        with self._op:
+            if token is None or token not in self._tokens:
+                return False
+            self._tokens.discard(token)
+            log.info("camera lease: %s gave it back (%d holder(s) left)", token[0], len(self._tokens))
+            if not self._tokens:
+                self._hand_back()
+            return True
+
+    def release_all(self) -> None:
+        """Close: every share goes, and the lease with them."""
+        with self._op:
+            had = bool(self._tokens)
+            self._tokens.clear()
+            if had:
+                self._hand_back()
+
+    def _hand_back(self) -> None:
+        if self._renew_stop is not None:
+            self._renew_stop.set()
+            self._renew_stop = None
+        for _ in range(3):              # F-185: a busy server may need a second try
+            resp = pipe_call({"cmd": "resume_camera"}, timeout_s=LEASE_CALL_S)
+            if resp and resp.get("ok"):
+                return
+            time.sleep(1.0)
+        log.warning("resume_camera was not confirmed; the lease lapses by itself")
 
 
-def build_worker(q: "queue.Queue", req: dict, timeout_s: float, pause_ttl: float) -> None:
+def build_worker(q: "queue.Queue", req: dict, timeout_s: float, pause_ttl: float,
+                 lease: "LeaseKeeper | None" = None) -> None:
+    """9d-r2 (W-14): the build holds its own share of the camera lease -- with the camera off it
+    takes the lease itself, for the build only."""
+    token = None
+    if lease is not None:
+        token = lease.acquire("build")
+        if token is None:
+            q.put(("built", {"ok": False, "reason": "lease"}))
+            return
     paused = _pause_watchdog(pause_ttl)
     try:
         resp = pipe_call(req, timeout_s=timeout_s)
     finally:
         _resume_watchdog(paused)
+        if lease is not None:
+            lease.release(token)
     q.put(("built", resp))
 
 
@@ -523,8 +654,9 @@ def calibrate_worker(q: "queue.Queue", frontal: list, left: list) -> None:
                                    timeout_s=30.0)))
 
 
-def readiness_worker(q: "queue.Queue", lease_released: bool) -> None:
-    """F-180: what face sign-in needs, checked for real."""
+def readiness_worker(q: "queue.Queue", camera_released: bool) -> None:
+    """F-180: what face sign-in needs, checked for real. 9d-r2 (W-18): ``camera_released`` is true
+    only when the camera thread was seen to end and no lease share is held."""
     from face_service.credentials import password_state
     status = pipe_call({"cmd": "status"}, timeout_s=5.0) or {}
     try:
@@ -537,24 +669,29 @@ def readiness_worker(q: "queue.Queue", lease_released: bool) -> None:
         "custody": ok and bool(status.get("data_dir_secure")),
         "enrollment": ok and bool(status.get("enrollment")),
         "password": pwd == "ok" and not status.get("password_rejected"),
-        "camera": lease_released,
+        "camera": bool(camera_released),
     }
     q.put(("readiness", checks, pwd, bool(status.get("password_rejected"))))
 
 
 def release_and_check_worker(q: "queue.Queue", s: "Session | None",
                              cam: "threading.Thread | None", lease: LeaseKeeper) -> None:
-    """9d (A-4): close the camera (the worker gives the lease back with it), then run the readiness
-    check. Worker only: the session, the thread, the lease and the queue."""
+    """9d (A-4): close the camera (the worker gives its lease share back with it), then run the
+    readiness check. 9d-r2 (W-18): "camera handed back" only when the camera thread was seen to
+    END (join confirmed) -- a thread still in a native read keeps its share, and the check says
+    the camera is still busy."""
+    gen = s.gen if s is not None else None
     if s is not None:
         s.stop.set()
         s.armed.clear()
+    joined = True
     if cam is not None and cam.is_alive():
-        cam.join(timeout=5.0)
-    if lease.held:                    # a camera thread that did not let go: the lease lapses anyway
-        lease.release()
-    q.put(("camera_closed",))
-    readiness_worker(q, not lease.held)
+        cam.join(timeout=CAMERA_JOIN_S)
+        joined = not cam.is_alive()
+    if not joined:
+        log.warning("enroll camera thread still holds the device after %.0fs", CAMERA_JOIN_S)
+    q.put(("camera_closed", gen))
+    readiness_worker(q, joined and not lease.held)
 
 
 def close_worker(q: "queue.Queue", s: "Session | None", cam: "threading.Thread | None",
@@ -568,35 +705,12 @@ def close_worker(q: "queue.Queue", s: "Session | None", cam: "threading.Thread |
         cam.join(timeout=3.0)
         if cam.is_alive():
             log.warning("enroll camera thread did not exit within 3s")
-    lease.release()
+    lease.release_all()
     q.put(("closed",))
-
-
-def camera_worker_after(prev: "threading.Thread | None", s: Session, q: "queue.Queue",
-                        lease: "LeaseKeeper | None" = None) -> None:
-    """Start the preview only once the previous camera thread has let the device go."""
-    if prev is not None and prev.is_alive():
-        prev.join(timeout=5.0)
-    camera_worker(s, q, lease)
 
 
 def wipe_worker(q: "queue.Queue") -> None:
     q.put(("wiped", pipe_call({"cmd": "clear_enrollment"}, timeout_s=30.0)))
-
-
-def camera_index_explicit(path=None) -> bool:
-    """9d (V-34): does config.toml carry camera_index itself (an older setup), rather than the
-    default? Only then is the "(older setting)" entry shown."""
-    from face_service.config import CONFIG_PATH
-    try:
-        import tomllib
-    except ImportError:                                   # pragma: no cover
-        import tomli as tomllib  # type: ignore
-    try:
-        raw = (path or CONFIG_PATH).read_text(encoding="utf-8")
-        return "camera_index" in tomllib.loads(raw)
-    except Exception:
-        return False
 
 
 def default_camera_name(devices, explicit_index: bool) -> str:
@@ -635,7 +749,9 @@ def ask_mode(parent) -> "str | None":
     top.resizable(False, False)
     frm = ttk.Frame(top, padding=14)
     frm.pack(fill="both", expand=True)
-    ttk.Label(frm, text=t("enroll.confirm.mode.body"), wraplength=420, justify="left").pack(
+    from .ui import px
+    ttk.Label(frm, text=t("enroll.confirm.mode.body"), wraplength=px(parent, 420),  # W-20: DPI
+              justify="left").pack(
         anchor="w", pady=(0, 12))
     btns = ttk.Frame(frm)
     btns.pack(anchor="e")
@@ -665,7 +781,9 @@ def ask_unbuilt(parent, n: int) -> "str | None":
     top.transient(parent)
     frm = ttk.Frame(top, padding=14)
     frm.pack(fill="both", expand=True)
-    ttk.Label(frm, text=t("enroll.unbuilt.body", n=n), wraplength=420, justify="left").pack(
+    from .ui import px
+    ttk.Label(frm, text=t("enroll.unbuilt.body", n=n), wraplength=px(parent, 420),  # W-20: DPI
+              justify="left").pack(
         anchor="w", pady=(0, 12))
     btns = ttk.Frame(frm)
     btns.pack(anchor="e")
@@ -689,15 +807,19 @@ class EnrollWindow:
         from .ui import apply_scaling, set_app_icon
         self.root = tk.Tk()
         self.root.title(t("enroll.title"))
-        apply_scaling(self.root)
+        self.scale = apply_scaling(self.root)
         set_app_icon(self.root)                      # 9d (V-48)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.q: "queue.Queue" = queue.Queue()
         self.cfg = Config.load()
         self.session: "Session | None" = None
         self.cam_thread: "threading.Thread | None" = None
+        # 9d-r2 (W-12): the camera session whose frames may be drawn; None while the camera is off
+        self.cam_gen: "int | None" = None
+        self._gen = 0
         self.lease = LeaseKeeper()
         self.stop_all = threading.Event()
+        self.service_up = threading.Event()          # 9d-r2 (W-13): the service has answered
         self.service_ready = False
         self.refusing: "str | None" = None
         self.camera_ok = False
@@ -706,6 +828,9 @@ class EnrollWindow:
         self.mode: "str | None" = None
         self.devices: list = []
         self._tk_image = None
+        self._preview_blank = True
+        self._extra_mode: "str | None" = None
+        self._relayout_pending = False
         self._pending_camera_save = ""       # 9d (V-34): the default camera, saved after a build
         self._calib_progress_at = 0.0        # 9d (V-31)
         self._calib_gen = 0
@@ -725,6 +850,7 @@ class EnrollWindow:
         self._px = lambda n: px(self.root, n)
         self.preview_size = (self._px(PREVIEW_W), self._px(PREVIEW_H))   # 9d (V-43)
         self._build_ui()
+        self._fit_layout()                                                # 9d-r2 (W-10)
         self._set_line(t("enroll.status.connecting"), "info")
         self._refresh_buttons()
         threading.Thread(target=service_wait_worker, args=(self.stop_all, self.q),
@@ -732,11 +858,17 @@ class EnrollWindow:
         self._load_devices()
         self._start_camera()
         self.root.after(33, self._drain)
+        self.root.after(250, self._keep_in_work_area)
 
     # ---- UI ----
     def _build_ui(self) -> None:
-        frm = ttk.Frame(self.root, padding=10)
-        frm.pack(fill="both", expand=True)
+        from .ui import derived_font
+        outer = ttk.Frame(self.root, padding=10)
+        outer.pack(fill="both", expand=True)
+        self.outer = outer
+        frm = ttk.Frame(outer)
+        frm.grid(row=0, column=0, sticky="n")
+        self.left = frm
         cam_row = ttk.Frame(frm)
         cam_row.pack(fill="x", pady=(0, 6))
         ttk.Label(cam_row, text=t("enroll.camera") + ":").pack(side="left")
@@ -748,23 +880,23 @@ class EnrollWindow:
         pw, ph = self.preview_size
         self.preview = tk.Label(frm, background="#222", width=pw, height=ph)
         self.preview.pack(pady=(0, 8))
-        blank = Image.new("RGB", (pw, ph), (24, 24, 24))
-        self._tk_image = ImageTk.PhotoImage(blank, master=self.root)
-        self.preview.configure(image=self._tk_image)
+        self._blank_preview()
 
+        # 9d-r2 (W-21): named fonts derived from TkDefaultFont
         self.line = ttk.Label(frm, text="", wraplength=pw, justify="center",
-                              font=("", 11, "bold"))
+                              font=derived_font(self.root, "FuWizardLine", delta=2))
         self.line.pack(fill="x", pady=(0, 4))
         # F-181: the shot counter and the pose instruction live in their own rows.
         prog = ttk.Frame(frm)
         prog.pack(fill="x", pady=(0, 2))
         self.progress = ttk.Progressbar(prog, mode="determinate", maximum=COUNT_DEFAULT)
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.count_lbl = ttk.Label(prog, text="", font=("", 10, "bold"))
+        self.count_lbl = ttk.Label(prog, text="", font=derived_font(self.root, "FuWizardCount", delta=1))
         self.count_lbl.pack(side="right")
         attach_tooltip(self.progress, "enroll.progress.tip")
-        ttk.Label(frm, text=t("enroll.pose_hint"), foreground="#555", wraplength=pw,
-                  justify="left").pack(anchor="w", pady=(0, 6))
+        self.hint = ttk.Label(frm, text=t("enroll.pose_hint"), foreground="#555", wraplength=pw,
+                              justify="left")
+        self.hint.pack(anchor="w", pady=(0, 6))
 
         row = ttk.Frame(frm)
         row.pack(fill="x", pady=2)
@@ -778,33 +910,44 @@ class EnrollWindow:
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(4, 0))
+        self.btns = btns
         self.start_btn = ttk.Button(btns, text=t("enroll.btn.start"), command=self._on_start_stop)
         self.start_btn.pack(side="left", padx=3)
         self.build_btn = ttk.Button(btns, text=t("enroll.btn.build"), command=self._on_build)
         self.build_btn.pack(side="left", padx=3)
         self.wipe_btn = ttk.Button(btns, text=t("enroll.btn.wipe"), command=self._on_wipe)
         self.wipe_btn.pack(side="left", padx=3)
-        self.retry_btn = ttk.Button(btns, text=t("enroll.btn.retry"), command=self._on_retry)
-        # 9d (V-31): calibration can be cancelled
-        self.calib_cancel_btn = ttk.Button(btns, text=t("enroll.btn.cancel_calib"),
-                                           command=lambda: self._abort_calibration("enroll.calib.cancelled"))
         self.close_btn = ttk.Button(btns, text=t("enroll.btn.close"), command=self._on_close)
         self.close_btn.pack(side="right", padx=3)
+        # 9d-r2 (W-20): ONE slot for Retry / Turn the camera on again / Cancel calibration (they
+        # never show together), and a spacer as wide as the row with its widest text -- the
+        # window does not change width when the button appears.
+        self.extra_btn = ttk.Button(btns, text="")
+        widest = 0
+        for mode in _EXTRA_MODES:
+            self.extra_btn.configure(text=t(_EXTRA_MODES[mode]))
+            self.extra_btn.pack(side="left", padx=3, after=self.wipe_btn)
+            btns.update_idletasks()
+            widest = max(widest, btns.winfo_reqwidth())
+            self.extra_btn.pack_forget()
+        ttk.Frame(frm, width=widest, height=1).pack(anchor="w")
 
-        # The end-state panel (F-180), shown after a build.
-        self.ready_frm = ttk.LabelFrame(frm, text=t("enroll.ready.title"), padding=8)
+        # The end-state panel (F-180), shown after a build -- 9d-r2 (W-10): in its own column
+        # beside the preview, its buttons stacked, so it is always on screen with them.
+        self.ready_frm = ttk.LabelFrame(outer, text=t("enroll.ready.title"), padding=8)
         self.ready_lines: dict = {}
+        wrap = self._px(READY_WRAP_PX)
         for i, key in enumerate(("service", "custody", "enrollment", "password", "camera")):
-            lbl = ttk.Label(self.ready_frm, text="", wraplength=pw - self._px(40), justify="left")
-            lbl.grid(row=i, column=0, sticky="w")
+            lbl = ttk.Label(self.ready_frm, text="", wraplength=wrap, justify="left")
+            lbl.grid(row=i, column=0, sticky="w", pady=1)
             self.ready_lines[key] = lbl
         rb = ttk.Frame(self.ready_frm)
-        rb.grid(row=10, column=0, sticky="w", pady=(6, 0))
+        rb.grid(row=10, column=0, sticky="we", pady=(8, 0))
         self.calib_btn = ttk.Button(rb, text=t("enroll.btn.calibrate"), command=self._on_calibrate)
-        self.calib_btn.pack(side="left", padx=3)
+        self.calib_btn.pack(fill="x", pady=2)
         self.pwd_btn = ttk.Button(rb, text=t("enroll.btn.set_password"), command=self._on_set_password)
-        self.pwd_btn.pack(side="left", padx=3)
-        ttk.Button(rb, text=t("enroll.btn.check_again"), command=self._check_ready).pack(side="left", padx=3)
+        self.pwd_btn.pack(fill="x", pady=2)
+        ttk.Button(rb, text=t("enroll.btn.check_again"), command=self._check_ready).pack(fill="x", pady=2)
 
         self.root.bind("<Escape>", lambda _e: self._on_close())
         # 9d (V-43): Enter presses the focused button (Start when nothing else has the focus); Tab
@@ -818,6 +961,93 @@ class EnrollWindow:
         self.start_btn.focus_set()
         self._refresh_existing()
 
+    def _measure_chrome(self) -> "tuple[int, int]":
+        """The window's size minus the preview, in its fullest state: readiness panel shown with
+        its longest texts, a four-line status line, title bar and borders."""
+        from .ui import frame_extra
+        r = self.root
+        saved = self.line.cget("text")
+        saved_ready = {k: lbl.cget("text") for k, lbl in self.ready_lines.items()}
+        shown = bool(self.ready_frm.winfo_manager())
+        longest = max((t(k) for k in _READY_TEXT_KEYS), key=len)
+        try:
+            self.line.configure(text="\n".join(["M"] * 4))
+            for lbl in self.ready_lines.values():
+                lbl.configure(text="✗ " + longest)
+            if not shown:
+                self._grid_ready()
+            r.update_idletasks()
+            dw, dh = frame_extra(r)
+            return (r.winfo_reqwidth() + dw - self.preview.winfo_reqwidth(),
+                    r.winfo_reqheight() + dh - self.preview.winfo_reqheight())
+        finally:
+            self.line.configure(text=saved)
+            for k, lbl in self.ready_lines.items():
+                lbl.configure(text=saved_ready[k])
+            if not shown:
+                self.ready_frm.grid_remove()
+
+    def _fit_layout(self) -> None:
+        """9d-r2 (W-10): size the preview so that the whole window -- readiness panel and its
+        buttons, the button row with its optional button, a four-line status line, title bar and
+        borders -- fits the work area of its monitor (``fit_preview``). A narrower preview wraps
+        the texts under it into more lines, so the fit is repeated until it holds."""
+        from .ui import work_area_of
+        left, top, right, bottom = work_area_of(self.root)
+        for _ in range(4):
+            chrome_w, chrome_h = self._measure_chrome()
+            size = fit_preview(right - left, bottom - top, chrome_w, chrome_h, self.scale)
+            self.chrome = (chrome_w, chrome_h)
+            if size == self.preview_size:
+                break
+            self._set_preview_size(size)
+        log.info("wizard layout: work area %dx%d, scale %.2f, chrome %dx%d -> preview %dx%d",
+                 right - left, bottom - top, self.scale, self.chrome[0], self.chrome[1],
+                 *self.preview_size)
+
+    def _set_preview_size(self, size: "tuple[int, int]") -> None:
+        self.preview_size = size
+        pw, ph = size
+        self.preview.configure(width=pw, height=ph)
+        self.line.configure(wraplength=pw)
+        self.hint.configure(wraplength=pw)
+        if self.session is not None:
+            self.session.preview_size = size
+        self._blank_preview()
+
+    def _grid_ready(self) -> None:
+        self.ready_frm.grid(row=0, column=1, sticky="n", padx=(self._px(12), 0))
+
+    def _relayout(self) -> None:
+        """9d-r2 (W-10): after any change of the layout, the window goes back inside the work area."""
+        if self._relayout_pending:
+            return
+        self._relayout_pending = True
+        try:
+            self.root.after_idle(self._keep_in_work_area)
+        except tk.TclError:
+            self._relayout_pending = False
+
+    def _keep_in_work_area(self) -> None:
+        self._relayout_pending = False
+        if self.closing:
+            return
+        from .ui import keep_in_work_area
+        if keep_in_work_area(self.root):
+            log.info("wizard moved back inside the work area")
+
+    def _set_extra(self, mode: "str | None") -> None:
+        self._extra_mode = mode
+        if mode is None:
+            self.extra_btn.pack_forget()
+        else:
+            cmd = (lambda: self._abort_calibration("enroll.calib.cancelled")) if mode == "cancel_calib" \
+                else self._on_retry
+            self.extra_btn.configure(text=t(_EXTRA_MODES[mode]), command=cmd)
+            if not self.extra_btn.winfo_manager():
+                self.extra_btn.pack(side="left", padx=3, after=self.wipe_btn)
+        self._relayout()
+
     def _on_enter(self, _e=None) -> None:
         w = self.root.focus_get()
         if isinstance(w, ttk.Button):
@@ -827,7 +1057,11 @@ class EnrollWindow:
             self.start_btn.invoke()
 
     def _set_line(self, text: str, level: str = "info") -> None:
-        self.line.configure(text=text, foreground=_COACH_FG.get(level, "#222"))
+        if self.line.cget("text") != text:
+            self.line.configure(text=text, foreground=_COACH_FG.get(level, "#222"))
+            self._relayout()
+        else:
+            self.line.configure(foreground=_COACH_FG.get(level, "#222"))
 
     def _refresh_existing(self) -> None:
         n = count_images()
@@ -849,6 +1083,8 @@ class EnrollWindow:
         self.count_spin.configure(state="disabled" if armed else "normal")
         self.cam_combo.configure(state="disabled" if (armed or self.building or self.calibrating)
                                  else "readonly")
+        if self._extra_mode in ("retry", "camera_on"):
+            self.extra_btn.configure(state="disabled" if self.building else "normal")
 
     def _capture_dir(self):
         return ENROLL_PENDING_DIR if self.mode == "replace" else ENROLL_DIR
@@ -857,18 +1093,15 @@ class EnrollWindow:
     def _load_devices(self) -> None:
         from face_service.camera_devices import list_video_devices
         try:
-            self.devices = [d.name for d in list_video_devices() if d.name]
+            devs = list(list_video_devices())
         except Exception:
-            self.devices = []
+            devs = []
+        self.devices = [d.name for d in devs if d.name]
         values = list(self.devices)
         cur = self.cfg.camera_name
+        explicit = camera_index_explicit()
         if not cur:
-            try:
-                from face_service.camera_devices import list_video_devices as _lvd
-                devs = _lvd()
-            except Exception:
-                devs = []
-            name = default_camera_name(devs, camera_index_explicit())
+            name = default_camera_name(devs, explicit)
             if name:
                 # 9d (V-34): a new install -- the camera at DirectShow 0 now, by name; saved after
                 # the first successful build.
@@ -876,7 +1109,10 @@ class EnrollWindow:
                 self._pending_camera_save = name
                 log.info("new install: camera %r chosen by name (DirectShow index 0)", name)
         if not cur:
-            label = t("settings.camera.by_index", i=self.cfg.camera_index)
+            # 9d-r2 (W-20): "(older setting)" only for a config.toml that sets camera_index itself;
+            # a new install with no camera at DirectShow 0 says so
+            label = (t("settings.camera.by_index", i=self.cfg.camera_index) if explicit
+                     else t("enroll.camera.not_found"))
             values = [label] + values
             self.cam_var.set(label)
         else:
@@ -890,33 +1126,47 @@ class EnrollWindow:
         if self.session is not None:
             self.session.stop.set()
         self.camera_ok = False
-        self.session = Session(self.cfg, self.cfg.camera_name)
+        self._gen += 1
+        self.cam_gen = self._gen
+        self.session = Session(self.cfg, self.cfg.camera_name, gen=self._gen, service_up=self.service_up)
         self.session.preview_size = self.preview_size
-        # 9d (A-4): the worker takes the lease before it opens the camera
-        self.cam_thread = threading.Thread(target=camera_worker_after,
-                                           args=(prev, self.session, self.q, self.lease),
+        # 9d (A-4): the worker takes its lease share before it opens the camera; 9d-r2 (W-11): it
+        # starts only once the previous camera thread has ended
+        self.cam_thread = threading.Thread(target=camera_worker,
+                                           args=(self.session, self.q, self.lease, prev),
                                            name="enroll-camera", daemon=True)
         self.cam_thread.start()
-        self.retry_btn.pack_forget()
+        self._set_extra(None)
         self._refresh_buttons()
 
     def _on_camera_chosen(self) -> None:
         name = self.cam_var.get()
         if name not in self.devices:
-            name = ""                              # the by-index entry
+            name = ""                              # the by-index / not-found entry
         if name == self.cfg.camera_name:
             return
         self.cfg.camera_name = name
         self._pending_camera_save = ""                 # the user chose: saved right now
         threading.Thread(target=save_camera_worker, args=(self.q, name), daemon=True).start()
         log.info("camera chosen: %r", name)
+        self._blank_preview()
         self._start_camera()
 
     def _on_retry(self) -> None:
         # 9d (A-4): a fresh lease and a fresh open (the camera worker takes both)
-        self.retry_btn.pack_forget()
+        self._set_extra(None)
         self._set_line(t("enroll.status.retrying"), "info")
         self.root.after(1500, self._start_camera)          # F-179: a beat after the release
+
+    def _first_frame_due(self, gen: int) -> None:
+        """9d-r2 (W-15): the first-frame limit is kept HERE, on the Tk side -- a worker stuck in a
+        native read() cannot report its own timeout."""
+        if self.closing or self.session is None or self.session.gen != gen:
+            return
+        if self.cam_gen == gen and not self.camera_ok:
+            log.warning("enroll camera: no usable frame within %.0fs (Tk timer)", FIRST_FRAME_S)
+            self.session.stop.set()
+            self._camera_failed("no-frame")
 
     # ---- the queue ----
     def _drain(self) -> None:
@@ -925,15 +1175,18 @@ class EnrollWindow:
             while True:
                 msg = self.q.get_nowait()
                 if msg[0] == "frame":
-                    frame = msg[1]                   # only the newest one is drawn
+                    frame = (msg[1], msg[-1])        # only the newest one is drawn
                 else:
                     self._handle(msg)
         except queue.Empty:
             pass
-        if frame is not None:
+        # 9d-r2 (W-12): a frame is drawn only for the camera session that is live NOW -- one that
+        # was queued before camera_closed / camera_failed (or a switch) is dropped
+        if frame is not None and self.cam_gen is not None and frame[1] == self.cam_gen:
             try:
-                self._tk_image = ImageTk.PhotoImage(Image.fromarray(frame), master=self.root)
+                self._tk_image = ImageTk.PhotoImage(Image.fromarray(frame[0]), master=self.root)
                 self.preview.configure(image=self._tk_image)
+                self._preview_blank = False
             except tk.TclError:
                 pass
         try:
@@ -943,10 +1196,14 @@ class EnrollWindow:
 
     def _handle(self, msg) -> None:
         kind = msg[0]
+        if kind in _CAMERA_MSGS and (self.session is None or msg[-1] != self.session.gen):
+            log.debug("stale camera message dropped: %s", kind)
+            return
         if kind == "service":
             _k, what, state, why = msg
             if what == "ready":
                 self.service_ready = True
+                self.service_up.set()                  # 9d-r2 (W-13): the camera may ask now
                 self.refusing = why if state == "refusing" else None
                 if self.refusing:
                     self._set_line(t("enroll.error.refusing", why=t(f"why.{self.refusing}")), "err")
@@ -955,21 +1212,18 @@ class EnrollWindow:
             else:
                 self._set_line(t("enroll.error.service_down"), "err")
             self._refresh_buttons()
+        elif kind == "camera_switching":
+            self._set_line(t("enroll.status.switching"), "info")
+        elif kind == "camera_opened":
+            self.root.after(int(FIRST_FRAME_S * 1000), self._first_frame_due, msg[-1])
         elif kind == "camera_failed":
-            self.camera_ok = False
-            self._blank_preview()
-            key = {"not-found": "enroll.error.camera_missing", "lease": "enroll.error.lease",
-                   "no-frame": "enroll.error.no_frame"}.get(msg[1], "enroll.error.camera")
-            self._set_line(t(key, name=self.cfg.camera_name or "?"), "err")
-            self.retry_btn.configure(text=t("enroll.btn.retry"))
-            self.retry_btn.pack(side="left", padx=3)
-            self._refresh_buttons()
+            self._camera_failed(msg[1])
         elif kind == "camera_closed":
             # 9d (A-4): the end state gave the camera and its lease back
             self.camera_ok = False
+            self.cam_gen = None
             self._blank_preview()
-            self.retry_btn.configure(text=t("enroll.btn.camera_on"))
-            self.retry_btn.pack(side="left", padx=3)
+            self._set_extra("camera_on")
             self._refresh_buttons()
         elif kind == "closed":
             self._finish_close()
@@ -1006,12 +1260,30 @@ class EnrollWindow:
         elif kind == "wiped":
             self._on_wiped(msg[1])
 
+    def _camera_failed(self, reason: str) -> None:
+        self.camera_ok = False
+        self.cam_gen = None
+        self._blank_preview()
+        if self.calibrating:                         # the calibration cannot go on without it
+            self.calibrating = False
+            self._calib_gen += 1
+            if self.session is not None:
+                with self.session.lock:
+                    self.session.calib = None
+        key = {"not-found": "enroll.error.camera_missing", "lease": "enroll.error.lease",
+               "no-frame": "enroll.error.no_frame",
+               "error": "enroll.error.camera_error"}.get(reason, "enroll.error.camera")
+        self._set_line(t(key, name=self.cfg.camera_name or "?"), "err")
+        self._set_extra("retry")
+        self._refresh_buttons()
+
     def _blank_preview(self) -> None:
         """The camera is not in use: an empty preview, not its last frame."""
         try:
             self._tk_image = ImageTk.PhotoImage(Image.new("RGB", self.preview_size, (24, 24, 24)),
                                                 master=self.root)
             self.preview.configure(image=self._tk_image)
+            self._preview_blank = True
         except tk.TclError:
             pass
 
@@ -1073,9 +1345,8 @@ class EnrollWindow:
             return
         if self.session:
             self.session.armed.clear()
-        if not self.lease.held:                  # 9d (A-4/V-42): no lease call on the Tk thread
-            self._set_line(t("enroll.error.lease"), "err")
-            return
+        # 9d-r2 (W-14): the build takes its own share of the lease on its worker -- it works with
+        # the camera off too (no lease call on the Tk thread, V-42)
         self.building = True
         self._refresh_buttons()
         self._set_line(t("enroll.guide.building"), "info")
@@ -1083,7 +1354,7 @@ class EnrollWindow:
         if self.mode == "replace":
             req["replace"] = True
         threading.Thread(target=build_worker,
-                         args=(self.q, req, build_timeout_s(n), self.cfg.watchdog_pause_ttl_s),
+                         args=(self.q, req, build_timeout_s(n), self.cfg.watchdog_pause_ttl_s, self.lease),
                          name="enroll-build", daemon=True).start()
 
     def _on_built(self, resp) -> None:
@@ -1100,26 +1371,33 @@ class EnrollWindow:
             self._offer_calibration()
         else:
             raw = (resp or {}).get("reason") or ("timeout" if resp is None else "")
+            log.warning("building the face profile failed: reason=%r", raw)   # W-19: the code, here only
             why = humanize_reason(raw)
             if why:
                 self._set_line(t("enroll.guide.build_rejected", why=why), "err")
                 messagebox.showerror(t("enroll.title"), t("enroll.build.failed", why=why), parent=self.root)
             else:
-                self._set_line(t("enroll.guide.build_failed"), "err")
-                messagebox.showerror(t("enroll.title"),
-                                     t("enroll.build.failed_raw", reason=raw or "?"), parent=self.root)
-            # 9d (A-4): the preview still holds the device, so the lease stays with it
+                text = build_failure_text(raw)
+                self._set_line(text, "err")
+                messagebox.showerror(t("enroll.title"), text, parent=self.root)
         self._refresh_buttons()
 
     # ---- calibration (R6 / F-117) ----
     def _offer_calibration(self) -> None:
+        if not self.camera_ok:
+            self._release_and_check()
+            return
         if messagebox.askyesno(t("enroll.calib.title"), t("enroll.calib.offer"), parent=self.root):
             self._on_calibrate()
         else:
             self._release_and_check()
 
     def _on_calibrate(self) -> None:
+        if self.calibrating:
+            return
         if self.session is None or not self.camera_ok:
+            # 9d-r2 (W-14): say what to do instead of doing nothing
+            self._set_line(t("enroll.calib.camera_off"), "warn")
             return
         if not self.lease.held:
             self._set_line(t("enroll.error.lease"), "err")
@@ -1127,7 +1405,7 @@ class EnrollWindow:
         self.calibrating = True
         self._calib_gen += 1
         self._calib_progress_at = time.monotonic()
-        self.calib_cancel_btn.pack(side="left", padx=3)
+        self._set_extra("cancel_calib")
         self._refresh_buttons()
         with self.session.lock:
             self.session.calib_names = {"frontal": [], "left": []}
@@ -1154,7 +1432,7 @@ class EnrollWindow:
         if self.session is not None:
             with self.session.lock:
                 self.session.calib = None
-        self.calib_cancel_btn.pack_forget()
+        self._set_extra(None)
         self._set_line(t(key), "warn")
         self._release_and_check()
 
@@ -1181,31 +1459,35 @@ class EnrollWindow:
         if not self.calibrating:
             return                                # cancelled or stalled meanwhile (V-31)
         self.calibrating = False
-        self.calib_cancel_btn.pack_forget()
+        self._set_extra(None)
         if resp and resp.get("ok"):
             self._set_line(t("enroll.calib.done"), "ok")
         else:
-            reason = (resp or {}).get("reason") or "?"
+            reason = (resp or {}).get("reason") or ("timeout" if resp is None else "?")
+            log.warning("head-turn calibration failed: reason=%r", reason)   # W-19: the code, here only
             key = {"turn-too-small": "enroll.calib.too_small",
                    "no-face": "enroll.calib.no_face"}.get(reason, "enroll.calib.failed")
-            self._set_line(t(key, reason=reason), "warn")
+            self._set_line(t(key), "warn")
         self._release_and_check()
 
     # ---- end state (F-180) ----
     def _release_and_check(self) -> None:
-        # 9d (A-4): the camera closes and the lease goes back with it, then the readiness check
+        # 9d (A-4): the camera closes and its lease share goes back with it, then the readiness check
         threading.Thread(target=release_and_check_worker,
                          args=(self.q, self.session, self.cam_thread, self.lease),
                          name="enroll-ready", daemon=True).start()
         self._refresh_buttons()
 
     def _check_ready(self) -> None:
-        threading.Thread(target=readiness_worker, args=(self.q, not self.lease.held),
-                         daemon=True).start()
+        # 9d-r2 (W-18): the camera counts as handed back only when its thread has ended and no
+        # lease share is held (reading them is no pipe call)
+        released = (self.cam_thread is None or not self.cam_thread.is_alive()) and not self.lease.held
+        threading.Thread(target=readiness_worker, args=(self.q, released), daemon=True).start()
 
     def _show_ready_panel(self) -> None:
-        if not self.ready_frm.winfo_ismapped():
-            self.ready_frm.pack(fill="x", pady=(8, 0))
+        if not self.ready_frm.winfo_manager():
+            self._grid_ready()
+            self._relayout()
 
     def _show_ready(self, checks: dict, pwd: str, rejected: bool) -> None:
         self._show_ready_panel()
@@ -1219,6 +1501,7 @@ class EnrollWindow:
         if all(checks.values()):
             self._set_line(t("enroll.ready.all_ok"), "ok")
         self._refresh_buttons()
+        self._relayout()
 
     def _on_set_password(self) -> None:
         import subprocess
