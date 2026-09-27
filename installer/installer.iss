@@ -1017,9 +1017,11 @@ begin
     Exec(ExpandConstant('{sys}\regsvr32.exe'), '/u /s "' + Dll + '"', '', SW_HIDE,
          ewWaitUntilTerminated, ResultCode);
     Log('ACL check failed: regsvr32 /u exit ' + IntToStr(ResultCode));
+    // 9d-r2 (W-30): CPClsid is written "{{...}" for the SECTIONS, where "{{" is an escaped
+    // brace; in [Code] a string is taken as it is, so the key name needs the single brace.
     RegDeleteKeyIncludingSubkeys(HKLM64,
-      'SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{#CPClsid}');
-    RegDeleteKeyIncludingSubkeys(HKLM64, 'SOFTWARE\Classes\CLSID\{#CPClsid}');
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{#StringChange(CPClsid, "{{", "{")}');
+    RegDeleteKeyIncludingSubkeys(HKLM64, 'SOFTWARE\Classes\CLSID\{#StringChange(CPClsid, "{{", "{")}');
     Fail(22, CustomMessage('AclFailed'));
     exit;
   end;

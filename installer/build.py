@@ -242,8 +242,9 @@ def step_preflight(variant: str, need_cp: bool) -> dict:
                          "--require-hashes --no-deps -r requirements-gpu.lock")
     has_nvidia = importlib.util.find_spec("nvidia") is not None
     if variant == "gpu" and not has_nvidia:
-        raise BuildAbort("the GPU variant needs the NVIDIA wheels: pip install --require-hashes -r "
-                         "requirements-gpu.lock (F-219: never a CPU bundle under a GPU name)")
+        raise BuildAbort("the GPU variant needs the NVIDIA wheels: pip install --require-hashes "
+                         "--no-deps -r requirements-gpu.lock (F-219: never a CPU bundle under a GPU "
+                         "name)")
     if not (REPO_ROOT / "LICENSE").is_file():
         raise BuildAbort("LICENSE is missing -- the MIT notice must ship (D-114)")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -507,6 +508,44 @@ def gate_frozen_custody(dist_root: Path) -> dict:
     return summary
 
 
+def engine_verdict(variant: str, data: dict) -> "list[str]":
+    """The engine gate's criteria over the self-check's JSON (pure). 9d-r2 (W-34): judged by the
+    ACTUAL runs -- each of the four models run on its own on a zero input, the provider of every
+    executed node taken from ONNX Runtime's profile: GPU -- CUDA ran nodes in all four; CPU --
+    the CPU and nothing else ran."""
+    bad = []
+    sessions = data.get("sessions") or {}
+    runs = data.get("session_runs") or {}
+    if data.get("rc") != 0:
+        bad.append(f"rc={data.get('rc')} errors={data.get('errors')}")
+    if data.get("frozen") is not True:
+        bad.append("the self-check did not run frozen")
+    if data.get("variant") != variant:
+        bad.append(f"the bundle's onnxruntime is {data.get('onnxruntime_dist')}, not the {variant} package")
+    if len(sessions) != 4:
+        bad.append(f"expected 4 sessions, got {sorted(sessions)}")
+    if len(runs) != 4:
+        bad.append(f"expected 4 session runs, got {sorted(runs)}")
+    if variant == "cpu" and any(p != ["CPUExecutionProvider"] for p in sessions.values()):
+        bad.append(f"CPU variant: a session is not CPU-only: {sessions}")
+    if variant == "cpu" and any(r.get("session_providers") != ["CPUExecutionProvider"]
+                                or set(r.get("node_providers") or {}) != {"CPUExecutionProvider"}
+                                for r in runs.values()):
+        bad.append(f"CPU variant: a run was not CPU-only: "
+                   f"{ {k: r.get('node_providers') for k, r in runs.items()} }")
+    if variant == "cpu" and data.get("provider_load_errors"):
+        bad.append(f"CPU variant: provider load messages {data.get('provider_load_errors')[:3]}")
+    if variant == "gpu" and any(not p or p[0] != "CUDAExecutionProvider" for p in sessions.values()):
+        bad.append(f"GPU variant: CUDA is not active in every session: {sessions} "
+                   f"(load errors: {(data.get('provider_load_errors') or [])[:3]})")
+    if variant == "gpu" and any(r.get("session_providers", [None])[:1] != ["CUDAExecutionProvider"]
+                                or not (r.get("node_providers") or {}).get("CUDAExecutionProvider")
+                                for r in runs.values()):
+        bad.append(f"GPU variant: CUDA did not run in every session: "
+                   f"{ {k: r.get('node_providers') for k, r in runs.items()} }")
+    return bad
+
+
 def gate_engine(variant: str, dist_root: Path) -> dict:
     """9d (V-61): the FROZEN engine on the variant's providers -- face_service.exe
     --selfcheck-engine on a model pack given in FU_GATE_MODELS (read only, never copied). CPU: only
@@ -533,26 +572,17 @@ def gate_engine(variant: str, dist_root: Path) -> dict:
     sessions = data.get("sessions") or {}
     log(f"gate: frozen engine rc={proc.returncode} variant={data.get('variant')} "
         f"sessions={sessions} init={data.get('init_ms')} ms median={data.get('run_ms_median')} ms")
-    bad = []
-    if proc.returncode != 0 or data.get("rc") != 0:
-        bad.append(f"rc={proc.returncode}/{data.get('rc')} errors={data.get('errors')}")
-    if data.get("frozen") is not True:
-        bad.append("the self-check did not run frozen")
-    if data.get("variant") != variant:
-        bad.append(f"the bundle's onnxruntime is {data.get('onnxruntime_dist')}, not the {variant} package")
-    if len(sessions) != 4:
-        bad.append(f"expected 4 sessions, got {sorted(sessions)}")
-    if variant == "cpu" and any(p != ["CPUExecutionProvider"] for p in sessions.values()):
-        bad.append(f"CPU variant: a session is not CPU-only: {sessions}")
-    if variant == "cpu" and data.get("provider_load_errors"):
-        bad.append(f"CPU variant: provider load messages {data.get('provider_load_errors')[:3]}")
-    if variant == "gpu" and any(not p or p[0] != "CUDAExecutionProvider" for p in sessions.values()):
-        bad.append(f"GPU variant: CUDA is not active in every session: {sessions} "
-                   f"(load errors: {data.get('provider_load_errors')[:3]})")
+    for task, r in (data.get("session_runs") or {}).items():
+        log(f"gate:   run {task}: {r.get('session_providers')} nodes={r.get('node_providers')} "
+            f"{r.get('run_ms')} ms input={r.get('input_shapes')}")
+    bad = engine_verdict(variant, data)
+    if proc.returncode != 0:
+        bad.insert(0, f"exit code {proc.returncode}")
     if bad:
         raise BuildAbort("GATE FAILED: frozen engine self-check -> " + "; ".join(bad))
     keep = ("variant", "onnxruntime_dist", "providers_requested", "available_providers", "sessions",
-            "init_ms", "run_ms", "run_ms_median", "errors", "provider_load_errors", "pack_problems")
+            "session_runs", "init_ms", "run_ms", "run_ms_median", "errors", "provider_load_errors",
+            "pack_problems", "downloads_forbidden")
     return {"state": "passed", **{k: data.get(k) for k in keep}}
 
 

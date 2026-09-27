@@ -108,7 +108,7 @@ def test_taskreg():
             fake = FakeSched(existing=[("FaceUnlock-Other", "Somebody", r"C:\Other\x.exe"),
                                        ("FaceUnlock-Legacy", "", str(Path(td, "face_service.exe")))])
             ok_sid = lambda sid: ("alice", "PC1")
-            here = lambda n, d: True             # the owner is signed in (V-71 below covers not)
+            here = lambda sid: True              # the owner is signed in (V-71 below covers not)
             rc = T.register(td, "S-1-5-21-11-22-33-1001", sched=fake, resolve=ok_sid, logged_on=here)
             check("register: 0 after verification", rc == 0, fake.calls)
             check("register: all three registered, then started",
@@ -132,8 +132,19 @@ def test_taskreg():
             def _no_run(name):
                 raise RuntimeError("0x80070520: a specified logon session does not exist")
             f5.run = _no_run
+            import logging as _lg
+            recs = []
+
+            class _H(_lg.Handler):
+                def emit(self, r):
+                    recs.append(r.getMessage())
+            _h = _H()
+            T.log.addHandler(_h)
+            T.log.setLevel(_lg.INFO)
             rc5 = T.register(td, "S-1-5-21-11-22-33-1001", sched=f5, resolve=ok_sid,
-                             logged_on=lambda n, d: False)
+                             logged_on=lambda sid: False)
+            check("W-37: the V-71 log line names the OWNER (PC1\\alice), not a task (no shadowing)",
+                  any("the owner PC1\\alice is not signed in" in m for m in recs), recs[-6:])
             check("V-71: owner without a session -> tasks registered, not started, Ready accepted, 0",
                   rc5 == 0 and [c[0] for c in f5.calls].count("register") == len(T.TASKS)
                   and all(f5.state(t.name) == T.TASK_STATE_READY for t in T.TASKS), (rc5, f5.calls))
@@ -141,7 +152,72 @@ def test_taskreg():
             f6.run = _no_run
             check("V-71: owner signed in and a start fails -> still 1",
                   T.register(td, "S-1-5-21-11-22-33-1001", sched=f6, resolve=ok_sid,
-                             logged_on=lambda n, d: True) == 1)
+                             logged_on=lambda sid: True) == 1)
+            # W-37: presence unknown -> the start is tried; a failure is logged and tolerated
+            f7 = FakeSched()
+            f7.run = _no_run
+            del recs[:]
+            rc7 = T.register(td, "S-1-5-21-11-22-33-1001", sched=f7, resolve=ok_sid,
+                             logged_on=lambda sid: None)
+            check("W-37: presence unknown and the start fails -> tried, logged, tolerated: 0",
+                  rc7 == 0 and any("presence unknown -- tolerated" in m for m in recs), (rc7, recs[-4:]))
+            f8 = FakeSched()
+            rc8 = T.register(td, "S-1-5-21-11-22-33-1001", sched=f8, resolve=ok_sid,
+                             logged_on=lambda sid: None)
+            check("W-37: presence unknown and the start works -> started, 0",
+                  rc8 == 0 and [c for c in f8.calls if c[0] == "run"] == [("run", t.name) for t in T.TASKS])
+            T.log.removeHandler(_h)
+            seen = {}
+
+            class _Wts:
+                WTS_CURRENT_SERVER_HANDLE, WTSActive, WTSDisconnected, WTSUserName, WTSDomainName = 0, 0, 4, 5, 7
+                sessions = [{"SessionId": 0, "State": 6}, {"SessionId": 2, "State": 0}]
+                users = {2: ("Alice", "PC1")}
+
+                def WTSEnumerateSessions(self, h):
+                    return self.sessions
+
+                def WTSQuerySessionInformation(self, h, sid, what):
+                    u, d = self.users.get(sid, ("", ""))
+                    return u if what == self.WTSUserName else d
+
+            class _Sec:
+                accounts = {"PC1\\Alice": "S-1-5-21-11-22-33-1001"}
+
+                def ConvertStringSidToSid(self, s):
+                    return s
+
+                def LookupAccountName(self, sysname, acct):
+                    seen["acct"] = acct
+                    if acct not in self.accounts:
+                        raise RuntimeError("1332: no mapping")
+                    return self.accounts[acct], "PC1", 1
+
+                def EqualSid(self, a, b):
+                    return a == b
+            w, sx = _Wts(), _Sec()
+            check("W-37: the owner found by SID (session user -> LookupAccountName -> EqualSid)",
+                  T._owner_logged_on("S-1-5-21-11-22-33-1001", _wts=w, _sec=sx) is True
+                  and seen.get("acct") == "PC1\\Alice")
+            check("W-37: another signed-in user -> not present",
+                  T._owner_logged_on("S-1-5-21-11-22-33-1002", _wts=w, _sec=sx) is False)
+            w.users = {2: ("Bob", "PC1")}
+            check("W-37: a session user that does not resolve and no match -> unknown (None)",
+                  T._owner_logged_on("S-1-5-21-11-22-33-1001", _wts=w, _sec=sx) is None)
+
+            class _WtsBroken(_Wts):
+                def WTSEnumerateSessions(self, h):
+                    raise OSError("RPC server unavailable")
+            check("W-37: sessions cannot be listed -> unknown (None), never an exception",
+                  T._owner_logged_on("S-1-5-21-11-22-33-1001", _wts=_WtsBroken(), _sec=sx) is None)
+            # the real pywin32 path (it has no win32security.EqualSid: PySID == is EqualSid)
+            from face_service import identity as _I
+            if os.environ.get("CI"):
+                print("  SKIP  W-37 live: no signed-in owner session on a CI runner")
+            else:
+                check("W-37 live: this signed-in user is present by SID; a made-up SID is not",
+                      T._owner_logged_on(_I.current_user_sid()) is True
+                      and T._owner_logged_on("S-1-5-21-1-2-3-1001") is False)
             f4 = FakeSched(existing=[(t.name, "WindowsFaceUnlock", str(Path(td, t.exe))) for t in T.TASKS])
             check("unregister removes ours and counts survivors", T.unregister(td, sched=f4) == 0
                   and not f4.reg)
@@ -185,9 +261,11 @@ def test_iss():
           and "if not WizardSilent() then\n    MsgBox(Msg" in code)
     reg = code.split("procedure RegisterProvider", 1)[1].split("\nend;", 1)[0]
     acl = reg.split("if not AclOk then", 1)[1].split("exit;", 1)[0]
+    check("W-36: the GPU hint for the NVIDIA wheels installs with --no-deps",
+          "--no-deps -r requirements-gpu.lock (F-219" in read("installer/build.py").replace('"\n                         "', ""))
     check("V-63: an ACL failure unregisters the old provider (regsvr32 /u + keys) BEFORE code 22",
           acl.find("/u /s") < acl.find("RegDeleteKeyIncludingSubkeys") < acl.find("Fail(22")
-          and "Credential Providers\\{#CPClsid}" in acl and "CLSID\\{#CPClsid}" in acl)
+          and acl.count("RegDeleteKeyIncludingSubkeys") == 2)
     step = code.split("procedure CurStepChanged", 1)[1].split("if CurStep = ssPostInstall", 1)[0]
     check("V-64: {app} is checked against the fixed folder at ssInstall (covers /LOADINF Dir=)",
           "CurStep = ssInstall" in step and "ExpandConstant('{app}')" in step and "ExpectedAppDir()" in step
@@ -236,6 +314,71 @@ def test_iss():
     used = set(re.findall(r"\{cm:(\w+)\}", s)) | set(re.findall(r"CustomMessage\('(\w+)'\)", s))
     check("every message used exists in EN and RU", used <= keys(en) and keys(en) == keys(ru), used - keys(en))
     check("the InsightFace terms are quoted on the page", "non-commercial research purposes only" in en)
+    # 9d-r2 (W-35): one wording everywhere -- the README of the PINNED insightface 1.0.1 on PyPI
+    models_q = "The pretrained models we provided with this library are available for non-commercial research purposes only, including both auto-downloading models and manual-downloading models."
+    link = "https://pypi.org/project/insightface/1.0.1/"
+    notices = read("THIRD_PARTY_NOTICES.md")
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_notices", REPO / "installer" / "notices.py")
+    _N = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_N)
+    check("W-35: THIRD_PARTY_NOTICES, notices.py and en.isl quote the 1.0.1 README with its PyPI link",
+          all(models_q in x and link in x for x in (notices, _N.INSIGHTFACE_TEXT, en)))
+    check("W-35: ru.isl carries a translation marked as such, the original and the link",
+          "(перевод)" in ru and models_q in ru and link in ru)
+    check("W-35: the requirements pin insightface 1.0.1 (the quoted README's version)",
+          "insightface==1.0.1" in read("requirements.lock") and "insightface==1.0.1" in read("requirements-gpu.lock"))
+    check("W-35: the ONNX Runtime row names the CPU package and licenses\\onnxruntime\\",
+          "package `onnxruntime`" in notices and "licenses\\onnxruntime\\` (CPU variant)" in notices)
+
+
+CP_CLSID = "{8414D7B6-D536-461B-B31B-ADF77B3A8974}"
+
+
+def test_iss_preprocessed():
+    """9d-r2 (W-30): the key names the fallback deletes, as ISPP hands them to the compiler --
+    read from the PREPROCESSED script (ISPP SaveToFile), not grepped from the source."""
+    print("[2b] installer.iss after the preprocessor (W-30)")
+    import shutil
+    import subprocess
+    sys.path.insert(0, str(REPO / "installer"))
+    import build as B
+    try:
+        iscc = B.find_iscc()
+    except Exception as e:
+        print(f"  SKIP  ISCC not found ({e}) -- the preprocessed check needs Inno Setup")
+        return
+    work = Path(tempfile.mkdtemp(prefix="fu_ispp_"))
+    try:
+        shutil.copytree(REPO / "installer", work / "installer",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.exe"))
+        iss = work / "installer" / "installer.iss"
+        pp = work / "installer" / "installer.pp.iss"
+        src = iss.read_text(encoding="utf-8")
+        # forward slashes: ISPP string literals take a backslash as it is or as an escape
+        # depending on its parser options -- a path with "/" means the same either way
+        iss.write_text(src + '\n#expr SaveToFile("' + pp.as_posix() + '")\n', encoding="utf-8")
+        r = subprocess.run([iscc, "/O-", "/Q", *B.iscc_defines("cpu"), str(iss)],
+                           capture_output=True, text=True, timeout=300)
+        check("W-30: ISPP wrote the preprocessed script", pp.is_file(),
+              (r.returncode, (r.stdout + r.stderr)[-600:]))
+        if not pp.is_file():
+            return
+        out = pp.read_text(encoding="utf-8-sig", errors="replace")
+        code = out.split("[Code]", 1)[1]
+        reg = code.split("procedure RegisterProvider", 1)[1].split("\nend;", 1)[0]
+        keys = re.findall(r"RegDeleteKeyIncludingSubkeys\(HKLM64,\s*'([^']*)'\)", reg)
+        want = [r"SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers" + "\\" + CP_CLSID,
+                r"SOFTWARE\Classes\CLSID" + "\\" + CP_CLSID]
+        check("W-30: the fallback deletes exactly the provider's two keys, single braces",
+              keys == want, keys)
+        check("W-30: no '{{' reaches a [Code] string", "{{" not in code.split("procedure RegisterProvider", 1)[1]
+              .split("\nend;", 1)[0])
+        sect = out.split("[Code]", 1)[0]
+        check("W-30: the [Registry] entries keep the escaped '{{' (a constant brace in a section)",
+              sect.count("{{" + CP_CLSID[1:]) == 2, sect.count("{{" + CP_CLSID[1:]))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def pe_with_cert(body: bytes) -> "tuple[bytes, bytes]":
@@ -320,6 +463,14 @@ def test_locks_ci():
         check(f"{rel}: every pin hashed", pins and all("--hash=sha256:" in b for b in blocks if "==" in b), len(pins))
     check("the GPU lock adds the NVIDIA wheels", "nvidia-cudnn-cu12==" in read("requirements-gpu.lock")
           and "nvidia-" not in read("requirements.lock"))
+    # 9d-r2 (W-38): charset-normalizer 3.4.8 was yanked on PyPI; both locks pin 3.5.1 (the newest
+    # release requests' charset_normalizer<4 allows), with every file hash PyPI publishes for it
+    for rel in ("requirements.lock", "requirements-gpu.lock"):
+        block = read(rel).split("charset-normalizer==", 1)[1].split("\n", 1)
+        n_hashes = block[1].split("\n" + next(ln for ln in block[1].splitlines()
+                                             if ln and not ln.startswith(" ")) + "\n", 1)[0].count("--hash=")
+        check(f"W-38: {rel} pins charset-normalizer 3.5.1 (not the yanked 3.4.8), {n_hashes} hashes",
+              block[0].startswith("3.5.1 ") and "charset-normalizer==3.4.8" not in read(rel) and n_hashes == 172)
     y = read(".github/workflows/release.yml")
     top = y.split("jobs:", 1)[0]
     check("workflow token read-only by default", "permissions:\n  contents: read" in top)
@@ -339,7 +490,15 @@ def test_locks_ci():
           y.count("--no-deps -r $lock") == 2 and y.count("tools.lock_check") == 3)
     ps = read("setup.ps1")
     check("V-60: setup.ps1 -Gpu installs with --no-deps and checks with lock_check",
-          "--no-deps -r $lock" in ps and "tools.lock_check" in ps)
+          "--no-deps -r $lock" in ps and "lock_check" in ps)
+    check("W-31: setup.ps1 runs lock_check by its absolute path (any current directory)",
+          '& $py "$root\\tools\\lock_check.py" --lock $lock' in ps and "-m tools.lock_check" not in ps)
+    import subprocess as _sp
+    with tempfile.TemporaryDirectory() as _td:
+        _r = _sp.run([sys.executable, str(REPO / "tools" / "lock_check.py"), "--help"], cwd=_td,
+                     capture_output=True, text=True, timeout=60)
+    check("W-31: tools/lock_check.py runs as a script from another directory", _r.returncode == 0
+          and "--lock" in _r.stdout, (_r.returncode, _r.stderr[-300:]))
     # 9d (V-72): signing only with every Azure variable, never an unsigned "signed" artefact, and
     # publish takes signed + Valid installers only
     sign = jobs.split("\n  sign:", 1)[1].split("\n  publish:", 1)[0]
@@ -463,6 +622,7 @@ def test_notices_and_docs():
 def main() -> int:
     test_taskreg()
     test_iss()
+    test_iss_preprocessed()
     test_build()
     test_locks_ci()
     test_misc()

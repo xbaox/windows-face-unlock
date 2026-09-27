@@ -43,7 +43,8 @@ if ($Gpu) {
     $lock = "$root\requirements.lock"
     Invoke-Checked 'installing the dependencies (CPU)' { & $py -m pip install --require-hashes -r $lock }
 }
-Invoke-Checked 'checking the install is complete' { & $py -m tools.lock_check --lock $lock }
+# 9d-r2 (W-31): by its path -- setup.ps1 may be started from any directory
+Invoke-Checked 'checking the install is complete' { & $py "$root\tools\lock_check.py" --lock $lock }
 
 # 2. The data directory only; no config file is seeded -- the service runs on its built-in defaults.
 $home_cfg = Join-Path $env:USERPROFILE ".face-unlock"

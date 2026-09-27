@@ -9,11 +9,15 @@ checks that the lock is complete -- this does:
     distribution, is satisfied by an installed distribution (name and version specifier).
     The one substitution allowed: ``onnxruntime`` is covered by ``onnxruntime-gpu``;
   * with ``--lock FILE``: every ``name==version`` pinned in FILE is installed at exactly that
-    version.
+    version, and (9d-r2, W-32) nothing ELSE is installed -- except pip and the build tools of
+    installer/requirements-build.txt;
+  * (9d-r2, W-32) ``onnxruntime`` and ``onnxruntime-gpu`` are never installed together: they
+    share the ``onnxruntime`` import package, and whichever was installed last wins silently.
 
-Run after either install (the CPU lock is installed normally, with dependencies):
-    python -m tools.lock_check --lock requirements.lock
-    python -m tools.lock_check --lock requirements-gpu.lock
+Run after either install (the CPU lock is installed normally, with dependencies), from any
+directory (9d-r2, W-31: setup.ps1 runs it by its path):
+    python tools/lock_check.py --lock requirements.lock
+    python tools/lock_check.py --lock requirements-gpu.lock
 Exit 0 = complete; 1 = something is missing or mismatched (listed).
 """
 from __future__ import annotations
@@ -30,6 +34,9 @@ from packaging.utils import canonicalize_name
 
 # requirement name -> installed distributions that satisfy it as well
 COVERED_BY = {"onnxruntime": ("onnxruntime-gpu",)}
+# 9d-r2 (W-32): installed next to a lock without being in it -- pip, and the build tools
+ALWAYS_ALLOWED = ("pip",)
+BUILD_REQUIREMENTS = Path(__file__).resolve().parents[1] / "installer" / "requirements-build.txt"
 
 
 def installed() -> "dict[str, str]":
@@ -90,13 +97,35 @@ def lock_mismatches(lock: Path, have: "dict[str, str] | None" = None) -> "list[s
     return out
 
 
+def both_runtimes(have: "dict[str, str] | None" = None) -> "list[str]":
+    """9d-r2 (W-32): onnxruntime and onnxruntime-gpu installed together."""
+    have = installed() if have is None else have
+    if have.get("onnxruntime") is not None and have.get("onnxruntime-gpu") is not None:
+        return [f"onnxruntime {have['onnxruntime']} and onnxruntime-gpu {have['onnxruntime-gpu']} "
+                "are both installed -- one variant per environment (act 9b A-6)"]
+    return []
+
+
+def not_in_lock(lock: Path, have: "dict[str, str] | None" = None,
+                allowed_files=(BUILD_REQUIREMENTS,)) -> "list[str]":
+    """9d-r2 (W-32): installed distributions that the lock does not pin (pip and the packages of
+    ``allowed_files`` excepted)."""
+    have = installed() if have is None else have
+    allowed = set(lock_pins(lock)) | {canonicalize_name(n) for n in ALWAYS_ALLOWED}
+    for f in allowed_files:
+        if Path(f).is_file():
+            allowed |= set(lock_pins(Path(f)))
+    return [f"{name} {ver} is installed but not pinned in {lock.name}"
+            for name, ver in sorted(have.items()) if name not in allowed]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--lock", type=Path, default=None)
     a = ap.parse_args(argv)
-    problems = missing_requirements()
+    problems = missing_requirements() + both_runtimes()
     if a.lock is not None:
-        problems += lock_mismatches(a.lock)
+        problems += lock_mismatches(a.lock) + not_in_lock(a.lock)
     for p in problems:
         print("  MISSING  " + p)
     if problems:

@@ -268,24 +268,44 @@ def _stop_stack(sched, install_dir: str) -> int:
     return kill_and_wait(install_dir)
 
 
-def _owner_logged_on(name: str, domain: str) -> bool:
-    """9d (V-71): does the owner have a session on this PC right now (active or disconnected)?
-    An interactive-token task of a user who is not signed in cannot start -- it starts at their
-    next sign-in. True when it cannot be told (the stricter check then applies)."""
+def _owner_logged_on(user_sid: str, _wts=None, _sec=None) -> "bool | None":
+    """9d (V-71) / 9d-r2 (W-37): does the owner have a logon session on this PC right now? An
+    interactive-token task of a user who is not signed in cannot start -- it starts at their next
+    sign-in. Compared by SID, not by name: the user of every signed-in session (active or
+    disconnected) -> LookupAccountName -> EqualSid with the owner. True / False; None when it
+    cannot be told (the sessions cannot be listed, or a session's user cannot be resolved and
+    none matched)."""
     try:
-        import win32ts  # type: ignore
-        for s in win32ts.WTSEnumerateSessions(win32ts.WTS_CURRENT_SERVER_HANDLE):
-            sid = s["SessionId"]
-            u = win32ts.WTSQuerySessionInformation(win32ts.WTS_CURRENT_SERVER_HANDLE, sid,
-                                                   win32ts.WTSUserName)
-            d = win32ts.WTSQuerySessionInformation(win32ts.WTS_CURRENT_SERVER_HANDLE, sid,
-                                                   win32ts.WTSDomainName)
-            if u and u.lower() == (name or "").lower() and (d or "").lower() == (domain or "").lower():
+        wts = _wts
+        sec = _sec
+        if wts is None:
+            import win32ts as wts  # type: ignore
+        if sec is None:
+            import win32security as sec  # type: ignore
+        owner = sec.ConvertStringSidToSid(user_sid)
+        h = wts.WTS_CURRENT_SERVER_HANDLE
+        unresolved = 0
+        for s in wts.WTSEnumerateSessions(h):
+            if s.get("State") not in (wts.WTSActive, wts.WTSDisconnected):
+                continue
+            user = wts.WTSQuerySessionInformation(h, s["SessionId"], wts.WTSUserName)
+            if not user:
+                continue
+            dom = wts.WTSQuerySessionInformation(h, s["SessionId"], wts.WTSDomainName)
+            try:
+                sid, _d, _t = sec.LookupAccountName(None, f"{dom}\\{user}" if dom else user)
+            except Exception as e:
+                unresolved += 1
+                log.debug("session %s: %s\\%s does not resolve: %r", s.get("SessionId"), dom, user, e)
+                continue
+            # pywin32 has no win32security.EqualSid; PySID's == IS EqualSid (PySID compare)
+            equal = getattr(sec, "EqualSid", None)
+            if (equal(sid, owner) if equal is not None else sid == owner):
                 return True
-        return False
+        return None if unresolved else False
     except Exception as e:
         log.debug("session check failed: %r", e)
-        return True
+        return None
 
 
 def _account_of(user_sid: str) -> "tuple[str, str]":
@@ -300,7 +320,9 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of,
 
     9d (V-71): an owner named with /OWNER= who is not signed in right now: the tasks are
     registered but cannot start (interactive token) -- they start at that user's next sign-in.
-    Then a failed start is not a failure and "Ready" verifies; exit 0."""
+    Then a failed start is not a failure and "Ready" verifies; exit 0.
+    9d-r2 (W-37): presence is decided by SID; when it cannot be told, the tasks are started
+    anyway and a failed start is logged and tolerated (exit 0 when "Ready" verifies)."""
     install_dir = norm(install_dir)
     # ---- phase A: build and validate, touch nothing ----
     if not _SID_RE.match(user_sid or ""):
@@ -309,7 +331,7 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of,
     try:
         name, domain = resolve(user_sid)
         log.info("tasks run for %s\\%s (%s)", domain, name, user_sid)
-        present = logged_on(name, domain)
+        present = logged_on(user_sid)
     except Exception as e:
         log.error("the owner SID %s does not resolve to an account: %r", user_sid, e)
         return 1
@@ -332,28 +354,35 @@ def register(install_dir: str, user_sid: str, sched=None, resolve=_account_of,
             log.error("registering %s failed: %r", t.name, e)
             failed = True
     declared = {t.name for t in TASKS}
-    for name in ours(sched.tasks(), install_dir):
-        if name not in declared:
+    for task_name in ours(sched.tasks(), install_dir):      # W-37: never shadows the owner's name
+        if task_name not in declared:
             try:
-                sched.delete(name)
-                log.info("removed our orphan task %s", name)
+                sched.delete(task_name)
+                log.info("removed our orphan task %s", task_name)
             except Exception as e:
-                log.warning("removing orphan %s failed: %r", name, e)
+                log.warning("removing orphan %s failed: %r", task_name, e)
     left = _stop_stack(sched, install_dir)
     if left:
         log.warning("%d old process(es) survived the stop; the new ones may exit as duplicates", left)
-    if not present:
+    if present is False:
         log.info("the owner %s\\%s is not signed in: the tasks are registered and start at the "
                  "next sign-in (V-71)", domain, name)
+    elif present is None:
+        log.info("whether the owner %s\\%s is signed in cannot be told: starting the tasks anyway; "
+                 "a failed start is tolerated (W-37)", domain, name)
     for t, _xml in plan:
-        if not present:
+        if present is False:
             break
         try:
             sched.run(t.name)
             log.info("started %s", t.name)
         except Exception as e:
-            log.error("starting %s failed: %r", t.name, e)
-            failed = True
+            if present is None:
+                log.warning("starting %s failed (owner presence unknown -- tolerated, it starts at "
+                            "the next sign-in): %r", t.name, e)
+            else:
+                log.error("starting %s failed: %r", t.name, e)
+                failed = True
     time.sleep(1.0)
     for t, _xml in plan:
         st = sched.state(t.name)

@@ -39,14 +39,13 @@ NVIDIA_PREFIX = "nvidia-"
 
 INSIGHTFACE_TEXT = """insightface (Python package) -- MIT License
 
-The insightface wheel carries no license file. Its README (github.com/deepinsight/insightface,
-python-package/README.md) states: "The library code is released under the MIT License, for
-academic and commercial use." Copyright (c) the InsightFace authors (deepinsight/insightface).
+The insightface wheel carries no license file. The README of insightface 1.0.1 (the pinned version,
+as published on PyPI: https://pypi.org/project/insightface/1.0.1/) states: "The code of InsightFace Python Library is released under the MIT License. There is no limitation for both academic and commercial usage."
+Copyright (c) the InsightFace authors (deepinsight/insightface).
 
-The PRETRAINED MODELS are NOT covered by this: "The pretrained models provided with this library are
-for non-commercial research only, whether downloaded automatically or manually." Windows Face Unlock
-does not redistribute them; Setup downloads the official buffalo_l.zip only after you accept those
-terms (see THIRD_PARTY_NOTICES.md).
+The PRETRAINED MODELS are NOT covered by this: "The pretrained models we provided with this library are available for non-commercial research purposes only, including both auto-downloading models and manual-downloading models."
+Windows Face Unlock does not redistribute them; Setup downloads the official buffalo_l.zip only
+after you accept those terms (see THIRD_PARTY_NOTICES.md).
 
 MIT License
 

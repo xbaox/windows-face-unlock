@@ -12,12 +12,12 @@ The MIT license of this project does **not** apply to any component listed here.
 
 The InsightFace **buffalo_l** models (`det_10g`, `w600k_r50`, `2d106det`, `1k3d68`,
 `genderage`) are **not part of this program and are not redistributed by it**. The terms, verbatim
-from the "License" section of the insightface library's README
-(<https://github.com/deepinsight/insightface/blob/master/python-package/README.md#license>):
+from the "License" section of the README of **insightface 1.0.1** -- the version this program pins
+-- as published with that release on PyPI (<https://pypi.org/project/insightface/1.0.1/>):
 
-> The library code is released under the **MIT License**, for academic and
-> commercial use. **The pretrained models provided with this library are for
-> non-commercial research only**, whether downloaded automatically or manually.
+> The code of InsightFace Python Library is released under the MIT License. There is no limitation for both academic and commercial usage.
+>
+> **The pretrained models we provided with this library are available for non-commercial research purposes only, including both auto-downloading models and manual-downloading models.**
 
 Setup shows these terms, and only after you accept them
 downloads the official archive from InsightFace's own release
@@ -32,7 +32,7 @@ SHA-256. Whether your use is permitted by those terms is between you and Insight
 | Microsoft Visual C++ runtime (`vcruntime140*.dll`, `msvcp140*.dll`; static CRT in the lock-screen DLL) | Microsoft Visual Studio Distributable Code | Redistributed unmodified, only as part of this application |
 | PyInstaller bootloader and run-time hooks | GPL-2.0-or-later **with the Bootloader Exception**; hooks Apache-2.0 | The exception permits distributing the executables under our own terms; `licenses\pyinstaller\`, `licenses\pyinstaller-hooks-contrib\` |
 | Inno Setup (Setup and the uninstaller `unins000.exe`) | Inno Setup License | Copyright (C) 1997-2026 Jordan Russell, Martijn Laan; `licenses\inno-setup\` |
-| ONNX Runtime (`onnxruntime-gpu` package; in the CPU variant without the CUDA provider) | MIT | Its `ThirdPartyNotices.txt` (Eigen MPL-2.0, protobuf, and others) and `Privacy.md` ship in `licenses\onnxruntime-gpu\`. Face Unlock turns ORT's telemetry off. Eigen source: https://gitlab.com/libeigen/eigen |
+| ONNX Runtime -- CPU variant: package `onnxruntime`; GPU variant: package `onnxruntime-gpu` | MIT | Its `LICENSE`, `ThirdPartyNotices.txt` (Eigen MPL-2.0, protobuf, and others) and `Privacy.md` ship in `licenses\onnxruntime\` (CPU variant) or `licenses\onnxruntime-gpu\` (GPU variant). Face Unlock turns ORT's telemetry off. Eigen source: https://gitlab.com/libeigen/eigen |
 | ONNX | Apache-2.0 | with its NOTICE |
 | OpenCV (`opencv-python`) | Apache-2.0 (OpenCV), MIT (packaging) | `LICENSE-3RD-PARTY.txt` covers the libraries built into `cv2`. The FFmpeg video plugin is **not** shipped. |
 | YuNet face detector (`face_detection_yunet_2023mar.onnx`, OpenCV Zoo) | MIT | Copyright (c) 2020 Shiqi Yu; `licenses\yunet\` |

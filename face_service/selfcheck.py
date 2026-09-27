@@ -109,6 +109,115 @@ def _capture_native_stderr(path: str):
         return None
 
 
+def pack_layout_problems(pack) -> "list[str]":
+    """9d-r2 (W-33): FaceAnalysis looks for <root>\\models\\buffalo_l and DOWNLOADS the pack when
+    it is not there -- so a pack anywhere else is a pack problem, never a reason to fetch one."""
+    from pathlib import Path
+    from face_service.model_pins import PACK_NAME
+    pack = Path(pack)
+    out = []
+    if pack.name != PACK_NAME:
+        out.append(f"the pack folder must be named {PACK_NAME}")
+    if pack.parent.name.lower() != "models":
+        out.append(f"the pack must sit in a folder named models (...\\models\\{PACK_NAME}), "
+                   f"not in {pack.parent.name or pack.parent}")
+    return out
+
+
+def forbid_model_downloads() -> "list[str]":
+    """9d-r2 (W-33): the engine self-check never downloads: every insightface download entry point
+    is replaced by one that raises. Returns what was replaced."""
+    import importlib
+
+    def _refuse(*_a, **_k):
+        raise RuntimeError("a model download was attempted during the engine self-check -- "
+                           "refused (9d-r2, W-33)")
+    done = []
+    for mod, attr in (("insightface.utils.download", "download_file"),
+                      ("insightface.utils.storage", "download_file"),
+                      ("insightface.utils.storage", "download_onnx"),
+                      ("insightface.utils", "download_onnx"),
+                      ("insightface.model_zoo.model_zoo", "download_onnx")):
+        try:
+            m = importlib.import_module(mod)
+        except Exception:
+            continue
+        if hasattr(m, attr):
+            setattr(m, attr, _refuse)
+            done.append(f"{mod}.{attr}")
+    return done
+
+
+_ORT_NP_TYPES = {"tensor(float)": "float32", "tensor(float16)": "float16", "tensor(double)": "float64",
+                 "tensor(uint8)": "uint8", "tensor(int64)": "int64", "tensor(int32)": "int32"}
+
+
+def zero_feeds(inputs, spatial: "tuple[int, int]") -> "tuple[dict, dict]":
+    """9d-r2 (W-34): a zero input for every session input, in its own shape; a dynamic axis is 1
+    for the batch and ``spatial`` (height, width) for the image axes."""
+    import numpy as np
+    feeds, shapes = {}, {}
+    for i in inputs:
+        shape = []
+        for k, d in enumerate(i.shape):
+            if isinstance(d, int) and d > 0:
+                shape.append(d)
+            elif k == 0:
+                shape.append(1)
+            elif k == len(i.shape) - 2:
+                shape.append(int(spatial[0]))
+            elif k == len(i.shape) - 1:
+                shape.append(int(spatial[1]))
+            else:
+                shape.append(1)
+        feeds[i.name] = np.zeros(shape, dtype=_ORT_NP_TYPES.get(i.type, "float32"))
+        shapes[i.name] = shape
+    return feeds, shapes
+
+
+def run_session_profiled(ort, model_file: str, providers, spatial, tmpdir: str, task: str) -> dict:
+    """9d-r2 (W-34): run ONE model on a zero input of its own shape in a fresh session with ONNX
+    Runtime profiling, and report what really ran: the session's providers, the provider of
+    every executed node (from the profile), and the median of three timed runs."""
+    import os
+    import statistics
+    import time as _time
+    so = ort.SessionOptions()
+    so.enable_profiling = True
+    so.profile_file_prefix = os.path.join(tmpdir, f"prof_{task}")
+    sess = ort.InferenceSession(model_file, sess_options=so, providers=providers)
+    feeds, shapes = zero_feeds(sess.get_inputs(), spatial)
+    sess.run(None, feeds)                                  # warm-up (CUDA kernels, allocators)
+    times = []
+    for _ in range(3):
+        t0 = _time.perf_counter()
+        sess.run(None, feeds)
+        times.append((_time.perf_counter() - t0) * 1000.0)
+    prof = sess.end_profiling()
+    nodes: dict = {}
+    with open(prof, "r", encoding="utf-8") as f:
+        for ev in json.load(f):
+            if ev.get("cat") == "Node":
+                p = (ev.get("args") or {}).get("provider")
+                if p:
+                    nodes[p] = nodes.get(p, 0) + 1
+    return {"session_providers": list(sess.get_providers()), "input_shapes": shapes,
+            "run_ms": round(statistics.median(times), 2), "node_providers": nodes}
+
+
+def session_runs_ok(variant: str, runs: dict) -> bool:
+    """9d-r2 (W-34): GPU -- CUDA runs nodes in all four sessions; CPU -- the CPU and only the CPU."""
+    if len(runs) != 4:
+        return False
+    if variant == "gpu":
+        return all(r.get("session_providers", [None])[:1] == ["CUDAExecutionProvider"]
+                   and (r.get("node_providers") or {}).get("CUDAExecutionProvider", 0) > 0
+                   for r in runs.values())
+    return all(r.get("session_providers") == ["CPUExecutionProvider"]
+               and set(r.get("node_providers") or {}) == {"CPUExecutionProvider"}
+               for r in runs.values())
+
+
 def selfcheck_engine_main(argv) -> int:
     """argv: ["--selfcheck-engine", <models_dir>, "--out", <file>].
 
@@ -125,7 +234,7 @@ def selfcheck_engine_main(argv) -> int:
     except (ValueError, IndexError):
         return 2
     result: dict = {"frozen": bool(getattr(sys, "frozen", False)), "models_dir": models_dir,
-                    "errors": [], "sessions": {}, "provider_load_errors": []}
+                    "errors": [], "sessions": {}, "session_runs": {}, "provider_load_errors": []}
     rc = 1
     err_path = out + ".stderr.txt"
     cap = _capture_native_stderr(err_path)
@@ -137,9 +246,7 @@ def selfcheck_engine_main(argv) -> int:
         import numpy as np
         from face_service.model_pins import PACK_NAME, check_pack
         pack = Path(models_dir)
-        result["pack_problems"] = check_pack(pack, hashes=True)
-        if pack.name != PACK_NAME:
-            result["pack_problems"].append(f"the pack folder must be named {PACK_NAME}")
+        result["pack_problems"] = check_pack(pack, hashes=True) + pack_layout_problems(pack)
         from importlib import metadata
         variant = "unknown"
         for dist, v in (("onnxruntime-gpu", "gpu"), ("onnxruntime", "cpu")):
@@ -169,6 +276,7 @@ def selfcheck_engine_main(argv) -> int:
             providers, ctx_id = R._select_providers(ort)
             result["available_providers"] = list(ort.get_available_providers())
             result["providers_requested"] = providers
+            result["downloads_forbidden"] = forbid_model_downloads()      # W-33
             from insightface.app import FaceAnalysis
             t0 = _time.perf_counter()
             app = FaceAnalysis(name=PACK_NAME, allowed_modules=R.ALLOWED_MODULES,
@@ -189,13 +297,28 @@ def selfcheck_engine_main(argv) -> int:
                 runs.append((_time.perf_counter() - t1) * 1000.0)
             result["run_ms"] = [round(x, 1) for x in runs]
             result["run_ms_median"] = round(statistics.median(runs), 1)
+            # W-34: every one of the four models run on its own, on a zero input of its shape
+            import shutil
+            import tempfile
+            prof_dir = tempfile.mkdtemp(prefix="fu_engine_prof_")
+            try:
+                for task, model in getattr(app, "models", {}).items():
+                    size = getattr(model, "input_size", None) or (R.DET_SIZE, R.DET_SIZE)
+                    try:
+                        result["session_runs"][task] = run_session_profiled(
+                            ort, model.model_file, providers, (int(size[1]), int(size[0])), prof_dir, task)
+                    except Exception as e:
+                        result["errors"].append(f"{task} run: {e.__class__.__name__}: {e}")
+            finally:
+                shutil.rmtree(prof_dir, ignore_errors=True)
             want = "CUDAExecutionProvider" if variant == "gpu" else "CPUExecutionProvider"
             sessions = result["sessions"]
             all_on = bool(sessions) and all(p and p[0] == want for p in sessions.values())
             cpu_only = variant != "cpu" or all(p == ["CPUExecutionProvider"] for p in sessions.values())
+            runs_ok = session_runs_ok(variant, result["session_runs"])
             result["all_sessions_on"] = want
-            result["ok_sessions"] = all_on and cpu_only
-            rc = 0 if (all_on and cpu_only and not result["errors"]) else 1
+            result["ok_sessions"] = all_on and cpu_only and runs_ok
+            rc = 0 if (all_on and cpu_only and runs_ok and not result["errors"]) else 1
     except Exception as e:
         result["errors"].append(f"{e.__class__.__name__}: {e}")
         rc = 1
