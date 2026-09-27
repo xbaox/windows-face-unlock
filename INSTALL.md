@@ -84,12 +84,15 @@ Tray → **Set up face…**.
    wizard tells you why -- fix the light and try again.
 5. **Calibration**: turn your head to the left when asked. This teaches Face Unlock which way "left"
    is for your camera (some cameras show a mirrored picture).
-6. At the end the wizard checks that everything is ready: password saved and accepted, face profile
-   loaded by the service, data folder secured. Each problem has a button to fix it.
+6. At the end the wizard checks, in a panel beside the preview, that everything is ready: password
+   saved and accepted, face profile loaded by the service, data folder secured, camera handed back
+   to face sign-in. Each problem has a button to fix it; **Check again** runs the check again.
 
 To start over later, open the wizard again in **Replace** mode (the old profile is kept until the new
 one is complete), **Add** more photos to the current profile, or **Delete face profile**. The
-calibration can be repeated with **Calibrate head turn**.
+calibration can be repeated with **Calibrate head turn** -- turn the camera on first with **Turn the
+camera on again**. **Build face profile** works with the camera off too. If you switch the camera
+while it is on, the wizard waits until the previous one is released ("Switching the camera...").
 
 ## 4. Everyday use
 
