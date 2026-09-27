@@ -354,6 +354,9 @@ class GestureSequence:
       * the whole round ends by ROUND_CAP_S (``round-timeout``).
     ``reason`` names the failure; ``steps_done`` counts the steps passed. Deterministic with an
     injected clock.
+    9e-0 (X-03): ``stillness_telemetry()`` gives the still window's numbers for the audit (pose
+    count, median interval, largest frame-to-frame |d yaw| / |d pitch|, span, outcome, which rule
+    fired); recording them changes nothing in the round.
     """
 
     def __init__(self, kinds, *, clock=time.monotonic, left_sign: float | None = None):
@@ -375,6 +378,9 @@ class GestureSequence:
         self._still_t0: float | None = None
         self._still: list[tuple[float, float]] = []
         self.neutral: tuple[float, float] | None = None
+        # 9e-0 (X-03): telemetry only -- when each window pose came, and which rule failed it
+        self._still_ts: list[float] = []
+        self.still_rule: str | None = None
 
     @property
     def started(self) -> bool:
@@ -434,15 +440,19 @@ class GestureSequence:
         (max-min over the window) above STILLNESS_MAX_DEG, in yaw or in pitch. Never restarts."""
         if self._still_t0 is None:
             self._still_t0, self._still = now, [(pitch, yaw)]      # open the window, once
+            self._still_ts = [now]
             return False
         past = now - self._still_t0 > STILLNESS_WINDOW_S
         if not (past and len(self._still) >= 2):                   # a pose OF the window
             prev = self._still[-1]
             self._still.append((pitch, yaw))
+            self._still_ts.append(now)
             arr = np.asarray(self._still, dtype=np.float32)
             span = arr.max(axis=0) - arr.min(axis=0)
-            if (abs(yaw - prev[1]) > STILLNESS_MAX_DEG or abs(pitch - prev[0]) > STILLNESS_MAX_DEG
-                    or float(span[0]) > STILLNESS_MAX_DEG or float(span[1]) > STILLNESS_MAX_DEG):
+            jump = abs(yaw - prev[1]) > STILLNESS_MAX_DEG or abs(pitch - prev[0]) > STILLNESS_MAX_DEG
+            wide = float(span[0]) > STILLNESS_MAX_DEG or float(span[1]) > STILLNESS_MAX_DEG
+            if jump or wide:
+                self.still_rule = "frame" if jump else "span"      # X-03: telemetry only
                 self._fail("motion-before-prompt")
                 return False
             if not past:
@@ -451,6 +461,32 @@ class GestureSequence:
         self.neutral = (float(arr[:, 0].mean()), float(arr[:, 1].mean()))
         self._task = self._step_task(0)
         return True
+
+    def stillness_telemetry(self) -> dict:
+        """9e-0 (X-03): the still window in numbers, for the audit -- no frames, paths or names.
+
+        ``poses`` fed to the window; ``interval_ms_median`` between them; ``max_dyaw_deg`` /
+        ``max_dpitch_deg``, the largest frame-to-frame |d yaw| / |d pitch|; ``span_yaw_deg`` /
+        ``span_pitch_deg``, max-min over the window; ``outcome`` "closed" (the window completed),
+        "motion" (motion-before-prompt) or "open" (the round ended first); ``motion_rule`` "frame"
+        (a frame-to-frame jump -- it wins when both fire) or "span", else None. The poses of a
+        window that failed include the one that failed it; the pose that closed a window is the
+        first step's, not the window's. Read-only: the round's verdict does not depend on it."""
+        n = len(self._still)
+        outcome = ("closed" if self.neutral is not None
+                   else "motion" if self.reason == "motion-before-prompt" else "open")
+        out = {"poses": n, "interval_ms_median": None, "max_dyaw_deg": None, "max_dpitch_deg": None,
+               "span_yaw_deg": None, "span_pitch_deg": None, "outcome": outcome,
+               "motion_rule": self.still_rule}
+        if n >= 2:
+            arr = np.asarray(self._still, dtype=np.float64)
+            d = np.abs(np.diff(arr, axis=0))
+            span = arr.max(axis=0) - arr.min(axis=0)
+            out.update(interval_ms_median=round(float(np.median(np.diff(self._still_ts))) * 1000.0, 1),
+                       max_dyaw_deg=round(float(d[:, 1].max()), 2),
+                       max_dpitch_deg=round(float(d[:, 0].max()), 2),
+                       span_yaw_deg=round(float(span[1]), 2), span_pitch_deg=round(float(span[0]), 2))
+        return out
 
     def feed(self, landmark, pose) -> ChallengeState:
         if self.done:

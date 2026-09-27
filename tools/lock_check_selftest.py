@@ -6,6 +6,9 @@
   [1b] W-32: onnxruntime and onnxruntime-gpu installed together are refused; a package the lock
        does not pin is refused, pip and the build tools of installer/requirements-build.txt
        excepted.
+  [1c] X-02: every problem line is tagged honestly (MISSING / EXTRA / CONFLICT); setup.ps1 on an
+       existing .venv that fails lock_check says to delete .venv (to the Recycle Bin) and run it
+       again, with a non-zero exit code (a stub venv and a stub lock_check -- nothing downloaded).
   [2b] W-33: the self-check never downloads -- a pack outside ...\\models\\buffalo_l is a pack
        problem, and every insightface download entry point raises; W-34: each of the four models
        is run on a zero input of its own shape, and the gate judges the actual runs.
@@ -71,6 +74,92 @@ def test_r2_lock_check():
                         "sys.exit(L.main([]))"], capture_output=True, text=True, timeout=60)
     check("W-32: main() fails (rc 1) with both runtimes installed", r.returncode == 1
           and "both installed" in r.stdout, (r.returncode, r.stdout[-300:]))
+
+
+_STUB_LOCK_CHECK = '''import os, sys
+print("  EXTRA     requests 2.32.0 is installed but not pinned in requirements.lock")
+sys.exit(int(os.environ.get("X02_LOCK_RC", "1")))
+'''
+
+
+def _run_setup(root: Path, rc: int) -> "subprocess.CompletedProcess":
+    env = dict(_os.environ, X02_LOCK_RC=str(rc), USERPROFILE=str(root / "profile"))
+    return subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                           "-File", str(root / "setup.ps1"), "-PythonExe", _sys.executable, "-SkipAutostart"],
+                          cwd=str(root), env=env, capture_output=True, text=True, timeout=180)
+
+
+def test_x02():
+    print("[1c] X-02: honest MISSING / EXTRA / CONFLICT tags; setup.ps1 on an existing .venv that fails")
+    have = {"numpy": "2.4.3", "requests": "2.32.0", "onnxruntime": "1.26.0", "onnxruntime-gpu": "1.26.0",
+            "pip": "25.0"}
+    with tempfile.TemporaryDirectory() as td:
+        lock = Path(td) / "x.lock"
+        lock.write_text("numpy==2.4.4 \\\n    --hash=sha256:00\nscipy==1.18.0 \\\n    --hash=sha256:11\n"
+                        "onnxruntime==1.26.0 \\\n    --hash=sha256:22\nonnxruntime-gpu==1.26.0 \\\n"
+                        "    --hash=sha256:33\n", encoding="utf-8")
+        orig = L.missing_requirements
+        L.missing_requirements = lambda dists=None, have=None: []
+        try:
+            got = L.tagged_problems(lock, have)
+        finally:
+            L.missing_requirements = orig
+        tags = {text.split()[0]: tag for tag, text in got}
+        check("X-02: absent pin -> MISSING, other version -> CONFLICT, not pinned -> EXTRA",
+              tags.get("scipy==1.18.0") == "MISSING" and tags.get("numpy==2.4.4") == "CONFLICT"
+              and tags.get("requests") == "EXTRA", got)
+        check("X-02: onnxruntime with onnxruntime-gpu -> CONFLICT",
+              any(tag == "CONFLICT" and "both installed" in text for tag, text in got), got)
+        check("X-02: every line carries one of the three tags", got and all(t in L.TAGS for t, _ in got))
+    d = [_Dist("insightface", ["numpy>=3", "scipy"])]
+    orig = L.missing_requirements
+    L.missing_requirements = lambda dists=None, have=None: orig(d, have)
+    try:
+        got = L.tagged_problems(None, {"numpy": "2.4.4"})
+    finally:
+        L.missing_requirements = orig
+    check("X-02: an unmet requirement -> CONFLICT (installed, wrong version) / MISSING (absent)",
+          sorted(t for t, _ in got) == ["CONFLICT", "MISSING"]
+          and any(t == "MISSING" and "scipy" in x for t, x in got), got)
+    r = subprocess.run([_sys.executable, "-c",
+                        "import sys; sys.path.insert(0, r'" + str(REPO) + "');"
+                        "from tools import lock_check as L;"
+                        "L.tagged_problems = lambda lock=None, have=None: [('EXTRA', 'requests 2.32.0 x'),"
+                        " ('CONFLICT', 'numpy==2.4.4 y'), ('MISSING', 'scipy==1 z')];"
+                        "sys.exit(L.main([]))"], capture_output=True, text=True, timeout=60)
+    lines = r.stdout.splitlines()
+    check("X-02: main() prints each tag at the line start and counts them (rc 1)",
+          r.returncode == 1 and "  EXTRA     requests 2.32.0 x" in lines and "  CONFLICT  numpy==2.4.4 y" in lines
+          and "  MISSING   scipy==1 z" in lines and "1 MISSING, 1 EXTRA, 1 CONFLICT" in r.stdout,
+          (r.returncode, r.stdout[-400:]))
+
+    # setup.ps1 against an EXISTING .venv whose lock_check fails: a stub venv (no pip download --
+    # a stub `pip` module), a stub tools\lock_check.py, a temp USERPROFILE
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "setup.ps1").write_bytes((REPO / "setup.ps1").read_bytes())
+        (root / "requirements.lock").write_text("", encoding="utf-8")
+        (root / "tools").mkdir()
+        (root / "tools" / "lock_check.py").write_text(_STUB_LOCK_CHECK, encoding="utf-8")
+        (root / "profile").mkdir()
+        mk = subprocess.run([_sys.executable, "-m", "venv", "--without-pip", str(root / ".venv")],
+                            capture_output=True, text=True, timeout=180)
+        site = root / ".venv" / "Lib" / "site-packages" / "pip"
+        site.mkdir(parents=True, exist_ok=True)
+        (site / "__init__.py").write_text("", encoding="utf-8")
+        (site / "__main__.py").write_text("print('stub pip: nothing installed')\n", encoding="utf-8")
+        bad = _run_setup(root, 1)
+        out = bad.stdout + bad.stderr
+        check("X-02: setup.ps1, existing .venv failing lock_check -> non-zero exit code",
+              mk.returncode == 0 and bad.returncode != 0, (mk.returncode, bad.returncode, out[-600:]))
+        check("X-02: ... with the tagged line and the clear next step (delete .venv to the Recycle Bin, "
+              "run again)", "EXTRA" in out and "Delete the .venv folder (to the Recycle Bin)" in out
+              and "run setup.ps1" in out and "again" in out, out[-600:])
+        check("X-02: ... and setup.ps1 itself deletes nothing", (root / ".venv" / "Scripts" / "python.exe").is_file())
+        good = _run_setup(root, 0)
+        check("X-02: the same existing .venv passing lock_check -> exit 0",
+              good.returncode == 0 and "Delete the .venv" not in good.stdout,
+              (good.returncode, (good.stdout + good.stderr)[-400:]))
 
 
 def test_lock_check():
@@ -241,6 +330,7 @@ def test_r2_engine():
 def main() -> int:
     test_lock_check()
     test_r2_lock_check()
+    test_x02()
     test_engine_gate()
     test_r2_engine()
     print()

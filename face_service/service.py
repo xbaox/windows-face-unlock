@@ -1132,7 +1132,9 @@ class FaceService:
           {"ok": True, "challenge", "prompt", "passed", "state", "reason" (the sequence's failure
            or None), "identity_frames", "distance_best", "faces", "frames_ok", "engine_errors",
            "screen_flagged",
-           "screen_checked", "scene_luma", "fps", "_embedding" (best identity frame, never sent)}
+           "screen_checked", "scene_luma", "fps", "stillness" (9e-0 X-03: the still window's
+           numbers, GestureSequence.stillness_telemetry), "_embedding" (best identity frame,
+           never sent)}
         """
         from .liveness import Challenge, GestureSequence
         from .recognizer import EngineError
@@ -1266,6 +1268,7 @@ class FaceService:
             "screen_checked": screen_checked,
             "scene_luma": None if luma_max is None else round(luma_max, 2),
             "fps": fps,
+            "stillness": seq.stillness_telemetry(),
             "_embedding": best_emb,
         }
 
@@ -2014,12 +2017,14 @@ class FaceService:
         best = resp.get("distance_best")
         faces = int(resp.get("faces") or 0)
 
-        # R6 telemetry for every round that ran (numbers only, no image data)
+        # R6 telemetry for every round that ran (numbers only, no image data); 9e-0 (X-03): with
+        # the still window's numbers, to measure live pose noise in 9e -- it decides nothing
         self._audit.write("gesture_telemetry", {
             "faces": faces, "frames_ok": resp.get("frames_ok"), "fps": resp.get("fps"),
             "screen_flagged": resp.get("screen_flagged"),
             "screen_checked": resp.get("screen_checked"), "scene_luma": resp.get("scene_luma"),
-            "steps_done": resp.get("steps_done"), "sequence_reason": resp.get("reason")})
+            "steps_done": resp.get("steps_done"), "sequence_reason": resp.get("reason"),
+            "stillness": resp.get("stillness")})
 
         def _audit_round(reason, passed=None):
             self._audit_gesture(challenge=resp.get("challenge"), passed=passed,

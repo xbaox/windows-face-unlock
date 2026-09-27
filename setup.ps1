@@ -29,7 +29,10 @@ if ($LASTEXITCODE -or $ver -ne '3.12') {
 }
 
 # 1. venv
-if (-not (Test-Path "$root\.venv")) {
+# 9e-0 (X-02): an EXISTING .venv that does not match the lock is not repaired in place -- it is
+# reported (lock_check: MISSING / EXTRA / CONFLICT) and the setup stops with a clear next step.
+$venvExisted = Test-Path "$root\.venv"
+if (-not $venvExisted) {
     Invoke-Checked 'creating the venv' { & $PythonExe -m venv "$root\.venv" }
 }
 $py = "$root\.venv\Scripts\python.exe"
@@ -44,7 +47,18 @@ if ($Gpu) {
     Invoke-Checked 'installing the dependencies (CPU)' { & $py -m pip install --require-hashes -r $lock }
 }
 # 9d-r2 (W-31): by its path -- setup.ps1 may be started from any directory
-Invoke-Checked 'checking the install is complete' { & $py "$root\tools\lock_check.py" --lock $lock }
+if ($venvExisted) {
+    & $py "$root\tools\lock_check.py" --lock $lock
+    if ($LASTEXITCODE) {
+        Write-Host ""
+        Write-Host "The existing .venv does not match $(Split-Path -Leaf $lock) (see the MISSING / EXTRA /" -ForegroundColor Red
+        Write-Host "CONFLICT lines above). Delete the .venv folder (to the Recycle Bin) and run setup.ps1" -ForegroundColor Red
+        Write-Host "again -- it then creates a fresh .venv from the lock." -ForegroundColor Red
+        exit 1
+    }
+} else {
+    Invoke-Checked 'checking the install is complete' { & $py "$root\tools\lock_check.py" --lock $lock }
+}
 
 # 2. The data directory only; no config file is seeded -- the service runs on its built-in defaults.
 $home_cfg = Join-Path $env:USERPROFILE ".face-unlock"

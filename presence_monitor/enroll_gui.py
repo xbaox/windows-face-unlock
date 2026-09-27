@@ -393,8 +393,17 @@ def _open_capture(cfg: Config, camera_name: str):
     return None, "open-failed"
 
 
+def _live_threads(threads) -> "list[threading.Thread]":
+    """9e-0 (X-01): the camera threads of ``threads`` (one thread, a sequence, or None) still alive."""
+    if threads is None:
+        return []
+    if isinstance(threads, threading.Thread):
+        threads = [threads]
+    return [t for t in threads if t is not None and t.is_alive()]
+
+
 def camera_worker(s: Session, q: "queue.Queue", lease: "LeaseKeeper | None" = None,
-                  prev: "threading.Thread | None" = None) -> None:
+                  prev: "threading.Thread | list[threading.Thread] | None" = None) -> None:
     """Preview + capture + calibration shots. Every message ends with the session's ``gen``:
     ("camera_switching", gen), ("camera_opened", gen), ("camera_failed", reason, gen),
     ("frame", rgb, gen), ("first_frame", gen), ("coach", CoachState, gen), ("captured", n, gen),
@@ -405,14 +414,20 @@ def camera_worker(s: Session, q: "queue.Queue", lease: "LeaseKeeper | None" = No
     9d-r2: W-11 -- the worker does not start while the previous camera thread (``prev``) lives
     (it says "camera_switching" and waits), and it gives back only ITS OWN lease token;
     W-13 -- the lease is asked for only after the service has answered (``s.service_up``);
-    W-15 -- any exception in the session, the calibration shots included, is "camera_failed"."""
-    if prev is not None and prev.is_alive():
+    W-15 -- any exception in the session, the calibration shots included, is "camera_failed".
+    9e-0: X-01 -- ``prev`` is EVERY earlier camera thread still alive, not only the last one: after
+    two quick changes the middle worker ends at once (its session was stopped) while the first may
+    still hang in a native read() holding the device."""
+    alive = _live_threads(prev)
+    if alive:
         q.put(("camera_switching", s.gen))
-        log.info("enroll camera: waiting for the previous camera session to let the device go")
-        while prev.is_alive():
+        log.info("enroll camera: waiting for %d earlier camera session(s) to let the device go",
+                 len(alive))
+        while alive:
             if s.stop.is_set():
                 return
-            prev.join(0.25)
+            alive[0].join(0.25)
+            alive = _live_threads(alive)
     if s.service_up is not None:
         while not s.service_up.wait(0.25):
             if s.stop.is_set():
@@ -675,7 +690,8 @@ def readiness_worker(q: "queue.Queue", camera_released: bool) -> None:
 
 
 def release_and_check_worker(q: "queue.Queue", s: "Session | None",
-                             cam: "threading.Thread | None", lease: LeaseKeeper) -> None:
+                             cam: "threading.Thread | list[threading.Thread] | None",
+                             lease: LeaseKeeper) -> None:
     """9d (A-4): close the camera (the worker gives its lease share back with it), then run the
     readiness check. 9d-r2 (W-18): "camera handed back" only when the camera thread was seen to
     END (join confirmed) -- a thread still in a native read keeps its share, and the check says
@@ -684,27 +700,28 @@ def release_and_check_worker(q: "queue.Queue", s: "Session | None",
     if s is not None:
         s.stop.set()
         s.armed.clear()
-    joined = True
-    if cam is not None and cam.is_alive():
-        cam.join(timeout=CAMERA_JOIN_S)
-        joined = not cam.is_alive()
+    deadline = time.monotonic() + CAMERA_JOIN_S
+    for th in _live_threads(cam):                 # X-01: every camera thread, not only the last
+        th.join(timeout=max(0.0, deadline - time.monotonic()))
+    joined = not _live_threads(cam)
     if not joined:
         log.warning("enroll camera thread still holds the device after %.0fs", CAMERA_JOIN_S)
     q.put(("camera_closed", gen))
     readiness_worker(q, joined and not lease.held)
 
 
-def close_worker(q: "queue.Queue", s: "Session | None", cam: "threading.Thread | None",
-                 lease: LeaseKeeper) -> None:
+def close_worker(q: "queue.Queue", s: "Session | None",
+                 cam: "threading.Thread | list[threading.Thread] | None", lease: LeaseKeeper) -> None:
     """9d (V-42): Close -- stop the camera and give the lease back off the Tk thread, then let the
     Tk thread destroy the window."""
     if s is not None:
         s.stop.set()
         s.armed.clear()
-    if cam is not None and cam.is_alive():
-        cam.join(timeout=3.0)
-        if cam.is_alive():
-            log.warning("enroll camera thread did not exit within 3s")
+    deadline = time.monotonic() + 3.0
+    for th in _live_threads(cam):                 # X-01: every camera thread still alive
+        th.join(timeout=max(0.0, deadline - time.monotonic()))
+    if _live_threads(cam):
+        log.warning("enroll camera thread did not exit within 3s")
     lease.release_all()
     q.put(("closed",))
 
@@ -814,6 +831,7 @@ class EnrollWindow:
         self.cfg = Config.load()
         self.session: "Session | None" = None
         self.cam_thread: "threading.Thread | None" = None
+        self.cam_threads: "list[threading.Thread]" = []    # 9e-0 (X-01): every one still alive
         # 9d-r2 (W-12): the camera session whose frames may be drawn; None while the camera is off
         self.cam_gen: "int | None" = None
         self._gen = 0
@@ -1122,7 +1140,7 @@ class EnrollWindow:
         self.cam_combo.configure(values=values)
 
     def _start_camera(self) -> None:
-        prev = self.cam_thread
+        prev = _live_threads(self.cam_threads + [self.cam_thread])     # X-01: all, not the last
         if self.session is not None:
             self.session.stop.set()
         self.camera_ok = False
@@ -1131,10 +1149,12 @@ class EnrollWindow:
         self.session = Session(self.cfg, self.cfg.camera_name, gen=self._gen, service_up=self.service_up)
         self.session.preview_size = self.preview_size
         # 9d (A-4): the worker takes its lease share before it opens the camera; 9d-r2 (W-11): it
-        # starts only once the previous camera thread has ended
+        # starts only once the previous camera thread has ended; 9e-0 (X-01): EVERY earlier camera
+        # thread still alive -- the UI keeps "switching camera" meanwhile
         self.cam_thread = threading.Thread(target=camera_worker,
                                            args=(self.session, self.q, self.lease, prev),
                                            name="enroll-camera", daemon=True)
+        self.cam_threads = prev + [self.cam_thread]
         self.cam_thread.start()
         self._set_extra(None)
         self._refresh_buttons()
@@ -1474,14 +1494,18 @@ class EnrollWindow:
     def _release_and_check(self) -> None:
         # 9d (A-4): the camera closes and its lease share goes back with it, then the readiness check
         threading.Thread(target=release_and_check_worker,
-                         args=(self.q, self.session, self.cam_thread, self.lease),
+                         args=(self.q, self.session, self._camera_threads(), self.lease),
                          name="enroll-ready", daemon=True).start()
         self._refresh_buttons()
+
+    def _camera_threads(self) -> "list[threading.Thread]":
+        """9e-0 (X-01): every camera thread still alive (a hung one included)."""
+        return _live_threads(self.cam_threads + [self.cam_thread])
 
     def _check_ready(self) -> None:
         # 9d-r2 (W-18): the camera counts as handed back only when its thread has ended and no
         # lease share is held (reading them is no pipe call)
-        released = (self.cam_thread is None or not self.cam_thread.is_alive()) and not self.lease.held
+        released = not self._camera_threads() and not self.lease.held
         threading.Thread(target=readiness_worker, args=(self.q, released), daemon=True).start()
 
     def _show_ready_panel(self) -> None:
@@ -1564,7 +1588,7 @@ class EnrollWindow:
         except Exception:
             pass
         # 9d (V-42): the camera stop and the lease release run on a worker; "closed" comes back
-        threading.Thread(target=close_worker, args=(self.q, self.session, self.cam_thread, self.lease),
+        threading.Thread(target=close_worker, args=(self.q, self.session, self._camera_threads(), self.lease),
                          name="enroll-close", daemon=True).start()
 
     def _finish_close(self) -> None:

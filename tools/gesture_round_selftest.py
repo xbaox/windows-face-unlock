@@ -19,6 +19,8 @@ No service process, no camera, no pipe. Reproducible checks:
       the user's window.
   [7] audit records and the phase-2 adaptation (F-47): a grant after a passed round offers the
       best identity frame to the adaptive gallery, never when a frame was screen-flagged.
+  [X-03] (9e-0) every round that ran writes its still window's numbers into gesture_telemetry;
+      the reply, the strikes and the unlock_gesture record are the same with or without them.
 
 Uses an isolated FACE_UNLOCK_HOME and FaceService.__new__. Time is never waited on: a clock shim
 advances 0.1 s per camera read and jumps past every deadline when the canned frames run out.
@@ -521,6 +523,63 @@ def test_audit_and_adaptation():
           tele is not None and tele.get("fps") == 20.0 and tele.get("screen_flagged") == 1, tele)
 
 
+def _with_stillness(runner, stillness):
+    def r(k, *, identity=True):
+        return {**runner(k, identity=identity), "stillness": stillness}
+    return r
+
+
+def test_x03():
+    print("[X-03] the still window's numbers in the audit; they never change the round's verdict")
+    patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
+    orig_luma = svc.scene_luma
+    svc.scene_luma = lambda frame: 90.0
+    try:
+        good = _round("turn_left,nod", _hold(_BASE) + _hold(_LEFT, 2) + _hold(_LEFT, 3) + _hold(_NOD, 2))
+        st = good.get("stillness") or {}
+        check("X-03: a real round reports its still window (closed, >= 2 poses, 100 ms apart, still)",
+              good.get("passed") is True and st.get("outcome") == "closed" and st.get("poses", 0) >= 2
+              and abs((st.get("interval_ms_median") or 0) - 100.0) < 1.0 and st.get("max_dyaw_deg") == 0.0
+              and st.get("motion_rule") is None, st)
+        jump = [_f(True, _BASE), _f(True, (_BASE[0], _BASE[1] + STILLNESS_MAX_DEG + 3.0))] \
+            + _hold(_LEFT, 3) + _hold(_NOD, 3)
+        mv = _round("turn_left,nod", jump)
+        sm = mv.get("stillness") or {}
+        check("X-03: a real motion-before-prompt round: outcome motion, rule frame, |dyaw| 7.0",
+              mv.get("reason") == "motion-before-prompt" and sm.get("outcome") == "motion"
+              and sm.get("motion_rule") == "frame" and sm.get("max_dyaw_deg") == STILLNESS_MAX_DEG + 3.0, sm)
+    finally:
+        svc.scene_luma = orig_luma
+
+    # through unlock_gesture: the record is written for the round, and the verdict is the same with
+    # and without the numbers (every outcome class: granted, gesture-failed, motion, dark, no-face)
+    sample = {"poses": 5, "interval_ms_median": 450.0, "max_dyaw_deg": 1.25, "max_dpitch_deg": 0.5,
+              "span_yaw_deg": 2.0, "span_pitch_deg": 1.0, "outcome": "closed", "motion_rule": None}
+    cases = (("granted", _round_result()),
+             ("gesture-failed", _round_result(passed=False, identity_frames=5)),
+             ("motion-before-prompt", _round_result(passed=False, reason="motion-before-prompt")),
+             ("too-dark", _round_result(passed=False, identity_frames=5, luma=20.0)),
+             ("no-face", _round_result(passed=False, faces=0, identity_frames=0)))
+    for label, runner in cases:
+        outs = []
+        for stl in (None, sample):
+            s, tok = _armed(runner if stl is None else _with_stillness(runner, stl))
+            r = s._handle({"cmd": "unlock_gesture", "v": 2, "token": tok}, None)
+            if r.get("ok"):
+                deliver_and_report(s)
+            # the sequence is drawn at random per phase 1 and the grant id per grant: not compared
+            norm = lambda d: {k: v for k, v in (d or {}).items()  # noqa: E731
+                              if k not in ("password", "challenge", "grant_id")}
+            outs.append((norm(r), s._lockout.records, norm(s._audit.last("unlock_gesture")),
+                         s._audit.last("gesture_telemetry")))
+        (r0, l0, a0, t0), (r1, l1, a1, t1) = outs
+        check(f"X-03: {label}: the reply, the strikes and the unlock_gesture record are the same "
+              "with the stillness numbers", r0 == r1 and l0 == l1 and a0 == a1 and a1["reason"] == label,
+              (r0, r1, l0, l1, a1))
+        check(f"X-03: {label}: gesture_telemetry carries the round's stillness record as is",
+              t1 is not None and t1.get("stillness") == sample and "stillness" in t0, t1)
+
+
 def test_9d():
     print("[9d] A-7 dark phase 2, V-11 dark no-face, V-14 engine faults, A-8 no-credentials")
     patch(svc, "load_password", lambda: {"u": "admin", "p": "pw", "d": "."})
@@ -664,6 +723,7 @@ def main() -> int:
         test_round,
         test_strikes,
         test_audit_and_adaptation,
+        test_x03,
         test_9d,
     )
     if FAILS:

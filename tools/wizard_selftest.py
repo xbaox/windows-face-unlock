@@ -30,6 +30,9 @@ recorder with canned answers. What it pins:
   [W-19] a failed build shows words, the raw reason goes to the log only.
   [W-20] dialog wrap width follows the DPI; the window width does not change when the optional
          button appears; no "(older setting)" when there is no camera at index 0.
+  9e-0:
+  [X-01] two camera changes while the first camera thread hangs in read(): the newest worker
+         waits for EVERY earlier camera thread still alive ("switching"), never two devices open.
 
 Run:  python -m tools.wizard_selftest [--shots DIR [--lang en|ru]]
 With --shots the window is captured (PNG) at each state -- the frames are synthetic, no face.
@@ -244,6 +247,91 @@ def test_worker() -> None:
           E.camera_index_explicit is C.camera_index_explicit)
 
 
+def _max_open(calls) -> int:
+    """The most camera devices open at once in a CALLS trace (a fake open always succeeds here)."""
+    n = peak = 0
+    for c in calls:
+        if c[0] == "open":
+            n += 1
+            peak = max(peak, n)
+        elif c == ("release",):
+            n -= 1
+    return peak
+
+
+def test_x01(lease) -> None:
+    print("[X-01] two camera changes while the first camera thread hangs in read(): one device open")
+
+    class _Win:                                   # just what EnrollWindow._start_camera touches
+        def __init__(self):
+            self.cfg = Config()
+            self.cfg.camera_name = "Synthetic Camera"
+            self.q: queue.Queue = queue.Queue()
+            self.lease = lease
+            self.service_up = threading.Event()
+            self.service_up.set()
+            self.preview_size = (E.PREVIEW_W, E.PREVIEW_H)
+            self.session = None
+            self.cam_thread = None
+            self.cam_threads = []
+            self._gen = 10
+            self.cam_gen = 10
+            self.camera_ok = False
+
+        def _set_extra(self, *_a):
+            pass
+
+        def _refresh_buttons(self):
+            pass
+
+    w = _Win()
+    start = E.EnrollWindow._start_camera
+    CALLS.clear()
+    BLOCK.clear()
+    OPEN_MODE["mode"] = "block"                   # the first device hangs in its native read()
+    try:
+        start(w)
+        t1 = w.cam_thread
+        deadline = time.monotonic() + 3
+        while ("open", "Synthetic Camera") not in CALLS and time.monotonic() < deadline:
+            time.sleep(0.02)
+        OPEN_MODE["mode"] = "ok"
+        w.cfg.camera_name = "Other Camera"        # change 1: its worker waits for t1
+        start(w)
+        time.sleep(0.4)
+        w.cfg.camera_name = "Synthetic Camera"    # change 2: must wait for t1 too, not only for t2
+        start(w)
+        kept = t1 in w.cam_threads and w.cam_thread in w.cam_threads
+        time.sleep(1.0)
+        msgs = _drain(w.q)
+        check("X-01: while the hung first camera thread lives, no second device is opened",
+              t1.is_alive() and CALLS.count(("open", "Synthetic Camera")) == 1
+              and ("open", "Other Camera") not in CALLS, CALLS)
+        check("X-01: the newest session says 'switching camera' meanwhile",
+              ("camera_switching", w.cam_gen) in msgs, msgs)
+        BLOCK.set()                               # the hung read() returns; the first device goes
+        deadline = time.monotonic() + 5
+        while CALLS.count(("open", "Synthetic Camera")) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        first = _idx(("open", "Synthetic Camera"))
+        check("X-01: the newest camera opens only after the first device was released",
+              0 <= first < _idx(("release",)) < _idx(("open", "Synthetic Camera"), first + 1), CALLS)
+        check("X-01: never more than one device open at a time", _max_open(CALLS) <= 1, CALLS)
+        check("X-01: the window keeps every camera thread still alive, the hung one included "
+              "(Close and the readiness check wait for all)", kept, w.cam_threads)
+    finally:
+        OPEN_MODE["mode"] = "ok"
+        if w.session is not None:
+            w.session.stop.set()
+        for t in list(getattr(w, "cam_threads", []) or []) + [w.cam_thread]:
+            if t is not None:
+                t.join(3)
+        BLOCK.clear()
+    check("X-01: every camera thread ended and the lease is back", not lease.held
+          and not any(t.is_alive() for t in w.cam_threads + [w.cam_thread] if t is not None))
+
+
 def test_r2_workers() -> None:
     print("[W-11] the lease is counted per holder; one camera session at a time")
     pipe = E.pipe_call
@@ -289,6 +377,8 @@ def test_r2_workers() -> None:
         check("W-11: ... and gives it back when it ends", not lease.held and not t2.is_alive())
     finally:
         RELEASE_DELAY["s"] = 0.0
+
+    test_x01(lease)
 
     print("[W-13] the lease only after the service answered; a lease request without answer")
     CALLS.clear()

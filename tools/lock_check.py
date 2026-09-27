@@ -19,6 +19,12 @@ directory (9d-r2, W-31: setup.ps1 runs it by its path):
     python tools/lock_check.py --lock requirements.lock
     python tools/lock_check.py --lock requirements-gpu.lock
 Exit 0 = complete; 1 = something is missing or mismatched (listed).
+
+9e-0 (X-02): every listed line says what it is --
+    MISSING   a pinned or required distribution is not installed;
+    EXTRA     an installed distribution the lock does not pin (pip and the build tools excepted);
+    CONFLICT  installed, but at another version than pinned / required, or onnxruntime together
+              with onnxruntime-gpu (or a requirement that cannot be read).
 """
 from __future__ import annotations
 
@@ -119,17 +125,39 @@ def not_in_lock(lock: Path, have: "dict[str, str] | None" = None,
             for name, ver in sorted(have.items()) if name not in allowed]
 
 
+TAGS = ("MISSING", "EXTRA", "CONFLICT")
+
+
+def _absent_or_conflict(text: str) -> str:
+    """9e-0 (X-02): a requirement / pin line is MISSING when nothing is installed under the name,
+    CONFLICT when something is, at another version (or the requirement cannot be read)."""
+    return "MISSING" if text.endswith("-- not installed") else "CONFLICT"
+
+
+def tagged_problems(lock: "Path | None" = None,
+                    have: "dict[str, str] | None" = None) -> "list[tuple[str, str]]":
+    """9e-0 (X-02): every problem with its honest tag (TAGS)."""
+    reqs = missing_requirements() if have is None else missing_requirements(have=have)
+    have = installed() if have is None else have
+    out = [(_absent_or_conflict(p), p) for p in reqs]
+    out += [("CONFLICT", p) for p in both_runtimes(have)]
+    if lock is not None:
+        out += [(_absent_or_conflict(p), p) for p in lock_mismatches(lock, have)]
+        out += [("EXTRA", p) for p in not_in_lock(lock, have)]
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--lock", type=Path, default=None)
     a = ap.parse_args(argv)
-    problems = missing_requirements() + both_runtimes()
-    if a.lock is not None:
-        problems += lock_mismatches(a.lock) + not_in_lock(a.lock)
-    for p in problems:
-        print("  MISSING  " + p)
+    problems = tagged_problems(a.lock)
+    for tag, p in problems:
+        print(f"  {tag:<9} {p}")
     if problems:
-        print(f"lock_check: {len(problems)} problem(s)")
+        counts = ", ".join(f"{sum(1 for t, _ in problems if t == tag)} {tag}" for tag in TAGS
+                           if any(t == tag for t, _ in problems))
+        print(f"lock_check: {len(problems)} problem(s): {counts}")
         return 1
     n = len(installed())
     print(f"lock_check OK: {n} distributions, every dependency satisfied"

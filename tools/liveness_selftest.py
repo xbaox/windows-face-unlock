@@ -2,7 +2,8 @@
 """Synthetic self-test for face_service.liveness -- no camera, no real waiting.
 
 Covers: EAR/blink state machine, blink window, head-pose gesture tasks, and the
-LivenessChallenge engine (issue -> AWAITING -> PASSED/FAILED). All clocks are injected
+LivenessChallenge engine (issue -> AWAITING -> PASSED/FAILED), the phase-2 GestureSequence
+(still window A-3 / W-01 / W-02, 9e-0 X-03: its telemetry). All clocks are injected
 (a manual counter) and pose/landmarks are constructed, so results are deterministic.
 
 Run from repo root:
@@ -379,6 +380,91 @@ def main() -> int:
                        still + [pose(pitch=down_pitch)] * 4 + [pose(pitch=down_pitch, yaw=left_yaw)] * 4)
     check("V-13: pairs with a nod keep their own baselines (nod, then left from the nodded pose)",
           nod_turn.passed)
+
+    print("\n9e-0 (X-03): the still window's numbers for the audit; recording them changes nothing")
+    keys = {"poses", "interval_ms_median", "max_dyaw_deg", "max_dpitch_deg", "span_yaw_deg",
+            "span_pitch_deg", "outcome", "motion_rule"}
+    y0, p0 = NEUTRAL[POSE_YAW], NEUTRAL[POSE_PITCH]
+    jit = [pose(yaw=y0 + dy, pitch=p0 + dp) for dy, dp in
+           ((0.0, 0.0), (1.0, 0.5), (-0.5, 0.0), (1.5, -1.0), (0.0, 0.0))]
+    jt = run_seq((Challenge.TURN_LEFT, Challenge.NOD),
+                 jit + [pose()] + [pose(yaw=left_yaw)] * 4 + [pose(yaw=left_yaw, pitch=down_pitch)] * 4,
+                 step=0.09)
+    tl = jt.stillness_telemetry()
+    check("X-03: the record has exactly the agreed keys", set(tl) == keys)
+    check("X-03: a jittery still window at 0.09 s: 5 poses, median 90 ms, max |dyaw| 2.0, "
+          "max |dpitch| 1.0, span yaw 2.0 / pitch 1.5, closed, no rule; the round passes",
+          jt.passed and tl["poses"] == 5 and abs(tl["interval_ms_median"] - 90.0) < 0.2
+          and tl["max_dyaw_deg"] == 2.0 and tl["max_dpitch_deg"] == 1.0 and tl["span_yaw_deg"] == 2.0
+          and tl["span_pitch_deg"] == 1.5 and tl["outcome"] == "closed" and tl["motion_rule"] is None)
+    vm = run_seq((Challenge.TURN_LEFT, Challenge.NOD),
+                 [pose(), pose(yaw=y0 + 1.0)] + [pose(yaw=left_yaw)] * 4
+                 + [pose(yaw=left_yaw, pitch=down_pitch)] * 4, step=0.8).stillness_telemetry()
+    check("X-03: a pose every 0.8 s (a VM): 2 poses, median 800 ms, closed",
+          vm["poses"] == 2 and abs(vm["interval_ms_median"] - 800.0) < 0.2 and vm["outcome"] == "closed"
+          and vm["max_dyaw_deg"] == 1.0)
+    fr = run_seq((Challenge.NOD, Challenge.TURN_RIGHT),
+                 [pose(), pose(yaw=y0 + STILLNESS_MAX_DEG + 1.0)] + still)
+    ft = fr.stillness_telemetry()
+    check("X-03: a frame-to-frame jump -> outcome motion, rule 'frame', the failing pose counted",
+          fr.reason == "motion-before-prompt" and ft["outcome"] == "motion" and ft["motion_rule"] == "frame"
+          and ft["poses"] == 2 and ft["max_dyaw_deg"] == STILLNESS_MAX_DEG + 1.0)
+    sp = run_seq((Challenge.TURN_LEFT, Challenge.TURN_RIGHT),
+                 [pose(yaw=y0 - 23.4 + i * 3.9) for i in range(13)], step=1.0 / 30.0)
+    st = sp.stillness_telemetry()
+    check("X-03: the 3.9 deg/frame drift -> outcome motion, rule 'span' (every jump <= 4 deg)",
+          sp.reason == "motion-before-prompt" and st["motion_rule"] == "span"
+          and st["max_dyaw_deg"] <= STILLNESS_MAX_DEG and st["span_yaw_deg"] > STILLNESS_MAX_DEG)
+    clk = FakeClock()
+    op = GestureSequence((Challenge.TURN_LEFT, Challenge.NOD), clock=clk)
+    op.feed(OPEN, pose())
+    clk.tick(ROUND_CAP_S + 1.0)
+    op.tick()
+    ot = op.stillness_telemetry()
+    check("X-03: one pose, then the round ends -> outcome open, 1 pose, no numbers to compute",
+          op.reason == "round-timeout" and ot["outcome"] == "open" and ot["poses"] == 1
+          and ot["interval_ms_median"] is None and ot["motion_rule"] is None)
+    fresh = GestureSequence((Challenge.TURN_LEFT, Challenge.NOD), clock=FakeClock()).stillness_telemetry()
+    check("X-03: a round with no pose fed -> 0 poses, open", fresh["poses"] == 0 and fresh["outcome"] == "open")
+    check("X-03: only numbers (and the two fixed words): no frame, path or name can be in it",
+          all(isinstance(t[k], (int, float, type(None))) for t in (tl, vm, ft, st, ot)
+              for k in keys - {"outcome", "motion_rule"})
+          and {t["outcome"] for t in (tl, vm, ft, st, ot)} <= {"closed", "motion", "open"}
+          and {t["motion_rule"] for t in (tl, vm, ft, st, ot)} <= {None, "frame", "span"})
+
+    def run_probed(kinds, poses, step=0.1):
+        clk = FakeClock()
+        seq = GestureSequence(kinds, clock=clk)
+        for p in poses:
+            seq.feed(OPEN, p)
+            seq.stillness_telemetry()
+            clk.tick(step)
+            if seq.done:
+                break
+        for _ in range(200):
+            if seq.done:
+                break
+            seq.tick()
+            seq.stillness_telemetry()
+            clk.tick(step)
+        return seq
+
+    scripts = (((Challenge.TURN_LEFT, Challenge.NOD),
+                jit + [pose()] + [pose(yaw=left_yaw)] * 4 + [pose(yaw=left_yaw, pitch=down_pitch)] * 4, 0.09),
+               ((Challenge.NOD, Challenge.TURN_RIGHT), [pose(), pose(yaw=y0 + 5.0)] + still, 0.1),
+               ((Challenge.TURN_LEFT, Challenge.TURN_RIGHT),
+                [pose(yaw=y0 - 23.4 + i * 3.9) for i in range(13)], 1.0 / 30.0),
+               ((Challenge.TURN_LEFT, Challenge.NOD), still + [pose(pitch=down_pitch)] * 4, 0.1),
+               ((Challenge.TURN_RIGHT, Challenge.TURN_LEFT),
+                [pose(), pose()] + [pose(yaw=right_yaw)] * 2 + [pose(yaw=left_yaw)] * 2, 0.8),
+               ((Challenge.TURN_LEFT, Challenge.NOD), still + [pose()] * 200, 0.1))
+    same = []
+    for kinds, poses, step in scripts:
+        a, b = run_seq(kinds, poses, step=step), run_probed(kinds, poses, step=step)
+        same.append((a.state, a.reason, a.steps_done, a.neutral) == (b.state, b.reason, b.steps_done, b.neutral))
+    check("X-03: reading the telemetry after every pose does not change any round's verdict "
+          "(pass, gesture-order, motion x2, timeouts)", all(same) and len(same) == 6)
+
     check("V-13: constants unchanged (YAW_DELTA 20, PITCH_DOWN_DELTA 10, window 0.4 s / 4 deg)",
           YAW_DELTA == 20.0 and PITCH_DOWN_DELTA == 10.0 and STILLNESS_WINDOW_S == 0.4
           and STILLNESS_MAX_DEG == 4.0)
